@@ -1,28 +1,64 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
+
+const NONCE_LEN: usize = 12;
 
 /// Agent-side secret injection.
-/// Writes decrypted secrets to files accessible by the target service.
+/// Decrypts secrets received from the server and writes plaintext
+/// to files with restrictive permissions accessible by the target service.
 pub struct SecretInjector {
     secrets_dir: PathBuf,
     /// service_name → secret_name → version
     injected: HashMap<String, HashMap<String, u64>>,
+    key: Arc<LessSafeKey>,
 }
 
 impl SecretInjector {
-    pub fn new(data_dir: &Path) -> Self {
+    pub fn new(data_dir: &Path, encryption_key: &[u8; 32]) -> Self {
+        let unbound =
+            UnboundKey::new(&AES_256_GCM, encryption_key).expect("valid 256-bit key required");
+        let key = LessSafeKey::new(unbound);
+
         Self {
             secrets_dir: data_dir.join("secrets"),
             injected: HashMap::new(),
+            key: Arc::new(key),
         }
     }
 
-    /// Inject a secret for a service. Writes to a file and returns the path.
+    /// Decrypt a sealed value (nonce || ciphertext || tag).
+    fn decrypt(&self, sealed: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+        if sealed.len() < NONCE_LEN {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "sealed data too short",
+            ));
+        }
+
+        let (nonce_bytes, ciphertext_and_tag) = sealed.split_at(NONCE_LEN);
+        let nonce = Nonce::try_assume_unique_for_key(nonce_bytes)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid nonce"))?;
+
+        let mut in_out = ciphertext_and_tag.to_vec();
+        let plaintext = self
+            .key
+            .open_in_place(nonce, Aad::empty(), &mut in_out)
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "decryption failed")
+            })?;
+
+        Ok(plaintext.to_vec())
+    }
+
+    /// Inject a secret for a service. Decrypts and writes to a file, returns the path.
     pub async fn inject(
         &mut self,
         service_name: &str,
         secret_name: &str,
-        value: &[u8],
+        encrypted_value: &[u8],
         version: u64,
     ) -> Result<PathBuf, std::io::Error> {
         // Check if already at this version
@@ -38,8 +74,9 @@ impl SecretInjector {
 
         let path = dir.join(secret_name);
 
-        // TODO: decrypt the value before writing (currently stored plaintext)
-        tokio::fs::write(&path, value).await?;
+        // Decrypt before writing to disk
+        let plaintext = self.decrypt(encrypted_value)?;
+        tokio::fs::write(&path, &plaintext).await?;
 
         // Set restrictive permissions (owner read-only)
         #[cfg(unix)]
@@ -59,7 +96,7 @@ impl SecretInjector {
             secret = %secret_name,
             version,
             path = %path.display(),
-            "Secret injected"
+            "Secret injected (decrypted)"
         );
 
         Ok(path)

@@ -1,13 +1,19 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
+use ring::rand::{SecureRandom, SystemRandom};
 use tokio::sync::RwLock;
 
+const NONCE_LEN: usize = 12; // AES-256-GCM nonce size
+
 /// Server-side encrypted secret storage.
-/// Secrets are encrypted at rest and scoped to specific services.
+/// Secrets are encrypted at rest with AES-256-GCM and scoped to specific services.
 #[derive(Clone)]
 pub struct SecretStore {
     inner: Arc<RwLock<StoreState>>,
+    key: Arc<LessSafeKey>,
+    rng: Arc<SystemRandom>,
 }
 
 struct StoreState {
@@ -17,21 +23,86 @@ struct StoreState {
 
 #[derive(Clone)]
 struct SecretEntry {
-    encrypted_value: Vec<u8>,
+    /// Nonce (12 bytes) || ciphertext || tag (16 bytes)
+    sealed: Vec<u8>,
     version: u64,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum SecretStoreError {
+    #[error("encryption failed")]
+    Encrypt,
+    #[error("decryption failed")]
+    Decrypt,
+}
+
 impl SecretStore {
-    pub fn new() -> Self {
+    /// Create a new SecretStore with the given 256-bit encryption key.
+    pub fn new(encryption_key: &[u8; 32]) -> Self {
+        let unbound =
+            UnboundKey::new(&AES_256_GCM, encryption_key).expect("valid 256-bit key required");
+        let key = LessSafeKey::new(unbound);
+
         Self {
             inner: Arc::new(RwLock::new(StoreState {
                 secrets: HashMap::new(),
             })),
+            key: Arc::new(key),
+            rng: Arc::new(SystemRandom::new()),
         }
     }
 
+    /// Encrypt plaintext value using AES-256-GCM.
+    /// Returns nonce || ciphertext || tag.
+    fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, SecretStoreError> {
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        self.rng
+            .fill(&mut nonce_bytes)
+            .map_err(|_| SecretStoreError::Encrypt)?;
+
+        let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+
+        let mut in_out = plaintext.to_vec();
+        self.key
+            .seal_in_place_append_tag(nonce, Aad::empty(), &mut in_out)
+            .map_err(|_| SecretStoreError::Encrypt)?;
+
+        // Prepend nonce to ciphertext+tag
+        let mut sealed = Vec::with_capacity(NONCE_LEN + in_out.len());
+        sealed.extend_from_slice(&nonce_bytes);
+        sealed.extend_from_slice(&in_out);
+        Ok(sealed)
+    }
+
+    /// Decrypt a sealed value (nonce || ciphertext || tag).
+    fn decrypt(&self, sealed: &[u8]) -> Result<Vec<u8>, SecretStoreError> {
+        if sealed.len() < NONCE_LEN {
+            return Err(SecretStoreError::Decrypt);
+        }
+
+        let (nonce_bytes, ciphertext_and_tag) = sealed.split_at(NONCE_LEN);
+        let nonce =
+            Nonce::try_assume_unique_for_key(nonce_bytes).map_err(|_| SecretStoreError::Decrypt)?;
+
+        let mut in_out = ciphertext_and_tag.to_vec();
+        let plaintext = self
+            .key
+            .open_in_place(nonce, Aad::empty(), &mut in_out)
+            .map_err(|_| SecretStoreError::Decrypt)?;
+
+        Ok(plaintext.to_vec())
+    }
+
     /// Store or update a secret for a service.
-    pub async fn put(&self, service_name: &str, secret_name: &str, value: &[u8]) -> u64 {
+    /// The value is encrypted before storage.
+    pub async fn put(
+        &self,
+        service_name: &str,
+        secret_name: &str,
+        value: &[u8],
+    ) -> Result<u64, SecretStoreError> {
+        let sealed = self.encrypt(value)?;
+
         let mut state = self.inner.write().await;
         let service_secrets = state.secrets.entry(service_name.to_string()).or_default();
 
@@ -40,35 +111,36 @@ impl SecretStore {
             .map(|e| e.version + 1)
             .unwrap_or(1);
 
-        // TODO: encrypt with fleet key before storing
-        let encrypted = value.to_vec();
-
-        service_secrets.insert(
-            secret_name.to_string(),
-            SecretEntry {
-                encrypted_value: encrypted,
-                version,
-            },
-        );
+        service_secrets.insert(secret_name.to_string(), SecretEntry { sealed, version });
 
         tracing::info!(
             service = %service_name,
             secret = %secret_name,
             version,
-            "Secret stored"
+            "Secret stored (encrypted)"
         );
 
-        version
+        Ok(version)
     }
 
-    /// Get a secret for a service. Returns (encrypted_value, version).
-    pub async fn get(&self, service_name: &str, secret_name: &str) -> Option<(Vec<u8>, u64)> {
+    /// Get a decrypted secret for a service. Returns (plaintext, version).
+    pub async fn get(
+        &self,
+        service_name: &str,
+        secret_name: &str,
+    ) -> Result<Option<(Vec<u8>, u64)>, SecretStoreError> {
         let state = self.inner.read().await;
-        state
+        match state
             .secrets
             .get(service_name)
             .and_then(|svc| svc.get(secret_name))
-            .map(|e| (e.encrypted_value.clone(), e.version))
+        {
+            Some(entry) => {
+                let plaintext = self.decrypt(&entry.sealed)?;
+                Ok(Some((plaintext, entry.version)))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Delete a secret.
@@ -95,7 +167,8 @@ impl SecretStore {
             .unwrap_or_default()
     }
 
-    /// Get all secrets that should be pushed to a node for its assigned services.
+    /// Get all encrypted secrets that should be pushed to a node for its assigned services.
+    /// Returns sealed (encrypted) values for transit — the agent decrypts on receipt.
     pub async fn secrets_for_services(
         &self,
         service_names: &[String],
@@ -109,7 +182,7 @@ impl SecretStore {
                     result.push((
                         svc_name.clone(),
                         secret_name.clone(),
-                        entry.encrypted_value.clone(),
+                        entry.sealed.clone(),
                         entry.version,
                     ));
                 }

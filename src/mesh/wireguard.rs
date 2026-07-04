@@ -54,12 +54,37 @@ impl WireguardManager {
         // Create interface
         run_cmd("ip", &["link", "add", &self.interface, "type", "wireguard"]).await?;
 
-        // Set private key (via temp file or stdin)
-        let key_cmd = format!(
-            "echo '{}' | wg set {} private-key /dev/stdin listen-port {}",
-            self.private_key, self.interface, self.listen_port
-        );
-        run_shell(&key_cmd).await?;
+        // Set private key via stdin (avoid exposing key in process args)
+        {
+            use tokio::io::AsyncWriteExt;
+            let mut child = tokio::process::Command::new("wg")
+                .args([
+                    "set",
+                    &self.interface,
+                    "private-key",
+                    "/dev/stdin",
+                    "listen-port",
+                    &self.listen_port.to_string(),
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(WgError::Io)?;
+
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(self.private_key.as_bytes()).await?;
+            }
+
+            let output = child.wait_with_output().await?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(WgError::Command(format!(
+                    "wg set private-key → {}",
+                    stderr.trim()
+                )));
+            }
+        }
 
         // Assign IP
         let ip_cidr = format!("{}/16", self.mesh_ip);
@@ -163,20 +188,6 @@ async fn run_cmd(cmd: &str, args: &[&str]) -> Result<(), WgError> {
             args.join(" "),
             stderr.trim()
         )));
-    }
-
-    Ok(())
-}
-
-async fn run_shell(cmd: &str) -> Result<(), WgError> {
-    let output = tokio::process::Command::new("sh")
-        .args(["-c", cmd])
-        .output()
-        .await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(WgError::Command(stderr.to_string()));
     }
 
     Ok(())

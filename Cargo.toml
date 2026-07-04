@@ -42,5 +42,9 @@ thiserror = "2"
 # Unique IDs
 uuid = { version = "1", features = ["v4", "serde"] }
 
+# Cryptography
+ring = "0.17"
+zeroize = { version = "1", features = ["derive"] }
+
 [build-dependencies]
 tonic-build = "0.13"

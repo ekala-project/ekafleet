@@ -76,12 +76,19 @@ table inet {table} {{
                 .collect::<Vec<_>>()
                 .join(", ");
 
+            // Sanitize description to prevent nftables comment injection
+            let desc: String = rule
+                .description
+                .chars()
+                .filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '-' || *c == '_')
+                .take(128)
+                .collect();
+
             nft_rules.push(format!(
                 "add rule inet {table} input ip saddr {src} ip daddr {dst} tcp dport {{ {ports} }} accept comment \"{desc}\"",
                 table = self.table_name,
                 src = rule.source_ip,
                 dst = rule.dest_ip,
-                desc = rule.description,
             ));
         }
 
@@ -109,21 +116,27 @@ table inet {table} {{
     }
 
     async fn apply_ruleset(&self, ruleset: &str) -> Result<(), NftError> {
-        let output = tokio::process::Command::new("nft")
+        use tokio::io::AsyncWriteExt;
+
+        let mut child = tokio::process::Command::new("nft")
             .args(["-f", "-"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()?
-            .wait_with_output()
-            .await?;
+            .spawn()?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(ruleset.as_bytes()).await?;
+            // Drop stdin to close the pipe so nft sees EOF
+        }
+
+        let output = child.wait_with_output().await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(NftError::Command(stderr.to_string()));
         }
 
-        let _ = ruleset; // will be piped to stdin when using proper stdin write
         Ok(())
     }
 }
