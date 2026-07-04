@@ -1,8 +1,18 @@
 mod agent;
 #[allow(dead_code)]
+mod ca;
+#[allow(dead_code)]
 mod config;
 #[allow(dead_code)]
 mod dns;
+#[allow(dead_code)]
+mod mesh;
+#[allow(dead_code)]
+mod policy;
+#[allow(dead_code)]
+mod proxy;
+#[allow(dead_code)]
+mod secrets;
 mod server;
 
 pub mod proto {
