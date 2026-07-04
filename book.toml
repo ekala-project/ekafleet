@@ -2,18 +2,18 @@
 title = "ekafleet Documentation"
 authors = ["Ekala Project Contributors"]
 language = "en"
-src = "src"
+src = "docs-src"
 description = "Unified fleet management for ekaos — one binary replacing the HashiCorp stack"
 
 [build]
-build-dir = "book"
+build-dir = "docs"
 create-missing = true
 
 [output.html]
 default-theme = "light"
 preferred-dark-theme = "navy"
 git-repository-url = "https://github.com/ekala-project/ekaos-fleet"
-edit-url-template = "https://github.com/ekala-project/ekaos-fleet/edit/master/docs/{path}"
+edit-url-template = "https://github.com/ekala-project/ekaos-fleet/edit/master/docs-src/{path}"
 site-url = "/ekaos-fleet/"
 
 [output.html.search]

@@ -1,0 +1,1328 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>ekafleet Documentation</title>
+        <meta name="robots" content="noindex">
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Unified fleet management for ekaos — one binary replacing the HashiCorp stack">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon.svg">
+        <link rel="shortcut icon" href="favicon.png">
+        <link rel="stylesheet" href="css/variables.css">
+        <link rel="stylesheet" href="css/general.css">
+        <link rel="stylesheet" href="css/chrome.css">
+        <link rel="stylesheet" href="css/print.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="FontAwesome/css/font-awesome.css">
+        <link rel="stylesheet" href="fonts/fonts.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="highlight-css" href="highlight.css">
+        <link rel="stylesheet" id="tomorrow-night-css" href="tomorrow-night.css">
+        <link rel="stylesheet" id="ayu-highlight-css" href="ayu-highlight.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "";
+            const default_light_theme = "light";
+            const default_dark_theme = "navy";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="toc.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('light')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+            }
+            sidebar_toggle.checked = sidebar === 'visible';
+            html.classList.remove('sidebar-visible');
+            html.classList.add("sidebar-" + sidebar);
+        </script>
+
+        <nav id="sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+            </noscript>
+            <div id="sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="menu-bar-hover-placeholder"></div>
+                <div id="menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="sidebar-toggle" class="icon-button" for="sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="sidebar">
+                            <i class="fa fa-bars"></i>
+                        </label>
+                        <button id="theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="theme-list">
+                            <i class="fa fa-paint-brush"></i>
+                        </button>
+                        <ul id="theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="ayu">Ayu</button></li>
+                        </ul>
+                        <button id="search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="searchbar">
+                            <i class="fa fa-search"></i>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">ekafleet Documentation</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <i id="print-button" class="fa fa-print"></i>
+                        </a>
+                        <a href="https://github.com/ekala-project/ekaos-fleet" title="Git repository" aria-label="Git repository">
+                            <i id="git-repository-button" class="fa fa-github"></i>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="search-wrapper" class="hidden">
+                    <form id="searchbar-outer" class="searchbar-outer">
+                        <input type="search" id="searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="searchresults-outer" aria-describedby="searchresults-header">
+                    </form>
+                    <div id="searchresults-outer" class="searchresults-outer hidden">
+                        <div id="searchresults-header" class="searchresults-header"></div>
+                        <ul id="searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="content" class="content">
+                    <main>
+                        <h1 id="ekafleet"><a class="header" href="#ekafleet">ekafleet</a></h1>
+<p>ekafleet is a single Rust binary that replaces the entire HashiCorp stack (Nomad + Consul + Vault) and supporting infrastructure tools with one purpose-built application for managing <a href="https://github.com/ekala-project/ekapkgs-roadmap">ekaos</a> fleets.</p>
+<h2 id="one-binary-two-modes"><a class="header" href="#one-binary-two-modes">One Binary, Two Modes</a></h2>
+<ul>
+<li><strong><code>ekafleet server</code></strong> — Control plane: scheduling, CA, secrets, DNS authority, deployment orchestration, Raft consensus</li>
+<li><strong><code>ekafleet agent</code></strong> — Data plane: service supervision, health checks, DNS resolver, secret injection, mesh networking, L7 proxy</li>
+</ul>
+<p>Server mode embeds all agent capabilities, meaning a server node can also run workloads. This follows the same pattern as k3s and Nomad.</p>
+<h2 id="why-ekafleet"><a class="header" href="#why-ekafleet">Why ekafleet?</a></h2>
+<p>Running a production fleet typically requires deploying and maintaining a dozen separate tools. ekafleet consolidates these into a single, statically-linked binary with no runtime dependencies:</p>
+<ul>
+<li><strong>Small footprint</strong> — single ~5MB musl-static binary</li>
+<li><strong>No runtime dependencies</strong> — no JVM, no interpreters, no container runtimes</li>
+<li><strong>Predictable latency</strong> — Rust's zero-cost abstractions and no GC</li>
+<li><strong>Nix-native</strong> — fleet configuration is pure Nix, consumed via <code>nix eval</code></li>
+<li><strong>Secure by default</strong> — mTLS, encrypted secrets, workload attestation via Nix store paths</li>
+</ul>
+<h2 id="design-principles"><a class="header" href="#design-principles">Design Principles</a></h2>
+<ol>
+<li><strong>Convention over configuration</strong> — sensible defaults for everything, override when needed</li>
+<li><strong>Reconciliation model</strong> — desired state is declared in Nix, ekafleet continuously converges actual state to match</li>
+<li><strong>Graceful degradation</strong> — agents continue operating when the server is unreachable</li>
+<li><strong>Defense in depth</strong> — mTLS for identity, nftables for network policy, encrypted secrets at rest</li>
+</ol>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="installation"><a class="header" href="#installation">Installation</a></h1>
+<h2 id="from-nix-flake"><a class="header" href="#from-nix-flake">From Nix Flake</a></h2>
+<p>The recommended way to install ekafleet:</p>
+<pre><code class="language-bash">nix profile install github:ekala-project/ekaos-fleet
+</code></pre>
+<p>Or add it to a NixOS configuration:</p>
+<pre><code class="language-nix">{
+  inputs.ekaos-fleet.url = "github:ekala-project/ekaos-fleet";
+
+  outputs = { self, nixpkgs, ekaos-fleet, ... }: {
+    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+      modules = [
+        # ekaos-fleet.nixosModules.default
+        ({ pkgs, ... }: {
+          environment.systemPackages = [ ekaos-fleet.packages.${pkgs.system}.default ];
+        })
+      ];
+    };
+  };
+}
+</code></pre>
+<h2 id="from-source"><a class="header" href="#from-source">From Source</a></h2>
+<pre><code class="language-bash">git clone https://github.com/ekala-project/ekaos-fleet
+cd ekaos-fleet
+nix build .
+# Binary is at ./result/bin/ekafleet
+</code></pre>
+<p>Or with cargo directly (requires protobuf compiler):</p>
+<pre><code class="language-bash">cargo build --release
+# Binary is at ./target/release/ekafleet
+</code></pre>
+<h2 id="development-shell"><a class="header" href="#development-shell">Development Shell</a></h2>
+<p>For contributors, the flake provides a development shell with all dependencies:</p>
+<pre><code class="language-bash">cd ekaos-fleet
+nix develop
+# or with direnv:
+direnv allow
+</code></pre>
+<p>This provides Rust toolchain (via fenix), protobuf compiler, pkg-config, and OpenSSL.</p>
+<h2 id="verify-installation"><a class="header" href="#verify-installation">Verify Installation</a></h2>
+<pre><code class="language-bash">ekafleet --help
+</code></pre>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="quick-start"><a class="header" href="#quick-start">Quick Start</a></h1>
+<p>This guide walks through setting up a minimal fleet with one server and one agent.</p>
+<h2 id="1-start-the-server"><a class="header" href="#1-start-the-server">1. Start the Server</a></h2>
+<p>On your first machine, start ekafleet in server mode:</p>
+<pre><code class="language-bash">ekafleet server --data-dir /var/lib/ekafleet
+</code></pre>
+<p>By default, the server listens on:</p>
+<ul>
+<li><code>0.0.0.0:7400</code> — gRPC (agent connections)</li>
+<li><code>0.0.0.0:7402</code> — HTTP API (health, metrics)</li>
+</ul>
+<h2 id="2-create-a-join-token"><a class="header" href="#2-create-a-join-token">2. Create a Join Token</a></h2>
+<p>Generate an authentication token for agents:</p>
+<pre><code class="language-bash">ekafleet token create --type=agent
+</code></pre>
+<h2 id="3-join-an-agent"><a class="header" href="#3-join-an-agent">3. Join an Agent</a></h2>
+<p>On another machine, start the agent and join the server:</p>
+<pre><code class="language-bash">ekafleet agent --join server-ip:7400 --token &lt;TOKEN&gt;
+</code></pre>
+<p>The agent will:</p>
+<ul>
+<li>Generate a unique node ID (persisted in <code>/var/lib/ekafleet/node-id</code>)</li>
+<li>Establish a bidirectional gRPC stream to the server</li>
+<li>Begin sending heartbeats every 5 seconds</li>
+<li>Report its status every 10 seconds</li>
+</ul>
+<h2 id="4-write-fleet-configuration"><a class="header" href="#4-write-fleet-configuration">4. Write Fleet Configuration</a></h2>
+<p>Create a <code>fleet.nix</code> that defines your services and machines:</p>
+<pre><code class="language-nix">{ pkgs }:
+{
+  fleet = {
+    name = "my-fleet";
+    domain = "fleet.internal";
+
+    services.web = {
+      command = "${pkgs.my-web-app}/bin/server";
+      ports.http = {
+        port = 8080;
+        healthCheck.path = "/health";
+      };
+      resources = {
+        cpu.request = 500;
+        memory.request = 512;
+      };
+      scheduling = {
+        replicas = 2;
+        type = "service";
+      };
+    };
+
+    machines.node-1 = {
+      targetHost = "10.0.1.1";
+      labels = { role = "app"; };
+      capacity = { cpu = 4000; memory = 8192; };
+    };
+
+    machines.node-2 = {
+      targetHost = "10.0.1.2";
+      labels = { role = "app"; };
+      capacity = { cpu = 4000; memory = 8192; };
+    };
+  };
+}
+</code></pre>
+<h2 id="5-plan-and-apply"><a class="header" href="#5-plan-and-apply">5. Plan and Apply</a></h2>
+<p>Preview what will change:</p>
+<pre><code class="language-bash">ekafleet plan --config fleet.nix
+</code></pre>
+<p>Apply the deployment:</p>
+<pre><code class="language-bash">ekafleet apply --config fleet.nix
+</code></pre>
+<p>Or run in continuous reconciliation mode:</p>
+<pre><code class="language-bash">ekafleet apply --config fleet.nix --watch
+</code></pre>
+<h2 id="6-check-status"><a class="header" href="#6-check-status">6. Check Status</a></h2>
+<pre><code class="language-bash">ekafleet status
+</code></pre>
+<p>This shows fleet health, connected nodes, and service placement.</p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="configuration"><a class="header" href="#configuration">Configuration</a></h1>
+<p>Fleet configuration is pure Nix. ekafleet consumes it by running <code>nix eval --json .#fleet</code> and operating on the resulting JSON.</p>
+<h2 id="fleet-structure"><a class="header" href="#fleet-structure">Fleet Structure</a></h2>
+<p>A fleet configuration has three top-level keys:</p>
+<pre><code class="language-nix">{
+  fleet = {
+    name = "production";       # Fleet name
+    domain = "fleet.internal"; # DNS domain for service discovery
+
+    services = { ... };        # Service definitions
+    machines = { ... };        # Machine inventory
+  };
+}
+</code></pre>
+<h2 id="service-configuration"><a class="header" href="#service-configuration">Service Configuration</a></h2>
+<p>Each service defines what to run and how to run it:</p>
+<pre><code class="language-nix">services.api-server = {
+  # Required: command to execute
+  command = "${pkgs.api-server}/bin/server";
+
+  # Port declarations with optional health checks
+  ports.http = {
+    port = 8080;
+    protocol = "tcp";           # default: tcp
+    hostname = "api.example.com"; # for L7 proxy routing
+    healthCheck = {
+      path = "/ready";          # HTTP health check path
+      interval = 10;            # seconds (default: 10)
+      timeout = 5;              # seconds (default: 5)
+      healthy_threshold = 3;    # consecutive successes (default: 3)
+      unhealthy_threshold = 3;  # consecutive failures (default: 3)
+    };
+  };
+
+  # Resource requirements (millicores for CPU, MB for memory)
+  resources = {
+    cpu = { request = 500; limit = 1000; };
+    memory = { request = 1024; limit = 2048; };
+  };
+
+  # Environment variables
+  environment = {
+    LOG_LEVEL = "info";
+    DB_HOST = "postgres.service.fleet.internal";
+  };
+
+  # Secrets (fetched from the built-in secret store)
+  secrets.db = {
+    type = "dynamic";
+    engine = "postgresql";
+    role = "rw";
+  };
+
+  # Identity contracts for service mesh
+  identity = {
+    allowedCallers = [ "web-frontend" ]; # who can call this service
+    allowedTargets = [ "postgres" ];     # what this service calls
+  };
+
+  # Scheduling configuration
+  scheduling = {
+    replicas = 3;
+    type = "service";  # service | stateful | system | batch
+
+    # Hard constraints (must be satisfied)
+    constraints = [
+      { attribute = "labels.role"; op = "="; value = "app"; }
+    ];
+
+    # Soft preferences (influence scoring)
+    spread = { attribute = "labels.zone"; };
+    affinity = [
+      { attribute = "labels.tier"; op = "="; value = "fast"; weight = 50; }
+    ];
+
+    # Update strategy
+    update = {
+      strategy = "rolling";  # rolling | canary | blue-green
+      maxParallel = 1;
+      canary = 1;
+      minHealthyTime = 10;   # seconds
+      healthyDeadline = 300; # seconds
+      autoRevert = true;
+    };
+  };
+};
+</code></pre>
+<h2 id="machine-configuration"><a class="header" href="#machine-configuration">Machine Configuration</a></h2>
+<p>Each machine defines its address, labels, and capacity:</p>
+<pre><code class="language-nix">machines.app-1 = {
+  targetHost = "10.0.1.1";
+  labels = {
+    role = "app";
+    zone = "us-east-1a";
+    tier = "fast";
+  };
+  capacity = {
+    cpu = 8000;     # millicores
+    memory = 16384; # MB
+    disk = 100000;  # MB
+  };
+};
+</code></pre>
+<h2 id="job-types"><a class="header" href="#job-types">Job Types</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Type</th><th>Behavior</th></tr></thead><tbody>
+<tr><td><code>service</code></td><td>Long-running, replicated across selected machines</td></tr>
+<tr><td><code>stateful</code></td><td>Sticky placement, migrates only when necessary</td></tr>
+<tr><td><code>system</code></td><td>Runs on every machine matching constraints</td></tr>
+<tr><td><code>batch</code></td><td>Run-to-completion, exits when done</td></tr>
+</tbody></table>
+</div>
+<h2 id="update-strategies"><a class="header" href="#update-strategies">Update Strategies</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Strategy</th><th>Behavior</th></tr></thead><tbody>
+<tr><td><code>rolling</code></td><td>Replace instances in batches of <code>maxParallel</code>, health-gated</td></tr>
+<tr><td><code>canary</code></td><td>Deploy to one instance first, verify health, then roll out</td></tr>
+<tr><td><code>blue-green</code></td><td>Deploy all new instances, verify health, then switch traffic</td></tr>
+</tbody></table>
+</div>
+<h2 id="constraint-operators"><a class="header" href="#constraint-operators">Constraint Operators</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Operator</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>=</code> / <code>==</code></td><td>Attribute equals value</td></tr>
+<tr><td><code>!=</code></td><td>Attribute does not equal value</td></tr>
+<tr><td><code>in</code></td><td>Attribute is one of comma-separated values</td></tr>
+<tr><td><code>not_in</code></td><td>Attribute is not one of comma-separated values</td></tr>
+</tbody></table>
+</div><div style="break-before: page; page-break-before: always;"></div><h1 id="architecture-overview"><a class="header" href="#architecture-overview">Architecture Overview</a></h1>
+<p>ekafleet is a single binary with two operational modes. Server mode includes all agent capabilities, allowing server nodes to also run workloads.</p>
+<pre><code class="language-text">┌─────────────────────────────────────────────────────────────────────┐
+│                    ekafleet (single binary)                         │
+│                                                                     │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │                    ALWAYS ACTIVE                               │  │
+│  │                                                                │  │
+│  │  supervisor   health     dns_resolver   wireguard   nftables   │  │
+│  │  secrets_inj  metrics    proxy_l7       gossip      certs      │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+│                                                                     │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │              SERVER MODE ONLY (ekafleet server)                │  │
+│  │                                                                │  │
+│  │  scheduler    nix_eval    raft      ca_root     dns_authority  │  │
+│  │  deployer     secrets_store         scaling     api            │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────┘
+</code></pre>
+<h2 id="subsystems"><a class="header" href="#subsystems">Subsystems</a></h2>
+<h3 id="always-active-agent--server"><a class="header" href="#always-active-agent--server">Always Active (Agent + Server)</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Subsystem</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><strong>supervisor</strong></td><td>Manages local services via systemd units</td></tr>
+<tr><td><strong>health</strong></td><td>HTTP/TCP/exec health check probes</td></tr>
+<tr><td><strong>dns_resolver</strong></td><td>Local caching DNS resolver for fleet queries</td></tr>
+<tr><td><strong>wireguard</strong></td><td>Kernel WireGuard mesh interface management</td></tr>
+<tr><td><strong>nftables</strong></td><td>Network policy enforcement</td></tr>
+<tr><td><strong>secrets_inj</strong></td><td>Local secret file injection</td></tr>
+<tr><td><strong>metrics</strong></td><td>Scrapes local service metrics, collects node metrics</td></tr>
+<tr><td><strong>proxy_l7</strong></td><td>HTTP reverse proxy with routing and TLS termination</td></tr>
+<tr><td><strong>gossip</strong></td><td>SWIM-based membership and service catalog propagation</td></tr>
+<tr><td><strong>certs</strong></td><td>Certificate request/renewal from built-in CA</td></tr>
+</tbody></table>
+</div>
+<h3 id="server-mode-only"><a class="header" href="#server-mode-only">Server Mode Only</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Subsystem</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><strong>scheduler</strong></td><td>Two-phase (filter + score) workload placement</td></tr>
+<tr><td><strong>nix_eval</strong></td><td>Evaluates fleet.nix via <code>nix eval</code></td></tr>
+<tr><td><strong>raft</strong></td><td>Consensus for server HA (3-node)</td></tr>
+<tr><td><strong>ca_root</strong></td><td>Root Certificate Authority, issues SPIFFE certs</td></tr>
+<tr><td><strong>dns_authority</strong></td><td>Authoritative DNS for <code>fleet.internal</code></td></tr>
+<tr><td><strong>deployer</strong></td><td>Rolling/canary/blue-green deployment orchestration</td></tr>
+<tr><td><strong>secrets_store</strong></td><td>Encrypted secret storage (Raft-backed)</td></tr>
+<tr><td><strong>scaling</strong></td><td>Autoscaling engine based on metrics</td></tr>
+<tr><td><strong>api</strong></td><td>gRPC + HTTP API endpoints</td></tr>
+</tbody></table>
+</div>
+<h2 id="reconciliation-model"><a class="header" href="#reconciliation-model">Reconciliation Model</a></h2>
+<p>ekafleet follows a Terraform-inspired reconciliation loop:</p>
+<pre><code class="language-text">┌─────────────┐     ┌──────────┐     ┌──────────┐     ┌──────────┐
+│  Evaluate   │────▶│  Refresh │────▶│   Plan   │────▶│  Apply   │
+│  (nix eval) │     │  (query) │     │  (diff)  │     │(converge)│
+└─────────────┘     └──────────┘     └──────────┘     └──────────┘
+</code></pre>
+<ol>
+<li><strong>Evaluate</strong> — <code>nix eval --json .#fleet</code> produces the desired state as JSON</li>
+<li><strong>Refresh</strong> — Query agents for current running services and health</li>
+<li><strong>Plan</strong> — Diff desired vs actual, compute placement and operations</li>
+<li><strong>Apply</strong> — Execute operations with health gates and rollback on failure</li>
+</ol>
+<p>In continuous mode (<code>ekafleet apply --watch</code>), this loop runs every 30 seconds.</p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="server-mode"><a class="header" href="#server-mode">Server Mode</a></h1>
+<p>Start with <code>ekafleet server</code>. The server runs the control plane and can optionally run workloads too.</p>
+<h2 id="responsibilities"><a class="header" href="#responsibilities">Responsibilities</a></h2>
+<ul>
+<li><strong>Scheduling</strong> — Decides which services run on which machines</li>
+<li><strong>Deployment orchestration</strong> — Manages rollouts with health gates</li>
+<li><strong>Certificate Authority</strong> — Issues SPIFFE-compatible X.509 certificates</li>
+<li><strong>Secret management</strong> — Stores and distributes encrypted secrets</li>
+<li><strong>DNS authority</strong> — Authoritative DNS for the fleet domain</li>
+<li><strong>Metrics aggregation</strong> — Collects fleet-wide metrics for scaling decisions</li>
+<li><strong>Raft consensus</strong> — Multi-server HA with consistent state replication</li>
+</ul>
+<h2 id="high-availability"><a class="header" href="#high-availability">High Availability</a></h2>
+<p>For production, run 3 server nodes in a Raft cluster:</p>
+<pre><code class="language-bash"># First server (bootstrap)
+ekafleet server --data-dir /var/lib/ekafleet
+
+# Additional servers
+ekafleet server --data-dir /var/lib/ekafleet --peers node1:7400,node2:7400
+</code></pre>
+<p>The Raft state machine stores:</p>
+<ul>
+<li>Fleet state (what's deployed where)</li>
+<li>Encrypted secrets</li>
+<li>Scheduling plans</li>
+<li>DNS zone data</li>
+</ul>
+<h2 id="state-persistence"><a class="header" href="#state-persistence">State Persistence</a></h2>
+<p>Server state is stored in <code>--data-dir</code> (default: <code>/var/lib/ekafleet</code>):</p>
+<pre><code class="language-text">/var/lib/ekafleet/
+├── node-id          # Unique server identity
+└── raft/
+    ├── log/         # Raft log entries (JSON files)
+    └── snapshots/   # State machine snapshots
+</code></pre>
+<p>Log compaction happens automatically after snapshots to prevent unbounded growth.</p>
+<h2 id="built-in-certificate-authority"><a class="header" href="#built-in-certificate-authority">Built-in Certificate Authority</a></h2>
+<p>The server operates a root CA that:</p>
+<ul>
+<li>Generates a self-signed root key/cert on first start (or loads from Raft state)</li>
+<li>Issues short-lived leaf certificates (1 hour default TTL)</li>
+<li>Includes SPIFFE URIs: <code>spiffe://fleet.internal/service/&lt;name&gt;</code></li>
+<li>Performs workload attestation by verifying Nix store paths</li>
+<li>Automatically renews certificates before expiry</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="agent-mode"><a class="header" href="#agent-mode">Agent Mode</a></h1>
+<p>Start with <code>ekafleet agent --join &lt;server&gt;:7400 --token &lt;TOKEN&gt;</code>. The agent runs the data plane on each fleet machine.</p>
+<h2 id="responsibilities-1"><a class="header" href="#responsibilities-1">Responsibilities</a></h2>
+<ul>
+<li><strong>Service supervision</strong> — Generates and manages systemd unit files</li>
+<li><strong>Health checking</strong> — Polls services with HTTP, TCP, or exec probes</li>
+<li><strong>Status reporting</strong> — Sends heartbeats and service status to server</li>
+<li><strong>Secret injection</strong> — Writes decrypted secrets to local files (mode 0400)</li>
+<li><strong>DNS resolution</strong> — Local caching resolver for fleet service discovery</li>
+<li><strong>Mesh networking</strong> — Manages kernel WireGuard interface and peers</li>
+<li><strong>Network policy</strong> — Applies nftables rules from identity contracts</li>
+<li><strong>Metrics collection</strong> — Scrapes Prometheus endpoints from local services</li>
+<li><strong>L7 proxy</strong> — HTTP reverse proxy for ingress routing</li>
+</ul>
+<h2 id="connection-lifecycle"><a class="header" href="#connection-lifecycle">Connection Lifecycle</a></h2>
+<ol>
+<li>Agent generates a persistent node ID (stored in <code>&lt;data-dir&gt;/node-id</code>)</li>
+<li>Opens a bidirectional gRPC stream to the server (<code>StreamControl</code> RPC)</li>
+<li>Sends an initial heartbeat to identify itself</li>
+<li>Begins receiving server commands (desired state, deploy, secrets, DNS, certs, peers, policy)</li>
+<li>Heartbeats sent every 5 seconds; status reports every 10 seconds</li>
+</ol>
+<h2 id="when-server-is-unreachable"><a class="header" href="#when-server-is-unreachable">When Server is Unreachable</a></h2>
+<p>The agent continues operating autonomously:</p>
+<div class="table-wrapper"><table><thead><tr><th>Capability</th><th>Behavior</th></tr></thead><tbody>
+<tr><td>Running services</td><td>Continue running</td></tr>
+<tr><td>Health checks</td><td>Continue polling</td></tr>
+<tr><td>DNS resolution</td><td>Serve from cache</td></tr>
+<tr><td>Certificates</td><td>Valid until expiry (default 1 hour)</td></tr>
+<tr><td>Gossip</td><td>Still works between agents</td></tr>
+<tr><td>New deployments</td><td><strong>Blocked</strong> until server returns</td></tr>
+</tbody></table>
+</div>
+<h2 id="nack-semantics"><a class="header" href="#nack-semantics">NACK Semantics</a></h2>
+<p>When the agent receives a desired state or deploy command, it validates the configuration before applying. If validation fails, the agent sends a NACK back to the server with the reason. The server will not mark the deployment as successful, and the agent continues running the last-known-good configuration.</p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="communication"><a class="header" href="#communication">Communication</a></h1>
+<h2 id="server--agent-grpc-tonic"><a class="header" href="#server--agent-grpc-tonic">Server ↔ Agent: gRPC (tonic)</a></h2>
+<p>The primary communication channel is a bidirectional gRPC stream over TCP port 7400.</p>
+<h3 id="agent--server-messages"><a class="header" href="#agent--server-messages">Agent → Server Messages</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Message</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>Heartbeat</code></td><td>Periodic liveness signal with available resources</td></tr>
+<tr><td><code>HealthReport</code></td><td>Health status of local services</td></tr>
+<tr><td><code>StatusReport</code></td><td>Running services, store paths, states</td></tr>
+<tr><td><code>CertificateRequest</code></td><td>Request a new certificate for a service</td></tr>
+<tr><td><code>MetricsSummary</code></td><td>Aggregated metrics from local services</td></tr>
+<tr><td><code>Nack</code></td><td>Reject an invalid server command</td></tr>
+</tbody></table>
+</div>
+<h3 id="server--agent-messages"><a class="header" href="#server--agent-messages">Server → Agent Messages</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Message</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>DesiredState</code></td><td>Full desired state for this agent's services</td></tr>
+<tr><td><code>DeployCommand</code></td><td>Deploy a specific service version</td></tr>
+<tr><td><code>SecretUpdate</code></td><td>Push an encrypted secret for a service</td></tr>
+<tr><td><code>DnsUpdate</code></td><td>DNS record updates for the local resolver cache</td></tr>
+<tr><td><code>CertificateResponse</code></td><td>Signed certificate + chain</td></tr>
+<tr><td><code>PeerUpdate</code></td><td>WireGuard peer list update</td></tr>
+<tr><td><code>PolicyUpdate</code></td><td>Network policy rules to apply</td></tr>
+</tbody></table>
+</div>
+<h3 id="rpc-methods"><a class="header" href="#rpc-methods">RPC Methods</a></h3>
+<pre><code class="language-protobuf">service FleetControl {
+  rpc StreamControl(stream AgentMessage) returns (stream ServerMessage);
+  rpc Plan(PlanRequest) returns (PlanResponse);
+  rpc Apply(ApplyRequest) returns (stream ApplyEvent);
+  rpc Status(StatusRequest) returns (FleetStatus);
+}
+</code></pre>
+<h2 id="gossip-udp-swim"><a class="header" href="#gossip-udp-swim">Gossip: UDP (SWIM)</a></h2>
+<p>Port 7401. Used for:</p>
+<ul>
+<li><strong>Membership</strong> — Alive/suspect/dead detection (2-5 second failure detection)</li>
+<li><strong>Service catalog</strong> — Eventually-consistent service discovery between agents</li>
+<li><strong>DNS cache hints</strong> — Cache invalidation signals between agents</li>
+</ul>
+<p>The gossip layer works independently of the server, providing continued service discovery even during server outages.</p>
+<h2 id="http-api"><a class="header" href="#http-api">HTTP API</a></h2>
+<p>Port 7402. Provides:</p>
+<ul>
+<li><code>GET /health</code> — Server health check</li>
+<li><code>GET /metrics</code> — Prometheus-compatible metrics endpoint</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="deployments"><a class="header" href="#deployments">Deployments</a></h1>
+<p>ekafleet orchestrates deployments with dependency ordering, health gates, and automatic rollback.</p>
+<h2 id="deployment-flow"><a class="header" href="#deployment-flow">Deployment Flow</a></h2>
+<ol>
+<li><strong>Evaluate</strong> — <code>nix eval</code> produces the desired fleet state</li>
+<li><strong>Schedule</strong> — Placement engine assigns services to machines</li>
+<li><strong>Order</strong> — Services are sorted into dependency tiers (data → app → web)</li>
+<li><strong>Deploy</strong> — Each tier is deployed according to its update strategy</li>
+<li><strong>Verify</strong> — Health checks gate progression between batches</li>
+</ol>
+<h2 id="update-strategies-1"><a class="header" href="#update-strategies-1">Update Strategies</a></h2>
+<h3 id="rolling"><a class="header" href="#rolling">Rolling</a></h3>
+<p>Updates instances in batches of <code>maxParallel</code>. Each batch must pass the health gate before the next batch begins.</p>
+<pre><code class="language-nix">update = {
+  strategy = "rolling";
+  maxParallel = 1;
+  minHealthyTime = 10;
+  healthyDeadline = 300;
+  autoRevert = true;
+};
+</code></pre>
+<h3 id="canary"><a class="header" href="#canary">Canary</a></h3>
+<p>Deploys to a single instance first. After the canary passes health checks, the remaining instances are updated via rolling deployment.</p>
+<pre><code class="language-nix">update = {
+  strategy = "canary";
+  canary = 1;
+  minHealthyTime = 30;
+  autoRevert = true;
+};
+</code></pre>
+<h3 id="blue-green"><a class="header" href="#blue-green">Blue-Green</a></h3>
+<p>Deploys all new instances simultaneously. Once all are healthy, traffic switches from old to new.</p>
+<pre><code class="language-nix">update = {
+  strategy = "blue-green";
+  minHealthyTime = 10;
+  healthyDeadline = 300;
+};
+</code></pre>
+<h2 id="health-gates"><a class="header" href="#health-gates">Health Gates</a></h2>
+<p>Between deployment batches, ekafleet waits for:</p>
+<ol>
+<li><strong>minHealthyTime</strong> — Instances must be healthy for at least this duration</li>
+<li><strong>healthyDeadline</strong> — Maximum time to wait for instances to become healthy</li>
+</ol>
+<p>If the deadline expires before instances are healthy, the deployment fails. With <code>autoRevert = true</code>, ekafleet automatically rolls back to the previous version.</p>
+<h2 id="dependency-ordering"><a class="header" href="#dependency-ordering">Dependency Ordering</a></h2>
+<p>Services are deployed in topological order based on their <code>identity.allowedTargets</code>. Services that call other services are deployed after their dependencies:</p>
+<pre><code class="language-text">Tier 1: postgres, redis        (no dependencies)
+Tier 2: api-server              (depends on postgres)
+Tier 3: web-frontend            (depends on api-server)
+</code></pre>
+<h2 id="manual-operations"><a class="header" href="#manual-operations">Manual Operations</a></h2>
+<pre><code class="language-bash"># Preview changes
+ekafleet plan --config fleet.nix
+
+# Apply with confirmation
+ekafleet apply --config fleet.nix
+
+# Apply without confirmation
+ekafleet apply --config fleet.nix --auto-approve
+
+# Continuous reconciliation
+ekafleet apply --config fleet.nix --watch
+
+# Rollback a specific machine
+ekafleet rollback app-1
+
+# Rollback all machines
+ekafleet rollback --all
+
+# Rollback to a specific generation
+ekafleet rollback --all --to=5
+</code></pre>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="scheduling"><a class="header" href="#scheduling">Scheduling</a></h1>
+<p>ekafleet uses a Nomad-inspired two-phase placement engine to decide which services run on which machines.</p>
+<h2 id="phase-1-filter"><a class="header" href="#phase-1-filter">Phase 1: Filter</a></h2>
+<p>Machines that don't satisfy hard constraints are eliminated. A machine must:</p>
+<ul>
+<li>Match all constraint expressions</li>
+<li>Have sufficient available CPU and memory</li>
+</ul>
+<h3 id="constraint-examples"><a class="header" href="#constraint-examples">Constraint Examples</a></h3>
+<pre><code class="language-nix">constraints = [
+  # Must be an app node
+  { attribute = "labels.role"; op = "="; value = "app"; }
+
+  # Must be in one of these zones
+  { attribute = "labels.zone"; op = "in"; value = "us-east-1a, us-east-1b"; }
+
+  # Must not be a GPU node
+  { attribute = "labels.gpu"; op = "!="; value = "true"; }
+];
+</code></pre>
+<h3 id="supported-attributes"><a class="header" href="#supported-attributes">Supported Attributes</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Attribute</th><th>Example</th></tr></thead><tbody>
+<tr><td><code>labels.&lt;key&gt;</code></td><td><code>labels.role</code>, <code>labels.zone</code></td></tr>
+<tr><td><code>capacity.cpu</code></td><td>Total CPU millicores</td></tr>
+<tr><td><code>capacity.memory</code></td><td>Total memory MB</td></tr>
+<tr><td><code>capacity.disk</code></td><td>Total disk MB</td></tr>
+<tr><td><code>name</code></td><td>Machine name</td></tr>
+</tbody></table>
+</div>
+<h2 id="phase-2-score"><a class="header" href="#phase-2-score">Phase 2: Score</a></h2>
+<p>Remaining candidates are ranked by a weighted scoring function:</p>
+<h3 id="bin-packing-weight-30"><a class="header" href="#bin-packing-weight-30">Bin-packing (weight: 30)</a></h3>
+<p>Prefer machines that are already partially utilized to consolidate workloads. Higher utilization scores higher, concentrating workloads onto fewer machines.</p>
+<h3 id="spread-configurable-weight-default-50"><a class="header" href="#spread-configurable-weight-default-50">Spread (configurable weight, default: 50)</a></h3>
+<p>Distribute instances across distinct values of an attribute. Fewer existing instances with the same attribute value scores higher.</p>
+<pre><code class="language-nix">spread = { attribute = "labels.zone"; weight = 50; };
+</code></pre>
+<h3 id="affinity-configurable-weight"><a class="header" href="#affinity-configurable-weight">Affinity (configurable weight)</a></h3>
+<p>Soft preference for machines matching an expression:</p>
+<pre><code class="language-nix">affinity = [
+  { attribute = "labels.tier"; op = "="; value = "fast"; weight = 30; }
+];
+</code></pre>
+<h3 id="distinct-hosts-penalty--100"><a class="header" href="#distinct-hosts-penalty--100">Distinct Hosts (penalty: -100)</a></h3>
+<p>Placing multiple replicas of the same service on the same machine is penalized heavily, distributing replicas across machines by default.</p>
+<h2 id="phase-3-select"><a class="header" href="#phase-3-select">Phase 3: Select</a></h2>
+<p>The highest-scoring candidate is selected. Resources are allocated, and the next replica is scheduled with updated availability.</p>
+<h2 id="job-types-1"><a class="header" href="#job-types-1">Job Types</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Type</th><th>Scheduling Behavior</th></tr></thead><tbody>
+<tr><td><code>system</code></td><td>Runs on <strong>every</strong> machine matching constraints (ignores <code>replicas</code>)</td></tr>
+<tr><td><code>service</code></td><td>Placed on best N machines (N = <code>replicas</code>)</td></tr>
+<tr><td><code>stateful</code></td><td>Same as service but with sticky placement</td></tr>
+<tr><td><code>batch</code></td><td>Same as service but exits when done</td></tr>
+</tbody></table>
+</div>
+<p>System jobs are scheduled first, then services, stateful, and batch.</p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="scaling"><a class="header" href="#scaling">Scaling</a></h1>
+<p>ekafleet supports both manual and automatic scaling.</p>
+<h2 id="manual-scaling"><a class="header" href="#manual-scaling">Manual Scaling</a></h2>
+<pre><code class="language-bash">ekafleet scale api-server 5
+</code></pre>
+<p>This triggers re-evaluation and deployment of the delta.</p>
+<h2 id="autoscaling"><a class="header" href="#autoscaling">Autoscaling</a></h2>
+<p>The autoscaling engine evaluates policies against collected metrics and computes desired replica counts.</p>
+<h3 id="scaling-policies"><a class="header" href="#scaling-policies">Scaling Policies</a></h3>
+<p>Policies define min/max bounds and metric-based rules:</p>
+<div class="table-wrapper"><table><thead><tr><th>Field</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>min_replicas</code></td><td>Floor for scale-down</td></tr>
+<tr><td><code>max_replicas</code></td><td>Ceiling for scale-up</td></tr>
+<tr><td><code>rules</code></td><td>List of metric-based scaling rules</td></tr>
+</tbody></table>
+</div>
+<h3 id="scaling-rules"><a class="header" href="#scaling-rules">Scaling Rules</a></h3>
+<p>Each rule defines a target metric value and thresholds:</p>
+<div class="table-wrapper"><table><thead><tr><th>Field</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>metric_name</code></td><td>Prometheus metric to evaluate</td></tr>
+<tr><td><code>target_value</code></td><td>Desired metric value</td></tr>
+<tr><td><code>scale_up_threshold</code></td><td>Ratio above which to scale up</td></tr>
+<tr><td><code>scale_down_threshold</code></td><td>Ratio below which to scale down</td></tr>
+</tbody></table>
+</div>
+<h3 id="how-it-works"><a class="header" href="#how-it-works">How It Works</a></h3>
+<ol>
+<li>Metrics are collected from agents every 15 seconds</li>
+<li>The scaling engine evaluates policies periodically</li>
+<li>For each service, it computes the average metric value across instances</li>
+<li>If the ratio of current to target exceeds the scale-up threshold, it adds replicas</li>
+<li>If below the scale-down threshold, it removes replicas</li>
+<li>A cooldown period (default: 60 seconds) prevents thrashing</li>
+</ol>
+<h3 id="draining"><a class="header" href="#draining">Draining</a></h3>
+<p>To remove a machine from the fleet (e.g., for maintenance):</p>
+<pre><code class="language-bash">ekafleet drain app-1
+</code></pre>
+<p>This reschedules all services off the machine before it's taken offline.</p>
+<h2 id="capacity-planning"><a class="header" href="#capacity-planning">Capacity Planning</a></h2>
+<p>View resource utilization across the fleet:</p>
+<pre><code class="language-bash">ekafleet capacity
+</code></pre>
+<p>View service placement:</p>
+<pre><code class="language-bash">ekafleet services
+</code></pre>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="dns--service-discovery"><a class="header" href="#dns--service-discovery">DNS &amp; Service Discovery</a></h1>
+<p>ekafleet provides built-in DNS for service discovery, replacing Consul DNS and external-dns.</p>
+<h2 id="how-it-works-1"><a class="header" href="#how-it-works-1">How It Works</a></h2>
+<h3 id="server-dns-authority"><a class="header" href="#server-dns-authority">Server: DNS Authority</a></h3>
+<p>The server maintains authoritative DNS records for the fleet domain (e.g., <code>fleet.internal</code>):</p>
+<ul>
+<li><strong>A records</strong>: <code>&lt;service&gt;.service.fleet.internal</code> → WireGuard IPs of hosting machines</li>
+<li><strong>SRV records</strong>: <code>_&lt;port&gt;._tcp.&lt;service&gt;.service.fleet.internal</code> → port + host</li>
+<li>Records are <strong>health-aware</strong> — unhealthy instances are removed</li>
+<li>Updated <strong>immediately</strong> on deploy or reschedule</li>
+</ul>
+<h3 id="agent-dns-resolver"><a class="header" href="#agent-dns-resolver">Agent: DNS Resolver</a></h3>
+<p>Each agent runs a local caching resolver:</p>
+<ul>
+<li>Listens on <code>127.0.0.53:53</code></li>
+<li>Fleet queries → answered from cache or forwarded to server</li>
+<li>External queries → forwarded to upstream DNS</li>
+<li>Cache TTL equals the health check interval</li>
+<li>Cache invalidated on health status changes</li>
+</ul>
+<p>Services use this resolver via <code>/etc/resolv.conf</code>.</p>
+<h2 id="usage"><a class="header" href="#usage">Usage</a></h2>
+<p>Services discover each other using DNS names:</p>
+<pre><code class="language-bash"># A record: get IPs of the api-server service
+dig api-server.service.fleet.internal
+
+# SRV record: get port and host
+dig _http._tcp.api-server.service.fleet.internal SRV
+</code></pre>
+<p>In application code, just use the hostname:</p>
+<pre><code class="language-python"># Python example
+import requests
+response = requests.get("http://api-server.service.fleet.internal:8080/data")
+</code></pre>
+<h2 id="gossip-based-discovery"><a class="header" href="#gossip-based-discovery">Gossip-Based Discovery</a></h2>
+<p>The service catalog is also propagated between agents via gossip. This provides eventually-consistent service discovery that works even when the server is unreachable.</p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="secrets-management"><a class="header" href="#secrets-management">Secrets Management</a></h1>
+<p>ekafleet includes a built-in secret store, replacing Vault for most use cases.</p>
+<h2 id="secret-types"><a class="header" href="#secret-types">Secret Types</a></h2>
+<h3 id="static-secrets"><a class="header" href="#static-secrets">Static Secrets</a></h3>
+<p>Key-value secrets stored encrypted in Raft state and distributed to agents for assigned services only.</p>
+<pre><code class="language-nix">secrets.api-key = {
+  type = "static";
+};
+</code></pre>
+<h3 id="dynamic-secrets"><a class="header" href="#dynamic-secrets">Dynamic Secrets</a></h3>
+<p>Generated unique credentials per service instance with automatic rotation.</p>
+<pre><code class="language-nix">secrets.db = {
+  type = "dynamic";
+  engine = "postgresql";
+  role = "rw";
+};
+</code></pre>
+<h2 id="how-it-works-2"><a class="header" href="#how-it-works-2">How It Works</a></h2>
+<ol>
+<li>Secrets are stored encrypted in the Raft state machine (server-side)</li>
+<li>Each secret is scoped to a specific service</li>
+<li>When a service is deployed to an agent, its secrets are pushed via gRPC</li>
+<li>The agent writes decrypted secrets to files with restrictive permissions (mode <code>0400</code>)</li>
+<li>Secret files are placed at <code>&lt;data-dir&gt;/secrets/&lt;service&gt;/&lt;secret-name&gt;</code></li>
+<li>Services authenticate via their SPIFFE certificate to access their secrets</li>
+</ol>
+<h2 id="access-control"><a class="header" href="#access-control">Access Control</a></h2>
+<p>Secrets are scoped to services. A service can only access secrets declared in its configuration. The server only pushes secrets to agents that are running the assigned service.</p>
+<h2 id="secret-injection-path"><a class="header" href="#secret-injection-path">Secret Injection Path</a></h2>
+<pre><code class="language-text">/var/lib/ekafleet/secrets/
+├── api-server/
+│   ├── api-key
+│   └── db
+└── web-frontend/
+    └── session-secret
+</code></pre>
+<h2 id="versioning"><a class="header" href="#versioning">Versioning</a></h2>
+<p>Each secret has a version number that increments on every update. The agent tracks injected versions to avoid unnecessary file writes. When a new version is pushed, the agent writes the updated value and the service can detect the change.</p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="mesh-networking"><a class="header" href="#mesh-networking">Mesh Networking</a></h1>
+<p>ekafleet manages a kernel WireGuard mesh network for encrypted inter-service communication.</p>
+<h2 id="how-it-works-3"><a class="header" href="#how-it-works-3">How It Works</a></h2>
+<ol>
+<li>Each machine gets a mesh IP from the fleet config (<code>10.100.{index}.1/16</code>)</li>
+<li>The agent creates a WireGuard interface, generates a keypair, and assigns the IP</li>
+<li>Peer lists are pushed from the server whenever machines join or leave</li>
+<li>All inter-service traffic flows encrypted over the mesh</li>
+</ol>
+<h2 id="wireguard-interface"><a class="header" href="#wireguard-interface">WireGuard Interface</a></h2>
+<p>The agent manages a <code>wg-ekafleet</code> interface:</p>
+<pre><code class="language-bash"># View interface status
+wg show wg-ekafleet
+
+# View assigned peers
+wg show wg-ekafleet peers
+</code></pre>
+<p>Configuration happens automatically — no manual WireGuard setup required.</p>
+<h2 id="peer-management"><a class="header" href="#peer-management">Peer Management</a></h2>
+<p>When the server sends a <code>PeerUpdate</code> message, the agent:</p>
+<ol>
+<li>Adds new peers with their public key, endpoint, and allowed IPs</li>
+<li>Updates peers whose keys or endpoints have changed</li>
+<li>Removes peers that are no longer in the fleet</li>
+<li>Configures persistent keepalive (25 seconds) for NAT traversal</li>
+</ol>
+<h2 id="mesh-ip-assignment"><a class="header" href="#mesh-ip-assignment">Mesh IP Assignment</a></h2>
+<p>IPs are deterministic based on the machine's index in the fleet:</p>
+<pre><code class="language-text">Machine 1:  10.100.0.1/16
+Machine 2:  10.100.0.2/16
+Machine 3:  10.100.0.3/16
+...
+</code></pre>
+<h2 id="security"><a class="header" href="#security">Security</a></h2>
+<p>The WireGuard mesh provides encryption at the network layer. Combined with mTLS at the application layer, this provides defense-in-depth:</p>
+<ul>
+<li><strong>WireGuard</strong> — Encrypts all traffic between machines</li>
+<li><strong>mTLS</strong> — Authenticates and encrypts service-to-service traffic</li>
+<li><strong>nftables</strong> — Enforces network policy as a third layer</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="network-policy"><a class="header" href="#network-policy">Network Policy</a></h1>
+<p>ekafleet enforces network policy via nftables rules derived from service identity contracts. This replaces Cilium/Calico.</p>
+<h2 id="default-deny"><a class="header" href="#default-deny">Default Deny</a></h2>
+<p>The base policy is <strong>default deny</strong> between services. Only explicitly allowed traffic is permitted.</p>
+<h2 id="identity-contracts"><a class="header" href="#identity-contracts">Identity Contracts</a></h2>
+<p>Services declare who can call them and what they call:</p>
+<pre><code class="language-nix">services.api-server = {
+  identity = {
+    allowedCallers = [ "web-frontend" ];  # who can call this service
+    allowedTargets = [ "postgres" ];      # what this service calls
+  };
+};
+</code></pre>
+<p>From these contracts, ekafleet generates nftables rules that allow traffic between the specified services on their declared ports.</p>
+<h2 id="how-rules-are-generated"><a class="header" href="#how-rules-are-generated">How Rules Are Generated</a></h2>
+<ol>
+<li>Service identity contracts are read from the fleet configuration</li>
+<li>Service placements map services to WireGuard mesh IPs</li>
+<li>For each allowed caller/target pair, an nftables rule is generated:
+<ul>
+<li>Source IP: caller's mesh IP</li>
+<li>Destination IP: target's mesh IP</li>
+<li>Allowed ports: from the target's port declarations</li>
+</ul>
+</li>
+</ol>
+<h2 id="base-rules"><a class="header" href="#base-rules">Base Rules</a></h2>
+<p>The default nftables table (<code>inet ekafleet</code>) includes:</p>
+<div class="table-wrapper"><table><thead><tr><th>Rule</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>ct state established,related accept</code></td><td>Allow return traffic</td></tr>
+<tr><td><code>iif lo accept</code></td><td>Allow loopback</td></tr>
+<tr><td><code>udp dport 51820 accept</code></td><td>Allow WireGuard</td></tr>
+<tr><td><code>udp dport 7401 accept</code></td><td>Allow gossip</td></tr>
+<tr><td><code>tcp dport 7400 accept</code></td><td>Allow gRPC</td></tr>
+<tr><td><code>tcp dport 7402 accept</code></td><td>Allow HTTP API</td></tr>
+</tbody></table>
+</div>
+<h2 id="defense-in-depth"><a class="header" href="#defense-in-depth">Defense in Depth</a></h2>
+<p>Network policy is the third layer of security:</p>
+<ol>
+<li><strong>mTLS</strong> — Primary: service identity verified via SPIFFE certificates</li>
+<li><strong>WireGuard</strong> — All traffic encrypted at the network layer</li>
+<li><strong>nftables</strong> — Backup: restricts traffic even if other layers fail</li>
+</ol>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="observability"><a class="header" href="#observability">Observability</a></h1>
+<p>ekafleet provides built-in metrics collection and aggregation.</p>
+<h2 id="metrics-collection"><a class="header" href="#metrics-collection">Metrics Collection</a></h2>
+<h3 id="service-metrics"><a class="header" href="#service-metrics">Service Metrics</a></h3>
+<p>The agent scrapes Prometheus-format metrics from local services every 15 seconds. Services expose metrics on the port declared in their configuration.</p>
+<h3 id="node-metrics"><a class="header" href="#node-metrics">Node Metrics</a></h3>
+<p>The agent collects system-level metrics from <code>/proc</code>:</p>
+<div class="table-wrapper"><table><thead><tr><th>Metric</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>node_cpu_usage_ratio</code></td><td>CPU utilization (0-1)</td></tr>
+<tr><td><code>node_memory_total_bytes</code></td><td>Total system memory</td></tr>
+<tr><td><code>node_memory_available_bytes</code></td><td>Available memory</td></tr>
+<tr><td><code>node_memory_usage_ratio</code></td><td>Memory utilization (0-1)</td></tr>
+</tbody></table>
+</div>
+<h3 id="fleet-wide-aggregation"><a class="header" href="#fleet-wide-aggregation">Fleet-Wide Aggregation</a></h3>
+<p>The server aggregates metrics from all agents and provides:</p>
+<ul>
+<li>Per-service averages and maximums across instances</li>
+<li>Per-node resource utilization</li>
+<li>Fleet-wide averages for capacity planning</li>
+</ul>
+<h2 id="prometheus-endpoint"><a class="header" href="#prometheus-endpoint">Prometheus Endpoint</a></h2>
+<p>The server exposes a Prometheus-compatible endpoint at:</p>
+<pre><code>http://&lt;server&gt;:7402/metrics
+</code></pre>
+<p>Point Grafana or other monitoring tools at this endpoint for fleet-wide dashboards.</p>
+<h2 id="logging"><a class="header" href="#logging">Logging</a></h2>
+<p>ekafleet uses structured logging via the <code>tracing</code> framework. Control log level with the <code>RUST_LOG</code> environment variable:</p>
+<pre><code class="language-bash"># Default: info
+RUST_LOG=info ekafleet server
+
+# Debug logging for specific subsystems
+RUST_LOG=ekafleet::server::scheduler=debug ekafleet server
+
+# Trace everything
+RUST_LOG=trace ekafleet server
+</code></pre>
+<h3 id="aggregated-logs"><a class="header" href="#aggregated-logs">Aggregated Logs</a></h3>
+<p>View logs from all replicas of a service:</p>
+<pre><code class="language-bash">ekafleet logs api-server
+</code></pre>
+<h2 id="health-status"><a class="header" href="#health-status">Health Status</a></h2>
+<pre><code class="language-bash"># Fleet overview
+ekafleet status
+
+# Check for state divergence
+ekafleet drift
+</code></pre>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="cli-reference"><a class="header" href="#cli-reference">CLI Reference</a></h1>
+<h2 id="server--agent"><a class="header" href="#server--agent">Server &amp; Agent</a></h2>
+<h3 id="ekafleet-server"><a class="header" href="#ekafleet-server"><code>ekafleet server</code></a></h3>
+<p>Start in server mode (control plane + agent capabilities).</p>
+<pre><code>ekafleet server [OPTIONS]
+</code></pre>
+<div class="table-wrapper"><table><thead><tr><th>Option</th><th>Default</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>--data-dir</code></td><td><code>/var/lib/ekafleet</code></td><td>Data directory for persistent state</td></tr>
+<tr><td><code>--peers</code></td><td></td><td>Comma-separated peer server addresses for HA</td></tr>
+<tr><td><code>--listen</code></td><td><code>0.0.0.0:7400</code></td><td>gRPC listen address</td></tr>
+<tr><td><code>--http-listen</code></td><td><code>0.0.0.0:7402</code></td><td>HTTP API listen address</td></tr>
+</tbody></table>
+</div>
+<h3 id="ekafleet-agent"><a class="header" href="#ekafleet-agent"><code>ekafleet agent</code></a></h3>
+<p>Start in agent mode (data plane).</p>
+<pre><code>ekafleet agent [OPTIONS]
+</code></pre>
+<div class="table-wrapper"><table><thead><tr><th>Option</th><th>Default</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>--join</code></td><td><em>(required)</em></td><td>Server address to join</td></tr>
+<tr><td><code>--token</code></td><td><em>(required)</em></td><td>Authentication token</td></tr>
+<tr><td><code>--data-dir</code></td><td><code>/var/lib/ekafleet</code></td><td>Data directory for local state</td></tr>
+</tbody></table>
+</div>
+<h2 id="deployment"><a class="header" href="#deployment">Deployment</a></h2>
+<h3 id="ekafleet-plan"><a class="header" href="#ekafleet-plan"><code>ekafleet plan</code></a></h3>
+<p>Show desired-vs-actual diff without making changes.</p>
+<pre><code>ekafleet plan [OPTIONS]
+</code></pre>
+<div class="table-wrapper"><table><thead><tr><th>Option</th><th>Default</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>--config</code></td><td><code>fleet.nix</code></td><td>Path to fleet configuration</td></tr>
+<tr><td><code>--server</code></td><td><code>127.0.0.1:7400</code></td><td>Server address</td></tr>
+</tbody></table>
+</div>
+<h3 id="ekafleet-apply"><a class="header" href="#ekafleet-apply"><code>ekafleet apply</code></a></h3>
+<p>Execute a deployment plan.</p>
+<pre><code>ekafleet apply [OPTIONS]
+</code></pre>
+<div class="table-wrapper"><table><thead><tr><th>Option</th><th>Default</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>--config</code></td><td><code>fleet.nix</code></td><td>Path to fleet configuration</td></tr>
+<tr><td><code>--auto-approve</code></td><td><code>false</code></td><td>Skip confirmation prompt</td></tr>
+<tr><td><code>--watch</code></td><td><code>false</code></td><td>Continuous reconciliation mode</td></tr>
+<tr><td><code>--server</code></td><td><code>127.0.0.1:7400</code></td><td>Server address</td></tr>
+</tbody></table>
+</div>
+<h3 id="ekafleet-rollback"><a class="header" href="#ekafleet-rollback"><code>ekafleet rollback</code></a></h3>
+<p>Revert to a previous generation.</p>
+<pre><code>ekafleet rollback [MACHINE] [OPTIONS]
+</code></pre>
+<div class="table-wrapper"><table><thead><tr><th>Option</th><th>Default</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>--all</code></td><td><code>false</code></td><td>Rollback all machines</td></tr>
+<tr><td><code>--to</code></td><td></td><td>Target generation number</td></tr>
+<tr><td><code>--server</code></td><td><code>127.0.0.1:7400</code></td><td>Server address</td></tr>
+</tbody></table>
+</div>
+<h2 id="operations"><a class="header" href="#operations">Operations</a></h2>
+<h3 id="ekafleet-status"><a class="header" href="#ekafleet-status"><code>ekafleet status</code></a></h3>
+<p>Fleet health overview.</p>
+<h3 id="ekafleet-drift"><a class="header" href="#ekafleet-drift"><code>ekafleet drift</code></a></h3>
+<p>Detect state divergence between desired and actual.</p>
+<h3 id="ekafleet-capacity"><a class="header" href="#ekafleet-capacity"><code>ekafleet capacity</code></a></h3>
+<p>Resource utilization report across the fleet.</p>
+<h3 id="ekafleet-services"><a class="header" href="#ekafleet-services"><code>ekafleet services</code></a></h3>
+<p>Service placement listing showing where each service is running.</p>
+<h3 id="ekafleet-drain-machine"><a class="header" href="#ekafleet-drain-machine"><code>ekafleet drain &lt;machine&gt;</code></a></h3>
+<p>Reschedule all services off a machine (e.g., for maintenance).</p>
+<h3 id="ekafleet-scale-service-count"><a class="header" href="#ekafleet-scale-service-count"><code>ekafleet scale &lt;service&gt; &lt;count&gt;</code></a></h3>
+<p>Manually set the replica count for a service.</p>
+<h3 id="ekafleet-logs-service"><a class="header" href="#ekafleet-logs-service"><code>ekafleet logs &lt;service&gt;</code></a></h3>
+<p>Aggregate and display logs from all replicas of a service.</p>
+<h2 id="authentication"><a class="header" href="#authentication">Authentication</a></h2>
+<h3 id="ekafleet-token-create"><a class="header" href="#ekafleet-token-create"><code>ekafleet token create</code></a></h3>
+<p>Generate a join token.</p>
+<pre><code>ekafleet token create [OPTIONS]
+</code></pre>
+<div class="table-wrapper"><table><thead><tr><th>Option</th><th>Default</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>--type</code></td><td><code>agent</code></td><td>Token type: <code>agent</code> or <code>server</code></td></tr>
+</tbody></table>
+</div><div style="break-before: page; page-break-before: always;"></div><h1 id="fleet-configuration-reference"><a class="header" href="#fleet-configuration-reference">Fleet Configuration Reference</a></h1>
+<p>Complete reference for the <code>fleet.nix</code> configuration schema.</p>
+<h2 id="top-level"><a class="header" href="#top-level">Top Level</a></h2>
+<pre><code class="language-nix">{
+  fleet = {
+    name = "string";           # Fleet name (required)
+    domain = "string";         # DNS domain, e.g., "fleet.internal" (required)
+    services = { ... };        # Service definitions
+    machines = { ... };        # Machine inventory
+  };
+}
+</code></pre>
+<h2 id="service"><a class="header" href="#service">Service</a></h2>
+<pre><code class="language-nix">services.&lt;name&gt; = {
+  command       = "string";              # Command to run (required)
+  ports         = { &lt;name&gt; = PortConfig; };
+  secrets       = { &lt;name&gt; = SecretConfig; };
+  identity      = IdentityConfig;
+  resources     = ResourceConfig;
+  scheduling    = SchedulingConfig;
+  environment   = { &lt;key&gt; = "value"; };
+};
+</code></pre>
+<h2 id="portconfig"><a class="header" href="#portconfig">PortConfig</a></h2>
+<pre><code class="language-nix">ports.&lt;name&gt; = {
+  port        = int;           # Port number (required)
+  protocol    = "tcp";         # "tcp" or "udp" (default: tcp)
+  hostname    = "string";      # For L7 proxy routing (optional)
+  healthCheck = HealthCheckConfig;
+};
+</code></pre>
+<h2 id="healthcheckconfig"><a class="header" href="#healthcheckconfig">HealthCheckConfig</a></h2>
+<pre><code class="language-nix">healthCheck = {
+  path                = "/health";  # HTTP path (optional, enables HTTP probe)
+  interval            = 10;         # Seconds between checks (default: 10)
+  timeout             = 5;          # Seconds before timeout (default: 5)
+  healthy_threshold   = 3;          # Consecutive successes to be healthy (default: 3)
+  unhealthy_threshold = 3;          # Consecutive failures to be unhealthy (default: 3)
+};
+</code></pre>
+<h2 id="secretconfig"><a class="header" href="#secretconfig">SecretConfig</a></h2>
+<pre><code class="language-nix">secrets.&lt;name&gt; = {
+  type   = "static";        # "static" or "dynamic" (required)
+  engine = "postgresql";     # For dynamic: database engine (optional)
+  role   = "rw";             # For dynamic: credential role (optional)
+};
+</code></pre>
+<h2 id="identityconfig"><a class="header" href="#identityconfig">IdentityConfig</a></h2>
+<pre><code class="language-nix">identity = {
+  allowedCallers = [ "service-a" "service-b" ];  # Services that may call this one
+  allowedTargets = [ "service-c" ];               # Services this one may call
+};
+</code></pre>
+<h2 id="resourceconfig"><a class="header" href="#resourceconfig">ResourceConfig</a></h2>
+<pre><code class="language-nix">resources = {
+  cpu = {
+    request = 500;     # Millicores requested (used for scheduling)
+    limit   = 1000;    # Millicores limit (optional)
+  };
+  memory = {
+    request = 1024;    # MB requested (used for scheduling)
+    limit   = 2048;    # MB limit (optional)
+  };
+};
+</code></pre>
+<h2 id="schedulingconfig"><a class="header" href="#schedulingconfig">SchedulingConfig</a></h2>
+<pre><code class="language-nix">scheduling = {
+  replicas    = 3;                    # Number of instances (default: 1)
+  type        = "service";            # Job type (default: "service")
+  constraints = [ Constraint ];
+  spread      = SpreadConfig;
+  affinity    = [ AffinityConfig ];
+  update      = UpdateConfig;
+};
+</code></pre>
+<h2 id="constraint"><a class="header" href="#constraint">Constraint</a></h2>
+<pre><code class="language-nix">{
+  attribute = "labels.role";    # Dot-separated attribute path
+  op        = "=";              # Operator: =, ==, !=, in, not_in
+  value     = "app";            # Expected value
+}
+</code></pre>
+<h2 id="spreadconfig"><a class="header" href="#spreadconfig">SpreadConfig</a></h2>
+<pre><code class="language-nix">spread = {
+  attribute = "labels.zone";   # Attribute to spread across
+  weight    = 50;              # Score weight (default: 50)
+};
+</code></pre>
+<h2 id="affinityconfig"><a class="header" href="#affinityconfig">AffinityConfig</a></h2>
+<pre><code class="language-nix">{
+  attribute = "labels.tier";   # Attribute to match
+  op        = "=";             # Operator
+  value     = "fast";          # Expected value
+  weight    = 50;              # Score weight (default: 50)
+}
+</code></pre>
+<h2 id="updateconfig"><a class="header" href="#updateconfig">UpdateConfig</a></h2>
+<pre><code class="language-nix">update = {
+  strategy        = "rolling";  # "rolling", "canary", or "blue-green" (default: "rolling")
+  maxParallel     = 1;          # Instances to update at once (default: 1)
+  canary          = 1;          # Canary count (for canary strategy)
+  minHealthyTime  = 10;         # Seconds instance must be healthy (default: 10)
+  healthyDeadline = 300;        # Seconds to wait for health (default: 300)
+  autoRevert      = true;       # Rollback on failure (default: false)
+};
+</code></pre>
+<h2 id="machine"><a class="header" href="#machine">Machine</a></h2>
+<pre><code class="language-nix">machines.&lt;name&gt; = {
+  targetHost = "10.0.1.1";     # IP or hostname (required)
+  labels = {                    # Arbitrary key-value labels
+    role = "app";
+    zone = "us-east-1a";
+  };
+  capacity = {
+    cpu    = 8000;              # Millicores (default: 0)
+    memory = 16384;             # MB (default: 0)
+    disk   = 100000;            # MB (default: 0)
+  };
+};
+</code></pre>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="ports--protocols"><a class="header" href="#ports--protocols">Ports &amp; Protocols</a></h1>
+<h2 id="ekafleet-ports"><a class="header" href="#ekafleet-ports">ekafleet Ports</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Port</th><th>Protocol</th><th>Used By</th><th>Purpose</th></tr></thead><tbody>
+<tr><td>7400</td><td>TCP (gRPC)</td><td>Server + Agent</td><td>Server API, agent ↔ server communication</td></tr>
+<tr><td>7401</td><td>UDP</td><td>Server + Agent</td><td>Gossip (SWIM membership protocol)</td></tr>
+<tr><td>7402</td><td>TCP (HTTP)</td><td>Server</td><td>HTTP API (health, metrics)</td></tr>
+<tr><td>53</td><td>UDP/TCP</td><td>Server + Agent</td><td>DNS (authority on server, resolver on agent)</td></tr>
+<tr><td>51820</td><td>UDP</td><td>Server + Agent</td><td>WireGuard mesh</td></tr>
+<tr><td>80</td><td>TCP</td><td>Agent (ingress)</td><td>L7 proxy HTTP</td></tr>
+<tr><td>443</td><td>TCP</td><td>Agent (ingress)</td><td>L7 proxy HTTPS</td></tr>
+</tbody></table>
+</div>
+<h2 id="firewall-requirements"><a class="header" href="#firewall-requirements">Firewall Requirements</a></h2>
+<h3 id="between-server-and-agents"><a class="header" href="#between-server-and-agents">Between Server and Agents</a></h3>
+<p>Agents must be able to reach the server on:</p>
+<ul>
+<li>TCP 7400 (gRPC)</li>
+</ul>
+<p>Servers must be able to reach agents on:</p>
+<ul>
+<li>TCP 7400 (for gRPC callbacks, if applicable)</li>
+</ul>
+<h3 id="between-all-fleet-nodes"><a class="header" href="#between-all-fleet-nodes">Between All Fleet Nodes</a></h3>
+<p>All fleet nodes (servers and agents) need mutual connectivity on:</p>
+<ul>
+<li>UDP 7401 (gossip)</li>
+<li>UDP 51820 (WireGuard)</li>
+</ul>
+<h3 id="external-access-ingress-nodes"><a class="header" href="#external-access-ingress-nodes">External Access (Ingress Nodes)</a></h3>
+<p>Nodes designated for ingress need:</p>
+<ul>
+<li>TCP 80 (HTTP)</li>
+<li>TCP 443 (HTTPS)</li>
+</ul>
+<h2 id="mesh-network"><a class="header" href="#mesh-network">Mesh Network</a></h2>
+<p>The WireGuard mesh uses the <code>10.100.0.0/16</code> subnet by default. All inter-service traffic flows over this encrypted mesh.</p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="what-ekafleet-replaces"><a class="header" href="#what-ekafleet-replaces">What ekafleet Replaces</a></h1>
+<p>ekafleet consolidates many separate tools into a single binary.</p>
+<div class="table-wrapper"><table><thead><tr><th>External Tool</th><th>Capability</th><th>ekafleet Subsystem</th></tr></thead><tbody>
+<tr><td><strong>Nomad</strong></td><td>Scheduling, deployment, scaling</td><td><code>scheduler</code> + <code>deployer</code> + <code>scaling</code></td></tr>
+<tr><td><strong>Consul DNS</strong></td><td>Service discovery</td><td><code>dns_authority</code> + <code>dns_resolver</code></td></tr>
+<tr><td><strong>Consul Connect</strong></td><td>Service mesh, mTLS</td><td><code>wireguard</code> + <code>certs</code> + <code>nftables</code></td></tr>
+<tr><td><strong>Consul KV</strong></td><td>Distributed config</td><td><code>raft</code> state (server)</td></tr>
+<tr><td><strong>Vault KV</strong></td><td>Static secrets</td><td><code>secrets_store</code></td></tr>
+<tr><td><strong>Vault PKI</strong></td><td>Certificate authority</td><td><code>ca_root</code> + <code>certs</code></td></tr>
+<tr><td><strong>Vault Dynamic</strong></td><td>Database credentials</td><td><code>secrets_store</code> (dynamic engine)</td></tr>
+<tr><td><strong>SPIRE</strong></td><td>Workload attestation</td><td><code>ca_root</code> (Nix store path verification)</td></tr>
+<tr><td><strong>cert-manager</strong></td><td>TLS automation</td><td><code>certs</code> (auto-renewal)</td></tr>
+<tr><td><strong>external-dns</strong></td><td>DNS record management</td><td><code>dns_authority</code></td></tr>
+<tr><td><strong>nginx / Traefik</strong></td><td>Reverse proxy, ingress</td><td><code>proxy_l7</code></td></tr>
+<tr><td><strong>Prometheus</strong></td><td>Metrics collection</td><td><code>metrics</code></td></tr>
+<tr><td><strong>WireGuard tools</strong></td><td>Mesh networking</td><td><code>wireguard</code></td></tr>
+<tr><td><strong>Cilium / Calico</strong></td><td>Network policy</td><td><code>nftables</code></td></tr>
+<tr><td><strong>deploy-rs</strong></td><td>NixOS deployment</td><td><code>deployer</code> + <code>nix_eval</code></td></tr>
+</tbody></table>
+</div>
+<h2 id="key-differences"><a class="header" href="#key-differences">Key Differences</a></h2>
+<h3 id="vs-nomad"><a class="header" href="#vs-nomad">vs. Nomad</a></h3>
+<ul>
+<li>ekafleet is Nix-native: configuration is pure Nix, deployments use Nix store paths</li>
+<li>No separate Consul dependency for service discovery</li>
+<li>Built-in secret management (no separate Vault)</li>
+</ul>
+<h3 id="vs-kubernetes"><a class="header" href="#vs-kubernetes">vs. Kubernetes</a></h3>
+<ul>
+<li>Single binary, no cluster of controllers</li>
+<li>No container runtime required — services run directly via systemd</li>
+<li>Nix-based configuration instead of YAML manifests</li>
+<li>WireGuard mesh instead of overlay networks</li>
+</ul>
+<h3 id="vs-deploy-rs"><a class="header" href="#vs-deploy-rs">vs. deploy-rs</a></h3>
+<ul>
+<li>ekafleet adds scheduling, health checks, and rolling deployments</li>
+<li>Continuous reconciliation rather than one-shot deployment</li>
+<li>Built-in service discovery and secrets</li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+
+            </nav>
+
+        </div>
+
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr.min.js"></script>
+        <script src="mark.min.js"></script>
+        <script src="searcher.js"></script>
+
+        <script src="clipboard.min.js"></script>
+        <script src="highlight.js"></script>
+        <script src="book.js"></script>
+
+        <!-- Custom JS scripts -->
+
+        <script>
+        window.addEventListener('load', function() {
+            window.setTimeout(window.print, 100);
+        });
+        </script>
+
+    </div>
+    </body>
+</html>
