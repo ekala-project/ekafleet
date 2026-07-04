@@ -15,6 +15,7 @@ pub struct ServerConfig {
     pub peers: Vec<String>,
     pub grpc_listen: String,
     pub http_listen: String,
+    pub token: String,
 }
 
 pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
@@ -33,7 +34,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
 
     // Start gRPC and HTTP servers concurrently
     let (grpc_result, http_result) = tokio::join!(
-        api::serve_grpc(grpc_addr, fleet_state),
+        api::serve_grpc(grpc_addr, fleet_state, &config.token),
         api::serve_http(http_addr),
     );
 

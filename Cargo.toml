@@ -14,7 +14,7 @@ path = "src/main.rs"
 tokio = { version = "1", features = ["full"] }
 
 # CLI
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 
 # gRPC
 tonic = "0.13"

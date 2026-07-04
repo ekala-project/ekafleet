@@ -55,6 +55,10 @@ enum Command {
         /// HTTP API listen address
         #[arg(long, default_value = "0.0.0.0:7402")]
         http_listen: String,
+
+        /// Bearer token required for agent authentication
+        #[arg(long, env = "EKAFLEET_TOKEN")]
+        token: String,
     },
 
     /// Start in agent mode (data plane)
@@ -215,6 +219,7 @@ async fn main() -> anyhow::Result<()> {
             peers,
             listen,
             http_listen,
+            token,
         } => {
             let peer_list: Vec<String> = peers
                 .map(|p| p.split(',').map(String::from).collect())
@@ -225,6 +230,7 @@ async fn main() -> anyhow::Result<()> {
                 peers: peer_list,
                 grpc_listen: listen,
                 http_listen,
+                token,
             };
 
             server::run(config).await?;
@@ -332,7 +338,8 @@ async fn main() -> anyhow::Result<()> {
             action: TokenAction::Create { r#type },
         } => {
             tracing::info!(token_type = %r#type, "Creating token");
-            eprintln!("token create not yet implemented");
+            let token = generate_token();
+            println!("{token}");
         }
 
         Command::Logs { service, server } => {
@@ -346,4 +353,13 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Generate a cryptographically random token (64 hex chars = 256 bits).
+fn generate_token() -> String {
+    use ring::rand::{SecureRandom, SystemRandom};
+    let rng = SystemRandom::new();
+    let mut bytes = [0u8; 32];
+    rng.fill(&mut bytes).expect("system RNG failure");
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

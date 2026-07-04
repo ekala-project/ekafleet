@@ -35,3 +35,11 @@ jobs:
     - uses: cachix/install-nix-action@v25
     - name: Clippy lint
       run: nix develop --command cargo clippy -- -D warnings
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: rustsec/audit-check@v2.0.0
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}

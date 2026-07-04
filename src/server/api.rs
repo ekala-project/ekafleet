@@ -198,12 +198,25 @@ async fn process_agent_message(state: &FleetState, node_id: &str, msg: AgentMess
     }
 }
 
-/// Start the gRPC server (FleetControl service).
-pub async fn serve_grpc(addr: SocketAddr, state: FleetState) -> anyhow::Result<()> {
-    tracing::info!(%addr, "gRPC server listening");
+/// Start the gRPC server (FleetControl service) with bearer token authentication.
+pub async fn serve_grpc(addr: SocketAddr, state: FleetState, token: &str) -> anyhow::Result<()> {
+    tracing::info!(%addr, "gRPC server listening (token-authenticated)");
+
+    let expected_token = format!("Bearer {token}");
+    #[allow(clippy::result_large_err)]
+    let interceptor = move |req: Request<()>| -> Result<Request<()>, Status> {
+        match req.metadata().get("authorization") {
+            Some(val) if val == expected_token.as_str() => Ok(req),
+            Some(_) => Err(Status::unauthenticated("invalid token")),
+            None => Err(Status::unauthenticated("missing authorization header")),
+        }
+    };
 
     tonic::transport::Server::builder()
-        .add_service(FleetControlServer::new(FleetControlService::new(state)))
+        .add_service(FleetControlServer::with_interceptor(
+            FleetControlService::new(state),
+            interceptor,
+        ))
         .serve(addr)
         .await?;
 

@@ -36,7 +36,18 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
     );
 
     let endpoint = format!("http://{}", config.server_addr);
-    let mut client = FleetControlClient::connect(endpoint).await?;
+    let channel = tonic::transport::Endpoint::from_shared(endpoint)?
+        .connect()
+        .await?;
+
+    // Attach bearer token to all outgoing requests
+    let token: tonic::metadata::MetadataValue<_> = format!("Bearer {}", config.token).parse()?;
+    #[allow(clippy::result_large_err)]
+    let mut client =
+        FleetControlClient::with_interceptor(channel, move |mut req: tonic::Request<()>| {
+            req.metadata_mut().insert("authorization", token.clone());
+            Ok(req)
+        });
 
     let node_id = get_node_id(&config.data_dir)?;
     tracing::info!(node_id = %node_id, "Agent identity established");
