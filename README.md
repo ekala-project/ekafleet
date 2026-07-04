@@ -1,6 +1,6 @@
 # ekafleet
 
-A single Rust binary that replaces the HashiCorp stack (Nomad + Consul + Vault) and supporting infrastructure tools for managing [ekaos](https://github.com/ekaos) fleets.
+A single Rust binary that replaces the HashiCorp stack (Nomad + Consul + Vault) and supporting infrastructure tools for managing [ekaos](https://github.com/ekala-project/ekapkgs-roadmap) fleets.
 
 ## Two Modes
 
