@@ -18,6 +18,12 @@ struct AggregatorState {
     service_metrics: HashMap<String, HashMap<String, Vec<(String, f64)>>>,
 }
 
+impl Default for MetricsAggregator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MetricsAggregator {
     pub fn new() -> Self {
         Self {

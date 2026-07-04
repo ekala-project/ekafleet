@@ -72,6 +72,12 @@ pub enum Command {
     },
 }
 
+impl Default for FleetStateMachine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FleetStateMachine {
     pub fn new() -> Self {
         Self {

@@ -37,6 +37,12 @@ struct AgentServiceInfo {
     health: HealthStatus,
 }
 
+impl Default for FleetState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FleetState {
     pub fn new() -> Self {
         Self {

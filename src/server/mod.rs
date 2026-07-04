@@ -1,4 +1,4 @@
-mod api;
+pub mod api;
 pub mod deployer;
 pub mod nix;
 pub mod reconciler;

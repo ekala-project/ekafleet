@@ -24,6 +24,12 @@ struct Route {
     weight: u32,
 }
 
+impl Default for ProxyRouter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ProxyRouter {
     pub fn new() -> Self {
         Self {

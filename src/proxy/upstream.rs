@@ -27,6 +27,12 @@ struct Endpoint {
     healthy: bool,
 }
 
+impl Default for UpstreamPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl UpstreamPool {
     pub fn new() -> Self {
         Self {

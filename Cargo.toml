@@ -5,6 +5,10 @@ edition = "2024"
 description = "Unified fleet management for ekaos"
 license = "MPL-2.0"
 
+[lib]
+name = "ekafleet"
+path = "src/lib.rs"
+
 [[bin]]
 name = "ekafleet"
 path = "src/main.rs"
@@ -54,6 +58,10 @@ zeroize = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"
+assert_cmd = "2"
+predicates = "3"
+reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
+tokio-stream = "0.1"
 
 [build-dependencies]
 tonic-build = "0.13"

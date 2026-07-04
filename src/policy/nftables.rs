@@ -24,6 +24,12 @@ pub struct PolicyRule {
     pub description: String,
 }
 
+impl Default for PolicyEnforcer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PolicyEnforcer {
     pub fn new() -> Self {
         Self {

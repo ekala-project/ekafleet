@@ -1,30 +1,5 @@
-mod agent;
-#[allow(dead_code)]
-mod ca;
-#[allow(dead_code)]
-mod config;
-#[allow(dead_code)]
-mod dns;
-#[allow(dead_code)]
-mod gossip;
-#[allow(dead_code)]
-mod mesh;
-#[allow(dead_code)]
-mod metrics;
-#[allow(dead_code)]
-mod policy;
-#[allow(dead_code)]
-mod proxy;
-#[allow(dead_code)]
-mod raft;
-#[allow(dead_code)]
-mod secrets;
-mod server;
-
-pub mod proto {
-    #![allow(clippy::result_large_err)]
-    tonic::include_proto!("fleet");
-}
+use ekafleet::agent;
+use ekafleet::server;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -209,6 +184,7 @@ enum TokenAction {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),

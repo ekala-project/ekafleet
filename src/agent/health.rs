@@ -25,6 +25,12 @@ struct HealthResult {
     unhealthy_threshold: u32,
 }
 
+impl Default for HealthChecker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HealthChecker {
     pub fn new() -> Self {
         Self {

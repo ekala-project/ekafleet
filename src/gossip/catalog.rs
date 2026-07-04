@@ -26,6 +26,12 @@ struct CatalogEntry {
     version: u64,
 }
 
+impl Default for ServiceCatalog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ServiceCatalog {
     pub fn new() -> Self {
         Self {
