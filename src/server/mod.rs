@@ -1,4 +1,7 @@
 mod api;
+pub mod deployer;
+pub mod nix;
+pub mod reconciler;
 pub mod scheduler;
 pub mod state;
 
