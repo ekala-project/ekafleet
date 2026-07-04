@@ -1,12 +1,18 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
+use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 
+const NONCE_LEN: usize = 12; // AES-256-GCM nonce size
+
 /// Persistent storage for Raft log entries and snapshots.
-/// Uses simple file-based storage. Production would use openraft
-/// with a proper storage backend.
+/// All data is encrypted at rest with AES-256-GCM.
 pub struct RaftStorage {
     data_dir: PathBuf,
+    key: Arc<LessSafeKey>,
+    rng: Arc<SystemRandom>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,10 +23,59 @@ pub struct LogEntry {
 }
 
 impl RaftStorage {
-    pub fn new(data_dir: &Path) -> Self {
+    pub fn new(data_dir: &Path, encryption_key: &[u8; 32]) -> Self {
+        let unbound =
+            UnboundKey::new(&AES_256_GCM, encryption_key).expect("valid 256-bit key required");
+        let key = LessSafeKey::new(unbound);
+
         Self {
             data_dir: data_dir.join("raft"),
+            key: Arc::new(key),
+            rng: Arc::new(SystemRandom::new()),
         }
+    }
+
+    /// Encrypt data using AES-256-GCM. Returns nonce || ciphertext || tag.
+    fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        self.rng
+            .fill(&mut nonce_bytes)
+            .map_err(|_| std::io::Error::other("RNG failure"))?;
+
+        let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+        let mut in_out = plaintext.to_vec();
+        self.key
+            .seal_in_place_append_tag(nonce, Aad::empty(), &mut in_out)
+            .map_err(|_| std::io::Error::other("encryption failed"))?;
+
+        let mut sealed = Vec::with_capacity(NONCE_LEN + in_out.len());
+        sealed.extend_from_slice(&nonce_bytes);
+        sealed.extend_from_slice(&in_out);
+        Ok(sealed)
+    }
+
+    /// Decrypt sealed data (nonce || ciphertext || tag).
+    fn decrypt(&self, sealed: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+        if sealed.len() < NONCE_LEN {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "sealed data too short",
+            ));
+        }
+
+        let (nonce_bytes, ciphertext_and_tag) = sealed.split_at(NONCE_LEN);
+        let nonce = Nonce::try_assume_unique_for_key(nonce_bytes)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid nonce"))?;
+
+        let mut in_out = ciphertext_and_tag.to_vec();
+        let plaintext = self
+            .key
+            .open_in_place(nonce, Aad::empty(), &mut in_out)
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "decryption failed")
+            })?;
+
+        Ok(plaintext.to_vec())
     }
 
     /// Initialize storage directory.
@@ -28,22 +83,32 @@ impl RaftStorage {
         tokio::fs::create_dir_all(&self.data_dir).await?;
         tokio::fs::create_dir_all(self.data_dir.join("log")).await?;
         tokio::fs::create_dir_all(self.data_dir.join("snapshots")).await?;
-        tracing::info!(dir = %self.data_dir.display(), "Raft storage initialized");
+
+        // Set restrictive permissions on the data directory
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o700);
+            tokio::fs::set_permissions(&self.data_dir, perms).await?;
+        }
+
+        tracing::info!(dir = %self.data_dir.display(), "Raft storage initialized (encrypted)");
         Ok(())
     }
 
-    /// Append a log entry.
+    /// Append a log entry (encrypted at rest).
     pub async fn append_log(&self, entry: &LogEntry) -> Result<(), std::io::Error> {
         let path = self
             .data_dir
             .join("log")
-            .join(format!("{:020}.json", entry.index));
-        let data = serde_json::to_vec(entry)
+            .join(format!("{:020}.log", entry.index));
+        let json = serde_json::to_vec(entry)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        tokio::fs::write(path, data).await
+        let sealed = self.encrypt(&json)?;
+        tokio::fs::write(path, sealed).await
     }
 
-    /// Read log entries from a given index.
+    /// Read log entries from a given index (decrypted).
     pub async fn read_log_from(&self, from_index: u64) -> Result<Vec<LogEntry>, std::io::Error> {
         let log_dir = self.data_dir.join("log");
         let mut entries = Vec::new();
@@ -56,8 +121,9 @@ impl RaftStorage {
         files.sort();
 
         for path in files {
-            let data = tokio::fs::read(&path).await?;
-            let entry: LogEntry = serde_json::from_slice(&data)
+            let sealed = tokio::fs::read(&path).await?;
+            let json = self.decrypt(&sealed)?;
+            let entry: LogEntry = serde_json::from_slice(&json)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
             if entry.index >= from_index {
                 entries.push(entry);
@@ -67,19 +133,21 @@ impl RaftStorage {
         Ok(entries)
     }
 
-    /// Save a snapshot.
+    /// Save a snapshot (encrypted at rest).
     pub async fn save_snapshot(&self, index: u64, data: &[u8]) -> Result<(), std::io::Error> {
         let path = self
             .data_dir
             .join("snapshots")
             .join(format!("{:020}.snap", index));
-        tokio::fs::write(path, data).await?;
+        let sealed = self.encrypt(data)?;
+        let sealed_size = sealed.len();
+        tokio::fs::write(path, sealed).await?;
 
-        tracing::info!(index, size = data.len(), "Snapshot saved");
+        tracing::info!(index, sealed_size, "Snapshot saved (encrypted)");
         Ok(())
     }
 
-    /// Load the latest snapshot.
+    /// Load the latest snapshot (decrypted).
     pub async fn load_latest_snapshot(&self) -> Result<Option<(u64, Vec<u8>)>, std::io::Error> {
         let snap_dir = self.data_dir.join("snapshots");
         if !snap_dir.exists() {
@@ -97,7 +165,8 @@ impl RaftStorage {
 
         match latest {
             Some(path) => {
-                let data = tokio::fs::read(&path).await?;
+                let sealed = tokio::fs::read(&path).await?;
+                let data = self.decrypt(&sealed)?;
                 let index = path
                     .file_stem()
                     .and_then(|s| s.to_str())

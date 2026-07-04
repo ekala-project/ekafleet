@@ -3,14 +3,19 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use ring::hmac;
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 
+const HMAC_LEN: usize = 32; // SHA-256 HMAC tag length
+
 /// SWIM-based membership protocol for failure detection.
 /// Detects node failures in 2-5 seconds via ping/ping-req/suspect cycle.
+/// All messages are authenticated with HMAC-SHA256 using a shared cluster key.
 #[derive(Clone)]
 pub struct SwimMembership {
     inner: Arc<RwLock<MembershipState>>,
+    hmac_key: Arc<hmac::Key>,
 }
 
 struct MembershipState {
@@ -38,7 +43,8 @@ pub enum MemberStatus {
 }
 
 impl SwimMembership {
-    pub fn new(node_id: &str, bind_addr: SocketAddr) -> Self {
+    pub fn new(node_id: &str, bind_addr: SocketAddr, cluster_key: &[u8; 32]) -> Self {
+        let hmac_key = hmac::Key::new(hmac::HMAC_SHA256, cluster_key);
         Self {
             inner: Arc::new(RwLock::new(MembershipState {
                 node_id: node_id.to_string(),
@@ -47,7 +53,29 @@ impl SwimMembership {
                 suspect_timeout: Duration::from_secs(3),
                 dead_timeout: Duration::from_secs(10),
             })),
+            hmac_key: Arc::new(hmac_key),
         }
+    }
+
+    /// Sign a message payload with HMAC-SHA256.
+    /// Returns payload || hmac_tag (32 bytes).
+    fn sign(&self, payload: &[u8]) -> Vec<u8> {
+        let tag = hmac::sign(&self.hmac_key, payload);
+        let mut signed = Vec::with_capacity(payload.len() + HMAC_LEN);
+        signed.extend_from_slice(payload);
+        signed.extend_from_slice(tag.as_ref());
+        signed
+    }
+
+    /// Verify and strip HMAC tag from a received message.
+    /// Returns the payload if verification succeeds.
+    fn verify<'a>(&self, data: &'a [u8]) -> Option<&'a [u8]> {
+        if data.len() < HMAC_LEN {
+            return None;
+        }
+        let (payload, tag) = data.split_at(data.len() - HMAC_LEN);
+        hmac::verify(&self.hmac_key, payload, tag).ok()?;
+        Some(payload)
     }
 
     /// Start the SWIM protocol. Listens for UDP messages and runs
@@ -58,18 +86,30 @@ impl SwimMembership {
         let bind = state.bind_addr;
         drop(state);
 
-        tracing::info!(addr = %bind, "SWIM membership started");
+        tracing::info!(addr = %bind, "SWIM membership started (HMAC-authenticated)");
 
         let inner = self.inner.clone();
 
         // Spawn receiver
         let recv_inner = inner.clone();
+        let recv_key = self.hmac_key.clone();
         tokio::spawn(async move {
             let mut buf = [0u8; 1500];
             loop {
                 match socket.recv_from(&mut buf).await {
                     Ok((len, src)) => {
-                        handle_message(&recv_inner, &buf[..len], src).await;
+                        // Verify HMAC before processing
+                        let data = &buf[..len];
+                        if data.len() < HMAC_LEN {
+                            tracing::warn!(src = %src, "SWIM message too short, dropping");
+                            continue;
+                        }
+                        let (payload, tag) = data.split_at(data.len() - HMAC_LEN);
+                        if hmac::verify(&recv_key, payload, tag).is_err() {
+                            tracing::warn!(src = %src, "SWIM HMAC verification failed, dropping");
+                            continue;
+                        }
+                        handle_message(&recv_inner, payload, src).await;
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "SWIM recv error");
@@ -128,7 +168,7 @@ impl SwimMembership {
     }
 }
 
-/// Handle an incoming SWIM message.
+/// Handle an incoming SWIM message (already HMAC-verified).
 async fn handle_message(state: &Arc<RwLock<MembershipState>>, data: &[u8], src: SocketAddr) {
     // Simple protocol: first byte is message type
     // 0x01 = ping, 0x02 = ack, 0x03 = ping-req
@@ -140,7 +180,7 @@ async fn handle_message(state: &Arc<RwLock<MembershipState>>, data: &[u8], src: 
         0x01 => {
             // Ping — respond with ack
             tracing::trace!(src = %src, "SWIM ping received");
-            // TODO: send ack back
+            // TODO: send ack back (signed with HMAC)
         }
         0x02 => {
             // Ack — mark sender as alive
@@ -156,7 +196,7 @@ async fn handle_message(state: &Arc<RwLock<MembershipState>>, data: &[u8], src: 
         0x03 => {
             // Ping-req — proxy ping to target
             tracing::trace!(src = %src, "SWIM ping-req received");
-            // TODO: forward ping
+            // TODO: forward ping (signed with HMAC)
         }
         _ => {
             tracing::trace!(src = %src, type_byte = data[0], "Unknown SWIM message");

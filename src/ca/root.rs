@@ -14,7 +14,8 @@ pub struct RootCa {
 struct CaState {
     /// Fleet domain for SPIFFE URIs (e.g., fleet.internal)
     domain: String,
-    /// Root CA private key (DER-encoded, encrypted at rest)
+    /// Root CA private key (DER-encoded)
+    /// WARNING: not yet encrypted at rest — requires encryption before production use
     root_key: Option<Vec<u8>>,
     /// Root CA certificate (DER-encoded)
     root_cert: Option<Vec<u8>>,
