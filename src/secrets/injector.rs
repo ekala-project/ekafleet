@@ -26,11 +26,11 @@ impl SecretInjector {
         version: u64,
     ) -> Result<PathBuf, std::io::Error> {
         // Check if already at this version
-        if let Some(svc) = self.injected.get(service_name) {
-            if svc.get(secret_name) == Some(&version) {
-                let path = self.secret_path(service_name, secret_name);
-                return Ok(path);
-            }
+        if let Some(svc) = self.injected.get(service_name)
+            && svc.get(secret_name) == Some(&version)
+        {
+            let path = self.secret_path(service_name, secret_name);
+            return Ok(path);
         }
 
         let dir = self.secrets_dir.join(service_name);

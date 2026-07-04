@@ -162,8 +162,8 @@ impl FleetState {
                     node_id: id.clone(),
                     address: info.address.clone(),
                     healthy,
-                    total_resources: Some(info.total_resources.clone()),
-                    available_resources: Some(info.available_resources.clone()),
+                    total_resources: Some(info.total_resources),
+                    available_resources: Some(info.available_resources),
                     last_heartbeat: info.last_heartbeat.elapsed().as_secs(),
                 }
             })

@@ -53,10 +53,10 @@ impl ScalingEngine {
 
         for (service_name, policy) in &self.policies {
             // Check cooldown
-            if let Some(last) = self.last_scale.get(service_name) {
-                if last.elapsed() < self.cooldown {
-                    continue;
-                }
+            if let Some(last) = self.last_scale.get(service_name)
+                && last.elapsed() < self.cooldown
+            {
+                continue;
             }
 
             if let Some(decision) = self.evaluate_policy(service_name, policy).await {

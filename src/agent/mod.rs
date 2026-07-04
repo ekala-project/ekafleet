@@ -2,7 +2,7 @@ pub mod health;
 pub mod supervisor;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -171,7 +171,7 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn get_node_id(data_dir: &PathBuf) -> anyhow::Result<String> {
+fn get_node_id(data_dir: &Path) -> anyhow::Result<String> {
     let id_path = data_dir.join("node-id");
     if id_path.exists() {
         Ok(std::fs::read_to_string(&id_path)?.trim().to_string())

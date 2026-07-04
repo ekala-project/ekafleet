@@ -35,7 +35,7 @@ impl PeerManager {
 
         // Add/update peers
         for peer in &updates {
-            let changed = self.peers.get(&peer.node_id).map_or(true, |existing| {
+            let changed = self.peers.get(&peer.node_id).is_none_or(|existing| {
                 existing.public_key != peer.public_key || existing.endpoint != peer.endpoint
             });
 

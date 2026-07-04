@@ -62,10 +62,10 @@ impl DnsResolver {
         if let Some(service_name) = name.strip_suffix(&fleet_suffix) {
             // Fleet query — check cache
             let state = self.inner.read().await;
-            if let Some(entry) = state.cache.get(service_name) {
-                if !entry.is_expired() {
-                    return ResolveResult::Cached(entry.ips.clone());
-                }
+            if let Some(entry) = state.cache.get(service_name)
+                && !entry.is_expired()
+            {
+                return ResolveResult::Cached(entry.ips.clone());
             }
             // Cache miss or expired — need to query server
             ResolveResult::CacheMiss(service_name.to_string())

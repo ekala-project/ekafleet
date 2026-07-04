@@ -64,7 +64,7 @@ impl ProxyRouter {
             })
             .collect();
 
-        matches.sort_by(|a, b| b.path_prefix.len().cmp(&a.path_prefix.len()));
+        matches.sort_by_key(|a| std::cmp::Reverse(a.path_prefix.len()));
 
         matches.first().map(|r| ResolvedRoute {
             service_name: r.service_name.clone(),

@@ -69,10 +69,10 @@ impl RootCa {
         }
 
         // Workload attestation: verify the Nix store path if provided
-        if let Some(path) = store_path {
-            if !path.starts_with("/nix/store/") {
-                return Err(CaError::AttestationFailed("invalid store path".into()));
-            }
+        if let Some(path) = store_path
+            && !path.starts_with("/nix/store/")
+        {
+            return Err(CaError::AttestationFailed("invalid store path".into()));
         }
 
         let spiffe_uri = format!("spiffe://{}/service/{}", state.domain, service_name);

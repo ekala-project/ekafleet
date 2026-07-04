@@ -10,23 +10,23 @@ pub async fn collect_node_metrics() -> Vec<super::collector::MetricSample> {
     let mut samples = Vec::new();
 
     // CPU: read from /proc/stat
-    if let Ok(contents) = tokio::fs::read_to_string("/proc/stat").await {
-        if let Some(cpu_line) = contents.lines().next() {
-            let parts: Vec<&str> = cpu_line.split_whitespace().collect();
-            if parts.len() >= 5 {
-                // user, nice, system, idle
-                let user: f64 = parts[1].parse().unwrap_or(0.0);
-                let system: f64 = parts[3].parse().unwrap_or(0.0);
-                let idle: f64 = parts[4].parse().unwrap_or(0.0);
-                let total = user + system + idle;
-                if total > 0.0 {
-                    samples.push(super::collector::MetricSample {
-                        name: "node_cpu_usage_ratio".into(),
-                        value: (user + system) / total,
-                        labels: HashMap::new(),
-                        timestamp: now,
-                    });
-                }
+    if let Ok(contents) = tokio::fs::read_to_string("/proc/stat").await
+        && let Some(cpu_line) = contents.lines().next()
+    {
+        let parts: Vec<&str> = cpu_line.split_whitespace().collect();
+        if parts.len() >= 5 {
+            // user, nice, system, idle
+            let user: f64 = parts[1].parse().unwrap_or(0.0);
+            let system: f64 = parts[3].parse().unwrap_or(0.0);
+            let idle: f64 = parts[4].parse().unwrap_or(0.0);
+            let total = user + system + idle;
+            if total > 0.0 {
+                samples.push(super::collector::MetricSample {
+                    name: "node_cpu_usage_ratio".into(),
+                    value: (user + system) / total,
+                    labels: HashMap::new(),
+                    timestamp: now,
+                });
             }
         }
     }
