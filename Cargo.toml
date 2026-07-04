@@ -16,8 +16,8 @@ tokio = { version = "1", features = ["full"] }
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
 
-# gRPC
-tonic = "0.13"
+# gRPC (with TLS via rustls + ring)
+tonic = { version = "0.13", features = ["tls-ring"] }
 prost = "0.13"
 prost-types = "0.13"
 
@@ -42,8 +42,14 @@ thiserror = "2"
 # Unique IDs
 uuid = { version = "1", features = ["v4", "serde"] }
 
-# Cryptography
+# Time (required by rcgen for certificate validity)
+time = "0.3"
+
+# Cryptography & TLS
 ring = "0.17"
+rcgen = { version = "0.13", features = ["x509-parser"] }
+x509-parser = "0.17"
+rustls-pemfile = "2"
 zeroize = { version = "1", features = ["derive"] }
 
 [build-dependencies]

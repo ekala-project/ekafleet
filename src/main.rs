@@ -74,6 +74,10 @@ enum Command {
         /// Data directory for local state
         #[arg(long, default_value = "/var/lib/ekafleet")]
         data_dir: PathBuf,
+
+        /// Path to CA certificate PEM for TLS verification
+        #[arg(long)]
+        ca_cert: Option<PathBuf>,
     },
 
     /// Show desired-vs-actual diff
@@ -240,11 +244,18 @@ async fn main() -> anyhow::Result<()> {
             join,
             token,
             data_dir,
+            ca_cert,
         } => {
+            let ca_cert_pem = match ca_cert {
+                Some(path) => Some(std::fs::read_to_string(&path)?),
+                None => None,
+            };
+
             let config = agent::AgentConfig {
                 server_addr: join,
                 token,
                 data_dir,
+                ca_cert_pem,
             };
 
             agent::run(config).await?;

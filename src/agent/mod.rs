@@ -19,6 +19,7 @@ pub struct AgentConfig {
     pub server_addr: String,
     pub token: String,
     pub data_dir: PathBuf,
+    pub ca_cert_pem: Option<String>,
 }
 
 /// Tracks local desired state as received from server.
@@ -35,10 +36,23 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
         "Starting ekafleet agent"
     );
 
-    let endpoint = format!("http://{}", config.server_addr);
-    let channel = tonic::transport::Endpoint::from_shared(endpoint)?
-        .connect()
-        .await?;
+    let channel = if let Some(ca_pem) = &config.ca_cert_pem {
+        // TLS connection with CA certificate verification
+        let endpoint = format!("https://{}", config.server_addr);
+        let ca_cert = tonic::transport::Certificate::from_pem(ca_pem);
+        let tls_config = tonic::transport::ClientTlsConfig::new().ca_certificate(ca_cert);
+        tonic::transport::Endpoint::from_shared(endpoint)?
+            .tls_config(tls_config)?
+            .connect()
+            .await?
+    } else {
+        // Plaintext fallback (development only)
+        tracing::warn!("Connecting without TLS — use --ca-cert in production");
+        let endpoint = format!("http://{}", config.server_addr);
+        tonic::transport::Endpoint::from_shared(endpoint)?
+            .connect()
+            .await?
+    };
 
     // Attach bearer token to all outgoing requests
     let token: tonic::metadata::MetadataValue<_> = format!("Bearer {}", config.token).parse()?;

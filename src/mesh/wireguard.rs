@@ -1,6 +1,8 @@
 use std::net::Ipv4Addr;
 use std::process::Stdio;
 
+use zeroize::Zeroizing;
+
 #[derive(Debug, thiserror::Error)]
 pub enum WgError {
     #[error("wg command failed: {0}")]
@@ -10,9 +12,11 @@ pub enum WgError {
 }
 
 /// Manages the kernel WireGuard interface for mesh networking.
+/// The private key is wrapped in `Zeroizing` to ensure it is
+/// cleared from memory when dropped.
 pub struct WireguardManager {
     interface: String,
-    private_key: String,
+    private_key: Zeroizing<String>,
     listen_port: u16,
     mesh_ip: Ipv4Addr,
 }
@@ -21,7 +25,7 @@ impl WireguardManager {
     pub fn new(interface: &str, listen_port: u16) -> Self {
         Self {
             interface: interface.to_string(),
-            private_key: String::new(),
+            private_key: Zeroizing::new(String::new()),
             listen_port,
             mesh_ip: Ipv4Addr::new(10, 100, 0, 1),
         }
@@ -49,7 +53,8 @@ impl WireguardManager {
             return Err(WgError::Command("genkey failed".into()));
         }
 
-        self.private_key = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        self.private_key =
+            Zeroizing::new(String::from_utf8_lossy(&output.stdout).trim().to_string());
 
         // Create interface
         run_cmd("ip", &["link", "add", &self.interface, "type", "wireguard"]).await?;

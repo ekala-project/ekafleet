@@ -4,6 +4,7 @@ use std::pin::Pin;
 use axum::Router;
 use axum::routing::get;
 use tokio_stream::wrappers::ReceiverStream;
+use tonic::transport::{Identity, ServerTlsConfig};
 use tonic::{Request, Response, Status, Streaming};
 
 use super::state::FleetState;
@@ -177,7 +178,7 @@ async fn process_agent_message(state: &FleetState, node_id: &str, msg: AgentMess
                 service = %req.service_name,
                 "Certificate request received"
             );
-            // TODO: issue certificate
+            // TODO: issue certificate via CertIssuer
         }
         Some(Payload::Metrics(summary)) => {
             tracing::debug!(
@@ -198,9 +199,23 @@ async fn process_agent_message(state: &FleetState, node_id: &str, msg: AgentMess
     }
 }
 
-/// Start the gRPC server (FleetControl service) with bearer token authentication.
-pub async fn serve_grpc(addr: SocketAddr, state: FleetState, token: &str) -> anyhow::Result<()> {
-    tracing::info!(%addr, "gRPC server listening (token-authenticated)");
+/// TLS configuration for the gRPC server.
+pub struct TlsConfig {
+    /// Server certificate PEM (leaf cert + private key)
+    pub cert_pem: String,
+    /// CA certificate PEM (for client verification in mTLS)
+    #[allow(dead_code)]
+    pub ca_cert_pem: String,
+}
+
+/// Start the gRPC server with TLS and bearer token authentication.
+pub async fn serve_grpc(
+    addr: SocketAddr,
+    state: FleetState,
+    token: &str,
+    tls: &TlsConfig,
+) -> anyhow::Result<()> {
+    tracing::info!(%addr, "gRPC server listening (TLS + token-authenticated)");
 
     let expected_token = format!("Bearer {token}");
     #[allow(clippy::result_large_err)]
@@ -212,7 +227,11 @@ pub async fn serve_grpc(addr: SocketAddr, state: FleetState, token: &str) -> any
         }
     };
 
+    let identity = Identity::from_pem(&tls.cert_pem, &tls.cert_pem);
+    let tls_config = ServerTlsConfig::new().identity(identity);
+
     tonic::transport::Server::builder()
+        .tls_config(tls_config)?
         .add_service(FleetControlServer::with_interceptor(
             FleetControlService::new(state),
             interceptor,
