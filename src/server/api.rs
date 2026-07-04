@@ -243,10 +243,34 @@ pub async fn serve_grpc(
 }
 
 /// Start the HTTP API server (health, metrics, status endpoints).
-pub async fn serve_http(addr: SocketAddr) -> anyhow::Result<()> {
+/// The /health endpoint is public; /metrics requires bearer token.
+pub async fn serve_http(addr: SocketAddr, token: String) -> anyhow::Result<()> {
+    use axum::extract::State;
+    use axum::http::StatusCode;
+
+    let authenticated_routes =
+        Router::new()
+            .route("/metrics", get(metrics))
+            .layer(axum::middleware::from_fn_with_state(
+                token.clone(),
+                |State(expected): State<String>,
+                 req: axum::http::Request<axum::body::Body>,
+                 next: axum::middleware::Next| async move {
+                    let expected_header = format!("Bearer {expected}");
+                    match req
+                        .headers()
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                    {
+                        Some(val) if val == expected_header => Ok(next.run(req).await),
+                        _ => Err(StatusCode::UNAUTHORIZED),
+                    }
+                },
+            ));
+
     let app = Router::new()
         .route("/health", get(health))
-        .route("/metrics", get(metrics));
+        .merge(authenticated_routes);
 
     tracing::info!(%addr, "HTTP server listening");
 

@@ -30,6 +30,12 @@ struct LocalState {
 }
 
 pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
+    // Validate server address format before connecting
+    config
+        .server_addr
+        .parse::<std::net::SocketAddr>()
+        .map_err(|e| anyhow::anyhow!("invalid server address '{}': {e}", config.server_addr))?;
+
     tracing::info!(
         server = %config.server_addr,
         data_dir = %config.data_dir.display(),

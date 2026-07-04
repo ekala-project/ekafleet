@@ -84,7 +84,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     // Start gRPC and HTTP servers concurrently
     let (grpc_result, http_result) = tokio::join!(
         api::serve_grpc(grpc_addr, fleet_state, &config.token, &tls),
-        api::serve_http(http_addr),
+        api::serve_http(http_addr, config.token.clone()),
     );
 
     grpc_result?;
