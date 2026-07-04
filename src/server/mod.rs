@@ -1,4 +1,5 @@
 mod api;
+pub mod scheduler;
 pub mod state;
 
 use std::path::PathBuf;
