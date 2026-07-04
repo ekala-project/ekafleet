@@ -81,3 +81,122 @@ impl CertIssuer {
         self.ca.issue_certificate(service_name, csr_der, None).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn test_issuer() -> CertIssuer {
+        let ca = RootCa::new("test.internal");
+        ca.initialize(None, None).await.unwrap();
+        CertIssuer::new(ca)
+    }
+
+    #[tokio::test]
+    async fn authorized_node_gets_certificate() {
+        let issuer = test_issuer().await;
+        issuer
+            .update_assignments("node-1", vec!["my-service".to_string()])
+            .await;
+
+        let result = issuer
+            .process_request("node-1", "my-service", b"dummy-csr")
+            .await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn unauthorized_node_denied() {
+        let issuer = test_issuer().await;
+        issuer
+            .update_assignments("node-1", vec!["allowed-service".to_string()])
+            .await;
+
+        let result = issuer
+            .process_request("node-1", "other-service", b"dummy-csr")
+            .await;
+
+        assert!(matches!(result, Err(CaError::AttestationFailed(_))));
+    }
+
+    #[tokio::test]
+    async fn unknown_node_denied() {
+        let issuer = test_issuer().await;
+        // No assignments registered for node-99
+
+        let result = issuer
+            .process_request("node-99", "any-service", b"csr")
+            .await;
+
+        assert!(matches!(result, Err(CaError::AttestationFailed(_))));
+    }
+
+    #[tokio::test]
+    async fn empty_csr_rejected() {
+        let issuer = test_issuer().await;
+        issuer
+            .update_assignments("node-1", vec!["svc".to_string()])
+            .await;
+
+        let result = issuer.process_request("node-1", "svc", b"").await;
+
+        assert!(matches!(result, Err(CaError::InvalidCsr(_))));
+    }
+
+    #[tokio::test]
+    async fn invalid_service_name_rejected() {
+        let issuer = test_issuer().await;
+
+        // Empty name
+        let result = issuer.process_request("node-1", "", b"csr").await;
+        assert!(matches!(result, Err(CaError::InvalidCsr(_))));
+
+        // Special characters
+        let result = issuer
+            .process_request("node-1", "svc;drop table", b"csr")
+            .await;
+        assert!(matches!(result, Err(CaError::InvalidCsr(_))));
+
+        // Too long
+        let long_name = "a".repeat(254);
+        let result = issuer.process_request("node-1", &long_name, b"csr").await;
+        assert!(matches!(result, Err(CaError::InvalidCsr(_))));
+    }
+
+    #[tokio::test]
+    async fn valid_service_name_formats_accepted() {
+        let issuer = test_issuer().await;
+        let valid_names = vec!["my-service", "my_service", "my.service.v2", "svc123", "a"];
+
+        for name in valid_names {
+            issuer
+                .update_assignments("node-1", vec![name.to_string()])
+                .await;
+            let result = issuer.process_request("node-1", name, b"csr").await;
+            assert!(result.is_ok(), "valid name '{name}' should be accepted");
+        }
+    }
+
+    #[tokio::test]
+    async fn assignment_update_replaces_previous() {
+        let issuer = test_issuer().await;
+
+        issuer
+            .update_assignments("node-1", vec!["svc-a".to_string()])
+            .await;
+        // Replace with svc-b only
+        issuer
+            .update_assignments("node-1", vec!["svc-b".to_string()])
+            .await;
+
+        let result = issuer.process_request("node-1", "svc-a", b"csr").await;
+        assert!(
+            matches!(result, Err(CaError::AttestationFailed(_))),
+            "old assignment should no longer be valid"
+        );
+
+        let result = issuer.process_request("node-1", "svc-b", b"csr").await;
+        assert!(result.is_ok(), "new assignment should be valid");
+    }
+}

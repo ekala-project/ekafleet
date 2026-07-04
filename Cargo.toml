@@ -52,5 +52,8 @@ x509-parser = "0.17"
 rustls-pemfile = "2"
 zeroize = { version = "1", features = ["derive"] }
 
+[dev-dependencies]
+tempfile = "3"
+
 [build-dependencies]
 tonic-build = "0.13"

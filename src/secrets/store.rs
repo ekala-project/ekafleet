@@ -192,3 +192,174 @@ impl SecretStore {
         result
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_key() -> [u8; 32] {
+        [0xAB; 32]
+    }
+
+    #[tokio::test]
+    async fn encrypt_decrypt_roundtrip() {
+        let store = SecretStore::new(&test_key());
+        let plaintext = b"my-database-password";
+
+        store.put("svc1", "db_pass", plaintext).await.unwrap();
+        let (retrieved, version) = store.get("svc1", "db_pass").await.unwrap().unwrap();
+
+        assert_eq!(retrieved, plaintext);
+        assert_eq!(version, 1);
+    }
+
+    #[tokio::test]
+    async fn secrets_are_not_stored_as_plaintext() {
+        let store = SecretStore::new(&test_key());
+        let plaintext = b"super-secret-value";
+
+        store.put("svc1", "secret", plaintext).await.unwrap();
+
+        // Access the internal sealed data directly
+        let state = store.inner.read().await;
+        let entry = state.secrets.get("svc1").unwrap().get("secret").unwrap();
+
+        // The sealed data must NOT contain the plaintext
+        assert_ne!(entry.sealed, plaintext.to_vec());
+        // And must be longer than plaintext (nonce + tag overhead)
+        assert!(entry.sealed.len() > plaintext.len());
+    }
+
+    #[tokio::test]
+    async fn different_encryptions_produce_different_ciphertext() {
+        let store = SecretStore::new(&test_key());
+        let plaintext = b"same-value";
+
+        // Encrypt twice — nonces should differ, producing different ciphertext
+        let sealed1 = store.encrypt(plaintext).unwrap();
+        let sealed2 = store.encrypt(plaintext).unwrap();
+
+        assert_ne!(
+            sealed1, sealed2,
+            "identical plaintext must produce different ciphertext (unique nonces)"
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_key_cannot_decrypt() {
+        let store1 = SecretStore::new(&[0xAA; 32]);
+        let store2 = SecretStore::new(&[0xBB; 32]);
+
+        let sealed = store1.encrypt(b"secret").unwrap();
+        let result = store2.decrypt(&sealed);
+
+        assert!(result.is_err(), "decryption with wrong key must fail");
+    }
+
+    #[tokio::test]
+    async fn tampered_ciphertext_fails_decryption() {
+        let store = SecretStore::new(&test_key());
+        let mut sealed = store.encrypt(b"secret").unwrap();
+
+        // Flip a byte in the ciphertext (after the nonce)
+        let idx = NONCE_LEN + 1;
+        sealed[idx] ^= 0xFF;
+
+        let result = store.decrypt(&sealed);
+        assert!(
+            result.is_err(),
+            "tampered ciphertext must fail authentication"
+        );
+    }
+
+    #[tokio::test]
+    async fn version_increments_on_update() {
+        let store = SecretStore::new(&test_key());
+
+        let v1 = store.put("svc", "key", b"val1").await.unwrap();
+        let v2 = store.put("svc", "key", b"val2").await.unwrap();
+        let v3 = store.put("svc", "key", b"val3").await.unwrap();
+
+        assert_eq!(v1, 1);
+        assert_eq!(v2, 2);
+        assert_eq!(v3, 3);
+
+        let (val, version) = store.get("svc", "key").await.unwrap().unwrap();
+        assert_eq!(val, b"val3");
+        assert_eq!(version, 3);
+    }
+
+    #[tokio::test]
+    async fn secrets_scoped_per_service() {
+        let store = SecretStore::new(&test_key());
+
+        store.put("svc-a", "password", b"alpha").await.unwrap();
+        store.put("svc-b", "password", b"beta").await.unwrap();
+
+        let a = store.get("svc-a", "password").await.unwrap().unwrap();
+        let b = store.get("svc-b", "password").await.unwrap().unwrap();
+
+        assert_eq!(a.0, b"alpha");
+        assert_eq!(b.0, b"beta");
+
+        // svc-c has no secrets
+        assert!(store.get("svc-c", "password").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_removes_secret() {
+        let store = SecretStore::new(&test_key());
+        store.put("svc", "key", b"val").await.unwrap();
+
+        assert!(store.delete("svc", "key").await);
+        assert!(store.get("svc", "key").await.unwrap().is_none());
+
+        // Deleting non-existent returns false
+        assert!(!store.delete("svc", "key").await);
+    }
+
+    #[tokio::test]
+    async fn list_returns_names_and_versions() {
+        let store = SecretStore::new(&test_key());
+        store.put("svc", "a", b"1").await.unwrap();
+        store.put("svc", "b", b"2").await.unwrap();
+        store.put("svc", "a", b"3").await.unwrap(); // version 2
+
+        let mut list = store.list("svc").await;
+        list.sort_by_key(|(name, _)| name.clone());
+
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0], ("a".to_string(), 2));
+        assert_eq!(list[1], ("b".to_string(), 1));
+    }
+
+    #[tokio::test]
+    async fn secrets_for_services_returns_encrypted_data() {
+        let store = SecretStore::new(&test_key());
+        store.put("svc-a", "key1", b"val1").await.unwrap();
+        store.put("svc-b", "key2", b"val2").await.unwrap();
+        store.put("svc-c", "key3", b"val3").await.unwrap();
+
+        let result = store
+            .secrets_for_services(&["svc-a".into(), "svc-c".into()])
+            .await;
+
+        assert_eq!(result.len(), 2);
+        // The returned values should be sealed (encrypted), not plaintext
+        for (_, _, sealed, _) in &result {
+            assert!(
+                sealed.len() > NONCE_LEN,
+                "sealed data must include nonce + ciphertext + tag"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn truncated_ciphertext_fails() {
+        let store = SecretStore::new(&test_key());
+        // Too short to contain a nonce
+        assert!(store.decrypt(&[0u8; 5]).is_err());
+        // Empty
+        assert!(store.decrypt(&[]).is_err());
+    }
+}

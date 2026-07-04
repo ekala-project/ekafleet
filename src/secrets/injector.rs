@@ -76,6 +76,15 @@ impl SecretInjector {
 
         // Decrypt before writing to disk
         let plaintext = self.decrypt(encrypted_value)?;
+
+        // If the file already exists with read-only permissions, make it writable first
+        #[cfg(unix)]
+        if path.exists() {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            tokio::fs::set_permissions(&path, perms).await?;
+        }
+
         tokio::fs::write(&path, &plaintext).await?;
 
         // Set restrictive permissions (owner read-only)
@@ -114,5 +123,132 @@ impl SecretInjector {
 
     fn secret_path(&self, service_name: &str, secret_name: &str) -> PathBuf {
         self.secrets_dir.join(service_name).join(secret_name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_key() -> [u8; 32] {
+        [0xAB; 32]
+    }
+
+    /// Encrypt a value the same way SecretStore does, for test input.
+    fn encrypt_value(key: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
+        use ring::aead::{AES_256_GCM, Aad, Nonce, UnboundKey};
+        use ring::rand::{SecureRandom, SystemRandom};
+
+        let unbound = UnboundKey::new(&AES_256_GCM, key).unwrap();
+        let sealing_key = LessSafeKey::new(unbound);
+        let rng = SystemRandom::new();
+
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        rng.fill(&mut nonce_bytes).unwrap();
+        let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+
+        let mut in_out = plaintext.to_vec();
+        sealing_key
+            .seal_in_place_append_tag(nonce, Aad::empty(), &mut in_out)
+            .unwrap();
+
+        let mut sealed = Vec::with_capacity(NONCE_LEN + in_out.len());
+        sealed.extend_from_slice(&nonce_bytes);
+        sealed.extend_from_slice(&in_out);
+        sealed
+    }
+
+    #[tokio::test]
+    async fn inject_decrypts_and_writes_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = test_key();
+        let mut injector = SecretInjector::new(dir.path(), &key);
+
+        let encrypted = encrypt_value(&key, b"database-password");
+        let path = injector
+            .inject("my-service", "db_pass", &encrypted, 1)
+            .await
+            .unwrap();
+
+        let contents = tokio::fs::read(&path).await.unwrap();
+        assert_eq!(contents, b"database-password");
+    }
+
+    #[tokio::test]
+    async fn inject_sets_restrictive_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = test_key();
+        let mut injector = SecretInjector::new(dir.path(), &key);
+
+        let encrypted = encrypt_value(&key, b"secret");
+        let path = injector.inject("svc", "key", &encrypted, 1).await.unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::metadata(&path).unwrap().permissions();
+            assert_eq!(
+                perms.mode() & 0o777,
+                0o400,
+                "secret file must be owner-read-only"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn inject_is_idempotent_for_same_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = test_key();
+        let mut injector = SecretInjector::new(dir.path(), &key);
+
+        let encrypted = encrypt_value(&key, b"value");
+        let path1 = injector.inject("svc", "key", &encrypted, 1).await.unwrap();
+        let path2 = injector.inject("svc", "key", &encrypted, 1).await.unwrap();
+
+        assert_eq!(path1, path2);
+    }
+
+    #[tokio::test]
+    async fn inject_updates_on_new_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = test_key();
+        let mut injector = SecretInjector::new(dir.path(), &key);
+
+        let enc1 = encrypt_value(&key, b"v1");
+        let enc2 = encrypt_value(&key, b"v2");
+
+        injector.inject("svc", "key", &enc1, 1).await.unwrap();
+        let path = injector.inject("svc", "key", &enc2, 2).await.unwrap();
+
+        let contents = tokio::fs::read(&path).await.unwrap();
+        assert_eq!(contents, b"v2");
+    }
+
+    #[tokio::test]
+    async fn wrong_key_fails_to_inject() {
+        let dir = tempfile::tempdir().unwrap();
+        let encrypted = encrypt_value(&[0xAA; 32], b"secret");
+
+        let mut injector = SecretInjector::new(dir.path(), &[0xBB; 32]);
+        let result = injector.inject("svc", "key", &encrypted, 1).await;
+
+        assert!(
+            result.is_err(),
+            "decryption with wrong key must fail during injection"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_service_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = test_key();
+        let mut injector = SecretInjector::new(dir.path(), &key);
+
+        let encrypted = encrypt_value(&key, b"secret");
+        let path = injector.inject("svc", "key", &encrypted, 1).await.unwrap();
+        assert!(path.exists());
+
+        injector.remove_service("svc").await.unwrap();
+        assert!(!path.exists());
     }
 }

@@ -202,3 +202,177 @@ impl RaftStorage {
         Ok(removed)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_key() -> [u8; 32] {
+        [0xCD; 32]
+    }
+
+    async fn test_storage() -> (RaftStorage, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = RaftStorage::new(dir.path(), &test_key());
+        storage.initialize().await.unwrap();
+        (storage, dir)
+    }
+
+    fn test_entry(index: u64) -> LogEntry {
+        LogEntry {
+            index,
+            term: 1,
+            command: super::super::state::Command::PutSecret {
+                service_name: "test-svc".into(),
+                secret_name: "password".into(),
+                encrypted_value: b"encrypted-data".to_vec(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn log_roundtrip_encrypted() {
+        let (storage, _dir) = test_storage().await;
+
+        let entry = test_entry(1);
+        storage.append_log(&entry).await.unwrap();
+
+        let entries = storage.read_log_from(0).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].index, 1);
+        assert_eq!(entries[0].term, 1);
+    }
+
+    #[tokio::test]
+    async fn log_files_are_not_plaintext() {
+        let (storage, dir) = test_storage().await;
+
+        let entry = test_entry(1);
+        storage.append_log(&entry).await.unwrap();
+
+        // Read the raw file bytes
+        let log_file = dir
+            .path()
+            .join("raft")
+            .join("log")
+            .join("00000000000000000001.log");
+        let raw = tokio::fs::read(&log_file).await.unwrap();
+
+        // Raw file must NOT contain plaintext JSON
+        let raw_str = String::from_utf8_lossy(&raw);
+        assert!(
+            !raw_str.contains("test-svc"),
+            "log file must not contain plaintext service name"
+        );
+        assert!(
+            !raw_str.contains("password"),
+            "log file must not contain plaintext secret name"
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_key_cannot_read_log() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Write with key A
+        let storage_a = RaftStorage::new(dir.path(), &[0xAA; 32]);
+        storage_a.initialize().await.unwrap();
+        storage_a.append_log(&test_entry(1)).await.unwrap();
+
+        // Try to read with key B
+        let storage_b = RaftStorage::new(dir.path(), &[0xBB; 32]);
+        let result = storage_b.read_log_from(0).await;
+
+        assert!(result.is_err(), "reading with wrong key must fail");
+    }
+
+    #[tokio::test]
+    async fn snapshot_roundtrip_encrypted() {
+        let (storage, _dir) = test_storage().await;
+
+        let data = b"snapshot-state-data-with-secrets";
+        storage.save_snapshot(42, data).await.unwrap();
+
+        let loaded = storage.load_latest_snapshot().await.unwrap();
+        assert!(loaded.is_some());
+
+        let (index, decrypted) = loaded.unwrap();
+        assert_eq!(index, 42);
+        assert_eq!(decrypted, data);
+    }
+
+    #[tokio::test]
+    async fn snapshot_files_are_not_plaintext() {
+        let (storage, dir) = test_storage().await;
+
+        storage
+            .save_snapshot(1, b"contains-secret-data")
+            .await
+            .unwrap();
+
+        let snap_file = dir
+            .path()
+            .join("raft")
+            .join("snapshots")
+            .join("00000000000000000001.snap");
+        let raw = tokio::fs::read(&snap_file).await.unwrap();
+
+        let raw_str = String::from_utf8_lossy(&raw);
+        assert!(
+            !raw_str.contains("contains-secret-data"),
+            "snapshot must not contain plaintext"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_removes_old_entries() {
+        let (storage, _dir) = test_storage().await;
+
+        for i in 1..=5 {
+            storage.append_log(&test_entry(i)).await.unwrap();
+        }
+
+        let removed = storage.compact_log(3).await.unwrap();
+        assert_eq!(removed, 3);
+
+        let remaining = storage.read_log_from(0).await.unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0].index, 4);
+        assert_eq!(remaining[1].index, 5);
+    }
+
+    #[tokio::test]
+    async fn read_log_from_filters_by_index() {
+        let (storage, _dir) = test_storage().await;
+
+        for i in 1..=5 {
+            storage.append_log(&test_entry(i)).await.unwrap();
+        }
+
+        let entries = storage.read_log_from(3).await.unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].index, 3);
+    }
+
+    #[tokio::test]
+    async fn no_snapshot_returns_none() {
+        let (storage, _dir) = test_storage().await;
+        let result = storage.load_latest_snapshot().await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn data_dir_has_restrictive_permissions() {
+        let (_, dir) = test_storage().await;
+        use std::os::unix::fs::PermissionsExt;
+
+        let raft_dir = dir.path().join("raft");
+        let perms = std::fs::metadata(&raft_dir).unwrap().permissions();
+        assert_eq!(
+            perms.mode() & 0o777,
+            0o700,
+            "raft data dir must be owner-only"
+        );
+    }
+}

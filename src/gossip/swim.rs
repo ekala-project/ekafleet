@@ -204,6 +204,16 @@ async fn handle_message(state: &Arc<RwLock<MembershipState>>, data: &[u8], src: 
     }
 }
 
+/// Sign a message payload with a given HMAC key (for testing).
+#[cfg(test)]
+fn sign_with_key(key: &hmac::Key, payload: &[u8]) -> Vec<u8> {
+    let tag = hmac::sign(key, payload);
+    let mut signed = Vec::with_capacity(payload.len() + HMAC_LEN);
+    signed.extend_from_slice(payload);
+    signed.extend_from_slice(tag.as_ref());
+    signed
+}
+
 /// Run one probe cycle: check for suspects and dead members.
 async fn probe_cycle(state: &Arc<RwLock<MembershipState>>) {
     let mut state = state.write().await;
@@ -232,5 +242,98 @@ async fn probe_cycle(state: &Arc<RwLock<MembershipState>>) {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cluster_key() -> [u8; 32] {
+        [0xDE; 32]
+    }
+
+    fn swim(node_id: &str) -> SwimMembership {
+        SwimMembership::new(node_id, "127.0.0.1:0".parse().unwrap(), &cluster_key())
+    }
+
+    #[test]
+    fn sign_verify_roundtrip() {
+        let s = swim("node-1");
+        let payload = b"hello";
+
+        let signed = s.sign(payload);
+        let verified = s.verify(&signed);
+
+        assert!(verified.is_some());
+        assert_eq!(verified.unwrap(), payload);
+    }
+
+    #[test]
+    fn verify_rejects_wrong_key() {
+        let s1 = SwimMembership::new("n1", "127.0.0.1:0".parse().unwrap(), &[0xAA; 32]);
+        let s2 = SwimMembership::new("n2", "127.0.0.1:0".parse().unwrap(), &[0xBB; 32]);
+
+        let signed = s1.sign(b"payload");
+        let result = s2.verify(&signed);
+
+        assert!(
+            result.is_none(),
+            "different cluster key must fail verification"
+        );
+    }
+
+    #[test]
+    fn verify_rejects_tampered_payload() {
+        let s = swim("node-1");
+        let mut signed = s.sign(b"original");
+
+        // Tamper with the payload (before the HMAC tag)
+        signed[0] ^= 0xFF;
+
+        let result = s.verify(&signed);
+        assert!(result.is_none(), "tampered payload must fail verification");
+    }
+
+    #[test]
+    fn verify_rejects_tampered_tag() {
+        let s = swim("node-1");
+        let mut signed = s.sign(b"payload");
+
+        // Tamper with the HMAC tag (last byte)
+        let last = signed.len() - 1;
+        signed[last] ^= 0xFF;
+
+        let result = s.verify(&signed);
+        assert!(result.is_none(), "tampered tag must fail verification");
+    }
+
+    #[test]
+    fn verify_rejects_truncated_message() {
+        let s = swim("node-1");
+
+        // Too short to contain an HMAC tag
+        assert!(s.verify(&[0u8; HMAC_LEN - 1]).is_none());
+        assert!(s.verify(&[]).is_none());
+    }
+
+    #[tokio::test]
+    async fn seed_members_start_alive() {
+        let s = swim("node-1");
+        s.add_seed("node-2", "10.0.0.2:7401".parse().unwrap()).await;
+
+        let alive = s.alive_members().await;
+        assert_eq!(alive.len(), 1);
+        assert_eq!(alive[0].0, "node-2");
+    }
+
+    #[tokio::test]
+    async fn all_members_includes_status() {
+        let s = swim("node-1");
+        s.add_seed("node-2", "10.0.0.2:7401".parse().unwrap()).await;
+
+        let all = s.all_members().await;
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].2, MemberStatus::Alive);
     }
 }

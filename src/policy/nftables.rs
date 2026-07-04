@@ -115,6 +115,36 @@ table inet {table} {{
         self.apply_ruleset(&cmd).await
     }
 
+    /// Generate policy rules as nftables commands without applying them.
+    /// Useful for testing rule generation and sanitization.
+    #[cfg(test)]
+    fn generate_rules(&self, rules: &[PolicyRule]) -> Vec<String> {
+        let mut nft_rules = Vec::new();
+        for rule in rules {
+            let ports: String = rule
+                .dest_ports
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            let desc: String = rule
+                .description
+                .chars()
+                .filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '-' || *c == '_')
+                .take(128)
+                .collect();
+
+            nft_rules.push(format!(
+                "add rule inet {table} input ip saddr {src} ip daddr {dst} tcp dport {{ {ports} }} accept comment \"{desc}\"",
+                table = self.table_name,
+                src = rule.source_ip,
+                dst = rule.dest_ip,
+            ));
+        }
+        nft_rules
+    }
+
     async fn apply_ruleset(&self, ruleset: &str) -> Result<(), NftError> {
         use tokio::io::AsyncWriteExt;
 
@@ -138,5 +168,116 @@ table inet {table} {{
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rule(desc: &str) -> PolicyRule {
+        PolicyRule {
+            source_ip: Ipv4Addr::new(10, 100, 1, 1),
+            dest_ip: Ipv4Addr::new(10, 100, 2, 1),
+            dest_ports: vec![8080, 8443],
+            description: desc.to_string(),
+        }
+    }
+
+    #[test]
+    fn sanitize_removes_dangerous_chars_from_description() {
+        let enforcer = PolicyEnforcer::new();
+        let rules = enforcer.generate_rules(&[rule("allow web\" ; drop table")]);
+
+        assert_eq!(rules.len(), 1);
+        // Extract just the comment content between the comment delimiters
+        let comment_start = rules[0].find("comment \"").unwrap() + 9;
+        let comment_end = rules[0].rfind('"').unwrap();
+        let comment = &rules[0][comment_start..comment_end];
+
+        // The sanitized description must not contain quotes or semicolons
+        assert!(!comment.contains('"'), "quotes must be stripped");
+        assert!(!comment.contains(';'), "semicolons must be stripped");
+        // But should still contain the safe words
+        assert!(comment.contains("allow"), "safe words should remain");
+        assert!(comment.contains("web"), "safe words should remain");
+    }
+
+    #[test]
+    fn sanitize_preserves_safe_characters() {
+        let enforcer = PolicyEnforcer::new();
+        let rules = enforcer.generate_rules(&[rule("allow frontend-to-backend_v2")]);
+
+        assert!(rules[0].contains("allow frontend-to-backend_v2"));
+    }
+
+    #[test]
+    fn sanitize_truncates_long_descriptions() {
+        let enforcer = PolicyEnforcer::new();
+        let long_desc = "a".repeat(256);
+        let rules = enforcer.generate_rules(&[rule(&long_desc)]);
+
+        // Extract the comment content
+        let comment_start = rules[0].find("comment \"").unwrap() + 9;
+        let comment_end = rules[0].rfind('"').unwrap();
+        let comment = &rules[0][comment_start..comment_end];
+
+        assert!(
+            comment.len() <= 128,
+            "description must be truncated to 128 chars"
+        );
+    }
+
+    #[test]
+    fn rule_generation_with_multiple_ports() {
+        let enforcer = PolicyEnforcer::new();
+        let r = PolicyRule {
+            source_ip: Ipv4Addr::new(10, 0, 0, 1),
+            dest_ip: Ipv4Addr::new(10, 0, 0, 2),
+            dest_ports: vec![80, 443, 8080],
+            description: "web traffic".into(),
+        };
+        let rules = enforcer.generate_rules(&[r]);
+
+        assert!(rules[0].contains("80, 443, 8080"));
+        assert!(rules[0].contains("10.0.0.1"));
+        assert!(rules[0].contains("10.0.0.2"));
+    }
+
+    #[test]
+    fn empty_rules_produces_empty_output() {
+        let enforcer = PolicyEnforcer::new();
+        let rules = enforcer.generate_rules(&[]);
+        assert!(rules.is_empty());
+    }
+
+    #[test]
+    fn shell_metacharacters_stripped() {
+        let enforcer = PolicyEnforcer::new();
+        let dangerous_descs = vec![
+            "$(rm -rf /)",
+            "`whoami`",
+            "foo\nbar",
+            "a && b",
+            "a || b",
+            "a | b",
+            "a > /etc/passwd",
+            "a < /dev/null",
+        ];
+
+        for desc in dangerous_descs {
+            let rules = enforcer.generate_rules(&[rule(desc)]);
+            let rule_str = &rules[0];
+
+            assert!(!rule_str.contains('$'), "$ must be stripped from: {desc}");
+            assert!(
+                !rule_str.contains('`'),
+                "backtick must be stripped from: {desc}"
+            );
+            assert!(!rule_str.contains('&'), "& must be stripped from: {desc}");
+            assert!(!rule_str.contains('|'), "| must be stripped from: {desc}");
+            assert!(!rule_str.contains('>'), "> must be stripped from: {desc}");
+            assert!(!rule_str.contains('<'), "< must be stripped from: {desc}");
+        }
     }
 }
