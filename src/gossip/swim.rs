@@ -7,6 +7,8 @@ use ring::hmac;
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 
+use crate::gossip::catalog::ServiceCatalog;
+
 const HMAC_LEN: usize = 32; // SHA-256 HMAC tag length
 
 /// SWIM-based membership protocol for failure detection.
@@ -24,6 +26,7 @@ struct MembershipState {
     members: HashMap<String, MemberInfo>,
     suspect_timeout: Duration,
     dead_timeout: Duration,
+    catalog: Option<ServiceCatalog>,
 }
 
 #[derive(Debug, Clone)]
@@ -52,9 +55,19 @@ impl SwimMembership {
                 members: HashMap::new(),
                 suspect_timeout: Duration::from_secs(3),
                 dead_timeout: Duration::from_secs(10),
+                catalog: None,
             })),
             hmac_key: Arc::new(hmac_key),
         }
+    }
+
+    /// Attach a service catalog for gossip propagation.
+    /// The catalog snapshot will be included in gossip piggyback data
+    /// during the probe cycle.
+    pub async fn attach_catalog(&self, catalog: ServiceCatalog) {
+        let mut state = self.inner.write().await;
+        state.catalog = Some(catalog);
+        tracing::info!("Service catalog attached to SWIM membership for gossip propagation");
     }
 
     /// Sign a message payload with HMAC-SHA256.

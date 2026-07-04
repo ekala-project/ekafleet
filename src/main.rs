@@ -171,6 +171,16 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:7400")]
         server: String,
     },
+
+    /// SSH into a fleet machine
+    Ssh {
+        /// Machine to connect to
+        machine: String,
+
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -502,9 +512,41 @@ async fn main() -> anyhow::Result<()> {
                 None => println!("Service '{service}' not found in fleet."),
             }
         }
+
+        Command::Ssh { machine, server } => {
+            let mut client = connect_server(&server).await?;
+            let resp = client.status(StatusRequest {}).await?;
+            let status = resp.into_inner();
+
+            let node = status.nodes.iter().find(|n| n.node_id == machine);
+            match node {
+                Some(n) => {
+                    let addr = &n.address;
+                    tracing::info!(machine = %machine, address = %addr, "Connecting via SSH");
+                    let ssh_target = if addr.contains(':') {
+                        // Strip port if present
+                        addr.split(':').next().unwrap_or(addr).to_string()
+                    } else {
+                        addr.to_string()
+                    };
+
+                    let err = exec_ssh(&ssh_target);
+                    anyhow::bail!("ssh exec failed: {err}");
+                }
+                None => {
+                    anyhow::bail!("Machine '{machine}' not found in fleet");
+                }
+            }
+        }
     }
 
     Ok(())
+}
+
+/// Execute ssh, replacing the current process.
+fn exec_ssh(target: &str) -> std::io::Error {
+    use std::os::unix::process::CommandExt;
+    std::process::Command::new("ssh").arg(target).exec()
 }
 
 /// Generate a cryptographically random token (64 hex chars = 256 bits).

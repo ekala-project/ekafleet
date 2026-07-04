@@ -9,6 +9,7 @@ use std::time::Duration;
 use tokio::sync::{RwLock, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::agent::health::HealthChecker;
 use crate::dns::resolver::DnsResolver;
 use crate::mesh::peers::PeerManager;
 use crate::mesh::wireguard::WireguardManager;
@@ -17,7 +18,8 @@ use crate::proto::agent_message::Payload;
 use crate::proto::fleet_control_client::FleetControlClient;
 use crate::proto::server_message::Payload as ServerPayload;
 use crate::proto::{
-    AgentMessage, CertificateRequest, Heartbeat, NodeResources, ServiceSpec, StatusReport,
+    AgentMessage, CertificateRequest, HealthReport, Heartbeat, NodeResources, ServiceSpec,
+    StatusReport,
 };
 use crate::secrets::injector::SecretInjector;
 use crate::spiffe::workload_api::WorkloadManager;
@@ -87,6 +89,7 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
         &config.data_dir,
         &[0u8; 32], // TODO: derive from fleet key distributed by server
     )));
+    let health_checker = HealthChecker::new();
     let dns_resolver = Arc::new(DnsResolver::new("fleet.internal", vec![]));
     let wg_manager = WireguardManager::new("wg-fleet", 51820);
     let peer_manager = Arc::new(RwLock::new(PeerManager::new(wg_manager)));
@@ -187,6 +190,30 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
         }
     });
 
+    // Spawn periodic health reporter
+    let health_tx = tx.clone();
+    let health_node_id = node_id.clone();
+    let health_checker_clone = health_checker.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        loop {
+            interval.tick().await;
+            let services = health_checker_clone.reports(&health_node_id).await;
+            if services.is_empty() {
+                continue;
+            }
+            let msg = AgentMessage {
+                payload: Some(Payload::Health(HealthReport {
+                    node_id: health_node_id.clone(),
+                    services,
+                })),
+            };
+            if health_tx.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
+
     // Process incoming server messages
     while let Some(msg) = inbound.message().await? {
         match msg.payload {
@@ -216,6 +243,18 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
                             })),
                         })
                         .await;
+                }
+
+                // Start health checking for services with health_check configured
+                for svc in &ds.services {
+                    if svc.health_check.is_some() {
+                        let instance_id = format!("{}-{}", svc.name, node_id);
+                        health_checker.start_checking(
+                            svc.name.clone(),
+                            instance_id,
+                            svc.health_check.clone().unwrap(),
+                        );
+                    }
                 }
 
                 // Reconcile local services with desired state
