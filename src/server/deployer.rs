@@ -241,7 +241,7 @@ async fn execute_blue_green(
 
 /// Wait for instances to report healthy status.
 async fn wait_healthy(
-    _state: &FleetState,
+    state: &FleetState,
     service_name: &str,
     placements: &[Placement],
     min_healthy_time: Duration,
@@ -257,16 +257,48 @@ async fn wait_healthy(
         "Waiting for health gate"
     );
 
-    // TODO: poll FleetState for actual health status from agents
-    // For now, simulate the health gate with a delay
-    tokio::time::sleep(min_healthy_time).await;
+    let started = tokio::time::Instant::now();
+    let mut healthy_since: Option<tokio::time::Instant> = None;
 
-    tracing::info!(
-        service = %service_name,
-        "Health gate passed"
-    );
+    loop {
+        if started.elapsed() > deadline {
+            return Err(DeployError::HealthTimeout);
+        }
 
-    Ok(())
+        // Check if all nodes report the service as healthy
+        let (_, services) = state.fleet_status().await;
+        let svc_status = services.iter().find(|s| s.name == service_name);
+
+        let all_healthy = if let Some(svc) = svc_status {
+            nodes.iter().all(|node| {
+                svc.instances.iter().any(|i| {
+                    i.node_id == *node && i.health == crate::proto::HealthStatus::Healthy as i32
+                })
+            })
+        } else {
+            false
+        };
+
+        if all_healthy {
+            match healthy_since {
+                Some(since) if since.elapsed() >= min_healthy_time => {
+                    tracing::info!(
+                        service = %service_name,
+                        "Health gate passed"
+                    );
+                    return Ok(());
+                }
+                None => {
+                    healthy_since = Some(tokio::time::Instant::now());
+                }
+                _ => {}
+            }
+        } else {
+            healthy_since = None;
+        }
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
 
 /// Compute a dependency-ordered deployment sequence.

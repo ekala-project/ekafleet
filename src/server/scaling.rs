@@ -9,6 +9,7 @@ use crate::metrics::aggregator::MetricsAggregator;
 /// metrics and computes desired replica counts.
 pub struct ScalingEngine {
     metrics: MetricsAggregator,
+    state: crate::server::state::FleetState,
     policies: HashMap<String, ScalingPolicy>,
     cooldown: Duration,
     last_scale: HashMap<String, std::time::Instant>,
@@ -33,9 +34,10 @@ pub struct ScalingRule {
 }
 
 impl ScalingEngine {
-    pub fn new(metrics: MetricsAggregator) -> Self {
+    pub fn new(metrics: MetricsAggregator, state: crate::server::state::FleetState) -> Self {
         Self {
             metrics,
+            state,
             policies: HashMap::new(),
             cooldown: Duration::from_secs(60),
             last_scale: HashMap::new(),
@@ -91,8 +93,12 @@ impl ScalingEngine {
             }
         }
 
-        // TODO: get current replica count from fleet state
-        let current_replicas = 1u32;
+        let (_, services) = self.state.fleet_status().await;
+        let current_replicas = services
+            .iter()
+            .find(|s| s.name == service_name)
+            .map(|s| s.instances.len() as u32)
+            .unwrap_or(0);
 
         let desired = if scale_up {
             (current_replicas + 1).min(policy.max_replicas)

@@ -9,6 +9,7 @@ use tonic::{Request, Response, Status, Streaming};
 
 use super::state::FleetState;
 use crate::ca::issuer::CertIssuer;
+use crate::metrics::aggregator::MetricsAggregator;
 use crate::proto::agent_message::Payload;
 use crate::proto::fleet_control_server::{FleetControl, FleetControlServer};
 use crate::proto::server_message::Payload as ServerPayload;
@@ -21,6 +22,7 @@ pub struct FleetControlService {
     state: FleetState,
     cert_issuer: Option<CertIssuer>,
     trust_bundle_pem: Option<String>,
+    metrics: MetricsAggregator,
 }
 
 impl FleetControlService {
@@ -29,6 +31,7 @@ impl FleetControlService {
             state,
             cert_issuer: None,
             trust_bundle_pem: None,
+            metrics: MetricsAggregator::new(),
         }
     }
 
@@ -95,11 +98,12 @@ impl FleetControl for FleetControlService {
         let state = self.state.clone();
         let nid = node_id.clone();
         let issuer = self.cert_issuer.clone();
+        let metrics = self.metrics.clone();
         tokio::spawn(async move {
             loop {
                 match inbound.message().await {
                     Ok(Some(msg)) => {
-                        process_agent_message(&state, &nid, msg, issuer.as_ref()).await;
+                        process_agent_message(&state, &nid, msg, issuer.as_ref(), &metrics).await;
                     }
                     Ok(None) => {
                         tracing::info!(node_id = %nid, "Agent stream ended");
@@ -171,7 +175,14 @@ impl FleetControl for FleetControlService {
 
 impl FleetControlService {
     async fn process_message(&self, node_id: &str, msg: AgentMessage) {
-        process_agent_message(&self.state, node_id, msg, self.cert_issuer.as_ref()).await;
+        process_agent_message(
+            &self.state,
+            node_id,
+            msg,
+            self.cert_issuer.as_ref(),
+            &self.metrics,
+        )
+        .await;
     }
 }
 
@@ -180,6 +191,7 @@ async fn process_agent_message(
     node_id: &str,
     msg: AgentMessage,
     cert_issuer: Option<&CertIssuer>,
+    metrics: &MetricsAggregator,
 ) {
     match msg.payload {
         Some(Payload::Heartbeat(hb)) => {
@@ -248,7 +260,7 @@ async fn process_agent_message(
                 points = summary.points.len(),
                 "Metrics received"
             );
-            // TODO: store/aggregate metrics
+            metrics.ingest(&summary.node_id, summary.points).await;
         }
         Some(Payload::Nack(nack)) => {
             tracing::warn!(

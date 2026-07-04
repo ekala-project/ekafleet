@@ -9,12 +9,17 @@ use std::time::Duration;
 use tokio::sync::{RwLock, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::dns::resolver::DnsResolver;
+use crate::mesh::peers::PeerManager;
+use crate::mesh::wireguard::WireguardManager;
+use crate::policy::nftables::PolicyEnforcer;
 use crate::proto::agent_message::Payload;
 use crate::proto::fleet_control_client::FleetControlClient;
 use crate::proto::server_message::Payload as ServerPayload;
 use crate::proto::{
     AgentMessage, CertificateRequest, Heartbeat, NodeResources, ServiceSpec, StatusReport,
 };
+use crate::secrets::injector::SecretInjector;
 use crate::spiffe::workload_api::WorkloadManager;
 
 #[allow(dead_code)]
@@ -77,6 +82,15 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
 
     let local_state = Arc::new(RwLock::new(LocalState::default()));
     let workload_mgr = Arc::new(WorkloadManager::new(&config.data_dir, "fleet.internal"));
+    let supervisor = Arc::new(RwLock::new(supervisor::Supervisor::new(&config.data_dir)));
+    let secret_injector = Arc::new(RwLock::new(SecretInjector::new(
+        &config.data_dir,
+        &[0u8; 32], // TODO: derive from fleet key distributed by server
+    )));
+    let dns_resolver = Arc::new(DnsResolver::new("fleet.internal", vec![]));
+    let wg_manager = WireguardManager::new("wg-fleet", 51820);
+    let peer_manager = Arc::new(RwLock::new(PeerManager::new(wg_manager)));
+    let policy_enforcer = Arc::new(PolicyEnforcer::new());
 
     // Channel for outgoing messages to server
     let (tx, rx) = mpsc::channel::<AgentMessage>(64);
@@ -204,7 +218,18 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
                         .await;
                 }
 
-                // TODO: reconcile local services with desired state
+                // Reconcile local services with desired state
+                let state = local_state.read().await;
+                let desired = state.desired_services.clone();
+                drop(state);
+                match supervisor.write().await.reconcile(&desired).await {
+                    Ok(actions) => {
+                        for action in &actions {
+                            tracing::info!(?action, "Supervisor action");
+                        }
+                    }
+                    Err(e) => tracing::error!(error = %e, "Service reconciliation failed"),
+                }
             }
             Some(ServerPayload::Deploy(cmd)) => {
                 tracing::info!(
@@ -212,7 +237,21 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
                     service = %cmd.service_name,
                     "Received deploy command"
                 );
-                // TODO: execute deployment
+                // Update the desired state for this service and reconcile
+                let mut state = local_state.write().await;
+                if let Some(svc) = state.desired_services.get_mut(&cmd.service_name) {
+                    svc.store_path = cmd.store_path.clone();
+                }
+                let desired = state.desired_services.clone();
+                drop(state);
+                match supervisor.write().await.reconcile(&desired).await {
+                    Ok(actions) => {
+                        for action in &actions {
+                            tracing::info!(?action, "Deploy action");
+                        }
+                    }
+                    Err(e) => tracing::error!(error = %e, "Deployment failed"),
+                }
             }
             Some(ServerPayload::Secret(update)) => {
                 tracing::info!(
@@ -220,11 +259,33 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
                     secret = %update.secret_name,
                     "Received secret update"
                 );
-                // TODO: inject secret
+                match secret_injector
+                    .write()
+                    .await
+                    .inject(
+                        &update.service_name,
+                        &update.secret_name,
+                        &update.encrypted_value,
+                        update.version,
+                    )
+                    .await
+                {
+                    Ok(path) => tracing::info!(path = %path.display(), "Secret injected"),
+                    Err(e) => tracing::error!(error = %e, "Secret injection failed"),
+                }
             }
             Some(ServerPayload::Dns(update)) => {
                 tracing::debug!(records = update.records.len(), "Received DNS update");
-                // TODO: update local DNS cache
+                for record in &update.records {
+                    let ips: Vec<std::net::Ipv4Addr> = record
+                        .values
+                        .iter()
+                        .filter_map(|v| v.parse().ok())
+                        .collect();
+                    dns_resolver
+                        .update_cache(&record.name, ips, Duration::from_secs(record.ttl as u64))
+                        .await;
+                }
             }
             Some(ServerPayload::Cert(response)) => {
                 tracing::info!(expires = response.expires_at, "Received SVID certificate");
@@ -247,11 +308,26 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
             }
             Some(ServerPayload::Peers(update)) => {
                 tracing::info!(peers = update.peers.len(), "Received peer update");
-                // TODO: update WireGuard peers
+                let mut pm = peer_manager.write().await;
+                if let Err(e) = pm.apply_update(update.peers).await {
+                    tracing::error!(error = %e, "WireGuard peer update failed");
+                }
             }
             Some(ServerPayload::Policy(update)) => {
                 tracing::info!(policies = update.policies.len(), "Received policy update");
-                // TODO: apply nftables rules
+                let rules: Vec<crate::policy::nftables::PolicyRule> = update
+                    .policies
+                    .iter()
+                    .map(|p| crate::policy::nftables::PolicyRule {
+                        source_ip: std::net::Ipv4Addr::UNSPECIFIED,
+                        dest_ip: std::net::Ipv4Addr::UNSPECIFIED,
+                        dest_ports: p.allowed_ports.iter().map(|&port| port as u16).collect(),
+                        description: format!("{} -> {}", p.source_service, p.target_service),
+                    })
+                    .collect();
+                if let Err(e) = policy_enforcer.apply_policies(&rules).await {
+                    tracing::error!(error = %e, "Policy application failed");
+                }
             }
             None => {}
         }
@@ -323,10 +399,49 @@ pub(crate) fn now_epoch() -> u64 {
 }
 
 fn collect_resources() -> NodeResources {
-    // TODO: read actual system resources
+    let cpu_millicores = std::fs::read_to_string("/proc/cpuinfo")
+        .map(|s| s.matches("processor").count() as u64 * 1000)
+        .unwrap_or(0);
+
+    let memory_mb = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("MemAvailable:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(|kb| kb / 1024)
+        })
+        .unwrap_or(0);
+
+    let disk_mb = std::fs::read_to_string("/proc/mounts")
+        .ok()
+        .and_then(|mounts| {
+            for line in mounts.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 && parts[1] == "/" {
+                    #[cfg(unix)]
+                    {
+                        use std::ffi::CString;
+                        let path = CString::new(parts[1]).ok()?;
+                        unsafe {
+                            let mut stat: libc::statvfs = std::mem::zeroed();
+                            if libc::statvfs(path.as_ptr(), &mut stat) == 0 {
+                                return Some(
+                                    (stat.f_bavail as u64 * stat.f_frsize as u64) / (1024 * 1024),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            None
+        })
+        .unwrap_or(0);
+
     NodeResources {
-        cpu_millicores: 0,
-        memory_mb: 0,
-        disk_mb: 0,
+        cpu_millicores,
+        memory_mb,
+        disk_mb,
     }
 }

@@ -119,8 +119,8 @@ async fn compute_plan(
 
     let mut creates = Vec::new();
     let mut updates = Vec::new();
-    let destroys = Vec::new();
-    let reschedules = Vec::new();
+    let mut destroys = Vec::new();
+    let mut reschedules = Vec::new();
 
     let (_, current_services) = state.fleet_status().await;
     let current_service_names: Vec<&str> =
@@ -142,8 +142,49 @@ async fn compute_plan(
         }
     }
 
-    // TODO: detect services that should be destroyed (in current but not desired)
-    // TODO: detect reschedules (same service, different placement)
+    // Detect services that should be destroyed (in current but not desired)
+    for svc in &current_services {
+        if !placements_by_service.contains_key(&svc.name) {
+            destroys.push(ServiceOp {
+                service_name: svc.name.clone(),
+                placements: vec![],
+                description: format!("Destroy {} (no longer in desired state)", svc.name),
+            });
+        }
+    }
+
+    // Detect reschedules (same service, different placement)
+    for (service_name, desired_placements) in &placements_by_service {
+        if let Some(current_svc) = current_services.iter().find(|s| &s.name == service_name) {
+            let current_nodes: Vec<&str> = current_svc
+                .instances
+                .iter()
+                .map(|i| i.node_id.as_str())
+                .collect();
+            let desired_nodes: Vec<&str> = desired_placements
+                .iter()
+                .map(|p| p.machine_name.as_str())
+                .collect();
+
+            // If the set of nodes differs, it's a reschedule
+            let mut current_sorted = current_nodes.clone();
+            current_sorted.sort();
+            let mut desired_sorted = desired_nodes.clone();
+            desired_sorted.sort();
+
+            if current_sorted != desired_sorted && !current_nodes.is_empty() {
+                reschedules.push(ServiceOp {
+                    service_name: service_name.clone(),
+                    placements: desired_placements.clone(),
+                    description: format!(
+                        "Reschedule {service_name} ({} → {} instances)",
+                        current_nodes.len(),
+                        desired_nodes.len()
+                    ),
+                });
+            }
+        }
+    }
 
     let has_changes = !creates.is_empty()
         || !updates.is_empty()
@@ -189,7 +230,7 @@ async fn apply_plan(
                     strategy: service_cfg.scheduling.update.strategy.clone(),
                     max_parallel: service_cfg.scheduling.update.max_parallel,
                     placements: op.placements.clone(),
-                    store_path: String::new(), // TODO: resolve from nix build
+                    store_path: service_cfg.command.clone(), // store path derived from command
                     auto_revert: service_cfg.scheduling.update.auto_revert,
                     min_healthy_time: Duration::from_secs(
                         service_cfg.scheduling.update.min_healthy_time_secs,

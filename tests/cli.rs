@@ -218,12 +218,9 @@ fn plan_help() {
 }
 
 #[test]
-fn plan_stub_runs() {
-    ekafleet()
-        .args(["plan"])
-        .assert()
-        .success()
-        .stderr(predicate::str::contains("plan not yet implemented"));
+fn plan_fails_without_server() {
+    // Plan now tries to connect to the gRPC server
+    ekafleet().args(["plan"]).assert().failure();
 }
 
 // ─── Apply subcommand ───────────────────────────────────────────────
@@ -243,12 +240,8 @@ fn apply_help() {
 }
 
 #[test]
-fn apply_stub_runs() {
-    ekafleet()
-        .args(["apply"])
-        .assert()
-        .success()
-        .stderr(predicate::str::contains("apply not yet implemented"));
+fn apply_fails_without_server() {
+    ekafleet().args(["apply"]).assert().failure();
 }
 
 // ─── Status subcommand ──────────────────────────────────────────────
@@ -263,12 +256,8 @@ fn status_help() {
 }
 
 #[test]
-fn status_stub_runs() {
-    ekafleet()
-        .args(["status"])
-        .assert()
-        .success()
-        .stderr(predicate::str::contains("status not yet implemented"));
+fn status_fails_without_server() {
+    ekafleet().args(["status"]).assert().failure();
 }
 
 // ─── Drift subcommand ───────────────────────────────────────────────
@@ -283,12 +272,8 @@ fn drift_help() {
 }
 
 #[test]
-fn drift_stub_runs() {
-    ekafleet()
-        .args(["drift"])
-        .assert()
-        .success()
-        .stderr(predicate::str::contains("drift not yet implemented"));
+fn drift_fails_without_server() {
+    ekafleet().args(["drift"]).assert().failure();
 }
 
 // ─── Rollback subcommand ────────────────────────────────────────────
@@ -307,12 +292,12 @@ fn rollback_help() {
 }
 
 #[test]
-fn rollback_stub_runs() {
+fn rollback_without_args_gives_guidance() {
     ekafleet()
         .args(["rollback"])
         .assert()
         .success()
-        .stderr(predicate::str::contains("rollback not yet implemented"));
+        .stdout(predicate::str::contains("Specify a machine name or --all"));
 }
 
 // ─── Capacity subcommand ────────────────────────────────────────────
@@ -327,12 +312,8 @@ fn capacity_help() {
 }
 
 #[test]
-fn capacity_stub_runs() {
-    ekafleet()
-        .args(["capacity"])
-        .assert()
-        .success()
-        .stderr(predicate::str::contains("capacity not yet implemented"));
+fn capacity_fails_without_server() {
+    ekafleet().args(["capacity"]).assert().failure();
 }
 
 // ─── Services subcommand ────────────────────────────────────────────
@@ -347,12 +328,8 @@ fn services_help() {
 }
 
 #[test]
-fn services_stub_runs() {
-    ekafleet()
-        .args(["services"])
-        .assert()
-        .success()
-        .stderr(predicate::str::contains("services not yet implemented"));
+fn services_fails_without_server() {
+    ekafleet().args(["services"]).assert().failure();
 }
 
 // ─── Drain subcommand ───────────────────────────────────────────────
@@ -376,12 +353,8 @@ fn drain_help() {
 }
 
 #[test]
-fn drain_stub_runs() {
-    ekafleet()
-        .args(["drain", "node-1"])
-        .assert()
-        .success()
-        .stderr(predicate::str::contains("drain not yet implemented"));
+fn drain_fails_without_server() {
+    ekafleet().args(["drain", "node-1"]).assert().failure();
 }
 
 // ─── Scale subcommand ───────────────────────────────────────────────
@@ -405,12 +378,8 @@ fn scale_help() {
 }
 
 #[test]
-fn scale_stub_runs() {
-    ekafleet()
-        .args(["scale", "web", "3"])
-        .assert()
-        .success()
-        .stderr(predicate::str::contains("scale not yet implemented"));
+fn scale_fails_without_server() {
+    ekafleet().args(["scale", "web", "3"]).assert().failure();
 }
 
 // ─── Logs subcommand ────────────────────────────────────────────────
@@ -430,10 +399,6 @@ fn logs_help() {
 }
 
 #[test]
-fn logs_stub_runs() {
-    ekafleet()
-        .args(["logs", "web"])
-        .assert()
-        .success()
-        .stderr(predicate::str::contains("logs not yet implemented"));
+fn logs_fails_without_server() {
+    ekafleet().args(["logs", "web"]).assert().failure();
 }

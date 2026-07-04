@@ -398,6 +398,7 @@ dependencies = [
  "assert_cmd",
  "axum",
  "clap",
+ "libc",
  "predicates",
  "prost",
  "prost-types",

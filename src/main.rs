@@ -1,4 +1,6 @@
 use ekafleet::agent;
+use ekafleet::proto::fleet_control_client::FleetControlClient;
+use ekafleet::proto::{PlanRequest, StatusRequest};
 use ekafleet::server;
 
 use clap::{Parser, Subcommand};
@@ -181,6 +183,14 @@ enum TokenAction {
     },
 }
 
+async fn connect_server(
+    server: &str,
+) -> anyhow::Result<FleetControlClient<tonic::transport::Channel>> {
+    let endpoint = format!("http://{server}");
+    let client = FleetControlClient::connect(endpoint).await?;
+    Ok(client)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -238,73 +248,205 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Command::Plan { config, server } => {
-            tracing::info!(
-                config = %config.display(),
-                server = %server,
-                "Planning deployment"
-            );
-            eprintln!("plan not yet implemented");
+            let mut client = connect_server(&server).await?;
+            let resp = client
+                .plan(PlanRequest {
+                    config_path: config.display().to_string(),
+                })
+                .await?;
+            let plan = resp.into_inner();
+
+            if !plan.has_changes {
+                println!("No changes detected.");
+            } else {
+                println!("Planned operations:");
+                for op in &plan.operations {
+                    println!(
+                        "  {:?} {} on {} — {}",
+                        ekafleet::proto::OperationType::try_from(op.operation_type)
+                            .unwrap_or(ekafleet::proto::OperationType::Create),
+                        op.service_name,
+                        op.target_node,
+                        op.description
+                    );
+                }
+            }
         }
 
         Command::Apply {
             config,
             auto_approve,
-            watch,
+            watch: _,
             server,
         } => {
-            tracing::info!(
-                config = %config.display(),
-                %auto_approve,
-                %watch,
-                server = %server,
-                "Applying deployment"
-            );
-            eprintln!("apply not yet implemented");
+            let mut client = connect_server(&server).await?;
+            let mut stream = client
+                .apply(ekafleet::proto::ApplyRequest {
+                    config_path: config.display().to_string(),
+                    auto_approve,
+                })
+                .await?
+                .into_inner();
+
+            while let Some(event) = stream.message().await? {
+                let status = ekafleet::proto::ApplyStatus::try_from(event.status)
+                    .unwrap_or(ekafleet::proto::ApplyStatus::ApplyPending);
+                println!("[{:?}] {} — {}", status, event.operation_id, event.message);
+            }
+            println!("Apply complete.");
         }
 
         Command::Status { server } => {
-            tracing::info!(server = %server, "Querying fleet status");
-            eprintln!("status not yet implemented");
+            let mut client = connect_server(&server).await?;
+            let resp = client.status(StatusRequest {}).await?;
+            let status = resp.into_inner();
+
+            println!("Fleet: {}", status.fleet_name);
+            println!();
+            println!("Nodes ({}):", status.nodes.len());
+            for node in &status.nodes {
+                let health = if node.healthy { "healthy" } else { "unhealthy" };
+                println!(
+                    "  {} ({}) — {} — last heartbeat {}s ago",
+                    node.node_id, node.address, health, node.last_heartbeat
+                );
+                if let Some(res) = &node.available_resources {
+                    println!(
+                        "    resources: {}m CPU, {}MB mem, {}MB disk",
+                        res.cpu_millicores, res.memory_mb, res.disk_mb
+                    );
+                }
+            }
+            println!();
+            println!("Services ({}):", status.services.len());
+            for svc in &status.services {
+                println!(
+                    "  {} — {}/{} healthy — {} instances",
+                    svc.name,
+                    svc.healthy_count,
+                    svc.instances.len(),
+                    svc.instances.len()
+                );
+            }
         }
 
         Command::Drift { server } => {
-            tracing::info!(server = %server, "Checking for drift");
-            eprintln!("drift not yet implemented");
+            let mut client = connect_server(&server).await?;
+            let resp = client.status(StatusRequest {}).await?;
+            let status = resp.into_inner();
+
+            let mut drifted = false;
+            for node in &status.nodes {
+                if !node.healthy {
+                    println!("DRIFT: node {} is unhealthy", node.node_id);
+                    drifted = true;
+                }
+            }
+            for svc in &status.services {
+                let unhealthy = svc.instances.len() as u32 - svc.healthy_count;
+                if unhealthy > 0 {
+                    println!(
+                        "DRIFT: service {} has {} unhealthy instances",
+                        svc.name, unhealthy
+                    );
+                    drifted = true;
+                }
+            }
+            if !drifted {
+                println!("No drift detected.");
+            }
         }
 
         Command::Rollback {
             machine,
             all,
             to,
-            server,
+            server: _,
         } => {
-            tracing::info!(
-                ?machine,
-                %all,
-                ?to,
-                server = %server,
-                "Rolling back"
-            );
-            eprintln!("rollback not yet implemented");
+            match (machine.as_deref(), all, to) {
+                (Some(m), _, Some(generation)) => {
+                    println!("Rolling back {m} to generation {generation}")
+                }
+                (Some(m), _, None) => println!("Rolling back {m} to previous generation"),
+                (None, true, Some(generation)) => {
+                    println!("Rolling back all machines to generation {generation}")
+                }
+                (None, true, None) => println!("Rolling back all machines to previous generation"),
+                _ => println!("Specify a machine name or --all"),
+            }
+            eprintln!("rollback requires server-side generation tracking (not yet wired)");
         }
 
         Command::Capacity { server } => {
-            tracing::info!(server = %server, "Querying capacity");
-            eprintln!("capacity not yet implemented");
+            let mut client = connect_server(&server).await?;
+            let resp = client.status(StatusRequest {}).await?;
+            let status = resp.into_inner();
+
+            println!("Cluster capacity:");
+            let mut total_cpu = 0u64;
+            let mut total_mem = 0u64;
+            let mut total_disk = 0u64;
+            for node in &status.nodes {
+                if let Some(res) = &node.available_resources {
+                    total_cpu += res.cpu_millicores;
+                    total_mem += res.memory_mb;
+                    total_disk += res.disk_mb;
+                }
+            }
+            println!("  Nodes: {}", status.nodes.len());
+            println!("  Available CPU: {}m", total_cpu);
+            println!("  Available memory: {}MB", total_mem);
+            println!("  Available disk: {}MB", total_disk);
         }
 
         Command::Services { server } => {
-            tracing::info!(server = %server, "Listing services");
-            eprintln!("services not yet implemented");
+            let mut client = connect_server(&server).await?;
+            let resp = client.status(StatusRequest {}).await?;
+            let status = resp.into_inner();
+
+            if status.services.is_empty() {
+                println!("No services deployed.");
+            } else {
+                for svc in &status.services {
+                    println!("{}:", svc.name);
+                    for inst in &svc.instances {
+                        let state = ekafleet::proto::ServiceState::try_from(inst.state)
+                            .unwrap_or(ekafleet::proto::ServiceState::Unknown);
+                        let health = ekafleet::proto::HealthStatus::try_from(inst.health)
+                            .unwrap_or(ekafleet::proto::HealthStatus::HealthUnknown);
+                        println!(
+                            "  {} on {} — {:?} / {:?}",
+                            inst.instance_id, inst.node_id, state, health
+                        );
+                    }
+                }
+            }
         }
 
         Command::Drain { machine, server } => {
-            tracing::info!(
-                machine = %machine,
-                server = %server,
-                "Draining machine"
-            );
-            eprintln!("drain not yet implemented");
+            let mut client = connect_server(&server).await?;
+            let resp = client.status(StatusRequest {}).await?;
+            let status = resp.into_inner();
+
+            let services_on_node: Vec<_> = status
+                .services
+                .iter()
+                .filter(|s| s.instances.iter().any(|i| i.node_id == machine))
+                .collect();
+
+            if services_on_node.is_empty() {
+                println!("No services running on {machine}.");
+            } else {
+                println!("Services to reschedule from {machine}:");
+                for svc in &services_on_node {
+                    println!("  {}", svc.name);
+                }
+                println!(
+                    "\n{} services would be rescheduled.",
+                    services_on_node.len()
+                );
+                eprintln!("drain execution requires reconciler integration (not yet wired)");
+            }
         }
 
         Command::Scale {
@@ -312,13 +454,25 @@ async fn main() -> anyhow::Result<()> {
             count,
             server,
         } => {
-            tracing::info!(
-                service = %service,
-                count = %count,
-                server = %server,
-                "Scaling service"
-            );
-            eprintln!("scale not yet implemented");
+            let mut client = connect_server(&server).await?;
+            let resp = client.status(StatusRequest {}).await?;
+            let status = resp.into_inner();
+
+            let current = status
+                .services
+                .iter()
+                .find(|s| s.name == service)
+                .map(|s| s.instances.len())
+                .unwrap_or(0);
+
+            println!("Service: {service}");
+            println!("  Current instances: {current}");
+            println!("  Desired instances: {count}");
+            if current == count as usize {
+                println!("  Already at desired count.");
+            } else {
+                eprintln!("scale execution requires reconciler integration (not yet wired)");
+            }
         }
 
         Command::Token {
@@ -330,12 +484,23 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Command::Logs { service, server } => {
-            tracing::info!(
-                service = %service,
-                server = %server,
-                "Fetching logs"
-            );
-            eprintln!("logs not yet implemented");
+            let mut client = connect_server(&server).await?;
+            let resp = client.status(StatusRequest {}).await?;
+            let status = resp.into_inner();
+
+            let svc = status.services.iter().find(|s| s.name == service);
+            match svc {
+                Some(s) => {
+                    println!("Service {} has {} instances:", service, s.instances.len());
+                    for inst in &s.instances {
+                        println!(
+                            "  {} on {} — use `journalctl -u ekafleet-{}` on that node",
+                            inst.instance_id, inst.node_id, service
+                        );
+                    }
+                }
+                None => println!("Service '{service}' not found in fleet."),
+            }
         }
     }
 
