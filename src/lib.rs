@@ -21,6 +21,8 @@ pub mod raft;
 #[allow(dead_code)]
 pub mod secrets;
 pub mod server;
+#[allow(dead_code)]
+pub mod spiffe;
 
 pub mod proto {
     #![allow(clippy::result_large_err)]

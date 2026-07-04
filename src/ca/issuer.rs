@@ -8,6 +8,7 @@ use super::root::{CaError, RootCa};
 /// Certificate issuance service.
 /// Validates CSRs, performs attestation, checks service assignment,
 /// and delegates to RootCa for signing.
+#[derive(Clone)]
 pub struct CertIssuer {
     ca: RootCa,
     /// node_id → list of service names assigned to that node

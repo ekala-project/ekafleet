@@ -8,20 +8,35 @@ use tonic::transport::{Identity, ServerTlsConfig};
 use tonic::{Request, Response, Status, Streaming};
 
 use super::state::FleetState;
+use crate::ca::issuer::CertIssuer;
 use crate::proto::agent_message::Payload;
 use crate::proto::fleet_control_server::{FleetControl, FleetControlServer};
+use crate::proto::server_message::Payload as ServerPayload;
 use crate::proto::{
-    AgentMessage, ApplyEvent, ApplyRequest, FleetStatus, PlanRequest, PlanResponse, ServerMessage,
-    StatusRequest,
+    AgentMessage, ApplyEvent, ApplyRequest, CertificateResponse, FleetStatus, PlanRequest,
+    PlanResponse, ServerMessage, StatusRequest, TrustBundleUpdate,
 };
 
 pub struct FleetControlService {
     state: FleetState,
+    cert_issuer: Option<CertIssuer>,
+    trust_bundle_pem: Option<String>,
 }
 
 impl FleetControlService {
     pub fn new(state: FleetState) -> Self {
-        Self { state }
+        Self {
+            state,
+            cert_issuer: None,
+            trust_bundle_pem: None,
+        }
+    }
+
+    /// Configure the service with a certificate issuer for SPIFFE SVID issuance.
+    pub fn with_cert_issuer(mut self, issuer: CertIssuer, trust_bundle_pem: String) -> Self {
+        self.cert_issuer = Some(issuer);
+        self.trust_bundle_pem = Some(trust_bundle_pem);
+        self
     }
 }
 
@@ -62,17 +77,29 @@ impl FleetControl for FleetControlService {
         // Register agent and get outbound channel
         let rx = self.state.register_agent(&node_id, remote).await;
 
+        // Push trust bundle to newly connected agent
+        if let Some(bundle_pem) = &self.trust_bundle_pem {
+            let bundle_msg = ServerMessage {
+                payload: Some(ServerPayload::TrustBundle(TrustBundleUpdate {
+                    trust_domain: "fleet.internal".into(),
+                    ca_certificate_pem: bundle_pem.as_bytes().to_vec(),
+                })),
+            };
+            let _ = self.state.send_to_agent(&node_id, bundle_msg).await;
+        }
+
         // Process the first message
         self.process_message(&node_id, first_msg).await;
 
         // Spawn task to process remaining inbound messages
         let state = self.state.clone();
         let nid = node_id.clone();
+        let issuer = self.cert_issuer.clone();
         tokio::spawn(async move {
             loop {
                 match inbound.message().await {
                     Ok(Some(msg)) => {
-                        process_agent_message(&state, &nid, msg).await;
+                        process_agent_message(&state, &nid, msg, issuer.as_ref()).await;
                     }
                     Ok(None) => {
                         tracing::info!(node_id = %nid, "Agent stream ended");
@@ -144,11 +171,16 @@ impl FleetControl for FleetControlService {
 
 impl FleetControlService {
     async fn process_message(&self, node_id: &str, msg: AgentMessage) {
-        process_agent_message(&self.state, node_id, msg).await;
+        process_agent_message(&self.state, node_id, msg, self.cert_issuer.as_ref()).await;
     }
 }
 
-async fn process_agent_message(state: &FleetState, node_id: &str, msg: AgentMessage) {
+async fn process_agent_message(
+    state: &FleetState,
+    node_id: &str,
+    msg: AgentMessage,
+    cert_issuer: Option<&CertIssuer>,
+) {
     match msg.payload {
         Some(Payload::Heartbeat(hb)) => {
             tracing::debug!(node_id = %hb.node_id, "Heartbeat received");
@@ -178,7 +210,37 @@ async fn process_agent_message(state: &FleetState, node_id: &str, msg: AgentMess
                 service = %req.service_name,
                 "Certificate request received"
             );
-            // TODO: issue certificate via CertIssuer
+
+            if let Some(issuer) = cert_issuer {
+                match issuer
+                    .process_request(&req.node_id, &req.service_name, &req.csr)
+                    .await
+                {
+                    Ok((cert, chain, expires_at)) => {
+                        let response = ServerMessage {
+                            payload: Some(ServerPayload::Cert(CertificateResponse {
+                                certificate: cert,
+                                chain,
+                                expires_at,
+                            })),
+                        };
+                        state.send_to_agent(node_id, response).await;
+                        tracing::info!(
+                            node_id = %req.node_id,
+                            service = %req.service_name,
+                            "SVID issued"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            node_id = %req.node_id,
+                            service = %req.service_name,
+                            error = %e,
+                            "Certificate request denied"
+                        );
+                    }
+                }
+            }
         }
         Some(Payload::Metrics(summary)) => {
             tracing::debug!(
@@ -214,8 +276,10 @@ pub async fn serve_grpc(
     state: FleetState,
     token: &str,
     tls: &TlsConfig,
+    cert_issuer: CertIssuer,
+    trust_bundle_pem: String,
 ) -> anyhow::Result<()> {
-    tracing::info!(%addr, "gRPC server listening (TLS + token-authenticated)");
+    tracing::info!(%addr, "gRPC server listening (TLS + token-authenticated + SPIFFE)");
 
     let expected_token = format!("Bearer {token}");
     #[allow(clippy::result_large_err)]
@@ -230,12 +294,11 @@ pub async fn serve_grpc(
     let identity = Identity::from_pem(&tls.cert_pem, &tls.cert_pem);
     let tls_config = ServerTlsConfig::new().identity(identity);
 
+    let service = FleetControlService::new(state).with_cert_issuer(cert_issuer, trust_bundle_pem);
+
     tonic::transport::Server::builder()
         .tls_config(tls_config)?
-        .add_service(FleetControlServer::with_interceptor(
-            FleetControlService::new(state),
-            interceptor,
-        ))
+        .add_service(FleetControlServer::with_interceptor(service, interceptor))
         .serve(addr)
         .await?;
 

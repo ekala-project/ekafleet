@@ -12,7 +12,10 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::proto::agent_message::Payload;
 use crate::proto::fleet_control_client::FleetControlClient;
 use crate::proto::server_message::Payload as ServerPayload;
-use crate::proto::{AgentMessage, Heartbeat, NodeResources, ServiceSpec, StatusReport};
+use crate::proto::{
+    AgentMessage, CertificateRequest, Heartbeat, NodeResources, ServiceSpec, StatusReport,
+};
+use crate::spiffe::workload_api::WorkloadManager;
 
 #[allow(dead_code)]
 pub struct AgentConfig {
@@ -73,6 +76,7 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
     tracing::info!(node_id = %node_id, "Agent identity established");
 
     let local_state = Arc::new(RwLock::new(LocalState::default()));
+    let workload_mgr = Arc::new(WorkloadManager::new(&config.data_dir, "fleet.internal"));
 
     // Channel for outgoing messages to server
     let (tx, rx) = mpsc::channel::<AgentMessage>(64);
@@ -145,6 +149,30 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
         }
     });
 
+    // Spawn SVID renewal checker
+    let renewal_tx = tx.clone();
+    let renewal_node_id = node_id.clone();
+    let renewal_mgr = workload_mgr.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            let renewals = renewal_mgr.needs_renewal().await;
+            for service_name in renewals {
+                tracing::info!(service = %service_name, "Requesting SVID renewal");
+                let _ = renewal_tx
+                    .send(AgentMessage {
+                        payload: Some(Payload::CertRequest(CertificateRequest {
+                            node_id: renewal_node_id.clone(),
+                            service_name,
+                            csr: vec![0x01],
+                        })),
+                    })
+                    .await;
+            }
+        }
+    });
+
     // Process incoming server messages
     while let Some(msg) = inbound.message().await? {
         match msg.payload {
@@ -157,9 +185,25 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
                 let mut state = local_state.write().await;
                 state.system_path = ds.system_path;
                 state.desired_services.clear();
-                for svc in ds.services {
-                    state.desired_services.insert(svc.name.clone(), svc);
+                for svc in &ds.services {
+                    state.desired_services.insert(svc.name.clone(), svc.clone());
                 }
+                drop(state);
+
+                // Request SPIFFE SVIDs for each assigned service
+                for svc in &ds.services {
+                    tracing::info!(service = %svc.name, "Requesting SVID for service");
+                    let _ = tx
+                        .send(AgentMessage {
+                            payload: Some(Payload::CertRequest(CertificateRequest {
+                                node_id: node_id.clone(),
+                                service_name: svc.name.clone(),
+                                csr: vec![0x01], // placeholder CSR
+                            })),
+                        })
+                        .await;
+                }
+
                 // TODO: reconcile local services with desired state
             }
             Some(ServerPayload::Deploy(cmd)) => {
@@ -183,8 +227,23 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
                 // TODO: update local DNS cache
             }
             Some(ServerPayload::Cert(response)) => {
-                tracing::info!(expires = response.expires_at, "Received certificate");
-                // TODO: install certificate
+                tracing::info!(expires = response.expires_at, "Received SVID certificate");
+                // Install SVID via workload manager
+                // The certificate field contains the service cert we need to figure out which
+                // service it's for. For now we extract the CN from the first line of PEM.
+                if let Err(e) = install_received_svid(&workload_mgr, &response).await {
+                    tracing::error!(error = %e, "Failed to install SVID");
+                }
+            }
+            Some(ServerPayload::TrustBundle(bundle)) => {
+                tracing::info!(
+                    trust_domain = %bundle.trust_domain,
+                    "Received trust bundle"
+                );
+                let pem = String::from_utf8_lossy(&bundle.ca_certificate_pem);
+                if let Err(e) = workload_mgr.set_trust_bundle(&pem).await {
+                    tracing::error!(error = %e, "Failed to install trust bundle");
+                }
             }
             Some(ServerPayload::Peers(update)) => {
                 tracing::info!(peers = update.peers.len(), "Received peer update");
@@ -200,6 +259,46 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
 
     tracing::warn!("Server stream ended");
     Ok(())
+}
+
+/// Install an SVID received from the server's CertificateResponse.
+/// Extracts the service name from the certificate CN.
+async fn install_received_svid(
+    mgr: &WorkloadManager,
+    response: &crate::proto::CertificateResponse,
+) -> Result<(), std::io::Error> {
+    let cert_pem = String::from_utf8(response.certificate.clone())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+    // Extract service name from the certificate's CN (first line of PEM content)
+    let service_name = extract_cn_from_pem(&cert_pem).unwrap_or_else(|| "unknown".to_string());
+
+    mgr.install_svid(
+        &service_name,
+        &response.certificate,
+        &response.chain,
+        response.expires_at,
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Extract the Common Name (CN) from a PEM certificate by parsing the DER.
+fn extract_cn_from_pem(pem: &str) -> Option<String> {
+    let cert_start = pem.find("-----BEGIN CERTIFICATE-----")?;
+    let cert_end = pem.find("-----END CERTIFICATE-----")? + "-----END CERTIFICATE-----".len();
+    let cert_pem = &pem[cert_start..cert_end];
+
+    let mut reader = std::io::BufReader::new(cert_pem.as_bytes());
+    let certs = rustls_pemfile::certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    let der = certs.first()?;
+
+    let (_, cert) = x509_parser::parse_x509_certificate(der).ok()?;
+    let cn = cert.subject().iter_common_name().next()?.as_str().ok()?;
+    Some(cn.to_string())
 }
 
 fn get_node_id(data_dir: &Path) -> anyhow::Result<String> {

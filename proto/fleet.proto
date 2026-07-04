@@ -117,7 +117,14 @@ message ServerMessage {
     CertificateResponse cert = 5;
     PeerUpdate peers = 6;
     PolicyUpdate policy = 7;
+    TrustBundleUpdate trust_bundle = 8;
   }
+}
+
+// CA trust bundle pushed to agents for SPIFFE workload verification.
+message TrustBundleUpdate {
+  string trust_domain = 1;
+  bytes ca_certificate_pem = 2;
 }
 
 message DesiredState {

@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 use state::FleetState;
 
+use crate::ca::issuer::CertIssuer;
 use crate::ca::root::RootCa;
 
 pub struct ServerConfig {
@@ -79,11 +80,23 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         ca_cert_pem: String::from_utf8(ca_chain_pem)?,
     };
 
+    // Initialize certificate issuer for SPIFFE SVID issuance
+    let cert_issuer = CertIssuer::new(ca.clone());
+
+    let trust_bundle_pem = ca.root_certificate_pem().await.unwrap_or_default();
+
     let fleet_state = FleetState::new();
 
     // Start gRPC and HTTP servers concurrently
     let (grpc_result, http_result) = tokio::join!(
-        api::serve_grpc(grpc_addr, fleet_state, &config.token, &tls),
+        api::serve_grpc(
+            grpc_addr,
+            fleet_state,
+            &config.token,
+            &tls,
+            cert_issuer,
+            trust_bundle_pem,
+        ),
         api::serve_http(http_addr, config.token.clone()),
     );
 
