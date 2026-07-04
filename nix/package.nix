@@ -4,6 +4,7 @@
   pkg-config,
   openssl,
   perl,
+  protobuf,
 }:
 
 rustPlatform.buildRustPackage {
@@ -21,6 +22,7 @@ rustPlatform.buildRustPackage {
   nativeBuildInputs = [
     perl
     pkg-config
+    protobuf
   ];
 
   buildInputs = [
@@ -31,6 +33,6 @@ rustPlatform.buildRustPackage {
 
   meta = with lib; {
     description = "EkaOS Fleet";
-    mainProgram = "ekaos-fleet";
+    mainProgram = "ekafleet";
   };
 }

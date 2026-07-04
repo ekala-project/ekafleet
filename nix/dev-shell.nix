@@ -3,6 +3,7 @@
   fenix,
   pkg-config,
   openssl,
+  protobuf,
 }:
 
 stdenv.mkDerivation {
@@ -17,6 +18,7 @@ stdenv.mkDerivation {
       "rustfmt-preview"
     ])
     pkg-config
+    protobuf
   ];
   buildInputs = [ openssl ];
 }
