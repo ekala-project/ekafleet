@@ -1,3 +1,6 @@
+pub mod health;
+pub mod supervisor;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -182,7 +185,7 @@ fn get_node_id(data_dir: &PathBuf) -> anyhow::Result<String> {
     }
 }
 
-fn now_epoch() -> u64 {
+pub(crate) fn now_epoch() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()

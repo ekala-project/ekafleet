@@ -1,6 +1,8 @@
 mod agent;
 #[allow(dead_code)]
 mod config;
+#[allow(dead_code)]
+mod dns;
 mod server;
 
 pub mod proto {
