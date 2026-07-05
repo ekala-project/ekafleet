@@ -16,6 +16,7 @@ ekafleet server [OPTIONS]
 | `--peers` | | Comma-separated peer server addresses for HA |
 | `--listen` | `0.0.0.0:7400` | gRPC listen address |
 | `--http-listen` | `0.0.0.0:7402` | HTTP API listen address |
+| `--token` | *(required)* | Bearer token for agent authentication (also reads `EKAFLEET_TOKEN` env) |
 
 ### `ekafleet agent`
 
@@ -27,15 +28,16 @@ ekafleet agent [OPTIONS]
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--join` | *(required)* | Server address to join |
+| `--join` | *(required)* | Server address to join (host:port) |
 | `--token` | *(required)* | Authentication token |
 | `--data-dir` | `/var/lib/ekafleet` | Data directory for local state |
+| `--ca-cert` | | Path to CA certificate PEM for TLS verification |
 
 ## Deployment
 
 ### `ekafleet plan`
 
-Show desired-vs-actual diff without making changes.
+Show desired-vs-actual diff without making changes. Connects to the server and displays planned operations.
 
 ```
 ekafleet plan [OPTIONS]
@@ -48,7 +50,7 @@ ekafleet plan [OPTIONS]
 
 ### `ekafleet apply`
 
-Execute a deployment plan.
+Execute a deployment plan. Streams operation progress in real-time.
 
 ```
 ekafleet apply [OPTIONS]
@@ -79,37 +81,73 @@ ekafleet rollback [MACHINE] [OPTIONS]
 
 ### `ekafleet status`
 
-Fleet health overview.
+Fleet health overview. Displays all nodes with health status, resources, and all services with instance details.
+
+```
+ekafleet status [--server 127.0.0.1:7400]
+```
 
 ### `ekafleet drift`
 
-Detect state divergence between desired and actual.
+Detect state divergence. Reports unhealthy nodes and services with unhealthy instances.
+
+```
+ekafleet drift [--server 127.0.0.1:7400]
+```
 
 ### `ekafleet capacity`
 
-Resource utilization report across the fleet.
+Resource utilization report. Shows aggregate available CPU, memory, and disk across all nodes.
+
+```
+ekafleet capacity [--server 127.0.0.1:7400]
+```
 
 ### `ekafleet services`
 
-Service placement listing showing where each service is running.
+Service placement listing. Shows every service instance with its state and health per node.
+
+```
+ekafleet services [--server 127.0.0.1:7400]
+```
 
 ### `ekafleet drain <machine>`
 
-Reschedule all services off a machine (e.g., for maintenance).
+Identify services running on a machine that would need rescheduling (e.g., for maintenance).
+
+```
+ekafleet drain <MACHINE> [--server 127.0.0.1:7400]
+```
 
 ### `ekafleet scale <service> <count>`
 
-Manually set the replica count for a service.
+Show current vs desired replica count for a service.
+
+```
+ekafleet scale <SERVICE> <COUNT> [--server 127.0.0.1:7400]
+```
 
 ### `ekafleet logs <service>`
 
-Aggregate and display logs from all replicas of a service.
+Show service instances and journal hints for accessing logs on each node.
+
+```
+ekafleet logs <SERVICE> [--server 127.0.0.1:7400]
+```
+
+### `ekafleet ssh <machine>`
+
+SSH to a fleet machine. Queries fleet status for the machine's address and opens an SSH session.
+
+```
+ekafleet ssh <MACHINE> [--server 127.0.0.1:7400]
+```
 
 ## Authentication
 
 ### `ekafleet token create`
 
-Generate a join token.
+Generate a cryptographically random join token (256-bit, hex-encoded).
 
 ```
 ekafleet token create [OPTIONS]
@@ -118,3 +156,5 @@ ekafleet token create [OPTIONS]
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--type` | `agent` | Token type: `agent` or `server` |
+
+Output: 64-character hex string to stdout.

@@ -18,12 +18,15 @@
 # Operations
 
 - [Deployments](./operations/deployments.md)
+- [System Activation](./operations/system-activation.md)
 - [Scheduling](./operations/scheduling.md)
 - [Scaling](./operations/scaling.md)
 - [DNS & Service Discovery](./operations/dns.md)
 - [Secrets Management](./operations/secrets.md)
+- [SPIFFE & Workload Identity](./operations/spiffe.md)
 - [Mesh Networking](./operations/mesh.md)
 - [Network Policy](./operations/network-policy.md)
+- [Reverse Proxy & Ingress](./operations/proxy.md)
 - [Observability](./operations/observability.md)
 
 # Reference
@@ -31,4 +34,5 @@
 - [CLI](./reference/cli.md)
 - [Fleet Configuration](./reference/fleet-config.md)
 - [Ports & Protocols](./reference/ports.md)
+- [NixOS Module](./reference/nixos-module.md)
 - [What ekafleet Replaces](./reference/replacements.md)

@@ -5,7 +5,7 @@ ekafleet is a single Rust binary that replaces the entire HashiCorp stack (Nomad
 ## One Binary, Two Modes
 
 - **`ekafleet server`** — Control plane: scheduling, CA, secrets, DNS authority, deployment orchestration, Raft consensus
-- **`ekafleet agent`** — Data plane: service supervision, health checks, DNS resolver, secret injection, mesh networking, L7 proxy
+- **`ekafleet agent`** — Data plane: system activation, service supervision, health checks, DNS resolver, secret injection, mesh networking, SPIFFE identity, L7 proxy
 
 Server mode embeds all agent capabilities, meaning a server node can also run workloads. This follows the same pattern as k3s and Nomad.
 
@@ -17,11 +17,26 @@ Running a production fleet typically requires deploying and maintaining a dozen 
 - **No runtime dependencies** — no JVM, no interpreters, no container runtimes
 - **Predictable latency** — Rust's zero-cost abstractions and no GC
 - **Nix-native** — fleet configuration is pure Nix, consumed via `nix eval`
-- **Secure by default** — mTLS, encrypted secrets, workload attestation via Nix store paths
+- **OS deployment** — activates full EkaOS/NixOS system closures, not just services
+- **Secure by default** — TLS everywhere, SPIFFE workload identity, encrypted secrets at rest, workload attestation via Nix store paths
 
 ## Design Principles
 
 1. **Convention over configuration** — sensible defaults for everything, override when needed
 2. **Reconciliation model** — desired state is declared in Nix, ekafleet continuously converges actual state to match
 3. **Graceful degradation** — agents continue operating when the server is unreachable
-4. **Defense in depth** — mTLS for identity, nftables for network policy, encrypted secrets at rest
+4. **Defense in depth** — mTLS (SPIFFE SVIDs) for identity, nftables for network policy, WireGuard for transport encryption, AES-256-GCM for secrets at rest
+5. **OS-level deployments** — manages full system closures, not just application containers
+
+## Key Features
+
+| Category | Capabilities |
+|----------|-------------|
+| Deployment | Rolling, canary, blue-green; health-gated; auto-revert; OS activation |
+| Identity | SPIFFE X.509-SVIDs, automatic renewal, mTLS enforcement |
+| Secrets | Static (encrypted), dynamic (PostgreSQL/MySQL credential rotation), transit encryption |
+| Networking | WireGuard mesh, DNS authority + resolver, nftables policy |
+| Proxy | L7 HTTP routing, traffic splitting, upstream health tracking |
+| Observability | Prometheus scraping, node metrics, fleet-wide aggregation |
+| Scaling | Metric-based autoscaling, manual scaling |
+| HA | Raft consensus for server state, gossip for failure detection |

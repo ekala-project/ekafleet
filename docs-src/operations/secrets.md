@@ -6,7 +6,7 @@ ekafleet includes a built-in secret store, replacing Vault for most use cases.
 
 ### Static Secrets
 
-Key-value secrets stored encrypted in Raft state and distributed to agents for assigned services only.
+Key-value secrets stored encrypted (AES-256-GCM) in Raft state and distributed to agents for assigned services only.
 
 ```nix
 secrets.api-key = {
@@ -16,7 +16,7 @@ secrets.api-key = {
 
 ### Dynamic Secrets
 
-Generated unique credentials per service instance with automatic rotation.
+Generates unique database credentials per service instance with automatic rotation. Credentials are provisioned directly in the database and revoked on lease expiry.
 
 ```nix
 secrets.db = {
@@ -26,14 +26,67 @@ secrets.db = {
 };
 ```
 
+**Supported databases:**
+
+| Engine | Connection URL | Provisioning |
+|--------|---------------|-------------|
+| PostgreSQL | `postgres://admin:pass@host:5432/db` | CREATE ROLE + GRANT |
+| MySQL | `mysql://root:pass@host:3306/db` | CREATE USER + GRANT |
+
+**Role mappings:**
+
+| Role name | Permissions granted |
+|-----------|-------------------|
+| `readonly` / `ro` / `read` | SELECT |
+| `readwrite` / `rw` / `write` | SELECT, INSERT, UPDATE, DELETE |
+| `admin` / `superuser` / `all` | ALL PRIVILEGES |
+
+**Lifecycle:**
+
+1. Server registers the database engine with admin connection URL
+2. On service deploy, server generates random username + password
+3. Server connects to DB and runs `CREATE ROLE`/`USER` + `GRANT`
+4. Credentials + service connection URL distributed to agent
+5. On lease expiry (default 1 hour), server runs `DROP ROLE`/`USER`
+
+**Safety features:**
+- `CONNECTION LIMIT 10` prevents credential abuse
+- `VALID UNTIL` (Postgres) / `PASSWORD EXPIRE` (MySQL) for DB-enforced expiry
+- Existing connections terminated on revocation
+- SQL injection prevented via identifier/literal escaping
+
+### Transit Encryption
+
+Provides encrypt/decrypt operations using named keys — application secrets never leave the server.
+
+```nix
+# Services call the transit API to encrypt/decrypt data
+# without having access to the raw encryption key
+```
+
+**Operations:**
+- `create_key(name)` — create a named AES-256-GCM key
+- `encrypt(key_name, plaintext)` — encrypt with named key
+- `decrypt(key_name, ciphertext)` — decrypt with named key
+
+Useful for services that need to encrypt data at rest but shouldn't hold the encryption key directly.
+
 ## How It Works
 
-1. Secrets are stored encrypted in the Raft state machine (server-side)
+1. Secrets are stored encrypted (AES-256-GCM) in the Raft state machine
 2. Each secret is scoped to a specific service
-3. When a service is deployed to an agent, its secrets are pushed via gRPC
-4. The agent writes decrypted secrets to files with restrictive permissions (mode `0400`)
-5. Secret files are placed at `<data-dir>/secrets/<service>/<secret-name>`
-6. Services authenticate via their SPIFFE certificate to access their secrets
+3. When a service is deployed, its secrets are pushed via gRPC (`SecretUpdate` message)
+4. The agent decrypts and writes secrets to files with restrictive permissions (mode `0400`)
+5. Services access their SPIFFE certificate to prove identity for secret access
+
+## Encryption
+
+All secrets are encrypted at rest using AES-256-GCM with:
+- 12-byte random nonces (unique per encryption)
+- Authenticated encryption (tampered ciphertext is rejected)
+- Fleet-wide encryption key
+
+The Raft log and snapshots are also encrypted — secrets never appear as plaintext on disk.
 
 ## Access Control
 
@@ -44,12 +97,33 @@ Secrets are scoped to services. A service can only access secrets declared in it
 ```text
 /var/lib/ekafleet/secrets/
 ├── api-server/
-│   ├── api-key
-│   └── db
+│   ├── api-key          (static secret)
+│   └── db               (dynamic: contains connection URL)
 └── web-frontend/
     └── session-secret
 ```
 
 ## Versioning
 
-Each secret has a version number that increments on every update. The agent tracks injected versions to avoid unnecessary file writes. When a new version is pushed, the agent writes the updated value and the service can detect the change.
+Each secret has a version number that increments on every update. The agent tracks injected versions to avoid unnecessary file writes. When a new version is pushed, the agent writes the updated value atomically.
+
+## Dynamic Secret Connection URLs
+
+For dynamic secrets, the injected file contains a ready-to-use connection URL:
+
+```
+postgres://v-api-server-rw-a1b2c3d4:randompassword@db.host:5432/myapp
+```
+
+Services can read this directly from the secret file and connect without additional configuration.
+
+## Integration with sops-nix / agenix
+
+Machine-level secrets (SSH host keys, bootstrap credentials) are handled by sops-nix or agenix. These activate during system switch and are complementary to ekafleet's service-level runtime secrets:
+
+| Concern | sops-nix / agenix | ekafleet |
+|---------|-------------------|----------|
+| When | At activation (boot/switch) | At runtime (hot) |
+| Rotation | Requires rebuild | Automatic |
+| Scope | Per-machine | Per-service |
+| Dynamic DB creds | No | Yes |
