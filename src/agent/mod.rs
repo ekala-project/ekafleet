@@ -1,3 +1,4 @@
+pub mod activation;
 pub mod health;
 pub mod supervisor;
 
@@ -221,8 +222,34 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
                 tracing::info!(
                     correlation_id = %ds.correlation_id,
                     services = ds.services.len(),
+                    system_path = %ds.system_path,
                     "Received desired state"
                 );
+
+                // Activate EkaOS system closure if a new system_path is provided
+                if !ds.system_path.is_empty() {
+                    let current = local_state.read().await.system_path.clone();
+                    if ds.system_path != current {
+                        let params = activation::ActivationParams {
+                            toplevel: ds.system_path.clone(),
+                            activate_script: None, // default: {toplevel}/bin/activate
+                            action: activation::ActivationAction::Switch,
+                        };
+                        match activation::activate_system(&params).await {
+                            Ok(result) => {
+                                tracing::info!(
+                                    toplevel = %result.toplevel,
+                                    action = ?result.action,
+                                    "System activation complete"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, "System activation failed");
+                            }
+                        }
+                    }
+                }
+
                 let mut state = local_state.write().await;
                 state.system_path = ds.system_path;
                 state.desired_services.clear();
