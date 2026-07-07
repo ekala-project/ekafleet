@@ -27,6 +27,8 @@ ekafleet consolidates many separate tools into a single binary.
 - ekafleet is Nix-native: configuration is pure Nix, deployments use Nix store paths
 - No separate Consul dependency for service discovery
 - Built-in secret management (no separate Vault)
+- Implements Nomad-equivalent scheduling: priority, constraints, affinities, spread, node pools
+- Adds Kubernetes-inspired features: taints/tolerations, topology spread constraints, inter-service affinity
 
 ### vs. Kubernetes
 
@@ -34,6 +36,8 @@ ekafleet consolidates many separate tools into a single binary.
 - No container runtime required — services run directly via systemd
 - Nix-based configuration instead of YAML manifests
 - WireGuard mesh instead of overlay networks
+- Implements K8s-equivalent scheduling: taints/tolerations, topology spread constraints (maxSkew/minDomains), pod (service) affinity/anti-affinity
+- Simpler resource model: no QoS classes, no runtime classes
 
 ### vs. deploy-rs
 

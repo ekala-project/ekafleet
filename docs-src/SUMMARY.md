@@ -33,6 +33,7 @@
 
 - [CLI](./reference/cli.md)
 - [Fleet Configuration](./reference/fleet-config.md)
+- [Scheduling Reference](./reference/scheduling.md)
 - [Ports & Protocols](./reference/ports.md)
 - [NixOS Module](./reference/nixos-module.md)
 - [What ekafleet Replaces](./reference/replacements.md)

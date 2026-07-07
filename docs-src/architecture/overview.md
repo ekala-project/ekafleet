@@ -43,7 +43,7 @@ ekafleet is a single binary with two operational modes. Server mode includes all
 
 | Subsystem | Purpose |
 |-----------|---------|
-| **scheduler** | Two-phase (filter + score) workload placement |
+| **scheduler** | Priority-based placement with constraints, affinities, taints, spread |
 | **nix_eval** | Evaluates fleet.nix via `nix eval` |
 | **raft** | Consensus for server HA (3-node) |
 | **ca_root** | Root Certificate Authority, issues SPIFFE certs |

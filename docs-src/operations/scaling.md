@@ -1,6 +1,6 @@
 # Scaling
 
-ekafleet supports both manual and automatic scaling.
+ekafleet supports manual scaling, metric-based autoscaling, and pool-level scaling.
 
 ## Manual Scaling
 
@@ -10,7 +10,7 @@ ekafleet scale api-server 5
 
 This triggers re-evaluation and deployment of the delta.
 
-## Autoscaling
+## Service Autoscaling
 
 The autoscaling engine evaluates policies against collected metrics and computes desired replica counts.
 
@@ -44,7 +44,28 @@ Each rule defines a target metric value and thresholds:
 5. If below the scale-down threshold, it removes replicas
 6. A cooldown period (default: 60 seconds) prevents thrashing
 
-### Draining
+## Pool-Level Scaling
+
+Node pools can define scaling policies that monitor aggregate pool utilization:
+
+```nix
+nodePools.compute = {
+  scaling = {
+    minCount = 2;
+    maxCount = 10;
+    rules = [{
+      metricName = "pool_cpu_utilization";
+      targetValue = 0.7;
+      scaleUpThreshold = 1.3;
+      scaleDownThreshold = 0.5;
+    }];
+  };
+};
+```
+
+Pool scaling decisions are advisory — they produce events and log recommendations but do not automatically provision machines (since ekafleet manages NixOS machines provisioned by external IaC tools).
+
+## Node Drain
 
 To remove a machine from the fleet (e.g., for maintenance):
 
@@ -52,7 +73,15 @@ To remove a machine from the fleet (e.g., for maintenance):
 ekafleet drain app-1
 ```
 
-This reschedules all services off the machine before it's taken offline.
+This reschedules all services off the machine. The migration policy on each service controls the pacing:
+
+```nix
+scheduling.migrate = {
+  maxParallel = 1;       # Migrate one instance at a time
+  minHealthyTime = 10;   # New instance must be healthy for 10s
+  healthyDeadline = 300;  # 5 minute deadline for migration
+};
+```
 
 ## Capacity Planning
 
@@ -61,6 +90,8 @@ View resource utilization across the fleet:
 ```bash
 ekafleet capacity
 ```
+
+Output includes per-pool breakdown when node pools are configured.
 
 View service placement:
 

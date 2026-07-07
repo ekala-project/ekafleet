@@ -32,11 +32,12 @@ Running a production fleet typically requires deploying and maintaining a dozen 
 
 | Category | Capabilities |
 |----------|-------------|
-| Deployment | Rolling, canary, blue-green; health-gated; auto-revert; OS activation |
+| Scheduling | Priority-based placement, constraints, affinities, spread, taints/tolerations, node pools |
+| Deployment | Rolling, canary, blue-green; health-gated; auto-revert; auto-promote; OS activation |
 | Identity | SPIFFE X.509-SVIDs, automatic renewal, mTLS enforcement |
 | Secrets | Static (encrypted), dynamic (PostgreSQL/MySQL credential rotation), transit encryption |
 | Networking | WireGuard mesh, DNS authority + resolver, nftables policy |
 | Proxy | L7 HTTP routing, traffic splitting, upstream health tracking |
 | Observability | Prometheus scraping, node metrics, fleet-wide aggregation |
-| Scaling | Metric-based autoscaling, manual scaling |
+| Scaling | Metric-based autoscaling, manual scaling, pool-level scaling |
 | HA | Raft consensus for server state, gossip for failure detection |

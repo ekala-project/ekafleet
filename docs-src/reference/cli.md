@@ -81,7 +81,7 @@ ekafleet rollback [MACHINE] [OPTIONS]
 
 ### `ekafleet status`
 
-Fleet health overview. Displays all nodes with health status, resources, and all services with instance details.
+Fleet health overview. Displays all nodes with health status, pool membership, resources, node pool summaries, and all services with instance details.
 
 ```
 ekafleet status [--server 127.0.0.1:7400]
@@ -97,7 +97,7 @@ ekafleet drift [--server 127.0.0.1:7400]
 
 ### `ekafleet capacity`
 
-Resource utilization report. Shows aggregate available CPU, memory, and disk across all nodes.
+Resource utilization report. Shows aggregate available CPU, memory, and disk across all nodes, with per-pool breakdown when node pools are configured.
 
 ```
 ekafleet capacity [--server 127.0.0.1:7400]

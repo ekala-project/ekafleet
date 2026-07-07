@@ -4,7 +4,7 @@ Start with `ekafleet server`. The server runs the control plane and can optional
 
 ## Responsibilities
 
-- **Scheduling** — Decides which services run on which machines
+- **Scheduling** — Priority-based placement with constraints, affinities, taints/tolerations, node pools, and spread
 - **Deployment orchestration** — Manages rollouts with health gates
 - **Certificate Authority** — Issues SPIFFE-compatible X.509 certificates
 - **Secret management** — Stores and distributes encrypted secrets

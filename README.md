@@ -4,7 +4,7 @@ A single Rust binary that replaces the HashiCorp stack (Nomad + Consul + Vault) 
 
 ## Two Modes
 
-- **`ekafleet server`** — control plane: scheduling, CA, secrets, DNS authority, deployment orchestration, Raft consensus
+- **`ekafleet server`** — control plane: priority-based scheduling, CA, secrets, DNS authority, deployment orchestration, Raft consensus
 - **`ekafleet agent`** — data plane: service supervision, health checks, DNS resolver, secret injection, mesh networking, L7 proxy
 
 Server mode embeds all agent capabilities and can run workloads directly.

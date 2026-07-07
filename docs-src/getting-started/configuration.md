@@ -4,7 +4,7 @@ Fleet configuration is pure Nix. ekafleet consumes it by running `nix eval --jso
 
 ## Fleet Structure
 
-A fleet configuration has three top-level keys:
+A fleet configuration has four top-level keys:
 
 ```nix
 {
@@ -14,6 +14,7 @@ A fleet configuration has three top-level keys:
 
     services = { ... };        # Service definitions
     machines = { ... };        # Machine inventory
+    nodePools = { ... };       # Node pool definitions (optional)
   };
 }
 ```
@@ -41,10 +42,11 @@ services.api-server = {
     };
   };
 
-  # Resource requirements (millicores for CPU, MB for memory)
+  # Resource requirements (millicores for CPU, MB for memory/disk)
   resources = {
     cpu = { request = 500; limit = 1000; };
     memory = { request = 1024; limit = 2048; };
+    disk = { request = 5000; };
   };
 
   # Environment variables
@@ -69,17 +71,36 @@ services.api-server = {
   # Scheduling configuration
   scheduling = {
     replicas = 3;
-    type = "service";  # service | stateful | system | batch
+    type = "service";  # service | stateful | system | batch | sysbatch
+    priority = 50;     # 1-100, higher = scheduled first (default: 50)
+
+    # Node pool preference (soft affinity)
+    pool = "default";
 
     # Hard constraints (must be satisfied)
     constraints = [
       { attribute = "labels.role"; op = "="; value = "app"; }
+      { attribute = "capacity.cpu"; op = ">="; value = "4000"; }
+    ];
+
+    # Spread across topology domains
+    spread = [
+      { attribute = "labels.zone"; weight = 50; }
     ];
 
     # Soft preferences (influence scoring)
-    spread = { attribute = "labels.zone"; };
     affinity = [
       { attribute = "labels.tier"; op = "="; value = "fast"; weight = 50; }
+    ];
+
+    # Inter-service affinity
+    serviceAffinity = [
+      { targetService = "redis"; topologyKey = "labels.zone"; weight = 30; }
+    ];
+
+    # Tolerate machine taints
+    tolerations = [
+      { key = "dedicated"; op = "equal"; value = "api"; effect = "noSchedule"; }
     ];
 
     # Update strategy
@@ -90,6 +111,32 @@ services.api-server = {
       minHealthyTime = 10;   # seconds
       healthyDeadline = 300; # seconds
       autoRevert = true;
+      autoPromote = false;   # auto-promote canaries when healthy
+      progressDeadline = 600; # overall deployment timeout (optional)
+      healthCheck = "checks"; # checks | taskStates | manual
+    };
+
+    # Local restart policy
+    restart = {
+      attempts = 2;
+      intervalSecs = 1800;
+      delaySecs = 15;
+      mode = "fail";  # fail | delay
+    };
+
+    # Cross-node reschedule policy
+    reschedule = {
+      delaySecs = 30;
+      delayFunction = "exponential";  # constant | exponential | fibonacci
+      maxDelaySecs = 3600;
+      # attempts = null;  # null = unlimited (default for service)
+    };
+
+    # Migration policy for node drain
+    migrate = {
+      maxParallel = 1;
+      minHealthyTime = 10;
+      healthyDeadline = 300;
     };
   };
 };
@@ -97,11 +144,12 @@ services.api-server = {
 
 ## Machine Configuration
 
-Each machine defines its address, labels, and capacity:
+Each machine defines its address, labels, capacity, and optional taints:
 
 ```nix
 machines.app-1 = {
   targetHost = "10.0.1.1";
+  pool = "default";            # Node pool membership (default: "default")
   labels = {
     role = "app";
     zone = "us-east-1a";
@@ -111,6 +159,55 @@ machines.app-1 = {
     cpu = 8000;     # millicores
     memory = 16384; # MB
     disk = 100000;  # MB
+  };
+  reserved = {                  # Reserved for OS/system use
+    cpu = 500;
+    memory = 512;
+  };
+  taints = [                    # Repel non-tolerating services
+    { key = "dedicated"; value = "api"; effect = "noSchedule"; }
+  ];
+};
+```
+
+## Node Pool Configuration
+
+Node pools group machines with shared properties:
+
+```nix
+nodePools.compute = {
+  labels = { tier = "compute-optimized"; };
+  schedulerAlgorithm = "binpack";  # binpack | spread
+  memoryOversubscription = false;
+  scaling = {
+    minCount = 2;
+    maxCount = 10;
+    rules = [{
+      metricName = "pool_cpu_utilization";
+      targetValue = 0.7;
+      scaleUpThreshold = 1.3;
+      scaleDownThreshold = 0.5;
+    }];
+  };
+};
+```
+
+## Periodic Jobs
+
+Batch jobs can run on a cron schedule:
+
+```nix
+services.nightly-backup = {
+  command = "${pkgs.backup}/bin/run";
+  scheduling = {
+    type = "batch";
+    periodic = {
+      cron = "0 3 * * *";          # daily at 3 AM
+      timeZone = "UTC";
+      concurrencyPolicy = "forbid"; # allow | forbid | replace
+      successfulJobsHistoryLimit = 3;
+      failedJobsHistoryLimit = 1;
+    };
   };
 };
 ```
@@ -123,6 +220,7 @@ machines.app-1 = {
 | `stateful` | Sticky placement, migrates only when necessary |
 | `system` | Runs on every machine matching constraints |
 | `batch` | Run-to-completion, exits when done |
+| `sysbatch` | Runs once on every matching machine, then completes |
 
 ## Update Strategies
 
@@ -140,3 +238,19 @@ machines.app-1 = {
 | `!=` | Attribute does not equal value |
 | `in` | Attribute is one of comma-separated values |
 | `not_in` | Attribute is not one of comma-separated values |
+| `>`, `>=`, `<`, `<=` | Numeric/lexical comparison |
+| `regexp` | RE2 regular expression match |
+| `is_set` | Attribute exists (value ignored) |
+| `is_not_set` | Attribute does not exist |
+| `set_contains` | Attribute (comma-separated) contains all listed values |
+| `set_contains_any` | Attribute contains any listed value |
+| `version` / `semver` | Semantic version comparison |
+| `distinct_hosts` | No two instances on same machine (hard constraint) |
+
+## Taint Effects
+
+| Effect | Behavior |
+|--------|----------|
+| `noSchedule` | Don't place services that don't tolerate the taint |
+| `preferNoSchedule` | Scoring penalty for non-tolerating services |
+| `noExecute` | Evict running non-tolerating services |
