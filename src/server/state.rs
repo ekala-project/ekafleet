@@ -7,8 +7,8 @@ use std::time::Instant;
 use tokio::sync::{RwLock, mpsc};
 
 use crate::proto::{
-    HealthStatus, NodeResources, NodeStatus, ServerMessage, ServiceHealth, ServiceState,
-    ServiceStatus,
+    HealthStatus, NodeResources, NodeStatus, PoolStatus, ServerMessage, ServiceHealth,
+    ServiceState, ServiceStatus,
 };
 
 /// Shared server state, accessible from gRPC handlers and background tasks.
@@ -23,6 +23,7 @@ struct FleetStateInner {
 
 struct NodeInfo {
     address: String,
+    pool: String,
     total_resources: NodeResources,
     available_resources: NodeResources,
     last_heartbeat: Instant,
@@ -57,6 +58,7 @@ impl FleetState {
         &self,
         node_id: &str,
         address: String,
+        pool: String,
     ) -> mpsc::Receiver<ServerMessage> {
         let (tx, rx) = mpsc::channel(64);
         let mut state = self.inner.write().await;
@@ -65,6 +67,7 @@ impl FleetState {
             node_id.to_string(),
             NodeInfo {
                 address,
+                pool,
                 total_resources: NodeResources {
                     cpu_millicores: 0,
                     memory_mb: 0,
@@ -156,7 +159,7 @@ impl FleetState {
     }
 
     /// Get a snapshot of fleet status for the Status RPC.
-    pub async fn fleet_status(&self) -> (Vec<NodeStatus>, Vec<ServiceStatus>) {
+    pub async fn fleet_status(&self) -> (Vec<NodeStatus>, Vec<ServiceStatus>, Vec<PoolStatus>) {
         let state = self.inner.read().await;
 
         let nodes: Vec<NodeStatus> = state
@@ -171,6 +174,7 @@ impl FleetState {
                     total_resources: Some(info.total_resources),
                     available_resources: Some(info.available_resources),
                     last_heartbeat: info.last_heartbeat.elapsed().as_secs(),
+                    pool: info.pool.clone(),
                 }
             })
             .collect();
@@ -199,7 +203,50 @@ impl FleetState {
             }
         }
 
-        (nodes, svc_map.into_values().collect())
+        // Aggregate pool status
+        let mut pool_map: HashMap<String, PoolStatus> = HashMap::new();
+        for info in state.nodes.values() {
+            let entry = pool_map
+                .entry(info.pool.clone())
+                .or_insert_with(|| PoolStatus {
+                    name: info.pool.clone(),
+                    machine_count: 0,
+                    total_schedulable: Some(NodeResources {
+                        cpu_millicores: 0,
+                        memory_mb: 0,
+                        disk_mb: 0,
+                    }),
+                    total_allocated: Some(NodeResources {
+                        cpu_millicores: 0,
+                        memory_mb: 0,
+                        disk_mb: 0,
+                    }),
+                    labels: HashMap::new(),
+                });
+            entry.machine_count += 1;
+            if let Some(ref mut sched) = entry.total_schedulable {
+                sched.cpu_millicores += info.total_resources.cpu_millicores;
+                sched.memory_mb += info.total_resources.memory_mb;
+            }
+            if let Some(ref mut alloc) = entry.total_allocated {
+                let used_cpu = info
+                    .total_resources
+                    .cpu_millicores
+                    .saturating_sub(info.available_resources.cpu_millicores);
+                let used_mem = info
+                    .total_resources
+                    .memory_mb
+                    .saturating_sub(info.available_resources.memory_mb);
+                alloc.cpu_millicores += used_cpu;
+                alloc.memory_mb += used_mem;
+            }
+        }
+
+        (
+            nodes,
+            svc_map.into_values().collect(),
+            pool_map.into_values().collect(),
+        )
     }
 
     /// Get list of connected node IDs.

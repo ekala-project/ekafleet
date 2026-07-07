@@ -316,14 +316,35 @@ async fn main() -> anyhow::Result<()> {
             println!("Nodes ({}):", status.nodes.len());
             for node in &status.nodes {
                 let health = if node.healthy { "healthy" } else { "unhealthy" };
+                let pool_label = if node.pool.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", node.pool)
+                };
                 println!(
-                    "  {} ({}) — {} — last heartbeat {}s ago",
-                    node.node_id, node.address, health, node.last_heartbeat
+                    "  {}{} ({}) — {} — last heartbeat {}s ago",
+                    node.node_id, pool_label, node.address, health, node.last_heartbeat
                 );
                 if let Some(res) = &node.available_resources {
                     println!(
                         "    resources: {}m CPU, {}MB mem, {}MB disk",
                         res.cpu_millicores, res.memory_mb, res.disk_mb
+                    );
+                }
+            }
+            if !status.pools.is_empty() {
+                println!();
+                println!("Pools ({}):", status.pools.len());
+                for pool in &status.pools {
+                    let sched = pool.total_schedulable.as_ref();
+                    let alloc = pool.total_allocated.as_ref();
+                    let sched_cpu = sched.map(|r| r.cpu_millicores).unwrap_or(0);
+                    let sched_mem = sched.map(|r| r.memory_mb).unwrap_or(0);
+                    let alloc_cpu = alloc.map(|r| r.cpu_millicores).unwrap_or(0);
+                    let alloc_mem = alloc.map(|r| r.memory_mb).unwrap_or(0);
+                    println!(
+                        "  {} — {} machines — {}m/{}m CPU, {}MB/{}MB mem",
+                        pool.name, pool.machine_count, alloc_cpu, sched_cpu, alloc_mem, sched_mem
                     );
                 }
             }
@@ -407,6 +428,23 @@ async fn main() -> anyhow::Result<()> {
             println!("  Available CPU: {}m", total_cpu);
             println!("  Available memory: {}MB", total_mem);
             println!("  Available disk: {}MB", total_disk);
+
+            if !status.pools.is_empty() {
+                println!();
+                println!("By pool:");
+                for pool in &status.pools {
+                    let sched = pool.total_schedulable.as_ref();
+                    let alloc = pool.total_allocated.as_ref();
+                    let sched_cpu = sched.map(|r| r.cpu_millicores).unwrap_or(0);
+                    let sched_mem = sched.map(|r| r.memory_mb).unwrap_or(0);
+                    let alloc_cpu = alloc.map(|r| r.cpu_millicores).unwrap_or(0);
+                    let alloc_mem = alloc.map(|r| r.memory_mb).unwrap_or(0);
+                    println!(
+                        "  {} — {} machines — {}m/{}m CPU used, {}MB/{}MB mem used",
+                        pool.name, pool.machine_count, alloc_cpu, sched_cpu, alloc_mem, sched_mem
+                    );
+                }
+            }
         }
 
         Command::Services { server } => {

@@ -65,9 +65,9 @@ impl FleetControl for FleetControlService {
             .map_err(|e| Status::internal(format!("stream error: {e}")))?
             .ok_or_else(|| Status::invalid_argument("no initial message"))?;
 
-        let node_id = match &first_msg.payload {
-            Some(Payload::Heartbeat(hb)) => hb.node_id.clone(),
-            Some(Payload::Status(sr)) => sr.node_id.clone(),
+        let (node_id, pool) = match &first_msg.payload {
+            Some(Payload::Heartbeat(hb)) => (hb.node_id.clone(), hb.pool.clone()),
+            Some(Payload::Status(sr)) => (sr.node_id.clone(), String::new()),
             _ => {
                 return Err(Status::invalid_argument(
                     "first message must be heartbeat or status",
@@ -78,7 +78,12 @@ impl FleetControl for FleetControlService {
         tracing::info!(node_id = %node_id, remote = %remote, "Agent connected");
 
         // Register agent and get outbound channel
-        let rx = self.state.register_agent(&node_id, remote).await;
+        let pool_name = if pool.is_empty() {
+            "default".to_string()
+        } else {
+            pool
+        };
+        let rx = self.state.register_agent(&node_id, remote, pool_name).await;
 
         // Push trust bundle to newly connected agent
         if let Some(bundle_pem) = &self.trust_bundle_pem {
@@ -163,12 +168,13 @@ impl FleetControl for FleetControlService {
         &self,
         _request: Request<StatusRequest>,
     ) -> Result<Response<FleetStatus>, Status> {
-        let (nodes, services) = self.state.fleet_status().await;
+        let (nodes, services, pools) = self.state.fleet_status().await;
 
         Ok(Response::new(FleetStatus {
             fleet_name: "ekafleet".into(),
             nodes,
             services,
+            pools,
         }))
     }
 }

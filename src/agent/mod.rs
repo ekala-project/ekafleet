@@ -105,6 +105,7 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
             node_id: node_id.clone(),
             timestamp: now_epoch(),
             available_resources: Some(collect_resources()),
+            pool: String::new(),
         })),
     })
     .await?;
@@ -125,6 +126,7 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
                     node_id: hb_node_id.clone(),
                     timestamp: now_epoch(),
                     available_resources: Some(collect_resources()),
+                    pool: String::new(),
                 })),
             };
             if heartbeat_tx.send(msg).await.is_err() {

@@ -8,7 +8,7 @@ use super::deployer::{self, DeploymentPlan};
 use super::nix;
 use super::scheduler::{self, Placement};
 use super::state::FleetState;
-use crate::config::FleetConfig;
+use crate::config::{self, FleetConfig};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReconcileError {
@@ -16,6 +16,8 @@ pub enum ReconcileError {
     NixEval(#[from] nix::NixError),
     #[error("deployment failed: {0}")]
     Deploy(#[from] deployer::DeployError),
+    #[error("validation failed: {0}")]
+    Validation(String),
 }
 
 /// Result of comparing desired state with current state.
@@ -44,6 +46,11 @@ pub async fn reconcile_once(
     // 1. Evaluate: get desired state from Nix
     tracing::info!(config = %config_path.display(), "Evaluating fleet configuration");
     let desired = nix::eval_fleet(config_path).await?;
+
+    // 1b. Validate configuration consistency
+    if let Err(errors) = config::validate(&desired) {
+        return Err(ReconcileError::Validation(errors.join("; ")));
+    }
 
     // 2. Refresh: query current state from agents
     let current_nodes = state.connected_nodes().await;
@@ -106,7 +113,8 @@ async fn compute_plan(
     state: &FleetState,
 ) -> ReconcilePlan {
     // Schedule services across machines
-    let placement_plan = scheduler::schedule(&desired.services, &desired.machines);
+    let placement_plan =
+        scheduler::schedule(&desired.services, &desired.machines, &desired.node_pools);
 
     // Group placements by service
     let mut placements_by_service: HashMap<String, Vec<Placement>> = HashMap::new();
@@ -122,7 +130,7 @@ async fn compute_plan(
     let mut destroys = Vec::new();
     let mut reschedules = Vec::new();
 
-    let (_, current_services) = state.fleet_status().await;
+    let (_, current_services, _) = state.fleet_status().await;
     let current_service_names: Vec<&str> =
         current_services.iter().map(|s| s.name.as_str()).collect();
 

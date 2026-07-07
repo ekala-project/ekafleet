@@ -3,13 +3,16 @@
 use std::collections::HashMap;
 
 use crate::config::{
-    AffinityConfig, Constraint, JobType, MachineConfig, NodePoolConfig, ServiceConfig, SpreadConfig,
+    AffinityConfig, Constraint, JobType, MachineConfig, NodePoolConfig, SchedulerAlgorithm,
+    ServiceAffinityConfig, ServiceConfig, SpreadConfig, TaintEffect, TolerationOp,
 };
 
 /// Result of scheduling: which services go to which machines.
 #[derive(Debug, Clone)]
 pub struct PlacementPlan {
     pub placements: Vec<Placement>,
+    pub blocked: Vec<BlockedPlacement>,
+    pub preemptions: Vec<Preemption>,
 }
 
 #[derive(Debug, Clone)]
@@ -17,6 +20,21 @@ pub struct Placement {
     pub service_name: String,
     pub instance_id: String,
     pub machine_name: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct BlockedPlacement {
+    pub service_name: String,
+    pub instance_id: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct Preemption {
+    pub evicted_service: String,
+    pub evicted_instance_id: String,
+    pub machine_name: String,
+    pub reason: String,
 }
 
 /// A machine candidate during scheduling with tracked allocated resources.
@@ -28,8 +46,10 @@ struct Candidate {
     merged_labels: HashMap<String, String>,
     schedulable_cpu: u64,
     schedulable_memory: u64,
+    schedulable_disk: u64,
     allocated_cpu: u64,
     allocated_memory: u64,
+    allocated_disk: u64,
     assigned_services: Vec<String>,
 }
 
@@ -41,6 +61,10 @@ impl Candidate {
     fn available_memory(&self) -> u64 {
         self.schedulable_memory
             .saturating_sub(self.allocated_memory)
+    }
+
+    fn available_disk(&self) -> u64 {
+        self.schedulable_disk.saturating_sub(self.allocated_disk)
     }
 
     fn utilization(&self) -> f64 {
@@ -86,15 +110,24 @@ pub fn schedule(
                     .capacity
                     .memory
                     .saturating_sub(config.reserved.memory),
+                schedulable_disk: config.capacity.disk.saturating_sub(config.reserved.disk),
                 config: config.clone(),
                 allocated_cpu: 0,
                 allocated_memory: 0,
+                allocated_disk: 0,
                 assigned_services: Vec::new(),
             }
         })
         .collect();
 
+    // Pre-compute pool algorithms for quick lookup
+    let pool_algorithms: HashMap<String, &SchedulerAlgorithm> = node_pools
+        .iter()
+        .filter_map(|(name, cfg)| cfg.scheduler_algorithm.as_ref().map(|a| (name.clone(), a)))
+        .collect();
+
     let mut placements = Vec::new();
+    let mut blocked = Vec::new();
 
     // Schedule system jobs first (run on all matching nodes),
     // then services, stateful, batch
@@ -103,11 +136,22 @@ pub fn schedule(
         .map(|(name, cfg)| (name.as_str(), cfg))
         .collect();
 
-    service_list.sort_by_key(|(_, cfg)| match cfg.scheduling.job_type {
-        JobType::System => 0,
-        JobType::Service => 1,
-        JobType::Stateful => 2,
-        JobType::Batch => 3,
+    service_list.sort_by(|(_, a), (_, b)| {
+        // Higher priority first
+        b.scheduling
+            .priority
+            .cmp(&a.scheduling.priority)
+            .then_with(|| {
+                // Then by job type: System/Sysbatch first
+                let type_order = |jt: &JobType| match jt {
+                    JobType::System => 0,
+                    JobType::Sysbatch => 1,
+                    JobType::Service => 2,
+                    JobType::Stateful => 3,
+                    JobType::Batch => 4,
+                };
+                type_order(&a.scheduling.job_type).cmp(&type_order(&b.scheduling.job_type))
+            })
     });
 
     for (service_name, service_cfg) in service_list {
@@ -124,6 +168,12 @@ pub fn schedule(
             .as_ref()
             .map(|r| r.request)
             .unwrap_or(0);
+        let disk_req = service_cfg
+            .resources
+            .disk
+            .as_ref()
+            .map(|r| r.request)
+            .unwrap_or(0);
 
         // Expand pool preference into a synthetic affinity
         let mut affinities = scheduling.affinity.clone();
@@ -136,15 +186,24 @@ pub fn schedule(
             });
         }
 
+        // Determine pool algorithm if service prefers a specific pool
+        let pool_algorithm = scheduling
+            .pool
+            .as_ref()
+            .and_then(|p| pool_algorithms.get(p).copied());
+
         match scheduling.job_type {
-            JobType::System => {
+            JobType::System | JobType::Sysbatch => {
                 // System jobs run on every matching machine
                 let matching: Vec<usize> = candidates
                     .iter()
                     .enumerate()
                     .filter(|(_, c)| passes_constraints(c, &scheduling.constraints))
+                    .filter(|(_, c)| passes_taints(c, &scheduling.tolerations))
                     .filter(|(_, c)| {
-                        c.available_cpu() >= cpu_req && c.available_memory() >= mem_req
+                        c.available_cpu() >= cpu_req
+                            && c.available_memory() >= mem_req
+                            && c.available_disk() >= disk_req
                     })
                     .map(|(i, _)| i)
                     .collect();
@@ -158,6 +217,7 @@ pub fn schedule(
                     });
                     candidates[idx].allocated_cpu += cpu_req;
                     candidates[idx].allocated_memory += mem_req;
+                    candidates[idx].allocated_disk += disk_req;
                     candidates[idx]
                         .assigned_services
                         .push(service_name.to_string());
@@ -173,8 +233,11 @@ pub fn schedule(
                         .iter()
                         .enumerate()
                         .filter(|(_, c)| passes_constraints(c, &scheduling.constraints))
+                        .filter(|(_, c)| passes_taints(c, &scheduling.tolerations))
                         .filter(|(_, c)| {
-                            c.available_cpu() >= cpu_req && c.available_memory() >= mem_req
+                            c.available_cpu() >= cpu_req
+                                && c.available_memory() >= mem_req
+                                && c.available_disk() >= disk_req
                         })
                         .map(|(i, _)| i)
                         .collect();
@@ -185,6 +248,11 @@ pub fn schedule(
                             replica,
                             "No machines satisfy constraints"
                         );
+                        blocked.push(BlockedPlacement {
+                            service_name: service_name.to_string(),
+                            instance_id,
+                            reason: "no feasible machines".to_string(),
+                        });
                         continue;
                     }
 
@@ -198,6 +266,8 @@ pub fn schedule(
                                 &candidates,
                                 &affinities,
                                 &scheduling.spread,
+                                &scheduling.service_affinity,
+                                pool_algorithm,
                             );
                             (i, score)
                         })
@@ -215,6 +285,7 @@ pub fn schedule(
                         });
                         candidates[best_idx].allocated_cpu += cpu_req;
                         candidates[best_idx].allocated_memory += mem_req;
+                        candidates[best_idx].allocated_disk += disk_req;
                         candidates[best_idx]
                             .assigned_services
                             .push(service_name.to_string());
@@ -224,7 +295,11 @@ pub fn schedule(
         }
     }
 
-    PlacementPlan { placements }
+    PlacementPlan {
+        placements,
+        blocked,
+        preemptions: Vec::new(), // Preemption not yet wired
+    }
 }
 
 /// Check if a candidate machine passes all hard constraints.
@@ -304,6 +379,32 @@ fn passes_constraints(candidate: &Candidate, constraints: &[Constraint]) -> bool
     true
 }
 
+/// Check if a service tolerates all taints on a candidate machine.
+fn passes_taints(candidate: &Candidate, tolerations: &[crate::config::Toleration]) -> bool {
+    for taint in &candidate.config.taints {
+        if taint.effect == TaintEffect::PreferNoSchedule {
+            // Soft taint — handled in scoring, not filtering
+            continue;
+        }
+        let tolerated = tolerations.iter().any(|t| {
+            // Key must match (or toleration key is None = match all)
+            let key_matches = t.key.as_ref().is_none_or(|k| k == &taint.key);
+            // Effect must match (or toleration effect is None = match all)
+            let effect_matches = t.effect.as_ref().is_none_or(|e| e == &taint.effect);
+            // Operator check
+            let op_matches = match t.op {
+                TolerationOp::Exists => true,
+                TolerationOp::Equal => t.value.as_deref() == taint.value.as_deref(),
+            };
+            key_matches && effect_matches && op_matches
+        });
+        if !tolerated {
+            return false;
+        }
+    }
+    true
+}
+
 /// Resolve a dotted attribute path against a candidate machine.
 fn get_attribute(candidate: &Candidate, attribute: &str) -> Option<String> {
     let parts: Vec<&str> = attribute.splitn(2, '.').collect();
@@ -334,6 +435,7 @@ fn get_attribute(candidate: &Candidate, attribute: &str) -> Option<String> {
                 match parts[1] {
                     "cpu" => Some(candidate.schedulable_cpu.to_string()),
                     "memory" => Some(candidate.schedulable_memory.to_string()),
+                    "disk" => Some(candidate.schedulable_disk.to_string()),
                     _ => None,
                 }
             } else {
@@ -345,6 +447,7 @@ fn get_attribute(candidate: &Candidate, attribute: &str) -> Option<String> {
                 match parts[1] {
                     "cpu" => Some(candidate.available_cpu().to_string()),
                     "memory" => Some(candidate.available_memory().to_string()),
+                    "disk" => Some(candidate.available_disk().to_string()),
                     _ => None,
                 }
             } else {
@@ -362,13 +465,23 @@ fn compute_score(
     all_candidates: &[Candidate],
     affinities: &[AffinityConfig],
     spreads: &[SpreadConfig],
+    service_affinities: &[ServiceAffinityConfig],
+    pool_algorithm: Option<&SchedulerAlgorithm>,
 ) -> f64 {
     let mut score = 0.0;
 
-    // Bin-packing score: prefer machines that are already partially utilized
-    // to consolidate workloads (higher utilization = higher score, up to a point)
+    // Bin-packing score: direction depends on pool algorithm
     let util = candidate.utilization();
-    score += util * 30.0; // weight: 30
+    match pool_algorithm {
+        Some(SchedulerAlgorithm::Spread) => {
+            // Spread: prefer less utilized machines
+            score += (1.0 - util) * 30.0;
+        }
+        _ => {
+            // Binpack (default): prefer more utilized machines
+            score += util * 30.0;
+        }
+    }
 
     // Spread scores: distribute instances across distinct attribute values
     for spread_cfg in spreads {
@@ -460,6 +573,27 @@ fn compute_score(
         score -= 100.0 * same_service_count as f64;
     }
 
+    // PreferNoSchedule taint penalty
+    for taint in &candidate.config.taints {
+        if taint.effect == TaintEffect::PreferNoSchedule {
+            score -= 50.0;
+        }
+    }
+
+    // Service affinity: co-locate or separate from other services
+    for sa in service_affinities {
+        let my_topo = get_attribute(candidate, &sa.topology_key);
+        if let Some(ref my_val) = my_topo {
+            let has_target = all_candidates.iter().any(|c| {
+                c.assigned_services.contains(&sa.target_service)
+                    && get_attribute(c, &sa.topology_key).as_deref() == Some(my_val)
+            });
+            if has_target {
+                score += sa.weight as f64;
+            }
+        }
+    }
+
     score
 }
 
@@ -489,6 +623,7 @@ mod tests {
                 },
                 pool: "default".to_string(),
                 reserved: CapacityConfig::default(),
+                taints: vec![],
             },
         )
     }
@@ -521,6 +656,7 @@ mod tests {
                     memory: reserved_memory,
                     disk: 0,
                 },
+                taints: vec![],
             },
         )
     }
@@ -542,6 +678,7 @@ mod tests {
                         request: memory,
                         limit: None,
                     }),
+                    disk: None,
                 },
                 scheduling: SchedulingConfig {
                     replicas,
@@ -602,6 +739,7 @@ mod tests {
                         request: 1024,
                         limit: None,
                     }),
+                    disk: None,
                 },
                 scheduling: SchedulingConfig {
                     replicas: 1,
@@ -647,6 +785,7 @@ mod tests {
                         request: 256,
                         limit: None,
                     }),
+                    disk: None,
                 },
                 scheduling: SchedulingConfig {
                     replicas: 1,
@@ -681,6 +820,8 @@ mod tests {
                 NodePoolConfig {
                     labels: HashMap::new(),
                     scaling: None,
+                    scheduler_algorithm: None,
+                    memory_oversubscription: false,
                 },
             ),
             (
@@ -688,6 +829,8 @@ mod tests {
                 NodePoolConfig {
                     labels: HashMap::new(),
                     scaling: None,
+                    scheduler_algorithm: None,
+                    memory_oversubscription: false,
                 },
             ),
         ]
@@ -715,6 +858,7 @@ mod tests {
                         request: 1024,
                         limit: None,
                     }),
+                    disk: None,
                 },
                 scheduling: SchedulingConfig {
                     replicas: 1,
@@ -739,6 +883,8 @@ mod tests {
                 NodePoolConfig {
                     labels: HashMap::new(),
                     scaling: None,
+                    scheduler_algorithm: None,
+                    memory_oversubscription: false,
                 },
             ),
             (
@@ -746,6 +892,8 @@ mod tests {
                 NodePoolConfig {
                     labels: HashMap::new(),
                     scaling: None,
+                    scheduler_algorithm: None,
+                    memory_oversubscription: false,
                 },
             ),
         ]
@@ -774,6 +922,7 @@ mod tests {
                         request: 1024,
                         limit: None,
                     }),
+                    disk: None,
                 },
                 scheduling: SchedulingConfig {
                     replicas: 2,
@@ -810,6 +959,8 @@ mod tests {
             NodePoolConfig {
                 labels: HashMap::new(),
                 scaling: None,
+                scheduler_algorithm: None,
+                memory_oversubscription: false,
             },
         )]
         .into();
@@ -837,6 +988,7 @@ mod tests {
                         request: 1024,
                         limit: None,
                     }),
+                    disk: None,
                 },
                 scheduling: SchedulingConfig {
                     replicas: 2,
@@ -909,6 +1061,8 @@ mod tests {
                 ]
                 .into(),
                 scaling: None,
+                scheduler_algorithm: None,
+                memory_oversubscription: false,
             },
         )]
         .into();
@@ -942,6 +1096,7 @@ mod tests {
                         request: 256,
                         limit: None,
                     }),
+                    disk: None,
                 },
                 scheduling: SchedulingConfig {
                     replicas: 1,
@@ -985,6 +1140,8 @@ mod tests {
                 NodePoolConfig {
                     labels: HashMap::new(),
                     scaling: None,
+                    scheduler_algorithm: None,
+                    memory_oversubscription: false,
                 },
             ),
             (
@@ -992,6 +1149,8 @@ mod tests {
                 NodePoolConfig {
                     labels: HashMap::new(),
                     scaling: None,
+                    scheduler_algorithm: None,
+                    memory_oversubscription: false,
                 },
             ),
         ]
@@ -1021,6 +1180,7 @@ mod tests {
                         request: 256,
                         limit: None,
                     }),
+                    disk: None,
                 },
                 scheduling: SchedulingConfig {
                     replicas: 1,
@@ -1069,6 +1229,7 @@ mod tests {
                         request: 256,
                         limit: None,
                     }),
+                    disk: None,
                 },
                 scheduling: SchedulingConfig {
                     replicas: 1,
@@ -1113,6 +1274,7 @@ mod tests {
                         request: 256,
                         limit: None,
                     }),
+                    disk: None,
                 },
                 scheduling: SchedulingConfig {
                     replicas: 1,
@@ -1157,6 +1319,7 @@ mod tests {
                         request: 256,
                         limit: None,
                     }),
+                    disk: None,
                 },
                 scheduling: SchedulingConfig {
                     replicas: 1,
@@ -1205,6 +1368,7 @@ mod tests {
                         request: 256,
                         limit: None,
                     }),
+                    disk: None,
                 },
                 scheduling: SchedulingConfig {
                     replicas: 4,
@@ -1238,5 +1402,185 @@ mod tests {
         used.sort();
         used.dedup();
         assert_eq!(used.len(), 4);
+    }
+
+    #[test]
+    fn priority_ordering() {
+        // One machine with limited capacity
+        let machines: HashMap<String, MachineConfig> =
+            [make_machine("node-1", 1000, 2048, vec![])].into();
+
+        // Two services both want the machine, high priority should win
+        let services: HashMap<String, ServiceConfig> = [
+            (
+                "low".to_string(),
+                ServiceConfig {
+                    command: "/bin/low".into(),
+                    ports: HashMap::new(),
+                    secrets: HashMap::new(),
+                    identity: Default::default(),
+                    resources: ResourceConfig {
+                        cpu: Some(ResourceValue {
+                            request: 800,
+                            limit: None,
+                        }),
+                        memory: Some(ResourceValue {
+                            request: 1024,
+                            limit: None,
+                        }),
+                        disk: None,
+                    },
+                    scheduling: SchedulingConfig {
+                        replicas: 1,
+                        priority: 30,
+                        ..Default::default()
+                    },
+                    environment: HashMap::new(),
+                },
+            ),
+            (
+                "high".to_string(),
+                ServiceConfig {
+                    command: "/bin/high".into(),
+                    ports: HashMap::new(),
+                    secrets: HashMap::new(),
+                    identity: Default::default(),
+                    resources: ResourceConfig {
+                        cpu: Some(ResourceValue {
+                            request: 800,
+                            limit: None,
+                        }),
+                        memory: Some(ResourceValue {
+                            request: 1024,
+                            limit: None,
+                        }),
+                        disk: None,
+                    },
+                    scheduling: SchedulingConfig {
+                        replicas: 1,
+                        priority: 80,
+                        ..Default::default()
+                    },
+                    environment: HashMap::new(),
+                },
+            ),
+        ]
+        .into();
+
+        let plan = schedule(&services, &machines, &no_pools());
+        // High priority should be placed, low should be blocked
+        assert_eq!(plan.placements.len(), 1);
+        assert_eq!(plan.placements[0].service_name, "high");
+        assert_eq!(plan.blocked.len(), 1);
+        assert_eq!(plan.blocked[0].service_name, "low");
+    }
+
+    #[test]
+    fn taint_blocks_non_tolerating_service() {
+        use crate::config::{Taint, TaintEffect, Toleration, TolerationOp};
+
+        let machines: HashMap<String, MachineConfig> = [(
+            "gpu-1".to_string(),
+            MachineConfig {
+                target_host: "10.0.0.1".into(),
+                labels: HashMap::new(),
+                capacity: CapacityConfig {
+                    cpu: 4000,
+                    memory: 8192,
+                    disk: 0,
+                },
+                pool: "default".to_string(),
+                reserved: CapacityConfig::default(),
+                taints: vec![Taint {
+                    key: "hardware".into(),
+                    value: Some("gpu".into()),
+                    effect: TaintEffect::NoSchedule,
+                }],
+            },
+        )]
+        .into();
+
+        // Service without toleration — should be blocked
+        let services: HashMap<String, ServiceConfig> = [make_service("web", 100, 256, 1)].into();
+        let plan = schedule(&services, &machines, &no_pools());
+        assert_eq!(plan.placements.len(), 0);
+        assert_eq!(plan.blocked.len(), 1);
+
+        // Service WITH toleration — should be placed
+        let services: HashMap<String, ServiceConfig> = [(
+            "ml".to_string(),
+            ServiceConfig {
+                command: "/bin/ml".into(),
+                ports: HashMap::new(),
+                secrets: HashMap::new(),
+                identity: Default::default(),
+                resources: ResourceConfig {
+                    cpu: Some(ResourceValue {
+                        request: 100,
+                        limit: None,
+                    }),
+                    memory: Some(ResourceValue {
+                        request: 256,
+                        limit: None,
+                    }),
+                    disk: None,
+                },
+                scheduling: SchedulingConfig {
+                    replicas: 1,
+                    tolerations: vec![Toleration {
+                        key: Some("hardware".into()),
+                        op: TolerationOp::Equal,
+                        value: Some("gpu".into()),
+                        effect: Some(TaintEffect::NoSchedule),
+                        toleration_seconds: None,
+                    }],
+                    ..Default::default()
+                },
+                environment: HashMap::new(),
+            },
+        )]
+        .into();
+        let plan = schedule(&services, &machines, &no_pools());
+        assert_eq!(plan.placements.len(), 1);
+    }
+
+    #[test]
+    fn sysbatch_runs_on_all_nodes() {
+        let machines: HashMap<String, MachineConfig> = [
+            make_machine("n1", 4000, 8192, vec![]),
+            make_machine("n2", 4000, 8192, vec![]),
+        ]
+        .into();
+
+        let services: HashMap<String, ServiceConfig> = [(
+            "migrate".to_string(),
+            ServiceConfig {
+                command: "/bin/migrate".into(),
+                ports: HashMap::new(),
+                secrets: HashMap::new(),
+                identity: Default::default(),
+                resources: ResourceConfig {
+                    cpu: Some(ResourceValue {
+                        request: 100,
+                        limit: None,
+                    }),
+                    memory: Some(ResourceValue {
+                        request: 256,
+                        limit: None,
+                    }),
+                    disk: None,
+                },
+                scheduling: SchedulingConfig {
+                    replicas: 1,
+                    job_type: JobType::Sysbatch,
+                    ..Default::default()
+                },
+                environment: HashMap::new(),
+            },
+        )]
+        .into();
+
+        let plan = schedule(&services, &machines, &no_pools());
+        assert_eq!(plan.placements.len(), 2);
     }
 }

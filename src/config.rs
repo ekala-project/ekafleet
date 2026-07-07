@@ -90,6 +90,8 @@ pub struct ResourceConfig {
     pub cpu: Option<ResourceValue>,
     #[serde(default)]
     pub memory: Option<ResourceValue>,
+    #[serde(default)]
+    pub disk: Option<ResourceValue>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,6 +120,28 @@ pub struct SchedulingConfig {
     /// Use a constraint with `attribute = "pool"` for hard binding instead.
     #[serde(default)]
     pub pool: Option<String>,
+    /// Service priority (1-100). Higher priority services are scheduled first
+    /// and can preempt lower priority services (delta >= 10).
+    #[serde(default = "default_priority")]
+    pub priority: u32,
+    /// Tolerations allow this service to be scheduled on tainted machines.
+    #[serde(default)]
+    pub tolerations: Vec<Toleration>,
+    /// Local restart policy before rescheduling to another machine.
+    #[serde(default)]
+    pub restart: RestartConfig,
+    /// Cross-node reschedule policy after local restarts are exhausted.
+    #[serde(default)]
+    pub reschedule: RescheduleConfig,
+    /// Migration policy for node drain operations.
+    #[serde(default)]
+    pub migrate: MigrateConfig,
+    /// Periodic/cron schedule for batch jobs.
+    #[serde(default)]
+    pub periodic: Option<PeriodicConfig>,
+    /// Inter-service affinity: prefer or avoid co-location with other services.
+    #[serde(default, rename = "serviceAffinity")]
+    pub service_affinity: Vec<ServiceAffinityConfig>,
 }
 
 impl Default for SchedulingConfig {
@@ -130,6 +154,13 @@ impl Default for SchedulingConfig {
             affinity: Vec::new(),
             update: UpdateConfig::default(),
             pool: None,
+            priority: default_priority(),
+            tolerations: Vec::new(),
+            restart: RestartConfig::default(),
+            reschedule: RescheduleConfig::default(),
+            migrate: MigrateConfig::default(),
+            periodic: None,
+            service_affinity: Vec::new(),
         }
     }
 }
@@ -140,6 +171,9 @@ fn default_replicas() -> u32 {
 fn default_job_type() -> JobType {
     JobType::Service
 }
+fn default_priority() -> u32 {
+    50
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -148,6 +182,7 @@ pub enum JobType {
     Stateful,
     System,
     Batch,
+    Sysbatch,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,6 +234,12 @@ pub struct UpdateConfig {
     pub healthy_deadline_secs: u64,
     #[serde(default, rename = "autoRevert")]
     pub auto_revert: bool,
+    #[serde(default, rename = "autoPromote")]
+    pub auto_promote: bool,
+    #[serde(default, rename = "progressDeadline")]
+    pub progress_deadline_secs: Option<u64>,
+    #[serde(default, rename = "healthCheck")]
+    pub health_check: HealthCheckMode,
 }
 
 impl Default for UpdateConfig {
@@ -210,6 +251,9 @@ impl Default for UpdateConfig {
             min_healthy_time_secs: default_min_healthy_time(),
             healthy_deadline_secs: default_healthy_deadline(),
             auto_revert: false,
+            auto_promote: false,
+            progress_deadline_secs: None,
+            health_check: HealthCheckMode::default(),
         }
     }
 }
@@ -249,6 +293,9 @@ pub struct MachineConfig {
     /// Capacity reserved for OS/system use. Scheduler uses capacity - reserved.
     #[serde(default)]
     pub reserved: CapacityConfig,
+    /// Taints repel services that don't tolerate them.
+    #[serde(default)]
+    pub taints: Vec<Taint>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -272,6 +319,10 @@ pub struct NodePoolConfig {
     pub labels: HashMap<String, String>,
     #[serde(default)]
     pub scaling: Option<PoolScalingConfig>,
+    #[serde(default, rename = "schedulerAlgorithm")]
+    pub scheduler_algorithm: Option<SchedulerAlgorithm>,
+    #[serde(default, rename = "memoryOversubscription")]
+    pub memory_oversubscription: bool,
 }
 
 /// Autoscaling configuration for a node pool.
@@ -296,6 +347,221 @@ pub struct PoolScalingRule {
     pub scale_up_threshold: f64,
     #[serde(rename = "scaleDownThreshold")]
     pub scale_down_threshold: f64,
+}
+
+/// Taint on a machine to repel non-tolerating services.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Taint {
+    pub key: String,
+    #[serde(default)]
+    pub value: Option<String>,
+    pub effect: TaintEffect,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum TaintEffect {
+    NoSchedule,
+    PreferNoSchedule,
+    NoExecute,
+}
+
+/// Toleration allows a service to be scheduled on a tainted machine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Toleration {
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub op: TolerationOp,
+    #[serde(default)]
+    pub value: Option<String>,
+    #[serde(default)]
+    pub effect: Option<TaintEffect>,
+    #[serde(default, rename = "tolerationSeconds")]
+    pub toleration_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum TolerationOp {
+    #[default]
+    Equal,
+    Exists,
+}
+
+/// Local restart policy before rescheduling.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RestartConfig {
+    #[serde(default = "default_restart_attempts")]
+    pub attempts: u32,
+    #[serde(default = "default_restart_interval", rename = "intervalSecs")]
+    pub interval_secs: u64,
+    #[serde(default = "default_restart_delay", rename = "delaySecs")]
+    pub delay_secs: u64,
+    #[serde(default)]
+    pub mode: RestartMode,
+}
+
+impl Default for RestartConfig {
+    fn default() -> Self {
+        Self {
+            attempts: default_restart_attempts(),
+            interval_secs: default_restart_interval(),
+            delay_secs: default_restart_delay(),
+            mode: RestartMode::default(),
+        }
+    }
+}
+
+fn default_restart_attempts() -> u32 {
+    2
+}
+fn default_restart_interval() -> u64 {
+    1800
+}
+fn default_restart_delay() -> u64 {
+    15
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RestartMode {
+    #[default]
+    Fail,
+    Delay,
+}
+
+/// Cross-node reschedule policy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RescheduleConfig {
+    #[serde(default = "default_reschedule_delay", rename = "delaySecs")]
+    pub delay_secs: u64,
+    #[serde(default, rename = "delayFunction")]
+    pub delay_function: DelayFunction,
+    #[serde(default = "default_max_delay", rename = "maxDelaySecs")]
+    pub max_delay_secs: u64,
+    /// None means unlimited attempts.
+    #[serde(default)]
+    pub attempts: Option<u32>,
+    #[serde(default = "default_reschedule_interval", rename = "intervalSecs")]
+    pub interval_secs: u64,
+}
+
+impl Default for RescheduleConfig {
+    fn default() -> Self {
+        Self {
+            delay_secs: default_reschedule_delay(),
+            delay_function: DelayFunction::default(),
+            max_delay_secs: default_max_delay(),
+            attempts: None,
+            interval_secs: default_reschedule_interval(),
+        }
+    }
+}
+
+fn default_reschedule_delay() -> u64 {
+    30
+}
+fn default_max_delay() -> u64 {
+    3600
+}
+fn default_reschedule_interval() -> u64 {
+    86400
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum DelayFunction {
+    Constant,
+    #[default]
+    Exponential,
+    Fibonacci,
+}
+
+/// Migration policy for node drain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MigrateConfig {
+    #[serde(default = "default_max_parallel", rename = "maxParallel")]
+    pub max_parallel: u32,
+    #[serde(default = "default_min_healthy_time", rename = "minHealthyTime")]
+    pub min_healthy_time_secs: u64,
+    #[serde(default = "default_healthy_deadline", rename = "healthyDeadline")]
+    pub healthy_deadline_secs: u64,
+}
+
+impl Default for MigrateConfig {
+    fn default() -> Self {
+        Self {
+            max_parallel: default_max_parallel(),
+            min_healthy_time_secs: default_min_healthy_time(),
+            healthy_deadline_secs: default_healthy_deadline(),
+        }
+    }
+}
+
+/// Periodic/cron schedule for batch jobs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeriodicConfig {
+    pub cron: String,
+    #[serde(default = "default_timezone", rename = "timeZone")]
+    pub time_zone: String,
+    #[serde(default, rename = "concurrencyPolicy")]
+    pub concurrency_policy: ConcurrencyPolicy,
+    #[serde(
+        default = "default_successful_history",
+        rename = "successfulJobsHistoryLimit"
+    )]
+    pub successful_jobs_history_limit: u32,
+    #[serde(default = "default_failed_history", rename = "failedJobsHistoryLimit")]
+    pub failed_jobs_history_limit: u32,
+}
+
+fn default_timezone() -> String {
+    "UTC".to_string()
+}
+fn default_successful_history() -> u32 {
+    3
+}
+fn default_failed_history() -> u32 {
+    1
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ConcurrencyPolicy {
+    #[default]
+    Allow,
+    Forbid,
+    Replace,
+}
+
+/// Inter-service affinity/anti-affinity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceAffinityConfig {
+    #[serde(rename = "targetService")]
+    pub target_service: String,
+    #[serde(rename = "topologyKey")]
+    pub topology_key: String,
+    #[serde(default = "default_affinity_weight")]
+    pub weight: i32,
+}
+
+/// Health check mode for deployments.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum HealthCheckMode {
+    #[default]
+    Checks,
+    TaskStates,
+    Manual,
+}
+
+/// Scheduler algorithm for node pools.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SchedulerAlgorithm {
+    Binpack,
+    Spread,
 }
 
 /// Validate a fleet configuration for consistency.
@@ -330,6 +596,19 @@ pub fn validate(config: &FleetConfig) -> Result<(), Vec<String>> {
             errors.push(format!(
                 "service '{}' prefers undefined pool '{}'",
                 name, pool
+            ));
+        }
+    }
+
+    // Validate periodic is only on batch/sysbatch types
+    for (name, service) in &config.services {
+        if service.scheduling.periodic.is_some()
+            && service.scheduling.job_type != JobType::Batch
+            && service.scheduling.job_type != JobType::Sysbatch
+        {
+            errors.push(format!(
+                "service '{}' has periodic config but is not batch/sysbatch type",
+                name
             ));
         }
     }

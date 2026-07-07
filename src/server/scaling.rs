@@ -93,7 +93,7 @@ impl ScalingEngine {
             }
         }
 
-        let (_, services) = self.state.fleet_status().await;
+        let (_, services, _) = self.state.fleet_status().await;
         let current_replicas = services
             .iter()
             .find(|s| s.name == service_name)
@@ -139,4 +139,111 @@ pub struct ScalingDecision {
     pub service_name: String,
     pub current_replicas: u32,
     pub desired_replicas: u32,
+}
+
+/// Pool-level scaling engine. Evaluates aggregate pool utilization and
+/// produces advisory scaling decisions (does not provision machines).
+pub struct PoolScalingEngine {
+    state: crate::server::state::FleetState,
+    policies: HashMap<String, crate::config::PoolScalingConfig>,
+    cooldown: Duration,
+    last_scale: HashMap<String, std::time::Instant>,
+}
+
+#[derive(Debug)]
+pub struct PoolScalingDecision {
+    pub pool_name: String,
+    pub current_count: u32,
+    pub desired_count: u32,
+}
+
+impl PoolScalingEngine {
+    pub fn new(state: crate::server::state::FleetState) -> Self {
+        Self {
+            state,
+            policies: HashMap::new(),
+            cooldown: Duration::from_secs(60),
+            last_scale: HashMap::new(),
+        }
+    }
+
+    /// Register a scaling policy for a node pool.
+    pub fn register_policy(&mut self, pool_name: &str, config: crate::config::PoolScalingConfig) {
+        self.policies.insert(pool_name.to_string(), config);
+    }
+
+    /// Evaluate all pool policies and return scaling decisions.
+    pub async fn evaluate(&mut self) -> Vec<PoolScalingDecision> {
+        let mut decisions = Vec::new();
+        let (_, _, pools) = self.state.fleet_status().await;
+
+        for (pool_name, policy) in &self.policies {
+            if let Some(last) = self.last_scale.get(pool_name)
+                && last.elapsed() < self.cooldown
+            {
+                continue;
+            }
+
+            let pool_status = pools.iter().find(|p| &p.name == pool_name);
+            let current_count = pool_status.map(|p| p.machine_count).unwrap_or(0);
+
+            // Compute pool utilization from schedulable vs allocated
+            let utilization = pool_status.and_then(|p| {
+                let sched = p.total_schedulable.as_ref()?;
+                let alloc = p.total_allocated.as_ref()?;
+                if sched.cpu_millicores == 0 {
+                    return None;
+                }
+                Some(alloc.cpu_millicores as f64 / sched.cpu_millicores as f64)
+            });
+
+            if let Some(util) = utilization {
+                let mut scale_up = false;
+                let mut scale_down = true;
+
+                for rule in &policy.rules {
+                    let ratio = util / rule.target_value;
+                    if ratio > rule.scale_up_threshold {
+                        scale_up = true;
+                        scale_down = false;
+                    } else if ratio > rule.scale_down_threshold {
+                        scale_down = false;
+                    }
+                }
+
+                let desired = if scale_up {
+                    (current_count + 1).min(policy.max_count)
+                } else if scale_down {
+                    current_count.saturating_sub(1).max(policy.min_count)
+                } else {
+                    continue;
+                };
+
+                if desired != current_count {
+                    tracing::info!(
+                        pool = %pool_name,
+                        current = current_count,
+                        desired,
+                        utilization = %format!("{:.1}%", util * 100.0),
+                        direction = if scale_up { "up" } else { "down" },
+                        "Pool scaling decision (advisory)"
+                    );
+
+                    decisions.push(PoolScalingDecision {
+                        pool_name: pool_name.clone(),
+                        current_count,
+                        desired_count: desired,
+                    });
+                }
+            }
+        }
+
+        decisions
+    }
+
+    /// Record that a pool scaling action was taken.
+    pub fn record_scale(&mut self, pool_name: &str) {
+        self.last_scale
+            .insert(pool_name.to_string(), std::time::Instant::now());
+    }
 }

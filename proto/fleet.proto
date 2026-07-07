@@ -34,6 +34,7 @@ message Heartbeat {
   string node_id = 1;
   uint64 timestamp = 2;
   NodeResources available_resources = 3;
+  string pool = 4;
 }
 
 message NodeResources {
@@ -299,6 +300,7 @@ message FleetStatus {
   string fleet_name = 1;
   repeated NodeStatus nodes = 2;
   repeated ServiceStatus services = 3;
+  repeated PoolStatus pools = 4;
 }
 
 message NodeStatus {
@@ -308,6 +310,15 @@ message NodeStatus {
   NodeResources total_resources = 4;
   NodeResources available_resources = 5;
   uint64 last_heartbeat = 6;
+  string pool = 7;
+}
+
+message PoolStatus {
+  string name = 1;
+  uint32 machine_count = 2;
+  NodeResources total_schedulable = 3;
+  NodeResources total_allocated = 4;
+  map<string, string> labels = 5;
 }
 
 message ServiceStatus {

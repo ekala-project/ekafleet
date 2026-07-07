@@ -266,7 +266,7 @@ async fn wait_healthy(
         }
 
         // Check if all nodes report the service as healthy
-        let (_, services) = state.fleet_status().await;
+        let (_, services, _) = state.fleet_status().await;
         let svc_status = services.iter().find(|s| s.name == service_name);
 
         let all_healthy = if let Some(svc) = svc_status {
