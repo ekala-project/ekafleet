@@ -51,12 +51,31 @@ update = {
 };
 ```
 
+### Auto-promote
+
+Canary deployments can auto-promote when the canary is healthy:
+
+```nix
+update = {
+  strategy = "canary";
+  canary = 1;
+  autoPromote = true;
+  autoRevert = true;
+};
+```
+
 ## Health Gates
 
 Between deployment batches, ekafleet waits for:
 
 1. **minHealthyTime** — Instances must be healthy for at least this duration
 2. **healthyDeadline** — Maximum time to wait for instances to become healthy
+3. **progressDeadline** — Overall deployment timeout (if set, the entire deployment fails if not complete within this window)
+
+Health check modes:
+- `checks` (default) — Health check endpoints must pass
+- `taskStates` — Only requires the process to be running
+- `manual` — Operator marks healthy via API
 
 If the deadline expires before instances are healthy, the deployment fails. With `autoRevert = true`, ekafleet automatically rolls back to the previous version.
 
