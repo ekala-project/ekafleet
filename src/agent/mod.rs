@@ -11,6 +11,7 @@ use tokio::sync::{RwLock, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::agent::health::HealthChecker;
+use crate::ca::csr;
 use crate::dns::resolver::DnsResolver;
 use crate::mesh::peers::PeerManager;
 use crate::mesh::wireguard::WireguardManager;
@@ -25,10 +26,127 @@ use crate::proto::{
 use crate::secrets::injector::SecretInjector;
 use crate::spiffe::workload_api::WorkloadManager;
 
+/// The agent's own SPIFFE node identity (spiffe://<domain>/agent/<node-id>).
+/// Persisted to disk and used for mTLS with the server.
+pub struct NodeIdentity {
+    pub cert_pem: Option<String>,
+    pub key_pem: Option<String>,
+    pub spiffe_id: Option<String>,
+    pub expires_at: u64,
+    data_dir: PathBuf,
+}
+
+impl NodeIdentity {
+    fn new(data_dir: &Path) -> Self {
+        Self {
+            cert_pem: None,
+            key_pem: None,
+            spiffe_id: None,
+            expires_at: 0,
+            data_dir: data_dir.to_path_buf(),
+        }
+    }
+
+    /// Try to load a persisted node SVID from disk.
+    async fn load(&mut self) -> bool {
+        let cert_path = self.data_dir.join("node-svid.pem");
+        let key_path = self.data_dir.join("node-svid-key.pem");
+
+        match (
+            tokio::fs::read_to_string(&cert_path).await,
+            tokio::fs::read_to_string(&key_path).await,
+        ) {
+            (Ok(cert), Ok(key)) => {
+                // Extract SPIFFE ID from cert SAN
+                let spiffe_id =
+                    crate::proxy::mtls::SpiffeAuthorizer::extract_spiffe_id_from_pem(&cert);
+                tracing::info!(spiffe_id = ?spiffe_id, "Loaded persisted node SVID");
+                self.cert_pem = Some(cert);
+                self.key_pem = Some(key);
+                self.spiffe_id = spiffe_id;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Persist node SVID to disk with restrictive permissions.
+    async fn save(&self) -> Result<(), std::io::Error> {
+        if let (Some(cert), Some(key)) = (&self.cert_pem, &self.key_pem) {
+            let cert_path = self.data_dir.join("node-svid.pem");
+            let key_path = self.data_dir.join("node-svid-key.pem");
+
+            tokio::fs::create_dir_all(&self.data_dir).await?;
+            tokio::fs::write(&cert_path, cert).await?;
+            tokio::fs::write(&key_path, key).await?;
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let perms = std::fs::Permissions::from_mode(0o400);
+                tokio::fs::set_permissions(&key_path, perms).await?;
+            }
+
+            tracing::info!(
+                spiffe_id = ?self.spiffe_id,
+                "Node SVID persisted to disk"
+            );
+        }
+        Ok(())
+    }
+
+    /// Install a node SVID received from attestation.
+    async fn install(
+        &mut self,
+        cert_pem: String,
+        key_pem: String,
+        spiffe_id: String,
+        expires_at: u64,
+    ) -> Result<(), std::io::Error> {
+        self.cert_pem = Some(cert_pem);
+        self.key_pem = Some(key_pem);
+        self.spiffe_id = Some(spiffe_id);
+        self.expires_at = expires_at;
+        self.save().await
+    }
+
+    /// Check if the node SVID exists and is valid.
+    pub fn has_valid_svid(&self) -> bool {
+        self.cert_pem.is_some() && self.key_pem.is_some()
+    }
+}
+
+/// Holds keypairs for pending certificate requests.
+/// When the agent generates a CSR, the keypair is stored here.
+/// When the signed certificate arrives, the keypair is retrieved and
+/// paired with the certificate.
+struct PendingKeyStore {
+    keys: HashMap<String, rcgen::KeyPair>,
+}
+
+impl PendingKeyStore {
+    fn new() -> Self {
+        Self {
+            keys: HashMap::new(),
+        }
+    }
+
+    fn store(&mut self, service_name: &str, keypair: rcgen::KeyPair) {
+        self.keys.insert(service_name.to_string(), keypair);
+    }
+
+    fn take(&mut self, service_name: &str) -> Option<rcgen::KeyPair> {
+        self.keys.remove(service_name)
+    }
+}
+
 #[allow(dead_code)]
 pub struct AgentConfig {
     pub server_addr: String,
+    /// Legacy bearer token for authentication.
     pub token: String,
+    /// One-time join token for SPIFFE node attestation (replaces token).
+    pub join_token: Option<String>,
     pub data_dir: PathBuf,
     pub ca_cert_pem: Option<String>,
 }
@@ -53,11 +171,41 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
         "Starting ekafleet agent"
     );
 
+    let node_id = get_node_id(&config.data_dir)?;
+    tracing::info!(node_id = %node_id, "Agent identity established");
+
+    // Load or prepare node SVID for mTLS
+    let node_identity = Arc::new(RwLock::new(NodeIdentity::new(&config.data_dir)));
+    {
+        let mut ni = node_identity.write().await;
+        if ni.load().await {
+            tracing::info!("Node SVID loaded from disk");
+        } else {
+            tracing::info!("No persisted node SVID — will use bearer token auth");
+        }
+    }
+
+    // Determine authentication mode: mTLS (node SVID) or bearer token
+    let ni = node_identity.read().await;
+    let use_mtls = ni.has_valid_svid();
+    let node_cert_pem = ni.cert_pem.clone();
+    let node_key_pem = ni.key_pem.clone();
+    drop(ni);
+
     let channel = if let Some(ca_pem) = &config.ca_cert_pem {
-        // TLS connection with CA certificate verification
         let endpoint = format!("https://{}", config.server_addr);
         let ca_cert = tonic::transport::Certificate::from_pem(ca_pem);
-        let tls_config = tonic::transport::ClientTlsConfig::new().ca_certificate(ca_cert);
+        let mut tls_config = tonic::transport::ClientTlsConfig::new().ca_certificate(ca_cert);
+
+        // Use node SVID for mTLS if available
+        if use_mtls {
+            if let (Some(cert), Some(key)) = (&node_cert_pem, &node_key_pem) {
+                tracing::info!("Using node SVID for mTLS authentication");
+                let identity = tonic::transport::Identity::from_pem(cert.as_bytes(), key.as_bytes());
+                tls_config = tls_config.identity(identity);
+            }
+        }
+
         tonic::transport::Endpoint::from_shared(endpoint)?
             .tls_config(tls_config)?
             .connect()
@@ -71,24 +219,32 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
             .await?
     };
 
-    // Attach bearer token to all outgoing requests
+    // Attach authentication metadata to all outgoing requests
     let token: tonic::metadata::MetadataValue<_> = format!("Bearer {}", config.token).parse()?;
+    let mtls_flag = use_mtls;
     #[allow(clippy::result_large_err)]
     let mut client =
         FleetControlClient::with_interceptor(channel, move |mut req: tonic::Request<()>| {
-            req.metadata_mut().insert("authorization", token.clone());
+            if mtls_flag {
+                // mTLS authenticated — signal to server interceptor
+                req.metadata_mut()
+                    .insert("x-ekafleet-mtls", "true".parse().unwrap());
+            } else {
+                // Legacy bearer token auth
+                req.metadata_mut().insert("authorization", token.clone());
+            }
             Ok(req)
         });
 
-    let node_id = get_node_id(&config.data_dir)?;
-    tracing::info!(node_id = %node_id, "Agent identity established");
-
     let local_state = Arc::new(RwLock::new(LocalState::default()));
+    // Trust domain starts as default; updated when TrustBundleUpdate is received from server.
     let workload_mgr = Arc::new(WorkloadManager::new(&config.data_dir, "fleet.internal"));
+    let pending_keys = Arc::new(RwLock::new(PendingKeyStore::new()));
     let supervisor = Arc::new(RwLock::new(supervisor::Supervisor::new(&config.data_dir)));
+    // Secret injector initialized with zeroed key; updated when FleetKeyUpdate is received
     let secret_injector = Arc::new(RwLock::new(SecretInjector::new(
         &config.data_dir,
-        &[0u8; 32], // TODO: derive from fleet key distributed by server
+        &[0u8; 32],
     )));
     let health_checker = HealthChecker::new();
     let dns_resolver = Arc::new(DnsResolver::new("fleet.internal", vec![]));
@@ -113,6 +269,14 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
     // Open bidirectional stream
     let response = client.stream_control(ReceiverStream::new(rx)).await?;
     let mut inbound = response.into_inner();
+
+    // Spawn SPIFFE Workload API socket listener
+    let wapi_mgr = workload_mgr.clone();
+    tokio::spawn(async move {
+        if let Err(e) = crate::spiffe::socket::serve_workload_api(wapi_mgr, None).await {
+            tracing::error!(error = %e, "Workload API socket failed");
+        }
+    });
 
     // Spawn heartbeat sender
     let heartbeat_tx = tx.clone();
@@ -173,6 +337,7 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
     let renewal_tx = tx.clone();
     let renewal_node_id = node_id.clone();
     let renewal_mgr = workload_mgr.clone();
+    let renewal_keys = pending_keys.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         loop {
@@ -180,15 +345,30 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
             let renewals = renewal_mgr.needs_renewal().await;
             for service_name in renewals {
                 tracing::info!(service = %service_name, "Requesting SVID renewal");
-                let _ = renewal_tx
-                    .send(AgentMessage {
-                        payload: Some(Payload::CertRequest(CertificateRequest {
-                            node_id: renewal_node_id.clone(),
-                            service_name,
-                            csr: vec![0x01],
-                        })),
-                    })
-                    .await;
+                // Get current trust domain for CSR generation
+                let trust_domain = renewal_mgr
+                    .trust_domain_str()
+                    .await
+                    .unwrap_or_else(|| "fleet.internal".to_string());
+                match csr::generate_service_csr(&trust_domain, &service_name) {
+                    Ok(csr_output) => {
+                        renewal_keys.write().await.store(&service_name, csr_output.keypair);
+                        let _ = renewal_tx
+                            .send(AgentMessage {
+                                payload: Some(Payload::CertRequest(CertificateRequest {
+                                    node_id: renewal_node_id.clone(),
+                                    service_name,
+                                    csr: csr_output.csr_der,
+                                    request_type: crate::proto::CertRequestType::ServiceCert
+                                        as i32,
+                                })),
+                            })
+                            .await;
+                    }
+                    Err(e) => {
+                        tracing::error!(service = %service_name, error = %e, "CSR generation failed");
+                    }
+                }
             }
         }
     });
@@ -261,17 +441,38 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
                 drop(state);
 
                 // Request SPIFFE SVIDs for each assigned service
+                let trust_domain = workload_mgr
+                    .trust_domain_str()
+                    .await
+                    .unwrap_or_else(|| "fleet.internal".to_string());
                 for svc in &ds.services {
                     tracing::info!(service = %svc.name, "Requesting SVID for service");
-                    let _ = tx
-                        .send(AgentMessage {
-                            payload: Some(Payload::CertRequest(CertificateRequest {
-                                node_id: node_id.clone(),
-                                service_name: svc.name.clone(),
-                                csr: vec![0x01], // placeholder CSR
-                            })),
-                        })
-                        .await;
+                    match csr::generate_service_csr(&trust_domain, &svc.name) {
+                        Ok(csr_output) => {
+                            pending_keys
+                                .write()
+                                .await
+                                .store(&svc.name, csr_output.keypair);
+                            let _ = tx
+                                .send(AgentMessage {
+                                    payload: Some(Payload::CertRequest(CertificateRequest {
+                                        node_id: node_id.clone(),
+                                        service_name: svc.name.clone(),
+                                        csr: csr_output.csr_der,
+                                        request_type: crate::proto::CertRequestType::ServiceCert
+                                            as i32,
+                                    })),
+                                })
+                                .await;
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                service = %svc.name,
+                                error = %e,
+                                "CSR generation failed"
+                            );
+                        }
+                    }
                 }
 
                 // Start health checking for services with health_check configured
@@ -356,11 +557,14 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
                 }
             }
             Some(ServerPayload::Cert(response)) => {
-                tracing::info!(expires = response.expires_at, "Received SVID certificate");
-                // Install SVID via workload manager
-                // The certificate field contains the service cert we need to figure out which
-                // service it's for. For now we extract the CN from the first line of PEM.
-                if let Err(e) = install_received_svid(&workload_mgr, &response).await {
+                tracing::info!(
+                    expires = response.expires_at,
+                    service = %response.service_name,
+                    "Received SVID certificate"
+                );
+                if let Err(e) =
+                    install_received_svid(&workload_mgr, &pending_keys, &response).await
+                {
                     tracing::error!(error = %e, "Failed to install SVID");
                 }
             }
@@ -369,6 +573,10 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
                     trust_domain = %bundle.trust_domain,
                     "Received trust bundle"
                 );
+                // Update trust domain from server's authoritative value
+                if !bundle.trust_domain.is_empty() {
+                    workload_mgr.set_trust_domain(&bundle.trust_domain).await;
+                }
                 let pem = String::from_utf8_lossy(&bundle.ca_certificate_pem);
                 if let Err(e) = workload_mgr.set_trust_bundle(&pem).await {
                     tracing::error!(error = %e, "Failed to install trust bundle");
@@ -397,6 +605,28 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
                     tracing::error!(error = %e, "Policy application failed");
                 }
             }
+            Some(ServerPayload::AttestChallenge(challenge)) => {
+                tracing::debug!(
+                    challenge_len = challenge.challenge_data.len(),
+                    "Received attestation challenge (handled via Attest RPC)"
+                );
+                // Attestation challenges are handled via the Attest RPC flow, not the stream.
+            }
+            Some(ServerPayload::FleetKey(key_update)) => {
+                tracing::info!(version = key_update.version, "Received fleet encryption key");
+                if key_update.encrypted_key.len() == 32 {
+                    let mut key = [0u8; 32];
+                    key.copy_from_slice(&key_update.encrypted_key);
+                    let mut inj = secret_injector.write().await;
+                    inj.update_key(&key);
+                    tracing::info!(version = key_update.version, "Fleet encryption key installed");
+                } else {
+                    tracing::warn!(
+                        len = key_update.encrypted_key.len(),
+                        "Invalid fleet key length (expected 32 bytes)"
+                    );
+                }
+            }
             None => {}
         }
     }
@@ -406,24 +636,47 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
 }
 
 /// Install an SVID received from the server's CertificateResponse.
-/// Extracts the service name from the certificate CN.
+///
+/// If a pending keypair exists for this service (proper CSR flow), the cert
+/// is paired with the local private key. Otherwise falls back to the legacy
+/// combined cert+key format.
 async fn install_received_svid(
     mgr: &WorkloadManager,
+    pending_keys: &Arc<RwLock<PendingKeyStore>>,
     response: &crate::proto::CertificateResponse,
 ) -> Result<(), std::io::Error> {
-    let cert_pem = String::from_utf8(response.certificate.clone())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    // Determine service name: prefer the explicit field, fall back to CN extraction
+    let service_name = if !response.service_name.is_empty() {
+        response.service_name.clone()
+    } else {
+        let cert_pem = String::from_utf8(response.certificate.clone())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        extract_cn_from_pem(&cert_pem).unwrap_or_else(|| "unknown".to_string())
+    };
 
-    // Extract service name from the certificate's CN (first line of PEM content)
-    let service_name = extract_cn_from_pem(&cert_pem).unwrap_or_else(|| "unknown".to_string());
+    // Check if we have a pending keypair for this service (proper CSR flow)
+    let local_keypair = pending_keys.write().await.take(&service_name);
 
-    mgr.install_svid(
-        &service_name,
-        &response.certificate,
-        &response.chain,
-        response.expires_at,
-    )
-    .await?;
+    if let Some(keypair) = local_keypair {
+        // Proper CSR flow: pair server-signed cert with our local private key
+        let cert_pem = String::from_utf8(response.certificate.clone())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let chain_pem = String::from_utf8(response.chain.clone())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let key_pem = keypair.serialize_pem();
+
+        mgr.install_svid_split(&service_name, &cert_pem, &key_pem, &chain_pem, response.expires_at)
+            .await?;
+    } else {
+        // Legacy flow: cert+key combined from server
+        mgr.install_svid(
+            &service_name,
+            &response.certificate,
+            &response.chain,
+            response.expires_at,
+        )
+        .await?;
+    }
 
     Ok(())
 }

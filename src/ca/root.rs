@@ -2,8 +2,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rcgen::{
-    BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
-    KeyUsagePurpose, SanType, SerialNumber,
+    BasicConstraints, CertificateParams, CertificateSigningRequestParams, DnType,
+    ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, SanType, SerialNumber,
 };
 use ring::rand::{SecureRandom, SystemRandom};
 use tokio::sync::RwLock;
@@ -189,6 +189,174 @@ impl RootCa {
         );
 
         // Return: leaf cert+key PEM combined, CA chain PEM, expiry
+        let leaf_pem = format!("{}\n{}", leaf_cert.pem(), leaf_keypair.serialize_pem());
+        let chain_pem = ca_cert_pem.clone();
+
+        Ok((leaf_pem.into_bytes(), chain_pem.into_bytes(), expires_at))
+    }
+
+    /// Sign a PKCS#10 Certificate Signing Request.
+    ///
+    /// The CSR's signature is validated (proving the requester holds the private key),
+    /// then a certificate is issued using the public key from the CSR. The private key
+    /// never leaves the requester — only the public key is embedded in the certificate.
+    ///
+    /// Returns (cert_pem, chain_pem, expires_at_epoch). Unlike `issue_certificate`,
+    /// the returned cert_pem does NOT contain the private key.
+    pub async fn sign_csr(
+        &self,
+        csr_der: &[u8],
+        service_name: &str,
+        store_path: Option<&str>,
+    ) -> Result<(Vec<u8>, Vec<u8>, u64), CaError> {
+        let state = self.inner.read().await;
+
+        let keypair = state.root_keypair.as_ref().ok_or(CaError::NotInitialized)?;
+        let ca_cert_pem = state
+            .root_cert_pem
+            .as_ref()
+            .ok_or(CaError::NotInitialized)?;
+
+        // Workload attestation: verify the Nix store path if provided
+        if let Some(path) = store_path
+            && !path.starts_with("/nix/store/")
+        {
+            return Err(CaError::AttestationFailed("invalid store path".into()));
+        }
+
+        // Parse and validate the CSR (this verifies the signature)
+        let csr_der_typed = rustls_pki_types::CertificateSigningRequestDer::from(csr_der.to_vec());
+        let mut csr_params = CertificateSigningRequestParams::from_der(&csr_der_typed)
+            .map_err(|e| CaError::InvalidCsr(format!("failed to parse CSR: {e}")))?;
+
+        // Override TTL and serial on the CSR's params
+        let expires_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            + state.default_ttl.as_secs();
+
+        // Set validity period on the CSR params
+        csr_params.params.not_after = time::OffsetDateTime::now_utc()
+            + time::Duration::seconds(state.default_ttl.as_secs() as i64);
+
+        let serial = generate_serial()?;
+        csr_params.params.serial_number = Some(serial);
+
+        // Parse the CA cert for signing
+        let ca_cert_params = CertificateParams::from_ca_cert_pem(ca_cert_pem)
+            .map_err(|e| CaError::Signing(format!("parse CA cert: {e}")))?;
+        let ca_cert = ca_cert_params
+            .self_signed(keypair)
+            .map_err(|e| CaError::Signing(format!("reconstruct CA cert: {e}")))?;
+
+        // Sign the CSR with the CA key — the cert uses the CSR's public key
+        let signed_cert = csr_params
+            .signed_by(&ca_cert, keypair)
+            .map_err(|e| CaError::Signing(format!("sign CSR: {e}")))?;
+
+        let spiffe_uri = format!("spiffe://{}/service/{}", state.domain, service_name);
+        tracing::info!(
+            service = %service_name,
+            spiffe = %spiffe_uri,
+            ttl = ?state.default_ttl,
+            "Certificate issued from CSR"
+        );
+
+        // Return cert PEM only (no private key — it stays with the requester)
+        let cert_pem = signed_cert.pem();
+        let chain_pem = ca_cert_pem.clone();
+
+        Ok((cert_pem.into_bytes(), chain_pem.into_bytes(), expires_at))
+    }
+
+    /// Issue a certificate for the server with a SPIFFE SVID identity.
+    ///
+    /// Returns (cert_pem + key_pem combined, chain_pem, expires_at).
+    /// The server SVID uses `spiffe://<domain>/server/<server_id>`.
+    pub async fn issue_server_svid(
+        &self,
+        server_id: &str,
+    ) -> Result<(Vec<u8>, Vec<u8>, u64), CaError> {
+        let state = self.inner.read().await;
+        let spiffe_name = format!("server/{server_id}");
+        let spiffe_uri = format!("spiffe://{}/{}", state.domain, spiffe_name);
+        drop(state);
+
+        // Issue a certificate with both the server hostname and SPIFFE URI as SANs
+        self.issue_certificate_with_uri(&format!("ekafleet-server-{server_id}"), &spiffe_uri)
+            .await
+    }
+
+    /// Issue a leaf certificate with a custom SPIFFE URI SAN.
+    async fn issue_certificate_with_uri(
+        &self,
+        cn: &str,
+        spiffe_uri: &str,
+    ) -> Result<(Vec<u8>, Vec<u8>, u64), CaError> {
+        let state = self.inner.read().await;
+
+        let keypair = state.root_keypair.as_ref().ok_or(CaError::NotInitialized)?;
+        let ca_cert_pem = state
+            .root_cert_pem
+            .as_ref()
+            .ok_or(CaError::NotInitialized)?;
+
+        let expires_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            + state.default_ttl.as_secs();
+
+        let leaf_keypair = KeyPair::generate()
+            .map_err(|e| CaError::Signing(format!("leaf keypair generation: {e}")))?;
+
+        let mut leaf_params = CertificateParams::new(vec![cn.to_string()])
+            .map_err(|e| CaError::Signing(format!("leaf cert params: {e}")))?;
+        leaf_params
+            .distinguished_name
+            .push(DnType::CommonName, cn);
+        leaf_params
+            .distinguished_name
+            .push(DnType::OrganizationName, "ekafleet");
+        leaf_params.subject_alt_names.push(SanType::URI(
+            spiffe_uri
+                .to_string()
+                .try_into()
+                .map_err(|e| CaError::Signing(format!("invalid SPIFFE URI: {e}")))?,
+        ));
+        leaf_params
+            .extended_key_usages
+            .push(ExtendedKeyUsagePurpose::ServerAuth);
+        leaf_params
+            .extended_key_usages
+            .push(ExtendedKeyUsagePurpose::ClientAuth);
+        leaf_params
+            .key_usages
+            .push(KeyUsagePurpose::DigitalSignature);
+        leaf_params.not_after = time::OffsetDateTime::now_utc()
+            + time::Duration::seconds(state.default_ttl.as_secs() as i64);
+
+        let serial = generate_serial()?;
+        leaf_params.serial_number = Some(serial);
+
+        let ca_cert_params = CertificateParams::from_ca_cert_pem(ca_cert_pem)
+            .map_err(|e| CaError::Signing(format!("parse CA cert: {e}")))?;
+        let ca_cert = ca_cert_params
+            .self_signed(keypair)
+            .map_err(|e| CaError::Signing(format!("reconstruct CA cert: {e}")))?;
+
+        let leaf_cert = leaf_params
+            .signed_by(&leaf_keypair, &ca_cert, keypair)
+            .map_err(|e| CaError::Signing(format!("sign leaf cert: {e}")))?;
+
+        tracing::info!(
+            cn = %cn,
+            spiffe = %spiffe_uri,
+            ttl = ?state.default_ttl,
+            "SVID certificate issued"
+        );
+
         let leaf_pem = format!("{}\n{}", leaf_cert.pem(), leaf_keypair.serialize_pem());
         let chain_pem = ca_cert_pem.clone();
 
@@ -427,6 +595,72 @@ mod tests {
         assert!(
             (295..=305).contains(&diff),
             "TTL should be ~300s, got {diff}s"
+        );
+    }
+
+    #[tokio::test]
+    async fn sign_csr_produces_valid_cert() {
+        let ca = initialized_ca().await;
+
+        // Generate a CSR
+        let csr_output =
+            crate::ca::csr::generate_service_csr("test.internal", "csr-svc").unwrap();
+
+        // Sign the CSR
+        let (cert_pem, chain_pem, expires_at) = ca
+            .sign_csr(&csr_output.csr_der, "csr-svc", None)
+            .await
+            .unwrap();
+
+        let cert_str = String::from_utf8(cert_pem).unwrap();
+        let chain_str = String::from_utf8(chain_pem).unwrap();
+
+        // Cert PEM should NOT contain a private key (private key stays with requester)
+        assert!(cert_str.contains("BEGIN CERTIFICATE"), "must contain cert");
+        assert!(
+            !cert_str.contains("PRIVATE KEY"),
+            "must NOT contain private key"
+        );
+        assert!(chain_str.contains("BEGIN CERTIFICATE"), "chain must exist");
+        assert!(expires_at > 0);
+
+        // Parse the certificate and verify it
+        let der = pem_to_der(&cert_str).unwrap();
+        let (_, cert) = x509_parser::parse_x509_certificate(&der).unwrap();
+        let cn = cert
+            .subject()
+            .iter_common_name()
+            .next()
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert_eq!(cn, "csr-svc");
+    }
+
+    #[tokio::test]
+    async fn issue_server_svid_has_spiffe_uri() {
+        let ca = initialized_ca().await;
+
+        let (cert_pem, _, _) = ca.issue_server_svid("srv-001").await.unwrap();
+        let cert_str = String::from_utf8(cert_pem).unwrap();
+
+        // Extract SPIFFE ID from the cert
+        let spiffe_id =
+            crate::proxy::mtls::SpiffeAuthorizer::extract_spiffe_id_from_pem(&cert_str);
+        assert_eq!(
+            spiffe_id.as_deref(),
+            Some("spiffe://test.internal/server/srv-001")
+        );
+    }
+
+    #[tokio::test]
+    async fn sign_csr_rejects_invalid_csr() {
+        let ca = initialized_ca().await;
+
+        let result = ca.sign_csr(b"not-a-real-csr", "svc", None).await;
+        assert!(
+            matches!(result, Err(CaError::InvalidCsr(_))),
+            "invalid CSR must be rejected"
         );
     }
 }

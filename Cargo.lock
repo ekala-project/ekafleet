@@ -542,6 +542,7 @@ dependencies = [
  "reqwest",
  "ring",
  "rustls-pemfile",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "sqlx",

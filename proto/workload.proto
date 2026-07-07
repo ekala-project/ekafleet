@@ -1,0 +1,86 @@
+syntax = "proto3";
+
+package spiffe.workload;
+
+// SPIFFE Workload API — subset compatible with the official SPIFFE spec.
+// Served over a Unix domain socket at /run/ekafleet/workload-api.sock.
+//
+// Workloads connect to this API using go-spiffe, rust-spiffe, or any
+// SPIFFE-compatible library with SPIFFE_ENDPOINT_SOCKET env var.
+service SpiffeWorkloadAPI {
+  // Fetch X.509-SVIDs for this workload. The server identifies the caller
+  // via Unix socket peer credentials (PID → systemd unit → service name).
+  // Returns a stream that pushes new SVIDs on renewal.
+  rpc FetchX509SVID(X509SVIDRequest) returns (stream X509SVIDResponse);
+
+  // Fetch X.509 trust bundles for the trust domain.
+  // Returns a stream that pushes updates when the CA rotates.
+  rpc FetchX509Bundles(X509BundlesRequest) returns (stream X509BundlesResponse);
+
+  // Fetch a JWT-SVID for the workload (future).
+  rpc FetchJWTSVID(JWTSVIDRequest) returns (JWTSVIDResponse);
+
+  // Validate a JWT-SVID (future).
+  rpc ValidateJWTSVID(ValidateJWTSVIDRequest) returns (ValidateJWTSVIDResponse);
+
+  // Fetch JWT trust bundles (future).
+  rpc FetchJWTBundles(JWTBundlesRequest) returns (stream JWTBundlesResponse);
+}
+
+message X509SVIDRequest {}
+
+message X509SVIDResponse {
+  repeated X509SVID svids = 1;
+}
+
+message X509SVID {
+  // The SPIFFE ID (e.g., spiffe://fleet.internal/service/my-app)
+  string spiffe_id = 1;
+  // X.509 certificate chain (leaf + intermediates), DER-encoded
+  bytes x509_svid = 2;
+  // Private key for the SVID, DER-encoded
+  bytes x509_svid_key = 3;
+  // Trust bundle for the trust domain, DER-encoded CA certs
+  bytes bundle = 4;
+}
+
+message X509BundlesRequest {}
+
+message X509BundlesResponse {
+  // Map of trust domain → DER-encoded CA certificate bundle
+  map<string, bytes> bundles = 1;
+}
+
+message JWTSVIDRequest {
+  repeated string audience = 1;
+  string spiffe_id = 2;
+}
+
+message JWTSVIDResponse {
+  repeated JWTSVID svids = 1;
+}
+
+message JWTSVID {
+  string spiffe_id = 1;
+  string svid = 2;  // JWT token
+}
+
+message ValidateJWTSVIDRequest {
+  string audience = 1;
+  string svid = 2;
+}
+
+message ValidateJWTSVIDResponse {
+  string spiffe_id = 1;
+  JWTSVIDClaims claims = 2;
+}
+
+message JWTSVIDClaims {
+  map<string, string> claims = 1;
+}
+
+message JWTBundlesRequest {}
+
+message JWTBundlesResponse {
+  map<string, bytes> bundles = 1;
+}

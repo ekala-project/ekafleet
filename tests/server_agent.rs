@@ -43,7 +43,8 @@ async fn start_server() -> (SocketAddr, SocketAddr, String, String) {
     let tls_config = tonic::transport::ServerTlsConfig::new().identity(identity);
 
     let fleet_state = ekafleet::server::state::FleetState::new();
-    let service = ekafleet::server::api::FleetControlService::new(fleet_state.clone());
+    let service =
+        ekafleet::server::api::FleetControlService::new(fleet_state.clone(), "fleet.internal");
 
     let expected_token = format!("Bearer {token}");
     #[allow(clippy::result_large_err)]

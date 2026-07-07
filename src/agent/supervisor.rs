@@ -120,12 +120,21 @@ impl Supervisor {
     ) -> Result<(), SupervisorError> {
         tokio::fs::create_dir_all(&self.unit_dir).await?;
 
-        let env_lines: String = spec
+        let mut env_entries: Vec<String> = spec
             .environment
             .iter()
             .map(|(k, v)| format!("Environment={k}={v}"))
-            .collect::<Vec<_>>()
-            .join("\n");
+            .collect();
+
+        // SPIFFE Workload API socket path for go-spiffe / rust-spiffe libraries
+        env_entries.push(format!(
+            "Environment=SPIFFE_ENDPOINT_SOCKET=unix://{}",
+            crate::spiffe::socket::DEFAULT_SOCKET_PATH
+        ));
+        // Service name for workload attestation (PID → service mapping fallback)
+        env_entries.push(format!("Environment=EKAFLEET_SERVICE={}", spec.name));
+
+        let env_lines = env_entries.join("\n");
 
         let unit_content = format!(
             r#"[Unit]

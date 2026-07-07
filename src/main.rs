@@ -36,6 +36,10 @@ enum Command {
         /// Bearer token required for agent authentication
         #[arg(long, env = "EKAFLEET_TOKEN")]
         token: String,
+
+        /// SPIFFE trust domain for fleet identities
+        #[arg(long, default_value = "fleet.internal")]
+        domain: String,
     },
 
     /// Start in agent mode (data plane)
@@ -44,9 +48,13 @@ enum Command {
         #[arg(long)]
         join: String,
 
-        /// Authentication token
-        #[arg(long)]
+        /// Authentication token (legacy — use --join-token for SPIFFE attestation)
+        #[arg(long, default_value = "")]
         token: String,
+
+        /// One-time join token for SPIFFE node attestation (replaces --token)
+        #[arg(long)]
+        join_token: Option<String>,
 
         /// Data directory for local state
         #[arg(long, default_value = "/var/lib/ekafleet")]
@@ -220,6 +228,7 @@ async fn main() -> anyhow::Result<()> {
             listen,
             http_listen,
             token,
+            domain,
         } => {
             let peer_list: Vec<String> = peers
                 .map(|p| p.split(',').map(String::from).collect())
@@ -231,6 +240,7 @@ async fn main() -> anyhow::Result<()> {
                 grpc_listen: listen,
                 http_listen,
                 token,
+                domain,
             };
 
             server::run(config).await?;
@@ -239,6 +249,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Agent {
             join,
             token,
+            join_token,
             data_dir,
             ca_cert,
         } => {
@@ -250,6 +261,7 @@ async fn main() -> anyhow::Result<()> {
             let config = agent::AgentConfig {
                 server_addr: join,
                 token,
+                join_token,
                 data_dir,
                 ca_cert_pem,
             };

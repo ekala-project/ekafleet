@@ -6,7 +6,7 @@ pub mod scaling;
 pub mod scheduler;
 pub mod state;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use state::FleetState;
 
@@ -19,6 +19,8 @@ pub struct ServerConfig {
     pub grpc_listen: String,
     pub http_listen: String,
     pub token: String,
+    /// Trust domain for SPIFFE identities (e.g., "fleet.internal").
+    pub domain: String,
 }
 
 pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
@@ -33,8 +35,8 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     let grpc_addr = config.grpc_listen.parse()?;
     let http_addr = config.http_listen.parse()?;
 
-    // Initialize the fleet CA
-    let ca = RootCa::new("fleet.internal");
+    // Initialize the fleet CA with configurable trust domain
+    let ca = RootCa::new(&config.domain);
 
     // Try to load persisted CA key/cert, or generate new ones
     let ca_key_path = config.data_dir.join("ca-key.pem");
@@ -71,9 +73,13 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         tracing::info!("CA key and certificate persisted to disk");
     }
 
-    // Issue a server certificate for gRPC TLS
+    // Generate or load server identity
+    let server_id = get_server_id(&config.data_dir)?;
+    tracing::info!(server_id = %server_id, domain = %config.domain, "Server identity established");
+
+    // Issue a server SVID for gRPC TLS: spiffe://<domain>/server/<server-id>
     let (server_cert_pem, ca_chain_pem, _expires_at) =
-        ca.issue_certificate("ekafleet-server", &[], None).await?;
+        ca.issue_server_svid(&server_id).await?;
 
     let tls = api::TlsConfig {
         cert_pem: String::from_utf8(server_cert_pem)?,
@@ -85,6 +91,9 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
 
     let trust_bundle_pem = ca.root_certificate_pem().await.unwrap_or_default();
 
+    // Generate or load fleet encryption key for secret distribution
+    let fleet_key = get_or_create_fleet_key(&config.data_dir)?;
+
     let fleet_state = FleetState::new();
 
     // Start gRPC and HTTP servers concurrently
@@ -95,7 +104,10 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
             &config.token,
             &tls,
             cert_issuer,
+            ca,
             trust_bundle_pem,
+            &config.domain,
+            fleet_key,
         ),
         api::serve_http(http_addr, config.token.clone()),
     );
@@ -104,4 +116,56 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     http_result?;
 
     Ok(())
+}
+
+/// Get or create a persistent fleet encryption key (256-bit).
+fn get_or_create_fleet_key(data_dir: &Path) -> anyhow::Result<Vec<u8>> {
+    let key_path = data_dir.join("fleet-key");
+    if key_path.exists() {
+        let hex_str = std::fs::read_to_string(&key_path)?.trim().to_string();
+        let key: Vec<u8> = (0..hex_str.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex_str[i..i + 2], 16))
+            .collect::<Result<Vec<u8>, _>>()
+            .map_err(|e| anyhow::anyhow!("invalid fleet key hex: {e}"))?;
+        if key.len() != 32 {
+            anyhow::bail!("fleet key must be 32 bytes, got {}", key.len());
+        }
+        tracing::info!("Fleet encryption key loaded from disk");
+        Ok(key)
+    } else {
+        use ring::rand::{SecureRandom, SystemRandom};
+        let rng = SystemRandom::new();
+        let mut key = [0u8; 32];
+        rng.fill(&mut key)
+            .map_err(|_| anyhow::anyhow!("RNG failure"))?;
+        if let Some(parent) = key_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+        std::fs::write(&key_path, &hex)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            std::fs::set_permissions(&key_path, perms)?;
+        }
+        tracing::info!("Fleet encryption key generated and persisted");
+        Ok(key.to_vec())
+    }
+}
+
+/// Get or create a persistent server identity (UUIDv4).
+fn get_server_id(data_dir: &Path) -> anyhow::Result<String> {
+    let id_path = data_dir.join("server-id");
+    if id_path.exists() {
+        Ok(std::fs::read_to_string(&id_path)?.trim().to_string())
+    } else {
+        let id = uuid::Uuid::new_v4().to_string();
+        if let Some(parent) = id_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&id_path, &id)?;
+        Ok(id)
+    }
 }

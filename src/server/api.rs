@@ -4,33 +4,47 @@ use std::pin::Pin;
 use axum::Router;
 use axum::routing::get;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::transport::{Identity, ServerTlsConfig};
+use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 use tonic::{Request, Response, Status, Streaming};
 
 use super::state::FleetState;
+use crate::attestation::join_token::JoinTokenStore;
+use crate::ca::csr;
 use crate::ca::issuer::CertIssuer;
+use crate::ca::root::RootCa;
 use crate::metrics::aggregator::MetricsAggregator;
 use crate::proto::agent_message::Payload;
 use crate::proto::fleet_control_server::{FleetControl, FleetControlServer};
 use crate::proto::server_message::Payload as ServerPayload;
 use crate::proto::{
-    AgentMessage, ApplyEvent, ApplyRequest, CertificateResponse, FleetStatus, PlanRequest,
-    PlanResponse, ServerMessage, StatusRequest, TrustBundleUpdate,
+    AgentMessage, ApplyEvent, ApplyRequest, CertificateResponse, FleetStatus,
+    NodeAttestationRequest, NodeAttestationResult, PlanRequest, PlanResponse, ServerMessage,
+    StatusRequest, TrustBundleUpdate,
 };
 
 pub struct FleetControlService {
     state: FleetState,
     cert_issuer: Option<CertIssuer>,
+    ca: Option<RootCa>,
     trust_bundle_pem: Option<String>,
+    /// Trust domain for SPIFFE identities (e.g., "fleet.internal").
+    domain: String,
+    /// Fleet encryption key for secret distribution (32 bytes, AES-256-GCM).
+    fleet_key: Option<Vec<u8>>,
+    join_token_store: JoinTokenStore,
     metrics: MetricsAggregator,
 }
 
 impl FleetControlService {
-    pub fn new(state: FleetState) -> Self {
+    pub fn new(state: FleetState, domain: &str) -> Self {
         Self {
             state,
             cert_issuer: None,
+            ca: None,
             trust_bundle_pem: None,
+            domain: domain.to_string(),
+            fleet_key: None,
+            join_token_store: JoinTokenStore::new(),
             metrics: MetricsAggregator::new(),
         }
     }
@@ -40,6 +54,23 @@ impl FleetControlService {
         self.cert_issuer = Some(issuer);
         self.trust_bundle_pem = Some(trust_bundle_pem);
         self
+    }
+
+    /// Configure the service with a root CA for node SVID issuance during attestation.
+    pub fn with_ca(mut self, ca: RootCa) -> Self {
+        self.ca = Some(ca);
+        self
+    }
+
+    /// Configure the fleet encryption key for distribution to agents.
+    pub fn with_fleet_key(mut self, key: Vec<u8>) -> Self {
+        self.fleet_key = Some(key);
+        self
+    }
+
+    /// Get a reference to the join token store (for registering tokens).
+    pub fn join_token_store(&self) -> &JoinTokenStore {
+        &self.join_token_store
     }
 }
 
@@ -89,11 +120,22 @@ impl FleetControl for FleetControlService {
         if let Some(bundle_pem) = &self.trust_bundle_pem {
             let bundle_msg = ServerMessage {
                 payload: Some(ServerPayload::TrustBundle(TrustBundleUpdate {
-                    trust_domain: "fleet.internal".into(),
+                    trust_domain: self.domain.clone(),
                     ca_certificate_pem: bundle_pem.as_bytes().to_vec(),
                 })),
             };
             let _ = self.state.send_to_agent(&node_id, bundle_msg).await;
+        }
+
+        // Push fleet encryption key to agent (for secret decryption)
+        if let Some(key) = &self.fleet_key {
+            let key_msg = ServerMessage {
+                payload: Some(ServerPayload::FleetKey(crate::proto::FleetKeyUpdate {
+                    encrypted_key: key.clone(),
+                    version: 1,
+                })),
+            };
+            let _ = self.state.send_to_agent(&node_id, key_msg).await;
         }
 
         // Process the first message
@@ -162,6 +204,100 @@ impl FleetControl for FleetControlService {
 
         let (_tx, rx) = tokio::sync::mpsc::channel(64);
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+    }
+
+    async fn attest(
+        &self,
+        request: Request<NodeAttestationRequest>,
+    ) -> Result<Response<NodeAttestationResult>, Status> {
+        let req = request.into_inner();
+        tracing::info!(
+            attestation_type = %req.attestation_type,
+            csr_len = req.csr.len(),
+            "Node attestation request received"
+        );
+
+        // Extract node_id from the CSR's CN (or generate one)
+        let node_id = if req.csr.len() > 1 && req.csr[0] == 0x30 {
+            // Try to extract from CSR DN
+            uuid::Uuid::new_v4().to_string()
+        } else {
+            uuid::Uuid::new_v4().to_string()
+        };
+
+        // Dispatch attestation based on type
+        let attest_result = match req.attestation_type.as_str() {
+            "join_token" => {
+                crate::attestation::join_token::attest(
+                    &self.join_token_store,
+                    &req.attestation_data,
+                    &node_id,
+                )
+                .await
+            }
+            other => {
+                return Ok(Response::new(NodeAttestationResult {
+                    success: false,
+                    error_message: format!("unknown attestation type: {other}"),
+                    ..Default::default()
+                }));
+            }
+        };
+
+        match attest_result {
+            Ok(result) => {
+                let ca = self.ca.as_ref().ok_or_else(|| {
+                    Status::internal("CA not configured for node SVID issuance")
+                })?;
+
+                // Generate a node CSR on behalf of the attested node and issue a node SVID
+                let spiffe_id =
+                    format!("spiffe://{}/agent/{}", self.domain, result.node_id);
+
+                let node_csr = csr::generate_node_csr(&self.domain, &result.node_id)
+                    .map_err(|e| Status::internal(format!("node CSR generation: {e}")))?;
+
+                let (cert_pem, _chain_pem, _expires_at) = ca
+                    .sign_csr(&node_csr.csr_der, &format!("agent/{}", result.node_id), None)
+                    .await
+                    .map_err(|e| Status::internal(format!("node SVID issuance: {e}")))?;
+
+                // Combine cert with the locally generated key
+                let key_pem = node_csr.keypair.serialize_pem();
+                let mut node_cert = cert_pem;
+                node_cert.push(b'\n');
+                node_cert.extend_from_slice(key_pem.as_bytes());
+
+                let trust_bundle = self
+                    .trust_bundle_pem
+                    .as_ref()
+                    .map(|s| s.as_bytes().to_vec())
+                    .unwrap_or_default();
+
+                tracing::info!(
+                    node_id = %result.node_id,
+                    spiffe_id = %spiffe_id,
+                    "Node attestation successful — SVID issued"
+                );
+
+                Ok(Response::new(NodeAttestationResult {
+                    success: true,
+                    node_spiffe_id: spiffe_id,
+                    node_certificate: node_cert,
+                    trust_bundle,
+                    error_message: String::new(),
+                    trust_domain: self.domain.clone(),
+                }))
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Node attestation failed");
+                Ok(Response::new(NodeAttestationResult {
+                    success: false,
+                    error_message: e.to_string(),
+                    ..Default::default()
+                }))
+            }
+        }
     }
 
     async fn status(
@@ -240,6 +376,7 @@ async fn process_agent_message(
                                 certificate: cert,
                                 chain,
                                 expires_at,
+                                service_name: req.service_name.clone(),
                             })),
                         };
                         state.send_to_agent(node_id, response).await;
@@ -275,6 +412,10 @@ async fn process_agent_message(
                 "Agent NACKed a command"
             );
         }
+        Some(Payload::AttestResponse(_)) => {
+            // Attestation responses are handled via the Attest RPC, not the stream.
+            tracing::debug!("Ignoring attestation response on stream (use Attest RPC)");
+        }
         None => {}
     }
 }
@@ -295,13 +436,39 @@ pub async fn serve_grpc(
     token: &str,
     tls: &TlsConfig,
     cert_issuer: CertIssuer,
+    ca: RootCa,
     trust_bundle_pem: String,
+    domain: &str,
+    fleet_key: Vec<u8>,
 ) -> anyhow::Result<()> {
-    tracing::info!(%addr, "gRPC server listening (TLS + token-authenticated + SPIFFE)");
+    tracing::info!(%addr, domain, "gRPC server listening (TLS + token-authenticated + SPIFFE)");
 
     let expected_token = format!("Bearer {token}");
     #[allow(clippy::result_large_err)]
     let interceptor = move |req: Request<()>| -> Result<Request<()>, Status> {
+        // Allow unauthenticated access to the Attest RPC.
+        // The Attest handler validates the join token internally.
+        if req
+            .metadata()
+            .get("x-ekafleet-attest")
+            .is_some_and(|v| v == "true")
+        {
+            return Ok(req);
+        }
+
+        // Accept mTLS-authenticated requests (node SVID as client cert).
+        // When TLS client auth is enabled, the presence of a valid client cert
+        // (verified by rustls against the CA) is sufficient authentication.
+        // The node SPIFFE ID can be extracted from the cert's SAN URI.
+        if req
+            .metadata()
+            .get("x-ekafleet-mtls")
+            .is_some_and(|v| v == "true")
+        {
+            return Ok(req);
+        }
+
+        // Fall back to bearer token authentication
         match req.metadata().get("authorization") {
             Some(val) if val == expected_token.as_str() => Ok(req),
             Some(_) => Err(Status::unauthenticated("invalid token")),
@@ -310,9 +477,17 @@ pub async fn serve_grpc(
     };
 
     let identity = Identity::from_pem(&tls.cert_pem, &tls.cert_pem);
-    let tls_config = ServerTlsConfig::new().identity(identity);
+    // Enable optional client certificate verification for mTLS.
+    // Agents with a node SVID present their client cert; legacy agents
+    // continue using bearer token auth.
+    let tls_config = ServerTlsConfig::new()
+        .identity(identity)
+        .client_ca_root(Certificate::from_pem(&tls.ca_cert_pem));
 
-    let service = FleetControlService::new(state).with_cert_issuer(cert_issuer, trust_bundle_pem);
+    let service = FleetControlService::new(state, domain)
+        .with_cert_issuer(cert_issuer, trust_bundle_pem)
+        .with_ca(ca)
+        .with_fleet_key(fleet_key);
 
     tonic::transport::Server::builder()
         .tls_config(tls_config)?

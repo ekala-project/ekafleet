@@ -62,6 +62,26 @@ impl WorkloadManager {
         }
     }
 
+    /// Get the current trust domain string.
+    pub async fn trust_domain_str(&self) -> Option<String> {
+        let state = self.inner.read().await;
+        Some(state.trust_domain.clone())
+    }
+
+    /// Update the trust domain. Called when the agent receives
+    /// a TrustBundleUpdate from the server with the authoritative domain.
+    pub async fn set_trust_domain(&self, domain: &str) {
+        let mut state = self.inner.write().await;
+        if state.trust_domain != domain {
+            tracing::info!(
+                old = %state.trust_domain,
+                new = %domain,
+                "SPIFFE trust domain updated"
+            );
+            state.trust_domain = domain.to_string();
+        }
+    }
+
     /// Update the CA trust bundle. Called when the agent receives
     /// the CA certificate from the server.
     pub async fn set_trust_bundle(&self, ca_cert_pem: &str) -> Result<(), std::io::Error> {
@@ -86,8 +106,33 @@ impl WorkloadManager {
         state.trust_bundle_pem.clone()
     }
 
+    /// Install an X.509-SVID for a service from separate cert and key PEM.
+    ///
+    /// This is the preferred method when the agent generates its own keypair
+    /// (proper CSR flow). The private key never leaves the agent.
+    ///
+    /// Writes files to `<data_dir>/spiffe/<service_name>/` with
+    /// restrictive permissions.
+    pub async fn install_svid_split(
+        &self,
+        service_name: &str,
+        cert_pem_str: &str,
+        key_pem_str: &str,
+        chain_pem_str: &str,
+        expires_at: u64,
+    ) -> Result<PathBuf, std::io::Error> {
+        let cert_pem = cert_pem_str.to_string();
+        let key_pem = key_pem_str.to_string();
+        let chain = chain_pem_str.to_string();
+        self.write_svid(service_name, cert_pem, key_pem, chain, expires_at)
+            .await
+    }
+
     /// Install an X.509-SVID for a service. The certificate material is
     /// split from the combined cert+key PEM returned by the CA.
+    ///
+    /// This is the legacy method used when the server generates the keypair.
+    /// Prefer `install_svid_split` for the proper CSR flow.
     ///
     /// Writes files to `<data_dir>/spiffe/<service_name>/` with
     /// restrictive permissions.
@@ -106,6 +151,19 @@ impl WorkloadManager {
         // Split the combined PEM into cert and key
         let (cert_pem, key_pem) = split_cert_and_key(&combined)?;
 
+        self.write_svid(service_name, cert_pem, key_pem, chain, expires_at)
+            .await
+    }
+
+    /// Shared implementation for writing SVID material to disk and updating state.
+    async fn write_svid(
+        &self,
+        service_name: &str,
+        cert_pem: String,
+        key_pem: String,
+        chain: String,
+        expires_at: u64,
+    ) -> Result<PathBuf, std::io::Error> {
         let svc_dir = self.data_dir.join(service_name);
         tokio::fs::create_dir_all(&svc_dir).await?;
 

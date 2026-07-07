@@ -23,12 +23,6 @@ struct AuthzState {
     policies: HashMap<String, Vec<String>>,
 }
 
-impl Default for SpiffeAuthorizer {
-    fn default() -> Self {
-        Self::new("fleet.internal")
-    }
-}
-
 impl SpiffeAuthorizer {
     pub fn new(trust_domain: &str) -> Self {
         Self {

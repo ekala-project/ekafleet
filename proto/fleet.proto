@@ -15,6 +15,10 @@ service FleetControl {
 
   // Query fleet status.
   rpc Status(StatusRequest) returns (FleetStatus);
+
+  // Node attestation — unauthenticated, bypasses bearer token interceptor.
+  // Used by new agents to bootstrap identity via SPIFFE-style attestation.
+  rpc Attest(NodeAttestationRequest) returns (NodeAttestationResult);
 }
 
 // --- Agent → Server messages ---
@@ -27,6 +31,7 @@ message AgentMessage {
     CertificateRequest cert_request = 4;
     MetricsSummary metrics = 5;
     Nack nack = 6;
+    NodeAttestationResponse attest_response = 7;
   }
 }
 
@@ -88,6 +93,12 @@ message CertificateRequest {
   string node_id = 1;
   string service_name = 2;
   bytes csr = 3;
+  CertRequestType request_type = 4;
+}
+
+enum CertRequestType {
+  SERVICE_CERT = 0;  // Default: request an X.509-SVID for a service workload.
+  NODE_CERT = 1;     // Request a node SVID (spiffe://<domain>/agent/<node-id>).
 }
 
 message MetricsSummary {
@@ -119,6 +130,8 @@ message ServerMessage {
     PeerUpdate peers = 6;
     PolicyUpdate policy = 7;
     TrustBundleUpdate trust_bundle = 8;
+    NodeAttestationChallenge attest_challenge = 9;
+    FleetKeyUpdate fleet_key = 10;
   }
 }
 
@@ -225,6 +238,7 @@ message CertificateResponse {
   bytes certificate = 1;
   bytes chain = 2;
   uint64 expires_at = 3;
+  string service_name = 4;  // Which service/identity this certificate is for.
 }
 
 message PeerUpdate {
@@ -246,6 +260,42 @@ message NetworkPolicy {
   string source_service = 1;
   string target_service = 2;
   repeated uint32 allowed_ports = 3;
+}
+
+// --- Node Attestation ---
+
+// Request from agent to initiate SPIFFE-style node attestation.
+// Sent via the Attest RPC (unauthenticated — no bearer token required).
+message NodeAttestationRequest {
+  string attestation_type = 1;  // "join_token", "nix_store_path", "tpm"
+  bytes attestation_data = 2;   // Type-specific payload (e.g., the join token)
+  bytes csr = 3;                // PKCS#10 CSR for the node SVID
+}
+
+// Server-initiated challenge (e.g., TPM nonce) sent during attestation.
+message NodeAttestationChallenge {
+  bytes challenge_data = 1;
+}
+
+// Agent response to a server attestation challenge.
+message NodeAttestationResponse {
+  bytes response_data = 1;
+}
+
+// Result of node attestation, returned by the Attest RPC.
+message NodeAttestationResult {
+  bool success = 1;
+  string node_spiffe_id = 2;    // e.g., spiffe://fleet.internal/agent/<node-id>
+  bytes node_certificate = 3;   // Node SVID certificate PEM
+  bytes trust_bundle = 4;       // CA trust bundle PEM
+  string error_message = 5;
+  string trust_domain = 6;      // Trust domain for SPIFFE IDs
+}
+
+// Fleet encryption key distributed to agents over mTLS channel.
+message FleetKeyUpdate {
+  bytes encrypted_key = 1;      // Fleet encryption key (encrypted or plaintext over mTLS)
+  uint64 version = 2;           // Key version for rotation
 }
 
 // --- Plan / Apply / Status RPCs ---

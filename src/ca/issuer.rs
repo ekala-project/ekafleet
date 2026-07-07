@@ -79,7 +79,19 @@ impl CertIssuer {
             )));
         }
 
-        self.ca.issue_certificate(service_name, csr_der, None).await
+        // Detect real PKCS#10 CSR vs legacy dummy CSR.
+        // A real CSR starts with ASN.1 SEQUENCE tag (0x30).
+        if csr_der.len() > 1 && csr_der[0] == 0x30 {
+            // Real CSR: sign it (private key stays with the requester)
+            self.ca.sign_csr(csr_der, service_name, None).await
+        } else {
+            // Legacy dummy CSR (e.g., [0x01]): generate keypair server-side
+            tracing::warn!(
+                service = %service_name,
+                "Legacy CSR detected — server generating keypair (deprecated)"
+            );
+            self.ca.issue_certificate(service_name, csr_der, None).await
+        }
     }
 }
 
@@ -177,6 +189,57 @@ mod tests {
             let result = issuer.process_request("node-1", name, b"csr").await;
             assert!(result.is_ok(), "valid name '{name}' should be accepted");
         }
+    }
+
+    #[tokio::test]
+    async fn real_csr_uses_sign_csr_path() {
+        let issuer = test_issuer().await;
+        issuer
+            .update_assignments("node-1", vec!["csr-service".to_string()])
+            .await;
+
+        // Generate a real CSR
+        let csr_output =
+            crate::ca::csr::generate_service_csr("test.internal", "csr-service").unwrap();
+
+        let result = issuer
+            .process_request("node-1", "csr-service", &csr_output.csr_der)
+            .await;
+
+        assert!(result.is_ok(), "real CSR should be accepted");
+
+        // The returned cert should NOT contain a private key
+        let (cert, _chain, _expires) = result.unwrap();
+        let cert_str = String::from_utf8(cert).unwrap();
+        assert!(cert_str.contains("BEGIN CERTIFICATE"));
+        assert!(
+            !cert_str.contains("PRIVATE KEY"),
+            "cert from CSR signing must not contain private key"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_dummy_csr_still_works() {
+        let issuer = test_issuer().await;
+        issuer
+            .update_assignments("node-1", vec!["legacy-svc".to_string()])
+            .await;
+
+        // Legacy dummy CSR (0x01)
+        let result = issuer
+            .process_request("node-1", "legacy-svc", &[0x01])
+            .await;
+
+        assert!(result.is_ok(), "legacy dummy CSR should still work");
+
+        // The returned cert SHOULD contain a private key (legacy combined format)
+        let (cert, _chain, _expires) = result.unwrap();
+        let cert_str = String::from_utf8(cert).unwrap();
+        assert!(cert_str.contains("BEGIN CERTIFICATE"));
+        assert!(
+            cert_str.contains("PRIVATE KEY"),
+            "legacy cert must contain private key"
+        );
     }
 
     #[tokio::test]

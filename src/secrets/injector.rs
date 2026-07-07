@@ -121,6 +121,14 @@ impl SecretInjector {
         Ok(())
     }
 
+    /// Update the encryption key (e.g., when the server distributes the fleet key).
+    pub fn update_key(&mut self, new_key: &[u8; 32]) {
+        let unbound =
+            UnboundKey::new(&AES_256_GCM, new_key).expect("valid 256-bit key required");
+        self.key = Arc::new(LessSafeKey::new(unbound));
+        tracing::info!("Secret injector encryption key updated");
+    }
+
     fn secret_path(&self, service_name: &str, secret_name: &str) -> PathBuf {
         self.secrets_dir.join(service_name).join(secret_name)
     }
