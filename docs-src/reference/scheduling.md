@@ -1183,111 +1183,113 @@ Summary of all features with implementation status and priority.
 
 ### Scheduler Types
 
-| Feature | Nomad | K8s | Status | Priority |
-|---------|-------|-----|--------|----------|
-| Service (long-running) | `service` | Deployment | Implemented | — |
-| Batch (run-to-completion) | `batch` | Job | Partial (no exit-code handling) | High |
-| System (all nodes) | `system` | DaemonSet | Implemented (no auto-eval on join) | High |
-| Stateful (sticky) | — | StatefulSet | Partial (no sticky placement) | Medium |
-| Sysbatch (system+batch) | `sysbatch` | — | Missing | Medium |
-| Periodic / Cron | `periodic` | CronJob | Missing | Medium |
-| Parameterized / Dispatch | `parameterized` | — | Missing | Low |
+| Feature | Nomad | K8s | Status |
+|---------|-------|-----|--------|
+| Service (long-running) | `service` | Deployment | Implemented |
+| Batch (run-to-completion) | `batch` | Job | Implemented |
+| System (all nodes) | `system` | DaemonSet | Implemented |
+| Stateful (sticky) | — | StatefulSet | Implemented (config; sticky placement via affinity) |
+| Sysbatch (system+batch) | `sysbatch` | — | Implemented |
+| Periodic / Cron | `periodic` | CronJob | Implemented (config type; server-side loop TBD) |
+| Parameterized / Dispatch | `parameterized` | — | Not planned |
 
 ### Constraints
 
-| Feature | Status | Priority |
-|---------|--------|----------|
-| `=`, `!=` | Implemented | — |
-| `in`, `not_in` | Implemented | — |
-| `>`, `>=`, `<`, `<=` | Missing | High |
-| `regexp` | Missing | High |
-| `is_set`, `is_not_set` | Missing | High |
-| `set_contains`, `set_contains_any` | Missing | Medium |
-| `version` / `semver` | Missing | Low |
-| `distinct_hosts` (hard constraint) | Missing (scoring penalty only) | Medium |
-| `distinct_property` | Missing | Medium |
+| Feature | Status |
+|---------|--------|
+| `=`, `!=` | Implemented |
+| `in`, `not_in` | Implemented |
+| `>`, `>=`, `<`, `<=` | Implemented |
+| `regexp` | Implemented |
+| `is_set`, `is_not_set` | Implemented |
+| `set_contains`, `set_contains_any` | Implemented |
+| `version` / `semver` | Implemented |
+| `distinct_hosts` (hard constraint) | Implemented |
+| `distinct_property` | Implemented (via required spread with maxSkew) |
 
 ### Affinities
 
-| Feature | Status | Priority |
-|---------|--------|----------|
-| Basic affinity (=, !=) | Implemented | — |
-| Extended operators | Missing | Medium |
-| Anti-affinity (negative weight) | Implemented | — |
-| Service affinity (inter-service) | Missing | Medium |
+| Feature | Status |
+|---------|--------|
+| Basic affinity (=, !=) | Implemented |
+| Extended operators (>, <, regexp, etc.) | Implemented |
+| Anti-affinity (negative weight) | Implemented |
+| Service affinity (inter-service) | Implemented |
 
 ### Spread
 
-| Feature | Status | Priority |
-|---------|--------|----------|
-| Even distribution by attribute | Implemented | — |
-| Multiple spread blocks | Missing | High |
-| Target percentages | Missing | Medium |
-| maxSkew (topology spread) | Missing | Medium |
+| Feature | Status |
+|---------|--------|
+| Even distribution by attribute | Implemented |
+| Multiple spread blocks | Implemented |
+| Target percentages | Implemented |
+| maxSkew (topology spread) | Implemented |
+| minDomains | Implemented |
+| Required spread (hard constraint) | Implemented |
 
 ### Priority and Preemption
 
-| Feature | Status | Priority |
-|---------|--------|----------|
-| Service priority (1-100) | Missing | High |
-| Priority-ordered scheduling | Missing | High |
-| Preemption | Missing | Medium |
-| Non-preempting priority | Missing | Low |
+| Feature | Status |
+|---------|--------|
+| Service priority (1-100) | Implemented |
+| Priority-ordered scheduling | Implemented |
+| Preemption | Planned (PlacementPlan.preemptions field exists) |
+| Non-preempting priority | Planned |
 
 ### Taints and Tolerations
 
-| Feature | Status | Priority |
-|---------|--------|----------|
-| Machine taints (NoSchedule) | Missing | Medium |
-| Machine taints (PreferNoSchedule) | Missing | Medium |
-| Machine taints (NoExecute) | Missing | Medium |
-| Service tolerations | Missing | Medium |
-| Built-in taints (health-based) | Missing | Low |
+| Feature | Status |
+|---------|--------|
+| Machine taints (NoSchedule) | Implemented |
+| Machine taints (PreferNoSchedule) | Implemented |
+| Machine taints (NoExecute) | Implemented (config; runtime eviction TBD) |
+| Service tolerations | Implemented |
+| Built-in taints (health-based) | Planned |
 
 ### Resources
 
-| Feature | Status | Priority |
-|---------|--------|----------|
-| CPU request/limit | Implemented | — |
-| Memory request/limit | Implemented | — |
-| Disk scheduling | Missing | Medium |
-| Memory oversubscription | Missing | Low |
-| Extended resources (GPU) | Missing | Low |
+| Feature | Status |
+|---------|--------|
+| CPU request/limit | Implemented |
+| Memory request/limit | Implemented |
+| Disk scheduling | Implemented |
+| Memory oversubscription | Implemented (per-pool config) |
+| Extended resources (GPU) | Planned |
 
 ### Lifecycle
 
-| Feature | Status | Priority |
-|---------|--------|----------|
-| Restart policy (local) | Missing | High |
-| Reschedule policy (cross-node) | Missing | High |
-| Delay functions (exp/fib) | Missing | High |
+| Feature | Status |
+|---------|--------|
+| Restart policy (local) | Implemented (config; agent-side enforcement TBD) |
+| Reschedule policy (cross-node) | Implemented (config; server-side tracking TBD) |
+| Delay functions (constant/exp/fibonacci) | Implemented (config type) |
 
 ### Deployment
 
-| Feature | Status | Priority |
-|---------|--------|----------|
-| Rolling update | Implemented | — |
-| Canary | Implemented | — |
-| Blue-green | Implemented | — |
-| auto_promote | Missing | High |
-| progress_deadline | Missing | High |
-| Health check modes | Missing | Medium |
-| Configurable migration | Missing | Medium |
+| Feature | Status |
+|---------|--------|
+| Rolling update | Implemented |
+| Canary | Implemented |
+| Blue-green | Implemented |
+| auto_promote | Implemented |
+| progress_deadline | Implemented |
+| Health check modes (checks/taskStates/manual) | Implemented |
+| Configurable migration | Implemented |
 
 ### Node Pools
 
-| Feature | Status | Priority |
-|---------|--------|----------|
-| Named pools with labels | Implemented | — |
-| Pool affinity (soft) | Implemented | — |
-| Pool constraint (hard) | Implemented | — |
-| Pool scaling (advisory) | Implemented | — |
-| Per-pool scheduler algorithm | Missing | Medium |
+| Feature | Status |
+|---------|--------|
+| Named pools with labels | Implemented |
+| Pool affinity (soft) | Implemented |
+| Pool constraint (hard) | Implemented |
+| Pool scaling (advisory) | Implemented |
+| Per-pool scheduler algorithm (binpack/spread) | Implemented |
 
 ### Scheduling Architecture
 
-| Feature | Status | Priority |
-|---------|--------|----------|
-| Filter-score-select | Implemented | — |
-| Blocked placement tracking | Missing | High |
-| Scheduler performance tuning | Missing | Low |
+| Feature | Status |
+|---------|--------|
+| Filter-score-select | Implemented |
+| Blocked placement tracking | Implemented |
+| Scheduler performance tuning | Planned |
