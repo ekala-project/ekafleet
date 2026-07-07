@@ -538,6 +538,7 @@ dependencies = [
  "prost",
  "prost-types",
  "rcgen",
+ "regex",
  "reqwest",
  "ring",
  "rustls-pemfile",
