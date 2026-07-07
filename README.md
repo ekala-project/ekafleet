@@ -51,17 +51,40 @@ Fleet configuration is pure Nix, consumed via `nix eval`:
     name = "production";
     domain = "fleet.internal";
 
+    # Node pools group machines with shared scheduling properties
+    nodePools.default = { labels = { tier = "general"; }; };
+    nodePools.compute = {
+      labels = { tier = "compute-optimized"; };
+      schedulerAlgorithm = "binpack";  # or "spread"
+    };
+
     services.api-server = {
       command = "${pkgs.api-server}/bin/server";
       ports.http = { port = 8080; healthCheck.path = "/ready"; };
       resources = { cpu.request = 500; memory.request = 1024; };
-      scheduling = { replicas = 3; type = "service"; };
+      scheduling = {
+        replicas = 3;
+        type = "service";
+        priority = 70;                   # higher = scheduled first
+        pool = "default";                # soft pool preference
+        spread = [{ attribute = "labels.zone"; }];
+        constraints = [
+          { attribute = "labels.role"; op = "="; value = "app"; }
+        ];
+        update = {
+          strategy = "rolling";
+          autoRevert = true;
+          autoPromote = true;
+        };
+      };
     };
 
     machines.app-1 = {
       targetHost = "10.0.1.1";
+      pool = "default";
       labels = { role = "app"; zone = "us-east-1a"; };
       capacity = { cpu = 8000; memory = 16384; };
+      reserved = { cpu = 500; memory = 512; };  # OS overhead
     };
   };
 }
