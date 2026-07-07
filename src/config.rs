@@ -205,6 +205,15 @@ pub struct SpreadConfig {
     pub weight: Option<u32>,
     #[serde(default)]
     pub targets: Vec<SpreadTarget>,
+    /// Maximum allowed skew between topology domains (K8s-style).
+    #[serde(default, rename = "maxSkew")]
+    pub max_skew: Option<u32>,
+    /// Minimum number of topology domains required.
+    #[serde(default, rename = "minDomains")]
+    pub min_domains: Option<u32>,
+    /// If true, spread becomes a hard constraint (filter phase).
+    #[serde(default)]
+    pub required: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

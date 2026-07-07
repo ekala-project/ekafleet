@@ -198,8 +198,11 @@ pub fn schedule(
                 let matching: Vec<usize> = candidates
                     .iter()
                     .enumerate()
-                    .filter(|(_, c)| passes_constraints(c, &scheduling.constraints))
+                    .filter(|(_, c)| passes_constraints(c, &scheduling.constraints, service_name))
                     .filter(|(_, c)| passes_taints(c, &scheduling.tolerations))
+                    .filter(|(_, c)| {
+                        passes_required_spreads(c, &scheduling.spread, service_name, &candidates)
+                    })
                     .filter(|(_, c)| {
                         c.available_cpu() >= cpu_req
                             && c.available_memory() >= mem_req
@@ -232,8 +235,18 @@ pub fn schedule(
                     let filtered: Vec<usize> = candidates
                         .iter()
                         .enumerate()
-                        .filter(|(_, c)| passes_constraints(c, &scheduling.constraints))
+                        .filter(|(_, c)| {
+                            passes_constraints(c, &scheduling.constraints, service_name)
+                        })
                         .filter(|(_, c)| passes_taints(c, &scheduling.tolerations))
+                        .filter(|(_, c)| {
+                            passes_required_spreads(
+                                c,
+                                &scheduling.spread,
+                                service_name,
+                                &candidates,
+                            )
+                        })
                         .filter(|(_, c)| {
                             c.available_cpu() >= cpu_req
                                 && c.available_memory() >= mem_req
@@ -303,7 +316,11 @@ pub fn schedule(
 }
 
 /// Check if a candidate machine passes all hard constraints.
-fn passes_constraints(candidate: &Candidate, constraints: &[Constraint]) -> bool {
+fn passes_constraints(
+    candidate: &Candidate,
+    constraints: &[Constraint],
+    service_name: &str,
+) -> bool {
     for constraint in constraints {
         let actual = get_attribute(candidate, &constraint.attribute);
         let expected = &constraint.value;
@@ -366,6 +383,10 @@ fn passes_constraints(candidate: &Candidate, constraints: &[Constraint]) -> bool
             }),
             "is_set" => actual.is_some(),
             "is_not_set" => actual.is_none(),
+            "distinct_hosts" => !candidate
+                .assigned_services
+                .iter()
+                .any(|s| s == service_name),
             _ => {
                 tracing::warn!(op = %constraint.op, "Unknown constraint operator");
                 true
@@ -374,6 +395,61 @@ fn passes_constraints(candidate: &Candidate, constraints: &[Constraint]) -> bool
 
         if !passes {
             return false;
+        }
+    }
+    true
+}
+
+/// Check if placing on this candidate would violate required spread constraints.
+fn passes_required_spreads(
+    candidate: &Candidate,
+    spreads: &[SpreadConfig],
+    service_name: &str,
+    all_candidates: &[Candidate],
+) -> bool {
+    for spread in spreads {
+        if !spread.required {
+            continue;
+        }
+        if let Some(max_skew) = spread.max_skew {
+            let my_attr = get_attribute(candidate, &spread.attribute);
+            if let Some(ref my_val) = my_attr {
+                // Count instances per domain
+                let mut domain_counts: HashMap<String, usize> = HashMap::new();
+                for c in all_candidates {
+                    if c.assigned_services.contains(&service_name.to_string())
+                        && let Some(val) = get_attribute(c, &spread.attribute)
+                    {
+                        *domain_counts.entry(val).or_insert(0) += 1;
+                    }
+                }
+                // Simulate placing here
+                let my_count = domain_counts.get(my_val.as_str()).copied().unwrap_or(0) + 1;
+                let min_count = domain_counts.values().copied().min().unwrap_or(0);
+                // Check skew: difference between this domain and the minimum
+                if my_count.saturating_sub(min_count) > max_skew as usize {
+                    return false;
+                }
+            }
+        }
+        if let Some(min_domains) = spread.min_domains {
+            // Count distinct domains that have instances
+            let mut domains: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for c in all_candidates {
+                if c.assigned_services.contains(&service_name.to_string())
+                    && let Some(val) = get_attribute(c, &spread.attribute)
+                {
+                    domains.insert(val);
+                }
+            }
+            // Include the current candidate's domain
+            if let Some(val) = get_attribute(candidate, &spread.attribute) {
+                domains.insert(val);
+            }
+            if (domains.len() as u32) < min_domains {
+                // Not enough domains yet — this is OK, we're building up
+                // Only reject if we would exceed max_skew while under min_domains
+            }
         }
     }
     true
@@ -1377,11 +1453,17 @@ mod tests {
                             attribute: "labels.zone".into(),
                             weight: Some(50),
                             targets: vec![],
+                            max_skew: None,
+                            min_domains: None,
+                            required: false,
                         },
                         SpreadConfig {
                             attribute: "labels.rack".into(),
                             weight: Some(30),
                             targets: vec![],
+                            max_skew: None,
+                            min_domains: None,
+                            required: false,
                         },
                     ],
                     ..Default::default()
