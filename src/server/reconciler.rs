@@ -116,6 +116,16 @@ async fn compute_plan(
     let placement_plan =
         scheduler::schedule(&desired.services, &desired.machines, &desired.node_pools);
 
+    // Log blocked placements
+    for b in &placement_plan.blocked {
+        tracing::warn!(
+            service = %b.service_name,
+            instance = %b.instance_id,
+            reason = %b.reason,
+            "Placement blocked"
+        );
+    }
+
     // Group placements by service
     let mut placements_by_service: HashMap<String, Vec<Placement>> = HashMap::new();
     for p in placement_plan.placements {
@@ -238,14 +248,20 @@ async fn apply_plan(
                     strategy: service_cfg.scheduling.update.strategy.clone(),
                     max_parallel: service_cfg.scheduling.update.max_parallel,
                     placements: op.placements.clone(),
-                    store_path: service_cfg.command.clone(), // store path derived from command
+                    store_path: service_cfg.command.clone(),
                     auto_revert: service_cfg.scheduling.update.auto_revert,
+                    auto_promote: service_cfg.scheduling.update.auto_promote,
                     min_healthy_time: Duration::from_secs(
                         service_cfg.scheduling.update.min_healthy_time_secs,
                     ),
                     healthy_deadline: Duration::from_secs(
                         service_cfg.scheduling.update.healthy_deadline_secs,
                     ),
+                    progress_deadline: service_cfg
+                        .scheduling
+                        .update
+                        .progress_deadline_secs
+                        .map(Duration::from_secs),
                 };
 
                 deployer::execute(state, deploy_plan).await?;

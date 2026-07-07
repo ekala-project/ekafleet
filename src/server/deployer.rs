@@ -28,8 +28,10 @@ pub struct DeploymentPlan {
     pub placements: Vec<Placement>,
     pub store_path: String,
     pub auto_revert: bool,
+    pub auto_promote: bool,
     pub min_healthy_time: Duration,
     pub healthy_deadline: Duration,
+    pub progress_deadline: Option<Duration>,
 }
 
 /// Execute a deployment plan against the fleet.
@@ -44,25 +46,60 @@ pub async fn execute(state: &FleetState, plan: DeploymentPlan) -> Result<(), Dep
         "Starting deployment"
     );
 
-    match plan.strategy {
-        UpdateStrategy::Rolling => {
-            execute_rolling(state, &deployment_id, &plan).await?;
+    // If a progress deadline is set, wrap the deployment in a timeout
+    let result = if let Some(progress_deadline) = plan.progress_deadline {
+        match tokio::time::timeout(progress_deadline, async {
+            match plan.strategy {
+                UpdateStrategy::Rolling => execute_rolling(state, &deployment_id, &plan).await,
+                UpdateStrategy::Canary => execute_canary(state, &deployment_id, &plan).await,
+                UpdateStrategy::BlueGreen => execute_blue_green(state, &deployment_id, &plan).await,
+            }
+        })
+        .await
+        {
+            Ok(inner) => inner,
+            Err(_) => {
+                tracing::error!(
+                    deployment_id = %deployment_id,
+                    service = %plan.service_name,
+                    "Deployment exceeded progress deadline"
+                );
+                if plan.auto_revert {
+                    Err(DeployError::Reverted(
+                        "progress deadline exceeded".to_string(),
+                    ))
+                } else {
+                    Err(DeployError::HealthTimeout)
+                }
+            }
         }
-        UpdateStrategy::Canary => {
-            execute_canary(state, &deployment_id, &plan).await?;
+    } else {
+        match plan.strategy {
+            UpdateStrategy::Rolling => execute_rolling(state, &deployment_id, &plan).await,
+            UpdateStrategy::Canary => execute_canary(state, &deployment_id, &plan).await,
+            UpdateStrategy::BlueGreen => execute_blue_green(state, &deployment_id, &plan).await,
         }
-        UpdateStrategy::BlueGreen => {
-            execute_blue_green(state, &deployment_id, &plan).await?;
+    };
+
+    match &result {
+        Ok(()) => {
+            tracing::info!(
+                deployment_id = %deployment_id,
+                service = %plan.service_name,
+                "Deployment completed successfully"
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                deployment_id = %deployment_id,
+                service = %plan.service_name,
+                error = %e,
+                "Deployment failed"
+            );
         }
     }
 
-    tracing::info!(
-        deployment_id = %deployment_id,
-        service = %plan.service_name,
-        "Deployment completed successfully"
-    );
-
-    Ok(())
+    result
 }
 
 /// Rolling deployment: update instances in batches of max_parallel.
@@ -170,12 +207,20 @@ async fn execute_canary(
     )
     .await?;
 
-    tracing::info!(
-        deployment_id,
-        "Canary healthy, promoting to remaining instances"
-    );
+    if plan.auto_promote {
+        tracing::info!(
+            deployment_id,
+            "Canary healthy, auto-promoting to remaining instances"
+        );
+    } else {
+        tracing::info!(
+            deployment_id,
+            "Canary healthy, promoting to remaining instances"
+        );
+    }
 
-    // Deploy remaining
+    // Deploy remaining (auto_promote proceeds automatically; without it,
+    // a real implementation would wait for manual promotion via API)
     if plan.placements.len() > 1 {
         let remaining = &plan.placements[1..];
         let remaining_plan = DeploymentPlan {
@@ -185,8 +230,10 @@ async fn execute_canary(
             placements: remaining.to_vec(),
             store_path: plan.store_path.clone(),
             auto_revert: plan.auto_revert,
+            auto_promote: plan.auto_promote,
             min_healthy_time: plan.min_healthy_time,
             healthy_deadline: plan.healthy_deadline,
+            progress_deadline: plan.progress_deadline,
         };
         execute_rolling(state, deployment_id, &remaining_plan).await?;
     }
