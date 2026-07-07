@@ -7,34 +7,41 @@ This guide walks through setting up a minimal fleet with one server and one agen
 On your first machine, start ekafleet in server mode:
 
 ```bash
-ekafleet server --data-dir /var/lib/ekafleet
+ekafleet server --data-dir /var/lib/ekafleet --domain fleet.internal
 ```
 
 By default, the server listens on:
-- `0.0.0.0:7400` — gRPC (agent connections)
+- `0.0.0.0:7400` — gRPC (agent connections + Attest RPC)
 - `0.0.0.0:7402` — HTTP API (health, metrics)
+
+The `--domain` flag sets the SPIFFE trust domain (default: `fleet.internal`). The server generates a persistent identity and SPIFFE SVID (`spiffe://<domain>/server/<server-id>`).
 
 ## 2. Create a Join Token
 
-Generate an authentication token for agents:
+Generate a one-time join token for SPIFFE node attestation:
 
 ```bash
 ekafleet token create --type=agent
 ```
 
+This token can only be used once. After successful attestation, it is consumed and cannot be replayed.
+
 ## 3. Join an Agent
 
-On another machine, start the agent and join the server:
+On another machine, start the agent with the join token:
 
 ```bash
-ekafleet agent --join server-ip:7400 --token <TOKEN>
+ekafleet agent --join server-ip:7400 --join-token <TOKEN> --ca-cert /path/to/ca.pem
 ```
 
 The agent will:
-- Generate a unique node ID (persisted in `/var/lib/ekafleet/node-id`)
-- Establish a bidirectional gRPC stream to the server
-- Begin sending heartbeats every 5 seconds
-- Report its status every 10 seconds
+- Call the `Attest` RPC with the join token to bootstrap its SPIFFE identity
+- Receive a node SVID (`spiffe://<domain>/agent/<node-id>`) and persist it to disk
+- Establish a mTLS gRPC connection using the node SVID as client certificate
+- Start the SPIFFE Workload API socket at `/run/ekafleet/workload-api.sock`
+- Begin sending heartbeats every 5 seconds and reporting status every 10 seconds
+
+Legacy bearer token auth is still supported via `--token` for migration.
 
 ## 4. Write Fleet Configuration
 

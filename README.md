@@ -4,8 +4,8 @@ A single Rust binary that replaces the HashiCorp stack (Nomad + Consul + Vault) 
 
 ## Two Modes
 
-- **`ekafleet server`** — control plane: priority-based scheduling, CA, secrets, DNS authority, deployment orchestration, Raft consensus
-- **`ekafleet agent`** — data plane: service supervision, health checks, DNS resolver, secret injection, mesh networking, L7 proxy
+- **`ekafleet server`** — control plane: priority-based scheduling, CA, secrets, DNS authority, deployment orchestration, Raft consensus, node attestation
+- **`ekafleet agent`** — data plane: service supervision, health checks, DNS resolver, secret injection, mesh networking, SPIFFE Workload API, L7 proxy
 
 Server mode embeds all agent capabilities and can run workloads directly.
 
@@ -16,7 +16,7 @@ Server mode embeds all agent capabilities and can run workloads directly.
 | Nomad | `scheduler` + `deployer` + `scaling` |
 | Consul (DNS, Connect, KV) | `dns_authority` + `dns_resolver` + `wireguard` + `certs` + `raft` |
 | Vault (KV, PKI, Dynamic) | `secrets_store` + `ca_root` + `certs` |
-| SPIRE | `ca_root` (Nix store path attestation) |
+| SPIRE | `ca_root` + `attestation` + `workload_api` (SPIFFE Workload API, node attestation) |
 | cert-manager | `certs` (auto-renewal) |
 | external-dns | `dns_authority` |
 | nginx/Traefik | `proxy_l7` |
@@ -29,11 +29,14 @@ Server mode embeds all agent capabilities and can run workloads directly.
 # Install
 nix profile install .#ekafleet
 
-# Start server
-ekafleet server --data-dir /var/lib/ekafleet
+# Start server (with custom trust domain)
+ekafleet server --data-dir /var/lib/ekafleet --domain fleet.internal
 
-# Join an agent
+# Join an agent via SPIFFE node attestation (one-time join token)
 TOKEN=$(ekafleet token create --type=agent)
+ekafleet agent --join server:7400 --join-token $TOKEN --ca-cert /path/to/ca.pem
+
+# Or join with legacy bearer token auth
 ekafleet agent --join server:7400 --token $TOKEN
 
 # Deploy

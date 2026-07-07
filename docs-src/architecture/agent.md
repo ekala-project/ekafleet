@@ -1,14 +1,16 @@
 # Agent Mode
 
-Start with `ekafleet agent --join <server>:7400 --token <TOKEN>`. The agent runs the data plane on each fleet machine.
+Start with `ekafleet agent --join <server>:7400 --join-token <TOKEN> --ca-cert <CA>`. The agent runs the data plane on each fleet machine.
 
 ## Responsibilities
 
+- **Node identity** — Bootstraps via SPIFFE node attestation; maintains a node SVID for mTLS
 - **System activation** — Activates EkaOS/NixOS system closures (full OS deployment)
-- **Service supervision** — Generates and manages systemd unit files
+- **Service supervision** — Generates and manages systemd unit files (with `SPIFFE_ENDPOINT_SOCKET` and `EKAFLEET_SERVICE` env vars)
 - **Health checking** — Polls services with HTTP, TCP, or exec probes; reports to server
-- **SPIFFE identity** — Requests and installs X.509-SVIDs for each service
-- **Secret injection** — Decrypts and writes secrets to local files (mode 0400)
+- **SPIFFE identity** — Generates ECDSA P-256 keypairs, sends PKCS#10 CSRs, installs X.509-SVIDs (private keys never leave the agent)
+- **SPIFFE Workload API** — Serves SVIDs and trust bundles over Unix socket at `/run/ekafleet/workload-api.sock`
+- **Secret injection** — Decrypts and writes secrets to local files (mode 0400) using fleet encryption key
 - **DNS resolution** — Local UDP listener (127.0.0.53:53) for fleet service discovery
 - **Mesh networking** — Manages kernel WireGuard interface and peers
 - **Network policy** — Applies nftables rules from identity contracts
@@ -18,10 +20,13 @@ Start with `ekafleet agent --join <server>:7400 --token <TOKEN>`. The agent runs
 ## Connection Lifecycle
 
 1. Agent validates server address and generates a persistent node ID (`<data-dir>/node-id`)
-2. Opens a TLS gRPC connection with bearer token authentication
-3. Sends initial heartbeat to identify itself
-4. Receives trust bundle (CA certificate) from server
-5. Begins receiving commands: desired state, deploy, secrets, DNS, certs, peers, policy
+2. Loads persisted node SVID if available (from previous attestation)
+3. If no node SVID and `--join-token` provided: calls `Attest` RPC to bootstrap SPIFFE identity
+4. Opens a mTLS gRPC connection using node SVID as client certificate (or falls back to bearer token with `--token`)
+5. Sends initial heartbeat to identify itself
+6. Receives trust bundle (CA certificate) and fleet encryption key from server
+7. Starts SPIFFE Workload API socket at `/run/ekafleet/workload-api.sock`
+8. Begins receiving commands: desired state, deploy, secrets, DNS, certs, peers, policy
 
 ## Periodic Tasks
 
@@ -30,14 +35,15 @@ Start with `ekafleet agent --join <server>:7400 --token <TOKEN>`. The agent runs
 | Heartbeat | 5 seconds | Report liveness + available resources (CPU/mem/disk) |
 | Status report | 10 seconds | Report running services |
 | Health report | 10 seconds | Report service health check results |
-| SVID renewal | 60 seconds | Re-request certificates nearing expiry |
+| SVID renewal | 60 seconds | Re-request certificates nearing expiry (generates fresh CSR + keypair) |
+| Workload API | Continuous | Serve SVIDs and bundles to workloads via Unix socket |
 
 ## Message Handling
 
 When the agent receives a `DesiredState` message:
 
 1. **System activation** — If `system_path` changed, activate the new closure via `{toplevel}/bin/activate switch`
-2. **SVID requests** — Request X.509 certificates for each assigned service
+2. **SVID requests** — Generate keypair + PKCS#10 CSR for each service, send to server for signing
 3. **Health checks** — Start health checking for services with health_check specs
 4. **Service reconciliation** — Start/stop/restart systemd units to match desired state
 
@@ -48,8 +54,10 @@ Other messages:
 | `Deploy` | Update service store path, re-reconcile |
 | `Secret` | Decrypt and write to `<data-dir>/secrets/<svc>/<name>` |
 | `Dns` | Update local resolver cache |
-| `Cert` | Install SVID via WorkloadManager |
-| `TrustBundle` | Update CA bundle in all SPIFFE directories |
+| `Cert` | Pair server-signed cert with local keypair, install SVID |
+| `TrustBundle` | Update trust domain + CA bundle in all SPIFFE directories |
+| `FleetKey` | Install fleet encryption key for SecretInjector |
+| `AttestChallenge` | Handle attestation challenge (TPM, future) |
 | `Peers` | Add/update/remove WireGuard peers |
 | `Policy` | Generate and apply nftables rules |
 

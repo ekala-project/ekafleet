@@ -4,8 +4,8 @@ ekafleet is a single Rust binary that replaces the entire HashiCorp stack (Nomad
 
 ## One Binary, Two Modes
 
-- **`ekafleet server`** — Control plane: scheduling, CA, secrets, DNS authority, deployment orchestration, Raft consensus
-- **`ekafleet agent`** — Data plane: system activation, service supervision, health checks, DNS resolver, secret injection, mesh networking, SPIFFE identity, L7 proxy
+- **`ekafleet server`** — Control plane: scheduling, CA, secrets, DNS authority, deployment orchestration, Raft consensus, node attestation
+- **`ekafleet agent`** — Data plane: system activation, service supervision, health checks, DNS resolver, secret injection, mesh networking, SPIFFE Workload API, L7 proxy
 
 Server mode embeds all agent capabilities, meaning a server node can also run workloads. This follows the same pattern as k3s and Nomad.
 
@@ -18,7 +18,7 @@ Running a production fleet typically requires deploying and maintaining a dozen 
 - **Predictable latency** — Rust's zero-cost abstractions and no GC
 - **Nix-native** — fleet configuration is pure Nix, consumed via `nix eval`
 - **OS deployment** — activates full EkaOS/NixOS system closures, not just services
-- **Secure by default** — TLS everywhere, SPIFFE workload identity, encrypted secrets at rest, workload attestation via Nix store paths
+- **Secure by default** — mTLS everywhere, SPIFFE workload identity with standard Workload API, node attestation, encrypted secrets at rest, proper CSR flow (private keys never leave the workload)
 
 ## Design Principles
 
@@ -34,7 +34,7 @@ Running a production fleet typically requires deploying and maintaining a dozen 
 |----------|-------------|
 | Scheduling | Priority-based placement, constraints, affinities, spread, taints/tolerations, node pools |
 | Deployment | Rolling, canary, blue-green; health-gated; auto-revert; auto-promote; OS activation |
-| Identity | SPIFFE X.509-SVIDs, automatic renewal, mTLS enforcement |
+| Identity | SPIFFE X.509-SVIDs, Workload API (UDS), node attestation, mTLS bootstrap, automatic renewal |
 | Secrets | Static (encrypted), dynamic (PostgreSQL/MySQL credential rotation), transit encryption |
 | Networking | WireGuard mesh, DNS authority + resolver, nftables policy |
 | Proxy | L7 HTTP routing, traffic splitting, upstream health tracking |

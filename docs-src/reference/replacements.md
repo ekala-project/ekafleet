@@ -11,7 +11,7 @@ ekafleet consolidates many separate tools into a single binary.
 | **Vault KV** | Static secrets | `secrets_store` |
 | **Vault PKI** | Certificate authority | `ca_root` + `certs` |
 | **Vault Dynamic** | Database credentials | `secrets_store` (dynamic engine) |
-| **SPIRE** | Workload attestation | `ca_root` (Nix store path verification) |
+| **SPIRE** | Workload attestation, Workload API | `ca_root` + `attestation` + `workload_api` (full SPIFFE Workload API, node attestation, CSR signing) |
 | **cert-manager** | TLS automation | `certs` (auto-renewal) |
 | **external-dns** | DNS record management | `dns_authority` |
 | **nginx / Traefik** | Reverse proxy, ingress | `proxy_l7` |

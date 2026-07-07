@@ -17,6 +17,7 @@ ekafleet server [OPTIONS]
 | `--listen` | `0.0.0.0:7400` | gRPC listen address |
 | `--http-listen` | `0.0.0.0:7402` | HTTP API listen address |
 | `--token` | *(required)* | Bearer token for agent authentication (also reads `EKAFLEET_TOKEN` env) |
+| `--domain` | `fleet.internal` | SPIFFE trust domain for fleet identities |
 
 ### `ekafleet agent`
 
@@ -29,7 +30,8 @@ ekafleet agent [OPTIONS]
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--join` | *(required)* | Server address to join (host:port) |
-| `--token` | *(required)* | Authentication token |
+| `--token` | | Legacy bearer token for authentication |
+| `--join-token` | | One-time join token for SPIFFE node attestation (preferred) |
 | `--data-dir` | `/var/lib/ekafleet` | Data directory for local state |
 | `--ca-cert` | | Path to CA certificate PEM for TLS verification |
 

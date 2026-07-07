@@ -4,13 +4,19 @@
 
 | Port | Protocol | Used By | Purpose |
 |------|----------|---------|---------|
-| 7400 | TCP (gRPC) | Server + Agent | Server API, agent ↔ server communication |
+| 7400 | TCP (gRPC) | Server + Agent | Server API, agent ↔ server communication, Attest RPC |
 | 7401 | UDP | Server + Agent | Gossip (SWIM membership protocol) |
 | 7402 | TCP (HTTP) | Server | HTTP API (health, metrics) |
 | 53 | UDP/TCP | Server + Agent | DNS (authority on server, resolver on agent) |
 | 51820 | UDP | Server + Agent | WireGuard mesh |
 | 80 | TCP | Agent (ingress) | L7 proxy HTTP |
 | 443 | TCP | Agent (ingress) | L7 proxy HTTPS |
+
+## Unix Sockets
+
+| Path | Protocol | Used By | Purpose |
+|------|----------|---------|---------|
+| `/run/ekafleet/workload-api.sock` | gRPC (UDS) | Agent | SPIFFE Workload API (FetchX509SVID, FetchX509Bundles) |
 
 ## Firewall Requirements
 

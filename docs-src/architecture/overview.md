@@ -11,6 +11,7 @@ ekafleet is a single binary with two operational modes. Server mode includes all
 │  │                                                                │  │
 │  │  supervisor   health     dns_resolver   wireguard   nftables   │  │
 │  │  secrets_inj  metrics    proxy_l7       gossip      certs      │  │
+│  │  workload_api                                                  │  │
 │  └───────────────────────────────────────────────────────────────┘  │
 │                                                                     │
 │  ┌───────────────────────────────────────────────────────────────┐  │
@@ -18,6 +19,7 @@ ekafleet is a single binary with two operational modes. Server mode includes all
 │  │                                                                │  │
 │  │  scheduler    nix_eval    raft      ca_root     dns_authority  │  │
 │  │  deployer     secrets_store         scaling     api            │  │
+│  │  attestation                                                   │  │
 │  └───────────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -37,7 +39,8 @@ ekafleet is a single binary with two operational modes. Server mode includes all
 | **metrics** | Scrapes local service metrics, collects node metrics |
 | **proxy_l7** | HTTP reverse proxy with routing and TLS termination |
 | **gossip** | SWIM-based membership and service catalog propagation |
-| **certs** | Certificate request/renewal from built-in CA |
+| **certs** | CSR generation, certificate request/renewal from built-in CA |
+| **workload_api** | SPIFFE Workload API over Unix domain socket |
 
 ### Server Mode Only
 
@@ -46,8 +49,9 @@ ekafleet is a single binary with two operational modes. Server mode includes all
 | **scheduler** | Priority-based placement with constraints, affinities, taints, spread |
 | **nix_eval** | Evaluates fleet.nix via `nix eval` |
 | **raft** | Consensus for server HA (3-node) |
-| **ca_root** | Root Certificate Authority, issues SPIFFE certs |
-| **dns_authority** | Authoritative DNS for `fleet.internal` |
+| **ca_root** | Root Certificate Authority, signs CSRs, issues SPIFFE SVIDs |
+| **attestation** | Node attestation (join token, future: TPM, Nix store path) |
+| **dns_authority** | Authoritative DNS for the fleet domain |
 | **deployer** | Rolling/canary/blue-green deployment orchestration |
 | **secrets_store** | Encrypted secret storage (Raft-backed) |
 | **scaling** | Autoscaling engine based on metrics |
