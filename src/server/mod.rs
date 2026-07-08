@@ -96,6 +96,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     let fleet_key = get_or_create_fleet_key(&config.data_dir)?;
 
     let fleet_state = FleetState::new();
+    let event_store = events::EventStore::new();
 
     // Initialize RBAC token store with the startup token as admin
     let token_store = rbac::TokenStore::new();
@@ -107,7 +108,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     let (grpc_result, http_result) = tokio::join!(
         api::serve_grpc(
             grpc_addr,
-            fleet_state,
+            fleet_state.clone(),
             token_store.clone(),
             &tls,
             cert_issuer,
@@ -116,7 +117,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
             &config.domain,
             fleet_key,
         ),
-        api::serve_http(http_addr, token_store),
+        api::serve_http(http_addr, fleet_state, event_store, token_store),
     );
 
     grpc_result?;
