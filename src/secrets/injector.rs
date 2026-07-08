@@ -128,9 +128,69 @@ impl SecretInjector {
         tracing::info!("Secret injector encryption key updated");
     }
 
+    /// Inject a secret and notify the service to reload if the value changed.
+    /// Sends the specified signal (default SIGHUP) to the service's systemd unit.
+    pub async fn inject_and_notify(
+        &mut self,
+        service_name: &str,
+        secret_name: &str,
+        encrypted_value: &[u8],
+        version: u64,
+        signal: Option<&str>,
+    ) -> Result<PathBuf, std::io::Error> {
+        // Check if already at this version
+        let was_updated = self
+            .injected
+            .get(service_name)
+            .and_then(|svc| svc.get(secret_name))
+            != Some(&version);
+
+        let path = self
+            .inject(service_name, secret_name, encrypted_value, version)
+            .await?;
+
+        if was_updated {
+            let sig = signal.unwrap_or("SIGHUP");
+            let unit = format!("ekafleet-{service_name}.service");
+            if let Err(e) = notify_service_reload(&unit, sig).await {
+                tracing::warn!(
+                    service = %service_name,
+                    signal = %sig,
+                    error = %e,
+                    "Failed to notify service of secret rotation"
+                );
+            } else {
+                tracing::info!(
+                    service = %service_name,
+                    signal = %sig,
+                    "Service notified of secret rotation"
+                );
+            }
+        }
+
+        Ok(path)
+    }
+
     fn secret_path(&self, service_name: &str, secret_name: &str) -> PathBuf {
         self.secrets_dir.join(service_name).join(secret_name)
     }
+}
+
+/// Send a signal to a systemd service unit to trigger reload.
+async fn notify_service_reload(unit: &str, signal: &str) -> Result<(), std::io::Error> {
+    let output = tokio::process::Command::new("systemctl")
+        .args(["kill", "--signal", signal, unit])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(std::io::Error::other(format!(
+            "systemctl kill failed: {}",
+            stderr.trim()
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

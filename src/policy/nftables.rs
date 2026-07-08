@@ -24,6 +24,22 @@ pub struct PolicyRule {
     pub description: String,
 }
 
+/// An egress network policy rule controlling outbound traffic from a service.
+#[derive(Debug, Clone)]
+pub struct EgressRule {
+    pub source_ip: Ipv4Addr,
+    pub dest_cidr: String,
+    pub dest_ports: Vec<u16>,
+    pub action: EgressAction,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EgressAction {
+    Allow,
+    Deny,
+}
+
 impl Default for PolicyEnforcer {
     fn default() -> Self {
         Self::new()
@@ -54,6 +70,11 @@ table inet {table} {{
         tcp dport 7400 accept
         # Allow HTTP API
         tcp dport 7402 accept
+    }}
+
+    chain output {{
+        type filter hook output priority 0; policy accept;
+        ct state established,related accept
     }}
 
     chain forward {{
@@ -106,6 +127,57 @@ table inet {table} {{
         self.apply_ruleset(&ruleset).await?;
 
         tracing::info!(rules = rules.len(), "Network policies applied");
+        Ok(())
+    }
+
+    /// Apply egress rules controlling outbound traffic from services.
+    pub async fn apply_egress(&self, rules: &[EgressRule]) -> Result<(), NftError> {
+        let mut nft_rules = Vec::new();
+
+        for rule in rules {
+            let action = match rule.action {
+                EgressAction::Allow => "accept",
+                EgressAction::Deny => "drop",
+            };
+
+            let desc: String = rule
+                .description
+                .chars()
+                .filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '-' || *c == '_')
+                .take(128)
+                .collect();
+
+            if rule.dest_ports.is_empty() {
+                nft_rules.push(format!(
+                    "add rule inet {table} output ip saddr {src} ip daddr {dst} {action} comment \"{desc}\"",
+                    table = self.table_name,
+                    src = rule.source_ip,
+                    dst = rule.dest_cidr,
+                ));
+            } else {
+                let ports: String = rule
+                    .dest_ports
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                nft_rules.push(format!(
+                    "add rule inet {table} output ip saddr {src} ip daddr {dst} tcp dport {{ {ports} }} {action} comment \"{desc}\"",
+                    table = self.table_name,
+                    src = rule.source_ip,
+                    dst = rule.dest_cidr,
+                ));
+            }
+        }
+
+        if nft_rules.is_empty() {
+            return Ok(());
+        }
+
+        let ruleset = nft_rules.join("\n");
+        self.apply_ruleset(&ruleset).await?;
+
+        tracing::info!(rules = rules.len(), "Egress policies applied");
         Ok(())
     }
 
