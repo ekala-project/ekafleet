@@ -33,6 +33,9 @@ pub struct ServiceConfig {
     /// Keys are destination paths, values are template definitions.
     #[serde(default)]
     pub templates: HashMap<String, TemplateConfig>,
+    /// Lifecycle hooks and shutdown configuration.
+    #[serde(default)]
+    pub lifecycle: LifecycleConfig,
 }
 
 /// A configuration file template that gets rendered with fleet context
@@ -595,6 +598,36 @@ pub struct ServiceAffinityConfig {
     pub topology_key: String,
     #[serde(default = "default_affinity_weight")]
     pub weight: i32,
+}
+
+/// Lifecycle hooks and shutdown configuration for a service.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LifecycleConfig {
+    /// Command to execute before stopping the service (pre-stop hook).
+    /// Runs before the shutdown signal is sent. If the command fails,
+    /// the service is still stopped.
+    #[serde(default, rename = "preStop")]
+    pub pre_stop: Option<Vec<String>>,
+    /// Command to execute after the service starts (post-start hook).
+    #[serde(default, rename = "postStart")]
+    pub post_start: Option<Vec<String>>,
+    /// Signal to send for graceful shutdown. Defaults to "SIGTERM".
+    #[serde(default = "default_stop_signal", rename = "stopSignal")]
+    pub stop_signal: String,
+    /// Seconds to wait after sending the stop signal before force-killing.
+    /// Defaults to 30 seconds.
+    #[serde(
+        default = "default_grace_period",
+        rename = "terminationGracePeriodSeconds"
+    )]
+    pub termination_grace_period_seconds: u64,
+}
+
+fn default_stop_signal() -> String {
+    "SIGTERM".to_string()
+}
+fn default_grace_period() -> u64 {
+    30
 }
 
 /// Disruption budget controls how many instances of a service can be

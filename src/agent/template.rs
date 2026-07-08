@@ -50,6 +50,15 @@ pub fn render(template: &str, ctx: &TemplateContext) -> String {
 }
 
 fn evaluate_expr(expr: &str, ctx: &TemplateContext) -> String {
+    // services "name" — comma-separated list (check before "service" to avoid prefix match)
+    if let Some(name) = strip_func(expr, "services") {
+        return ctx
+            .services
+            .get(name)
+            .map(|addrs| addrs.join(","))
+            .unwrap_or_default();
+    }
+
     // service "name" — first address
     if let Some(name) = strip_func(expr, "service") {
         return ctx
@@ -57,15 +66,6 @@ fn evaluate_expr(expr: &str, ctx: &TemplateContext) -> String {
             .get(name)
             .and_then(|addrs| addrs.first())
             .cloned()
-            .unwrap_or_default();
-    }
-
-    // services "name" — comma-separated list
-    if let Some(name) = strip_func(expr, "services") {
-        return ctx
-            .services
-            .get(name)
-            .map(|addrs| addrs.join(","))
             .unwrap_or_default();
     }
 

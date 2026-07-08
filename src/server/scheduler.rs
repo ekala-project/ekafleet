@@ -762,6 +762,7 @@ mod tests {
                 },
                 environment: HashMap::new(),
                 templates: HashMap::new(),
+                lifecycle: Default::default(),
             },
         )
     }
@@ -829,6 +830,7 @@ mod tests {
                 },
                 environment: HashMap::new(),
                 templates: HashMap::new(),
+                lifecycle: Default::default(),
             },
         )]
         .into();
@@ -872,6 +874,7 @@ mod tests {
                 },
                 environment: HashMap::new(),
                 templates: HashMap::new(),
+                lifecycle: Default::default(),
             },
         )]
         .into();
@@ -946,6 +949,7 @@ mod tests {
                 },
                 environment: HashMap::new(),
                 templates: HashMap::new(),
+                lifecycle: Default::default(),
             },
         )]
         .into();
@@ -1011,6 +1015,7 @@ mod tests {
                 },
                 environment: HashMap::new(),
                 templates: HashMap::new(),
+                lifecycle: Default::default(),
             },
         )]
         .into();
@@ -1082,6 +1087,7 @@ mod tests {
                 },
                 environment: HashMap::new(),
                 templates: HashMap::new(),
+                lifecycle: Default::default(),
             },
         )]
         .into();
@@ -1191,6 +1197,7 @@ mod tests {
                 },
                 environment: HashMap::new(),
                 templates: HashMap::new(),
+                lifecycle: Default::default(),
             },
         )]
         .into();
@@ -1277,6 +1284,7 @@ mod tests {
                 },
                 environment: HashMap::new(),
                 templates: HashMap::new(),
+                lifecycle: Default::default(),
             },
         )]
         .into();
@@ -1326,6 +1334,7 @@ mod tests {
                 },
                 environment: HashMap::new(),
                 templates: HashMap::new(),
+                lifecycle: Default::default(),
             },
         )]
         .into();
@@ -1372,6 +1381,7 @@ mod tests {
                 },
                 environment: HashMap::new(),
                 templates: HashMap::new(),
+                lifecycle: Default::default(),
             },
         )]
         .into();
@@ -1418,6 +1428,7 @@ mod tests {
                 },
                 environment: HashMap::new(),
                 templates: HashMap::new(),
+                lifecycle: Default::default(),
             },
         )]
         .into();
@@ -1481,6 +1492,7 @@ mod tests {
                 },
                 environment: HashMap::new(),
                 templates: HashMap::new(),
+                lifecycle: Default::default(),
             },
         )]
         .into();
@@ -1530,6 +1542,8 @@ mod tests {
                         ..Default::default()
                     },
                     environment: HashMap::new(),
+                    templates: HashMap::new(),
+                    lifecycle: Default::default(),
                 },
             ),
             (
@@ -1556,6 +1570,8 @@ mod tests {
                         ..Default::default()
                     },
                     environment: HashMap::new(),
+                    templates: HashMap::new(),
+                    lifecycle: Default::default(),
                 },
             ),
         ]
@@ -1632,6 +1648,7 @@ mod tests {
                 },
                 environment: HashMap::new(),
                 templates: HashMap::new(),
+                lifecycle: Default::default(),
             },
         )]
         .into();
@@ -1672,6 +1689,7 @@ mod tests {
                 },
                 environment: HashMap::new(),
                 templates: HashMap::new(),
+                lifecycle: Default::default(),
             },
         )]
         .into();

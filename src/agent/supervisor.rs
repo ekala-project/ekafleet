@@ -113,6 +113,8 @@ impl Supervisor {
     }
 
     /// Generate a systemd unit file from a service spec.
+    /// Supports lifecycle hooks: pre-stop, post-start, custom stop signal,
+    /// and configurable grace period.
     async fn write_unit_file(
         &self,
         unit_name: &str,
@@ -136,6 +138,45 @@ impl Supervisor {
 
         let env_lines = env_entries.join("\n");
 
+        // Extract lifecycle configuration
+        let lifecycle = spec.lifecycle.as_ref();
+        let stop_signal = lifecycle
+            .and_then(|l| {
+                if l.stop_signal.is_empty() {
+                    None
+                } else {
+                    Some(l.stop_signal.as_str())
+                }
+            })
+            .unwrap_or("SIGTERM");
+        let grace_period = lifecycle
+            .map(|l| l.termination_grace_period_seconds)
+            .unwrap_or(30);
+
+        // Build optional lifecycle directives
+        let mut extra_directives = Vec::new();
+
+        // Post-start hook: ExecStartPost runs after the main process starts
+        if let Some(lc) = lifecycle {
+            if !lc.post_start.is_empty() {
+                extra_directives.push(format!("ExecStartPost={}", lc.post_start.join(" ")));
+            }
+        }
+
+        // Pre-stop hook: ExecStop runs when systemd stops the unit.
+        // We run the hook first, then let systemd send KillSignal to the main process.
+        if let Some(lc) = lifecycle {
+            if !lc.pre_stop.is_empty() {
+                extra_directives.push(format!("ExecStop={}", lc.pre_stop.join(" ")));
+            }
+        }
+
+        // Custom kill signal and grace period
+        extra_directives.push(format!("KillSignal={stop_signal}"));
+        extra_directives.push(format!("TimeoutStopSec={grace_period}"));
+
+        let extra_lines = extra_directives.join("\n");
+
         let unit_content = format!(
             r#"[Unit]
 Description=ekafleet managed: {name}
@@ -146,6 +187,7 @@ Type=simple
 ExecStart={command}
 Restart=on-failure
 RestartSec=5
+{extra}
 {env}
 
 [Install]
@@ -153,6 +195,7 @@ WantedBy=multi-user.target
 "#,
             name = spec.name,
             command = spec.command,
+            extra = extra_lines,
             env = env_lines,
         );
 

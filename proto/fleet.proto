@@ -165,6 +165,20 @@ message ServiceSpec {
   HealthCheckSpec liveness_probe = 8;
   HealthCheckSpec readiness_probe = 9;
   HealthCheckSpec startup_probe = 10;
+
+  // Lifecycle hooks and shutdown configuration.
+  LifecycleHooks lifecycle = 11;
+}
+
+message LifecycleHooks {
+  // Command to run before stopping the service (pre-stop hook).
+  repeated string pre_stop = 1;
+  // Command to run after the service starts (post-start hook).
+  repeated string post_start = 2;
+  // Signal to send for graceful shutdown (e.g., "SIGTERM", "SIGQUIT").
+  string stop_signal = 3;
+  // Seconds to wait after stop signal before force-killing.
+  uint32 termination_grace_period_seconds = 4;
 }
 
 message ResourceRequirements {
