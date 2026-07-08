@@ -29,7 +29,9 @@ prost-types = "0.13"
 tokio-stream = { version = "0.1", features = ["net"] }
 
 # HTTP API & proxy
-axum = "0.8"
+axum = { version = "0.8", features = ["default"] }
+async-stream = "0.3"
+futures-core = "0.3"
 hyper = "1"
 hyper-util = { version = "0.1", features = ["client-legacy", "tokio", "http1", "http2"] }
 http-body-util = "0.1"

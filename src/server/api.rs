@@ -552,6 +552,7 @@ pub async fn serve_http(
         .route("/v1/events", get(rest_events))
         .route("/v1/deployments", get(rest_deployments))
         .route("/v1/deployments/{service}", get(rest_service_deployments))
+        .route("/v1/watch", get(rest_watch))
         .with_state(api_state)
         .layer(axum::middleware::from_fn_with_state(
             token_store,
@@ -728,4 +729,37 @@ async fn rest_service_deployments(
 #[derive(serde::Deserialize)]
 struct DeploymentsQuery {
     limit: Option<u32>,
+}
+
+/// GET /v1/watch — Server-Sent Events stream of fleet events.
+/// Polls the event store every 2 seconds and sends new events as SSE.
+async fn rest_watch(
+    axum::extract::State(state): axum::extract::State<HttpApiState>,
+) -> axum::response::Sse<
+    impl futures_core::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
+> {
+    use axum::response::sse;
+
+    let mut last_count = 0usize;
+    let stream = async_stream::stream! {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let events = state.event_store.query(None, None, 100).await;
+            let current_count = events.len();
+            if current_count > last_count {
+                let new_events = &events[..current_count - last_count];
+                for event in new_events {
+                    let data = serde_json::to_string(event).unwrap_or_default();
+                    yield Ok(sse::Event::default().data(data));
+                }
+                last_count = current_count;
+            }
+        }
+    };
+
+    axum::response::Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(std::time::Duration::from_secs(15))
+            .text("keep-alive"),
+    )
 }
