@@ -122,6 +122,27 @@ The `UpstreamPool` tracks backend health:
 - Backends recover when health checks pass again
 - Circuit breaker records success/failure for threshold tracking
 
+## Rate Limiting
+
+The proxy includes per-service rate limiting using a token bucket algorithm. Configure limits to prevent individual callers from overwhelming a service:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `requests_per_second` | 100 | Sustained request rate |
+| `burst` | 200 | Maximum burst capacity |
+
+When the rate limit is exceeded, the proxy returns `429 Too Many Requests`. Each service has its own independent token bucket that refills at the configured rate.
+
+## Session Affinity
+
+For stateful applications that need sticky routing, the proxy supports client-IP-based session affinity:
+
+- Requests from the same client IP are routed to the same backend
+- Sessions expire after a configurable TTL (default 1 hour)
+- When a sticky backend becomes unhealthy, the session is cleared and a new backend is selected
+
+Session affinity works alongside round-robin — the first request from a client gets round-robin selection, and subsequent requests within the TTL go to the same backend.
+
 ## mTLS Enforcement
 
 When the proxy receives a request from another fleet service (internal traffic), it can validate the caller's SPIFFE identity:
@@ -141,4 +162,5 @@ This enforces identity-based access control at the application layer.
 | Circuit breaker open | 503 Service Unavailable |
 | All backends unhealthy | 503 Service Unavailable |
 | All retry attempts failed | 502 Bad Gateway (backend marked unhealthy) |
+| Rate limit exceeded | 429 Too Many Requests |
 | Unauthorized caller (mTLS) | 403 Forbidden |

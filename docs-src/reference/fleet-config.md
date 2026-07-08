@@ -436,3 +436,87 @@ nodePools.<name> = {
   };
 };
 ```
+
+## ResourceQuota
+
+Per-pool or per-namespace resource quotas that prevent one service class from consuming all cluster resources:
+
+```nix
+resourceQuotas.default = {
+  maxCpu      = 16000;   # Maximum total CPU millicores in this scope
+  maxMemory   = 65536;   # Maximum total memory MB
+  maxDisk     = 500000;  # Maximum total disk MB (optional)
+  maxInstances = 50;     # Maximum number of service instances (optional)
+};
+```
+
+The scheduler checks quotas before allocating resources. If a new placement would exceed the quota, the placement is blocked with a descriptive error.
+
+## PolicyRule
+
+Organizational policies evaluated during `plan` and `apply` to enforce rules like "all production services must have at least 2 replicas":
+
+```nix
+policies = [
+  {
+    name = "min-replicas";
+    expression = "service.replicas >= 2";
+    message = "Production services must have at least 2 replicas";
+    enforcement = "enforce";  # "enforce" (block) or "warn" (log only)
+  }
+  {
+    name = "require-cpu-request";
+    expression = "service.resources.cpu.request > 0";
+    message = "All services must declare CPU resource requests";
+    enforcement = "warn";
+  }
+];
+```
+
+## WebhookConfig
+
+Outbound webhook notifications triggered by fleet events:
+
+```nix
+webhooks = [
+  {
+    name = "slack-deploys";
+    url = "http://webhook-proxy:8080/deploy";
+    events = [ "deployment" "rollback" ];
+    timeout_seconds = 10;
+  }
+];
+```
+
+## AlertRule
+
+Threshold-based alerting on collected metrics:
+
+```nix
+alerting.rules = [
+  {
+    name = "high-memory";
+    metric = "node_memory_usage_ratio";
+    threshold = 0.9;
+    op = "gt";
+    forSeconds = 300;
+    severity = "critical";
+    webhook_url = "http://alertmanager:9093/api/v1/alerts";
+  }
+];
+```
+
+## FederatedCluster
+
+Configuration for multi-region federation with peer clusters:
+
+```nix
+federation = [
+  {
+    name = "us-west";
+    address = "us-west-server:7400";
+    trustDomain = "us-west.fleet.internal";
+    discoveryEnabled = true;
+  }
+];
+```

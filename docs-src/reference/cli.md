@@ -1,6 +1,30 @@
 # CLI Reference
 
+## Global Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--output` / `-o` | `text` | Output format: `text` or `json` for machine-readable output |
+
+Use `--output json` with any command for structured JSON output suitable for scripting and CI/CD pipelines.
+
 ## Server & Agent
+
+### `ekafleet dev`
+
+Start in single-process development mode. Runs server + agent without TLS, WireGuard, or multi-machine setup. Ideal for testing fleet configurations locally.
+
+```
+ekafleet dev [OPTIONS]
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--data-dir` | `/tmp/ekafleet-dev` | Data directory |
+| `--http-listen` | `127.0.0.1:7402` | HTTP API listen address |
+| `--listen` | `127.0.0.1:7400` | gRPC listen address |
+
+A dev token (`dev-token`) is automatically generated and printed at startup.
 
 ### `ekafleet server`
 
@@ -143,6 +167,50 @@ SSH to a fleet machine. Queries fleet status for the machine's address and opens
 
 ```
 ekafleet ssh <MACHINE> [--server 127.0.0.1:7400]
+```
+
+## Disaster Recovery
+
+### `ekafleet snapshot`
+
+Take a Raft state snapshot for backup and disaster recovery.
+
+```
+ekafleet snapshot [OPTIONS]
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--output` | `ekafleet-snapshot.bin` | Path to save the snapshot |
+| `--server` | `127.0.0.1:7400` | Server address |
+
+### `ekafleet restore`
+
+Restore Raft state from a previously saved snapshot.
+
+```
+ekafleet restore <INPUT> [OPTIONS]
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--data-dir` | `/var/lib/ekafleet` | Data directory to restore into |
+
+## Shell Completions
+
+### `ekafleet completions`
+
+Generate shell completions for your shell. Supports `bash`, `zsh`, `fish`, `elvish`, and `powershell`.
+
+```bash
+# Bash
+ekafleet completions bash > /etc/bash_completion.d/ekafleet
+
+# Zsh
+ekafleet completions zsh > ~/.zfunc/_ekafleet
+
+# Fish
+ekafleet completions fish > ~/.config/fish/completions/ekafleet.fish
 ```
 
 ## Authentication & RBAC

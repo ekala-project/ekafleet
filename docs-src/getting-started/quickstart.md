@@ -2,7 +2,27 @@
 
 This guide walks through setting up a minimal fleet with one server and one agent.
 
-## 1. Start the Server
+## Local Development Mode
+
+For testing fleet configurations without real machines, TLS, or WireGuard:
+
+```bash
+ekafleet dev
+```
+
+This starts server + agent in a single process on `127.0.0.1`. A dev token is printed at startup. The data directory defaults to `/tmp/ekafleet-dev`.
+
+```bash
+# Check status
+curl -H "Authorization: Bearer dev-token" http://127.0.0.1:7402/v1/status
+
+# JSON output for scripting
+ekafleet status --server 127.0.0.1:7400 --output json
+```
+
+## Production Setup
+
+### 1. Start the Server
 
 On your first machine, start ekafleet in server mode:
 

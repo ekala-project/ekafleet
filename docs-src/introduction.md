@@ -32,16 +32,18 @@ Running a production fleet typically requires deploying and maintaining a dozen 
 
 | Category | Capabilities |
 |----------|-------------|
-| Scheduling | Priority-based placement, constraints, affinities, spread, taints/tolerations, node pools, disruption budgets |
-| Deployment | Rolling, canary, blue-green; health-gated; auto-revert; auto-promote; deployment history; OS activation |
+| Scheduling | Priority-based placement with preemption, constraints, affinities, spread, taints/tolerations, node pools, disruption budgets, resource quotas |
+| Deployment | Rolling, canary, blue-green; health-gated; auto-revert; auto-promote; deployment history; policy engine; OS activation |
 | Health | Separate liveness, readiness, and startup probes; configurable thresholds |
-| Security | RBAC (admin/operator/viewer), SPIFFE X.509-SVIDs, Workload API, node attestation, mTLS |
-| Secrets | Static (encrypted), dynamic (PostgreSQL/MySQL credential rotation), transit encryption |
-| Networking | WireGuard mesh, DNS authority + resolver, nftables policy |
-| Proxy | L7 HTTP (all methods) + L4 TCP proxy; circuit breaking; retries; traffic splitting |
+| Security | RBAC (admin/operator/viewer), SPIFFE X.509-SVIDs with trust domain federation, Workload API, node attestation, mTLS, audit logging, namespaces |
+| Secrets | Static (encrypted), dynamic (PostgreSQL/MySQL credential rotation), transit encryption, versioned rollback, rotation notification |
+| Networking | WireGuard mesh, DNS authority + resolver + external service registration, nftables ingress + egress policy |
+| Proxy | L7 HTTP + L4 TCP proxy; circuit breaking; retries; rate limiting; session affinity; traffic splitting; distributed tracing |
 | Config | Config file templating with service discovery, secrets, and fleet metadata interpolation |
 | Lifecycle | Pre-stop/post-start hooks, configurable stop signal, termination grace period |
-| Storage | Persistent volumes with provisioning, reclaim policies, and recovery on restart |
-| Observability | Prometheus scraping, node metrics, fleet-wide aggregation, event timeline, REST API |
-| Scaling | Metric-based autoscaling, manual scaling, pool-level scaling |
+| Storage | Persistent volumes with provisioning, snapshots, data migration, reclaim policies |
+| Observability | Prometheus scraping, node metrics, fleet-wide aggregation, event timeline, SSE streaming, alerting rules, webhook notifications, REST API, audit trail |
+| Scaling | Metric-based autoscaling, manual scaling, pool-level scaling, node maintenance windows, descheduler/rebalancer |
+| Operations | Structured CLI output (`-o json`), shell completions, disaster recovery (snapshot/restore), local dev mode |
+| Federation | Multi-region cluster federation, cross-cluster service discovery, SPIFFE trust domain federation |
 | HA | Raft consensus for server state, gossip for failure detection |

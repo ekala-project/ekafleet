@@ -93,6 +93,81 @@ The server exposes JSON REST endpoints alongside the gRPC API:
 
 All `/v1/` endpoints require a bearer token with at least `viewer` role permissions.
 
+### Event Streaming (SSE)
+
+For real-time event notifications without polling, use the Server-Sent Events endpoint:
+
+```bash
+curl -N -H "Authorization: Bearer $TOKEN" http://server:7402/v1/watch
+```
+
+The stream emits JSON events as they occur (deployments, health transitions, node joins/leaves, scaling actions). Each event is delivered as an SSE `data:` line. A keep-alive is sent every 15 seconds.
+
+## Audit Logging
+
+ekafleet records a structured audit trail of all control-plane actions for compliance (SOC2, HIPAA) and incident investigation.
+
+Each audit entry contains:
+
+| Field | Description |
+|-------|-------------|
+| `timestamp` | Unix epoch seconds |
+| `actor` | Who performed the action (token identity) |
+| `action` | What was done (`apply`, `plan`, `drain`, `scale`, `token_create`, `secret_write`, etc.) |
+| `resource` | Target resource (service name, node ID, secret name) |
+| `detail` | Human-readable description |
+| `outcome` | `success`, `denied`, or `failed` |
+
+Audit entries are retained in memory (up to 50,000 entries) and are also emitted via structured logging (`tracing`), so they can be forwarded to external log aggregation systems.
+
+## Alerting Rules
+
+ekafleet evaluates alerting rules against collected metrics and fires alerts when thresholds are breached:
+
+```nix
+alerting.rules = [
+  {
+    name = "high-cpu";
+    metric = "node_cpu_usage_ratio";
+    threshold = 0.9;
+    op = "gt";                      # "gt", "lt", "gte", "lte", "eq"
+    forSeconds = 300;               # condition must hold for 5 minutes
+    severity = "critical";          # "warning" or "critical"
+    webhook_url = "http://alertmanager:9093/api/v1/alerts";
+  }
+];
+```
+
+When an alert fires, ekafleet logs it at `WARN` level and optionally sends a webhook notification to the configured URL.
+
+## Webhook Notifications
+
+Configure outbound webhooks to integrate with external systems (Slack, PagerDuty, custom dashboards):
+
+```nix
+webhooks = [
+  {
+    name = "slack-deploys";
+    url = "http://slack-webhook-proxy:8080/deploy";
+    events = [ "deployment" "rollback" ];
+    timeout_seconds = 10;
+  }
+  {
+    name = "pagerduty-health";
+    url = "http://pd-proxy:8080/alert";
+    events = [ "*" ];  # all events
+  }
+];
+```
+
+Webhook payloads are JSON with `event`, `data`, and `timestamp` fields. Delivery failures are logged but don't block the triggering operation.
+
+## Distributed Tracing
+
+The reverse proxy propagates W3C Trace Context headers (`traceparent` / `tracestate`) through the request chain. When an incoming request has a `traceparent` header, the proxy generates a child span ID while preserving the trace ID. When no trace context is present, the proxy generates a new one.
+
+This enables integration with OpenTelemetry, Jaeger, and other distributed tracing systems for end-to-end request visibility across fleet services.
+
 ## Health Status
 
 ```bash

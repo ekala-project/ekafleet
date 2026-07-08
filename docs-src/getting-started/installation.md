@@ -56,6 +56,21 @@ direnv allow
 
 This provides Rust toolchain (via fenix), protobuf compiler, pkg-config, and OpenSSL.
 
+## Shell Completions
+
+Generate shell completions for tab-completion of commands, options, and arguments:
+
+```bash
+# Bash
+ekafleet completions bash > /etc/bash_completion.d/ekafleet
+
+# Zsh (add ~/.zfunc to your fpath)
+ekafleet completions zsh > ~/.zfunc/_ekafleet
+
+# Fish
+ekafleet completions fish > ~/.config/fish/completions/ekafleet.fish
+```
+
 ## Verify Installation
 
 ```bash

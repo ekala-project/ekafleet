@@ -103,9 +103,26 @@ Secrets are scoped to services. A service can only access secrets declared in it
     └── session-secret
 ```
 
-## Versioning
+## Versioning & Rollback
 
 Each secret has a version number that increments on every update. The agent tracks injected versions to avoid unnecessary file writes. When a new version is pushed, the agent writes the updated value atomically.
+
+Previous versions are retained (up to a configurable limit, default 5) allowing rollback to a prior value if a secret update breaks authentication:
+
+```bash
+# List available versions
+curl -H "Authorization: Bearer $TOKEN" http://server:7402/v1/secrets/api-server/db-password/versions
+
+# Rollback to a specific version
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  http://server:7402/v1/secrets/api-server/db-password/rollback?version=3
+```
+
+## Secret Rotation Notification
+
+When a secret is updated on disk, the agent can signal the service to reload without restart. By default, `SIGHUP` is sent to the service's systemd unit after writing the new secret value. This enables zero-downtime credential rotation.
+
+The signal is only sent when the secret value actually changes (not on no-op version checks). If the signal delivery fails (e.g., process not running), the failure is logged but does not block the secret injection.
 
 ## Dynamic Secret Connection URLs
 

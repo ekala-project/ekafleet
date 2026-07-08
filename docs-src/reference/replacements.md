@@ -19,6 +19,11 @@ ekafleet consolidates many separate tools into a single binary.
 | **WireGuard tools** | Mesh networking | `wireguard` |
 | **Cilium / Calico** | Network policy | `nftables` |
 | **deploy-rs** | NixOS deployment | `deployer` + `nix_eval` |
+| **OPA / Gatekeeper** | Policy engine | `policy` (built-in admission rules) |
+| **Alertmanager** | Alert evaluation | `alerting` (built-in threshold rules + webhook delivery) |
+| **consul-template** | Config rendering | `template` (built-in with fleet context) |
+| **Kubernetes Dashboard** | Fleet visibility | REST API + SSE streaming |
+| **rsync / Velero** | Data migration, backup | `storage` (volume snapshots, rsync-based migration) |
 
 ## Key Differences
 

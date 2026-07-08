@@ -1233,7 +1233,7 @@ Summary of all features with implementation status and priority.
 |---------|--------|
 | Service priority (1-100) | Implemented |
 | Priority-ordered scheduling | Implemented |
-| Preemption | Planned (PlacementPlan.preemptions field exists) |
+| Preemption | Implemented (evicts services with priority delta >= 10) |
 | Non-preempting priority | Planned |
 
 ### Taints and Tolerations

@@ -118,15 +118,19 @@ Fleet configuration is pure Nix, consumed via `nix eval`:
 ## CLI
 
 ```
-ekafleet server    Start control plane
-ekafleet agent     Start data plane
-ekafleet plan      Show desired-vs-actual diff
-ekafleet apply     Execute plan (--watch for continuous)
-ekafleet status    Fleet health overview
-ekafleet drain     Reschedule services off a machine
-ekafleet rollback  Revert to previous generation
-ekafleet scale     Manual replica scaling
-ekafleet logs      Aggregate logs from replicas
+ekafleet dev         Local development mode (no TLS/WireGuard)
+ekafleet server      Start control plane
+ekafleet agent       Start data plane
+ekafleet plan        Show desired-vs-actual diff
+ekafleet apply       Execute plan (--watch for continuous)
+ekafleet status      Fleet health overview (--output json for scripting)
+ekafleet drain       Reschedule services off a machine
+ekafleet rollback    Revert to previous generation
+ekafleet scale       Manual replica scaling
+ekafleet logs        Aggregate logs from replicas
+ekafleet snapshot    Backup Raft state for disaster recovery
+ekafleet restore     Restore from snapshot
+ekafleet completions Generate shell completions (bash/zsh/fish)
 ```
 
 ## License
