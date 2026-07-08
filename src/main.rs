@@ -15,6 +15,21 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Single-process development mode (server + agent, no TLS, no WireGuard)
+    Dev {
+        /// Data directory for persistent state
+        #[arg(long, default_value = "/tmp/ekafleet-dev")]
+        data_dir: PathBuf,
+
+        /// HTTP API listen address
+        #[arg(long, default_value = "127.0.0.1:7402")]
+        http_listen: String,
+
+        /// gRPC listen address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        listen: String,
+    },
+
     /// Start in server mode (control plane + agent capabilities)
     Server {
         /// Data directory for persistent state
@@ -222,6 +237,34 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Command::Dev {
+            data_dir,
+            http_listen,
+            listen,
+        } => {
+            tracing::info!(
+                data_dir = %data_dir.display(),
+                grpc = %listen,
+                http = %http_listen,
+                "Starting ekafleet in dev mode (no TLS, no WireGuard)"
+            );
+
+            // Generate a dev token
+            let dev_token = "dev-token";
+            tracing::info!(token = dev_token, "Dev mode token (use for API access)");
+
+            let config = server::ServerConfig {
+                data_dir,
+                peers: Vec::new(),
+                grpc_listen: listen,
+                http_listen,
+                token: dev_token.to_string(),
+                domain: "dev.local".to_string(),
+            };
+
+            server::run(config).await?;
+        }
+
         Command::Server {
             data_dir,
             peers,
