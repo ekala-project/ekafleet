@@ -19,6 +19,7 @@ tokio = { version = "1", features = ["full"] }
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
 
 # gRPC (with TLS via rustls + ring)
 tonic = { version = "0.13", features = ["tls-ring"] }

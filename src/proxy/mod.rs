@@ -1,3 +1,4 @@
+pub mod affinity;
 pub mod circuit;
 pub mod l4;
 pub mod listener;
@@ -5,4 +6,5 @@ pub mod mtls;
 pub mod ratelimit;
 pub mod router;
 pub mod splitting;
+pub mod tracing_ctx;
 pub mod upstream;

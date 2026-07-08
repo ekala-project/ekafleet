@@ -11,6 +11,16 @@ use std::path::PathBuf;
 struct Cli {
     #[command(subcommand)]
     command: Command,
+
+    /// Output format: "text" (default) or "json" for machine-readable output
+    #[arg(long, short, default_value = "text", global = true)]
+    output: OutputFormat,
+}
+
+#[derive(Clone, Debug, clap::ValueEnum)]
+enum OutputFormat {
+    Text,
+    Json,
 }
 
 #[derive(Subcommand)]
@@ -204,6 +214,34 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:7400")]
         server: String,
     },
+
+    /// Generate shell completions
+    Completions {
+        /// Shell to generate completions for
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
+
+    /// Take a Raft state snapshot for disaster recovery
+    Snapshot {
+        /// Path to save the snapshot
+        #[arg(long, default_value = "ekafleet-snapshot.bin")]
+        output: std::path::PathBuf,
+
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+
+    /// Restore Raft state from a snapshot
+    Restore {
+        /// Path to the snapshot file
+        input: std::path::PathBuf,
+
+        /// Data directory
+        #[arg(long, default_value = "/var/lib/ekafleet")]
+        data_dir: std::path::PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -365,6 +403,26 @@ async fn main() -> anyhow::Result<()> {
             let mut client = connect_server(&server).await?;
             let resp = client.status(StatusRequest {}).await?;
             let status = resp.into_inner();
+
+            if matches!(cli.output, OutputFormat::Json) {
+                let json = serde_json::json!({
+                    "fleet_name": status.fleet_name,
+                    "nodes": status.nodes.iter().map(|n| serde_json::json!({
+                        "node_id": n.node_id,
+                        "address": n.address,
+                        "healthy": n.healthy,
+                        "pool": n.pool,
+                        "last_heartbeat": n.last_heartbeat,
+                    })).collect::<Vec<_>>(),
+                    "services": status.services.iter().map(|s| serde_json::json!({
+                        "name": s.name,
+                        "healthy_count": s.healthy_count,
+                        "instances": s.instances.len(),
+                    })).collect::<Vec<_>>(),
+                });
+                println!("{}", serde_json::to_string_pretty(&json)?);
+                return Ok(());
+            }
 
             println!("Fleet: {}", status.fleet_name);
             println!();
@@ -630,6 +688,29 @@ async fn main() -> anyhow::Result<()> {
                     anyhow::bail!("Machine '{machine}' not found in fleet");
                 }
             }
+        }
+
+        Command::Completions { shell } => {
+            use clap::CommandFactory;
+            let mut cmd = Cli::command();
+            clap_complete::generate(shell, &mut cmd, "ekafleet", &mut std::io::stdout());
+        }
+
+        Command::Snapshot { output, server: _ } => {
+            // TODO: call server's Raft snapshot RPC
+            println!("Saving Raft snapshot to {}", output.display());
+            eprintln!(
+                "snapshot save requires server-side snapshot export (Raft snapshot method exists)"
+            );
+        }
+
+        Command::Restore { input, data_dir } => {
+            println!(
+                "Restoring from {} to {}",
+                input.display(),
+                data_dir.display()
+            );
+            eprintln!("snapshot restore requires server-side import (Raft restore method exists)");
         }
     }
 

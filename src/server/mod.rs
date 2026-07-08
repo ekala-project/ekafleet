@@ -5,12 +5,15 @@ pub mod events;
 pub mod federation;
 pub mod namespace;
 pub mod nix;
+pub mod policy;
 pub mod quota;
 pub mod rbac;
+pub mod rebalance;
 pub mod reconciler;
 pub mod scaling;
 pub mod scheduler;
 pub mod state;
+pub mod webhook;
 
 use std::path::{Path, PathBuf};
 
