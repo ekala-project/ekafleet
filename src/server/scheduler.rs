@@ -128,6 +128,7 @@ pub fn schedule(
 
     let mut placements = Vec::new();
     let mut blocked = Vec::new();
+    let mut preemptions = Vec::new();
 
     // Schedule system jobs first (run on all matching nodes),
     // then services, stateful, batch
@@ -256,6 +257,65 @@ pub fn schedule(
                         .collect();
 
                     if filtered.is_empty() {
+                        // Attempt preemption: find machines where evicting
+                        // lower-priority services would free enough resources.
+                        // Only services with priority delta >= 10 are eligible.
+                        if let Some((preempt_idx, evicted)) = find_preemption_candidate(
+                            &candidates,
+                            &scheduling.constraints,
+                            &scheduling.tolerations,
+                            service_name,
+                            scheduling.priority,
+                            cpu_req,
+                            mem_req,
+                            disk_req,
+                            services,
+                        ) {
+                            for ev in &evicted {
+                                preemptions.push(ev.clone());
+                                // Free the resources from the evicted services
+                                let ev_cpu = services
+                                    .get(&ev.evicted_service)
+                                    .and_then(|s| s.resources.cpu.as_ref())
+                                    .map(|r| r.request)
+                                    .unwrap_or(0);
+                                let ev_mem = services
+                                    .get(&ev.evicted_service)
+                                    .and_then(|s| s.resources.memory.as_ref())
+                                    .map(|r| r.request)
+                                    .unwrap_or(0);
+                                let ev_disk = services
+                                    .get(&ev.evicted_service)
+                                    .and_then(|s| s.resources.disk.as_ref())
+                                    .map(|r| r.request)
+                                    .unwrap_or(0);
+                                candidates[preempt_idx].allocated_cpu =
+                                    candidates[preempt_idx].allocated_cpu.saturating_sub(ev_cpu);
+                                candidates[preempt_idx].allocated_memory = candidates[preempt_idx]
+                                    .allocated_memory
+                                    .saturating_sub(ev_mem);
+                                candidates[preempt_idx].allocated_disk = candidates[preempt_idx]
+                                    .allocated_disk
+                                    .saturating_sub(ev_disk);
+                                candidates[preempt_idx]
+                                    .assigned_services
+                                    .retain(|s| s != &ev.evicted_service);
+                            }
+
+                            placements.push(Placement {
+                                service_name: service_name.to_string(),
+                                instance_id,
+                                machine_name: candidates[preempt_idx].name.clone(),
+                            });
+                            candidates[preempt_idx].allocated_cpu += cpu_req;
+                            candidates[preempt_idx].allocated_memory += mem_req;
+                            candidates[preempt_idx].allocated_disk += disk_req;
+                            candidates[preempt_idx]
+                                .assigned_services
+                                .push(service_name.to_string());
+                            continue;
+                        }
+
                         tracing::warn!(
                             service = service_name,
                             replica,
@@ -311,7 +371,7 @@ pub fn schedule(
     PlacementPlan {
         placements,
         blocked,
-        preemptions: Vec::new(), // Preemption not yet wired
+        preemptions,
     }
 }
 
@@ -671,6 +731,113 @@ fn compute_score(
     }
 
     score
+}
+
+/// Find a machine where evicting lower-priority services would free enough
+/// resources for the requesting service. Returns the candidate index and
+/// the list of evictions required. Only services with priority delta >= 10
+/// are eligible for preemption.
+fn find_preemption_candidate(
+    candidates: &[Candidate],
+    constraints: &[Constraint],
+    tolerations: &[crate::config::Toleration],
+    service_name: &str,
+    service_priority: u32,
+    cpu_req: u64,
+    mem_req: u64,
+    disk_req: u64,
+    all_services: &HashMap<String, ServiceConfig>,
+) -> Option<(usize, Vec<Preemption>)> {
+    let mut best: Option<(usize, Vec<Preemption>, u32)> = None;
+
+    for (idx, candidate) in candidates.iter().enumerate() {
+        // Machine must still pass constraints and taints
+        if !passes_constraints(candidate, constraints, service_name) {
+            continue;
+        }
+        if !passes_taints(candidate, tolerations) {
+            continue;
+        }
+
+        // Find evictable services on this machine (priority delta >= 10)
+        let mut evictable: Vec<(&str, u64, u64, u64, u32)> = Vec::new();
+        for assigned in &candidate.assigned_services {
+            if let Some(svc_cfg) = all_services.get(assigned) {
+                let svc_priority = svc_cfg.scheduling.priority;
+                if service_priority >= svc_priority + 10 {
+                    let cpu = svc_cfg
+                        .resources
+                        .cpu
+                        .as_ref()
+                        .map(|r| r.request)
+                        .unwrap_or(0);
+                    let mem = svc_cfg
+                        .resources
+                        .memory
+                        .as_ref()
+                        .map(|r| r.request)
+                        .unwrap_or(0);
+                    let disk = svc_cfg
+                        .resources
+                        .disk
+                        .as_ref()
+                        .map(|r| r.request)
+                        .unwrap_or(0);
+                    evictable.push((assigned, cpu, mem, disk, svc_priority));
+                }
+            }
+        }
+
+        if evictable.is_empty() {
+            continue;
+        }
+
+        // Sort by priority ascending (evict lowest priority first)
+        evictable.sort_by_key(|e| e.4);
+
+        // Greedily evict until we have enough resources
+        let mut freed_cpu = candidate.available_cpu();
+        let mut freed_mem = candidate.available_memory();
+        let mut freed_disk = candidate.available_disk();
+        let mut evictions = Vec::new();
+        let mut total_evicted_priority = 0u32;
+
+        for (svc_name, cpu, mem, disk, priority) in &evictable {
+            if freed_cpu >= cpu_req && freed_mem >= mem_req && freed_disk >= disk_req {
+                break;
+            }
+            freed_cpu += cpu;
+            freed_mem += mem;
+            freed_disk += disk;
+            total_evicted_priority += priority;
+            evictions.push(Preemption {
+                evicted_service: svc_name.to_string(),
+                evicted_instance_id: format!("{svc_name}-{}", candidate.name),
+                machine_name: candidate.name.clone(),
+                reason: format!(
+                    "preempted by {service_name} (priority {service_priority} > {priority})"
+                ),
+            });
+        }
+
+        // Check if enough resources after evictions
+        if freed_cpu >= cpu_req && freed_mem >= mem_req && freed_disk >= disk_req {
+            // Prefer fewer evictions, then lower total evicted priority
+            let is_better = match &best {
+                None => true,
+                Some((_, prev_evictions, prev_priority)) => {
+                    evictions.len() < prev_evictions.len()
+                        || (evictions.len() == prev_evictions.len()
+                            && total_evicted_priority < *prev_priority)
+                }
+            };
+            if is_better {
+                best = Some((idx, evictions, total_evicted_priority));
+            }
+        }
+    }
+
+    best.map(|(idx, evictions, _)| (idx, evictions))
 }
 
 #[cfg(test)]
