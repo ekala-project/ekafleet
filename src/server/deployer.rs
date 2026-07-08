@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use super::scheduler::Placement;
 use super::state::FleetState;
-use crate::config::UpdateStrategy;
+use crate::config::{DisruptionBudget, UpdateStrategy};
 use crate::proto::server_message::Payload;
 use crate::proto::{DeployCommand, DeployStrategy, ServerMessage};
 
@@ -17,6 +17,8 @@ pub enum DeployError {
     NodeFailed { node: String, reason: String },
     #[error("auto-reverted: {0}")]
     Reverted(String),
+    #[error("disruption budget violated: {0}")]
+    DisruptionBudgetViolation(String),
 }
 
 /// A deployment operation for a single service.
@@ -32,6 +34,10 @@ pub struct DeploymentPlan {
     pub min_healthy_time: Duration,
     pub healthy_deadline: Duration,
     pub progress_deadline: Option<Duration>,
+    /// Disruption budget limiting how many instances can be down simultaneously.
+    pub disruption_budget: Option<DisruptionBudget>,
+    /// Total desired replica count (used with disruption budget).
+    pub total_replicas: u32,
 }
 
 /// Execute a deployment plan against the fleet.
@@ -103,14 +109,28 @@ pub async fn execute(state: &FleetState, plan: DeploymentPlan) -> Result<(), Dep
 }
 
 /// Rolling deployment: update instances in batches of max_parallel.
+/// Respects disruption budgets by limiting batch sizes.
 async fn execute_rolling(
     state: &FleetState,
     deployment_id: &str,
     plan: &DeploymentPlan,
 ) -> Result<(), DeployError> {
+    // Compute effective max_parallel respecting disruption budget.
+    let effective_parallel = if let Some(ref budget) = plan.disruption_budget {
+        let allowed = budget.allowed_disruptions(plan.total_replicas);
+        if allowed == 0 {
+            return Err(DeployError::DisruptionBudgetViolation(
+                "disruption budget allows 0 simultaneous disruptions".to_string(),
+            ));
+        }
+        plan.max_parallel.min(allowed)
+    } else {
+        plan.max_parallel
+    };
+
     let batches = plan
         .placements
-        .chunks(plan.max_parallel as usize)
+        .chunks(effective_parallel as usize)
         .collect::<Vec<_>>();
 
     for (batch_idx, batch) in batches.iter().enumerate() {
@@ -234,6 +254,8 @@ async fn execute_canary(
             min_healthy_time: plan.min_healthy_time,
             healthy_deadline: plan.healthy_deadline,
             progress_deadline: plan.progress_deadline,
+            disruption_budget: plan.disruption_budget.clone(),
+            total_replicas: plan.total_replicas,
         };
         execute_rolling(state, deployment_id, &remaining_plan).await?;
     }

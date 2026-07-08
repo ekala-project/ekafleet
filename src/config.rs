@@ -154,6 +154,10 @@ pub struct SchedulingConfig {
     /// Inter-service affinity: prefer or avoid co-location with other services.
     #[serde(default, rename = "serviceAffinity")]
     pub service_affinity: Vec<ServiceAffinityConfig>,
+    /// Disruption budget: minimum availability guarantees during voluntary disruptions
+    /// (node drain, rolling updates, scaling down).
+    #[serde(default, rename = "disruptionBudget")]
+    pub disruption_budget: Option<DisruptionBudget>,
 }
 
 impl Default for SchedulingConfig {
@@ -173,6 +177,7 @@ impl Default for SchedulingConfig {
             migrate: MigrateConfig::default(),
             periodic: None,
             service_affinity: Vec::new(),
+            disruption_budget: None,
         }
     }
 }
@@ -565,6 +570,59 @@ pub struct ServiceAffinityConfig {
     pub topology_key: String,
     #[serde(default = "default_affinity_weight")]
     pub weight: i32,
+}
+
+/// Disruption budget controls how many instances of a service can be
+/// unavailable during voluntary disruptions (drain, rolling updates).
+/// Specify either `minAvailable` or `maxUnavailable`, not both.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DisruptionBudget {
+    /// Minimum number of instances that must remain available during disruptions.
+    /// Can be an absolute count (e.g., 2) or a percentage string (e.g., "50%").
+    #[serde(default, rename = "minAvailable")]
+    pub min_available: Option<DisruptionValue>,
+    /// Maximum number of instances that can be unavailable during disruptions.
+    /// Can be an absolute count (e.g., 1) or a percentage string (e.g., "25%").
+    #[serde(default, rename = "maxUnavailable")]
+    pub max_unavailable: Option<DisruptionValue>,
+}
+
+/// A disruption budget value: either an absolute count or a percentage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum DisruptionValue {
+    Count(u32),
+    Percent(String),
+}
+
+impl DisruptionBudget {
+    /// Compute how many instances can be disrupted given the total replica count.
+    pub fn allowed_disruptions(&self, total_replicas: u32) -> u32 {
+        if total_replicas == 0 {
+            return 0;
+        }
+
+        if let Some(ref min_avail) = self.min_available {
+            let min = resolve_value(min_avail, total_replicas);
+            total_replicas.saturating_sub(min)
+        } else if let Some(ref max_unavail) = self.max_unavailable {
+            resolve_value(max_unavail, total_replicas)
+        } else {
+            // No budget set — allow all disruptions
+            total_replicas
+        }
+    }
+}
+
+fn resolve_value(value: &DisruptionValue, total: u32) -> u32 {
+    match value {
+        DisruptionValue::Count(n) => *n,
+        DisruptionValue::Percent(pct) => {
+            let pct_str = pct.trim_end_matches('%');
+            let pct_val: f64 = pct_str.parse().unwrap_or(0.0);
+            ((total as f64 * pct_val / 100.0).ceil()) as u32
+        }
+    }
 }
 
 /// Health check mode for deployments.

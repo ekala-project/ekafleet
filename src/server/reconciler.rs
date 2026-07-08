@@ -262,6 +262,8 @@ async fn apply_plan(
                         .update
                         .progress_deadline_secs
                         .map(Duration::from_secs),
+                    disruption_budget: service_cfg.scheduling.disruption_budget.clone(),
+                    total_replicas: service_cfg.scheduling.replicas,
                 };
 
                 deployer::execute(state, deploy_plan).await?;
