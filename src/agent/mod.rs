@@ -1,6 +1,7 @@
 pub mod activation;
 pub mod health;
 pub mod supervisor;
+pub mod template;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

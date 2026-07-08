@@ -29,6 +29,31 @@ pub struct ServiceConfig {
     pub scheduling: SchedulingConfig,
     #[serde(default)]
     pub environment: HashMap<String, String>,
+    /// Configuration file templates to render and inject into the service.
+    /// Keys are destination paths, values are template definitions.
+    #[serde(default)]
+    pub templates: HashMap<String, TemplateConfig>,
+}
+
+/// A configuration file template that gets rendered with fleet context
+/// (service discovery, secrets, metadata) and written to a destination path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TemplateConfig {
+    /// Template source: inline content with `{{ }}` placeholders.
+    pub source: String,
+    /// Destination path where the rendered file is written.
+    #[serde(rename = "destPath")]
+    pub dest_path: String,
+    /// File permissions (octal, e.g., "0644"). Defaults to "0644".
+    #[serde(default = "default_file_perms")]
+    pub perms: String,
+    /// If true, signal the service to reload after rendering (SIGHUP).
+    #[serde(default, rename = "changeSignal")]
+    pub change_signal: Option<String>,
+}
+
+fn default_file_perms() -> String {
+    "0644".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

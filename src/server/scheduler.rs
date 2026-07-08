@@ -761,6 +761,7 @@ mod tests {
                     ..Default::default()
                 },
                 environment: HashMap::new(),
+                templates: HashMap::new(),
             },
         )
     }
@@ -827,6 +828,7 @@ mod tests {
                     ..Default::default()
                 },
                 environment: HashMap::new(),
+                templates: HashMap::new(),
             },
         )]
         .into();
@@ -869,6 +871,7 @@ mod tests {
                     ..Default::default()
                 },
                 environment: HashMap::new(),
+                templates: HashMap::new(),
             },
         )]
         .into();
@@ -942,6 +945,7 @@ mod tests {
                     ..Default::default()
                 },
                 environment: HashMap::new(),
+                templates: HashMap::new(),
             },
         )]
         .into();
@@ -1006,6 +1010,7 @@ mod tests {
                     ..Default::default()
                 },
                 environment: HashMap::new(),
+                templates: HashMap::new(),
             },
         )]
         .into();
@@ -1076,6 +1081,7 @@ mod tests {
                     ..Default::default()
                 },
                 environment: HashMap::new(),
+                templates: HashMap::new(),
             },
         )]
         .into();
@@ -1184,6 +1190,7 @@ mod tests {
                     ..Default::default()
                 },
                 environment: HashMap::new(),
+                templates: HashMap::new(),
             },
         )]
         .into();
@@ -1269,6 +1276,7 @@ mod tests {
                     ..Default::default()
                 },
                 environment: HashMap::new(),
+                templates: HashMap::new(),
             },
         )]
         .into();
@@ -1317,6 +1325,7 @@ mod tests {
                     ..Default::default()
                 },
                 environment: HashMap::new(),
+                templates: HashMap::new(),
             },
         )]
         .into();
@@ -1362,6 +1371,7 @@ mod tests {
                     ..Default::default()
                 },
                 environment: HashMap::new(),
+                templates: HashMap::new(),
             },
         )]
         .into();
@@ -1407,6 +1417,7 @@ mod tests {
                     ..Default::default()
                 },
                 environment: HashMap::new(),
+                templates: HashMap::new(),
             },
         )]
         .into();
@@ -1469,6 +1480,7 @@ mod tests {
                     ..Default::default()
                 },
                 environment: HashMap::new(),
+                templates: HashMap::new(),
             },
         )]
         .into();
@@ -1619,6 +1631,7 @@ mod tests {
                     ..Default::default()
                 },
                 environment: HashMap::new(),
+                templates: HashMap::new(),
             },
         )]
         .into();
@@ -1658,6 +1671,7 @@ mod tests {
                     ..Default::default()
                 },
                 environment: HashMap::new(),
+                templates: HashMap::new(),
             },
         )]
         .into();
