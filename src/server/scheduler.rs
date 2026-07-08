@@ -763,6 +763,7 @@ mod tests {
                 environment: HashMap::new(),
                 templates: HashMap::new(),
                 lifecycle: Default::default(),
+                volumes: Vec::new(),
             },
         )
     }
@@ -831,6 +832,7 @@ mod tests {
                 environment: HashMap::new(),
                 templates: HashMap::new(),
                 lifecycle: Default::default(),
+                volumes: Vec::new(),
             },
         )]
         .into();
@@ -875,6 +877,7 @@ mod tests {
                 environment: HashMap::new(),
                 templates: HashMap::new(),
                 lifecycle: Default::default(),
+                volumes: Vec::new(),
             },
         )]
         .into();
@@ -950,6 +953,7 @@ mod tests {
                 environment: HashMap::new(),
                 templates: HashMap::new(),
                 lifecycle: Default::default(),
+                volumes: Vec::new(),
             },
         )]
         .into();
@@ -1016,6 +1020,7 @@ mod tests {
                 environment: HashMap::new(),
                 templates: HashMap::new(),
                 lifecycle: Default::default(),
+                volumes: Vec::new(),
             },
         )]
         .into();
@@ -1088,6 +1093,7 @@ mod tests {
                 environment: HashMap::new(),
                 templates: HashMap::new(),
                 lifecycle: Default::default(),
+                volumes: Vec::new(),
             },
         )]
         .into();
@@ -1198,6 +1204,7 @@ mod tests {
                 environment: HashMap::new(),
                 templates: HashMap::new(),
                 lifecycle: Default::default(),
+                volumes: Vec::new(),
             },
         )]
         .into();
@@ -1285,6 +1292,7 @@ mod tests {
                 environment: HashMap::new(),
                 templates: HashMap::new(),
                 lifecycle: Default::default(),
+                volumes: Vec::new(),
             },
         )]
         .into();
@@ -1335,6 +1343,7 @@ mod tests {
                 environment: HashMap::new(),
                 templates: HashMap::new(),
                 lifecycle: Default::default(),
+                volumes: Vec::new(),
             },
         )]
         .into();
@@ -1382,6 +1391,7 @@ mod tests {
                 environment: HashMap::new(),
                 templates: HashMap::new(),
                 lifecycle: Default::default(),
+                volumes: Vec::new(),
             },
         )]
         .into();
@@ -1429,6 +1439,7 @@ mod tests {
                 environment: HashMap::new(),
                 templates: HashMap::new(),
                 lifecycle: Default::default(),
+                volumes: Vec::new(),
             },
         )]
         .into();
@@ -1493,6 +1504,7 @@ mod tests {
                 environment: HashMap::new(),
                 templates: HashMap::new(),
                 lifecycle: Default::default(),
+                volumes: Vec::new(),
             },
         )]
         .into();
@@ -1544,6 +1556,7 @@ mod tests {
                     environment: HashMap::new(),
                     templates: HashMap::new(),
                     lifecycle: Default::default(),
+                    volumes: Vec::new(),
                 },
             ),
             (
@@ -1572,6 +1585,7 @@ mod tests {
                     environment: HashMap::new(),
                     templates: HashMap::new(),
                     lifecycle: Default::default(),
+                    volumes: Vec::new(),
                 },
             ),
         ]
@@ -1649,6 +1663,7 @@ mod tests {
                 environment: HashMap::new(),
                 templates: HashMap::new(),
                 lifecycle: Default::default(),
+                volumes: Vec::new(),
             },
         )]
         .into();
@@ -1690,6 +1705,7 @@ mod tests {
                 environment: HashMap::new(),
                 templates: HashMap::new(),
                 lifecycle: Default::default(),
+                volumes: Vec::new(),
             },
         )]
         .into();

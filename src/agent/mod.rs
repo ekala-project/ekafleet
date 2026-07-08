@@ -1,5 +1,6 @@
 pub mod activation;
 pub mod health;
+pub mod storage;
 pub mod supervisor;
 pub mod template;
 

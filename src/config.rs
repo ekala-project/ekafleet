@@ -36,6 +36,50 @@ pub struct ServiceConfig {
     /// Lifecycle hooks and shutdown configuration.
     #[serde(default)]
     pub lifecycle: LifecycleConfig,
+    /// Persistent volumes to attach to this service.
+    #[serde(default)]
+    pub volumes: Vec<VolumeConfig>,
+}
+
+/// A persistent volume to attach to a stateful service.
+/// Volumes survive service restarts and are migrated when a stateful
+/// service is rescheduled (if the storage backend supports it).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VolumeConfig {
+    /// Volume name (unique within the service).
+    pub name: String,
+    /// Mount path inside the service's filesystem namespace.
+    #[serde(rename = "mountPath")]
+    pub mount_path: String,
+    /// Requested storage size in megabytes.
+    #[serde(default = "default_volume_size", rename = "sizeMb")]
+    pub size_mb: u64,
+    /// Storage class (e.g., "local", "nfs", "zfs"). Defaults to "local".
+    #[serde(default = "default_storage_class", rename = "storageClass")]
+    pub storage_class: String,
+    /// Access mode: "ReadWriteOnce" (default) or "ReadWriteMany".
+    #[serde(default, rename = "accessMode")]
+    pub access_mode: VolumeAccessMode,
+    /// If true, the volume is not deleted when the service is destroyed.
+    #[serde(default = "default_true", rename = "reclaimRetain")]
+    pub reclaim_retain: bool,
+}
+
+fn default_volume_size() -> u64 {
+    1024
+}
+fn default_storage_class() -> String {
+    "local".to_string()
+}
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum VolumeAccessMode {
+    #[default]
+    ReadWriteOnce,
+    ReadWriteMany,
 }
 
 /// A configuration file template that gets rendered with fleet context

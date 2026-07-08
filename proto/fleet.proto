@@ -168,6 +168,18 @@ message ServiceSpec {
 
   // Lifecycle hooks and shutdown configuration.
   LifecycleHooks lifecycle = 11;
+
+  // Persistent volumes attached to this service.
+  repeated VolumeMount volumes = 12;
+}
+
+message VolumeMount {
+  string name = 1;
+  string mount_path = 2;
+  uint64 size_mb = 3;
+  string storage_class = 4;
+  string access_mode = 5;
+  bool reclaim_retain = 6;
 }
 
 message LifecycleHooks {
