@@ -7,6 +7,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 use tonic::{Request, Response, Status, Streaming};
 
+use super::rbac::{Permission, TokenStore, extract_bearer_token};
 use super::state::FleetState;
 use crate::attestation::join_token::JoinTokenStore;
 use crate::ca::csr;
@@ -246,19 +247,23 @@ impl FleetControl for FleetControlService {
 
         match attest_result {
             Ok(result) => {
-                let ca = self.ca.as_ref().ok_or_else(|| {
-                    Status::internal("CA not configured for node SVID issuance")
-                })?;
+                let ca = self
+                    .ca
+                    .as_ref()
+                    .ok_or_else(|| Status::internal("CA not configured for node SVID issuance"))?;
 
                 // Generate a node CSR on behalf of the attested node and issue a node SVID
-                let spiffe_id =
-                    format!("spiffe://{}/agent/{}", self.domain, result.node_id);
+                let spiffe_id = format!("spiffe://{}/agent/{}", self.domain, result.node_id);
 
                 let node_csr = csr::generate_node_csr(&self.domain, &result.node_id)
                     .map_err(|e| Status::internal(format!("node CSR generation: {e}")))?;
 
                 let (cert_pem, _chain_pem, _expires_at) = ca
-                    .sign_csr(&node_csr.csr_der, &format!("agent/{}", result.node_id), None)
+                    .sign_csr(
+                        &node_csr.csr_der,
+                        &format!("agent/{}", result.node_id),
+                        None,
+                    )
                     .await
                     .map_err(|e| Status::internal(format!("node SVID issuance: {e}")))?;
 
@@ -429,11 +434,11 @@ pub struct TlsConfig {
     pub ca_cert_pem: String,
 }
 
-/// Start the gRPC server with TLS and bearer token authentication.
+/// Start the gRPC server with TLS and RBAC-based authentication.
 pub async fn serve_grpc(
     addr: SocketAddr,
     state: FleetState,
-    token: &str,
+    token_store: TokenStore,
     tls: &TlsConfig,
     cert_issuer: CertIssuer,
     ca: RootCa,
@@ -441,9 +446,8 @@ pub async fn serve_grpc(
     domain: &str,
     fleet_key: Vec<u8>,
 ) -> anyhow::Result<()> {
-    tracing::info!(%addr, domain, "gRPC server listening (TLS + token-authenticated + SPIFFE)");
+    tracing::info!(%addr, domain, "gRPC server listening (TLS + RBAC + SPIFFE)");
 
-    let expected_token = format!("Bearer {token}");
     #[allow(clippy::result_large_err)]
     let interceptor = move |req: Request<()>| -> Result<Request<()>, Status> {
         // Allow unauthenticated access to the Attest RPC.
@@ -459,7 +463,6 @@ pub async fn serve_grpc(
         // Accept mTLS-authenticated requests (node SVID as client cert).
         // When TLS client auth is enabled, the presence of a valid client cert
         // (verified by rustls against the CA) is sufficient authentication.
-        // The node SPIFFE ID can be extracted from the cert's SAN URI.
         if req
             .metadata()
             .get("x-ekafleet-mtls")
@@ -468,12 +471,29 @@ pub async fn serve_grpc(
             return Ok(req);
         }
 
-        // Fall back to bearer token authentication
-        match req.metadata().get("authorization") {
-            Some(val) if val == expected_token.as_str() => Ok(req),
-            Some(_) => Err(Status::unauthenticated("invalid token")),
-            None => Err(Status::unauthenticated("missing authorization header")),
-        }
+        // RBAC bearer token authentication.
+        // The token is validated against the TokenStore; role checks
+        // happen at the RPC handler level via the role stored in metadata.
+        let auth_header = req
+            .metadata()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok());
+        let raw_token = extract_bearer_token(auth_header)
+            .ok_or_else(|| Status::unauthenticated("missing or invalid authorization header"))?;
+
+        // TokenStore::authenticate is async but interceptors are sync.
+        // We use blocking_read() for non-blocking access — the store is rarely written to.
+        let tokens = token_store.inner_ref();
+        let role = tokens
+            .blocking_read()
+            .get(raw_token)
+            .copied()
+            .ok_or_else(|| Status::unauthenticated("invalid token"))?;
+
+        // Stash the role in request extensions so RPC handlers can check permissions.
+        let mut req = req;
+        req.extensions_mut().insert(role);
+        Ok(req)
     };
 
     let identity = Identity::from_pem(&tls.cert_pem, &tls.cert_pem);
@@ -499,8 +519,8 @@ pub async fn serve_grpc(
 }
 
 /// Start the HTTP API server (health, metrics, status endpoints).
-/// The /health endpoint is public; /metrics requires bearer token.
-pub async fn serve_http(addr: SocketAddr, token: String) -> anyhow::Result<()> {
+/// The /health endpoint is public; other endpoints require authentication via RBAC tokens.
+pub async fn serve_http(addr: SocketAddr, token_store: TokenStore) -> anyhow::Result<()> {
     use axum::extract::State;
     use axum::http::StatusCode;
 
@@ -508,19 +528,27 @@ pub async fn serve_http(addr: SocketAddr, token: String) -> anyhow::Result<()> {
         Router::new()
             .route("/metrics", get(metrics))
             .layer(axum::middleware::from_fn_with_state(
-                token.clone(),
-                |State(expected): State<String>,
+                token_store,
+                |State(store): State<TokenStore>,
                  req: axum::http::Request<axum::body::Body>,
                  next: axum::middleware::Next| async move {
-                    let expected_header = format!("Bearer {expected}");
-                    match req
+                    let auth_header = req
                         .headers()
                         .get("authorization")
-                        .and_then(|v| v.to_str().ok())
-                    {
-                        Some(val) if val == expected_header => Ok(next.run(req).await),
-                        _ => Err(StatusCode::UNAUTHORIZED),
+                        .and_then(|v| v.to_str().ok());
+                    let token =
+                        extract_bearer_token(auth_header).ok_or(StatusCode::UNAUTHORIZED)?;
+
+                    let role = store
+                        .authenticate(token)
+                        .await
+                        .ok_or(StatusCode::UNAUTHORIZED)?;
+
+                    if !role.has_permission(Permission::Read) {
+                        return Err(StatusCode::FORBIDDEN);
                     }
+
+                    Ok(next.run(req).await)
                 },
             ));
 

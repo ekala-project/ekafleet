@@ -1,6 +1,7 @@
 pub mod api;
 pub mod deployer;
 pub mod nix;
+pub mod rbac;
 pub mod reconciler;
 pub mod scaling;
 pub mod scheduler;
@@ -78,8 +79,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     tracing::info!(server_id = %server_id, domain = %config.domain, "Server identity established");
 
     // Issue a server SVID for gRPC TLS: spiffe://<domain>/server/<server-id>
-    let (server_cert_pem, ca_chain_pem, _expires_at) =
-        ca.issue_server_svid(&server_id).await?;
+    let (server_cert_pem, ca_chain_pem, _expires_at) = ca.issue_server_svid(&server_id).await?;
 
     let tls = api::TlsConfig {
         cert_pem: String::from_utf8(server_cert_pem)?,
@@ -96,12 +96,18 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
 
     let fleet_state = FleetState::new();
 
+    // Initialize RBAC token store with the startup token as admin
+    let token_store = rbac::TokenStore::new();
+    token_store
+        .register(&config.token, rbac::Role::Admin, "initial admin token")
+        .await;
+
     // Start gRPC and HTTP servers concurrently
     let (grpc_result, http_result) = tokio::join!(
         api::serve_grpc(
             grpc_addr,
             fleet_state,
-            &config.token,
+            token_store.clone(),
             &tls,
             cert_issuer,
             ca,
@@ -109,7 +115,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
             &config.domain,
             fleet_key,
         ),
-        api::serve_http(http_addr, config.token.clone()),
+        api::serve_http(http_addr, token_store),
     );
 
     grpc_result?;
