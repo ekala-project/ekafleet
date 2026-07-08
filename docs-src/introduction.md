@@ -4,8 +4,8 @@ ekafleet is a single Rust binary that replaces the entire HashiCorp stack (Nomad
 
 ## One Binary, Two Modes
 
-- **`ekafleet server`** — Control plane: scheduling, CA, secrets, DNS authority, deployment orchestration, Raft consensus, node attestation
-- **`ekafleet agent`** — Data plane: system activation, service supervision, health checks, DNS resolver, secret injection, mesh networking, SPIFFE Workload API, L7 proxy
+- **`ekafleet server`** — Control plane: scheduling, RBAC, CA, secrets, DNS authority, deployment orchestration with disruption budgets, event tracking, REST API, Raft consensus, node attestation
+- **`ekafleet agent`** — Data plane: system activation, service supervision with lifecycle hooks, liveness/readiness/startup probes, config templating, DNS resolver, secret injection, mesh networking, SPIFFE Workload API, L7/L4 proxy with circuit breaking, persistent volumes
 
 Server mode embeds all agent capabilities, meaning a server node can also run workloads. This follows the same pattern as k3s and Nomad.
 
@@ -32,12 +32,16 @@ Running a production fleet typically requires deploying and maintaining a dozen 
 
 | Category | Capabilities |
 |----------|-------------|
-| Scheduling | Priority-based placement, constraints, affinities, spread, taints/tolerations, node pools |
-| Deployment | Rolling, canary, blue-green; health-gated; auto-revert; auto-promote; OS activation |
-| Identity | SPIFFE X.509-SVIDs, Workload API (UDS), node attestation, mTLS bootstrap, automatic renewal |
+| Scheduling | Priority-based placement, constraints, affinities, spread, taints/tolerations, node pools, disruption budgets |
+| Deployment | Rolling, canary, blue-green; health-gated; auto-revert; auto-promote; deployment history; OS activation |
+| Health | Separate liveness, readiness, and startup probes; configurable thresholds |
+| Security | RBAC (admin/operator/viewer), SPIFFE X.509-SVIDs, Workload API, node attestation, mTLS |
 | Secrets | Static (encrypted), dynamic (PostgreSQL/MySQL credential rotation), transit encryption |
 | Networking | WireGuard mesh, DNS authority + resolver, nftables policy |
-| Proxy | L7 HTTP routing, traffic splitting, upstream health tracking |
-| Observability | Prometheus scraping, node metrics, fleet-wide aggregation |
+| Proxy | L7 HTTP (all methods) + L4 TCP proxy; circuit breaking; retries; traffic splitting |
+| Config | Config file templating with service discovery, secrets, and fleet metadata interpolation |
+| Lifecycle | Pre-stop/post-start hooks, configurable stop signal, termination grace period |
+| Storage | Persistent volumes with provisioning, reclaim policies, and recovery on restart |
+| Observability | Prometheus scraping, node metrics, fleet-wide aggregation, event timeline, REST API |
 | Scaling | Metric-based autoscaling, manual scaling, pool-level scaling |
 | HA | Raft consensus for server state, gossip for failure detection |

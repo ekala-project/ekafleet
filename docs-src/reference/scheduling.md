@@ -1263,6 +1263,19 @@ Summary of all features with implementation status and priority.
 | Restart policy (local) | Implemented (config; agent-side enforcement TBD) |
 | Reschedule policy (cross-node) | Implemented (config; server-side tracking TBD) |
 | Delay functions (constant/exp/fibonacci) | Implemented (config type) |
+| Lifecycle hooks (preStop/postStart) | Implemented |
+| Configurable stop signal | Implemented |
+| Termination grace period | Implemented |
+| Disruption budgets (minAvailable/maxUnavailable) | Implemented |
+
+### Health Checks
+
+| Feature | Status |
+|---------|--------|
+| Unified health check (HTTP/TCP/exec) | Implemented |
+| Separate liveness probe | Implemented |
+| Separate readiness probe | Implemented |
+| Startup probe | Implemented |
 
 ### Deployment
 
@@ -1275,6 +1288,44 @@ Summary of all features with implementation status and priority.
 | progress_deadline | Implemented |
 | Health check modes (checks/taskStates/manual) | Implemented |
 | Configurable migration | Implemented |
+| Disruption budget enforcement | Implemented |
+| Deployment history tracking | Implemented |
+
+### Proxy & Networking
+
+| Feature | Status |
+|---------|--------|
+| L7 HTTP proxy (all methods) | Implemented |
+| L4 TCP proxy | Implemented |
+| Circuit breaking | Implemented |
+| Retry with exponential backoff | Implemented |
+| Traffic splitting (canary) | Implemented |
+
+### Observability & API
+
+| Feature | Status |
+|---------|--------|
+| Event timeline | Implemented |
+| Deployment history | Implemented |
+| REST API (JSON) | Implemented |
+| RBAC (admin/operator/viewer) | Implemented |
+
+### Storage
+
+| Feature | Status |
+|---------|--------|
+| Persistent volumes (local) | Implemented |
+| Volume provisioning/release | Implemented |
+| Volume recovery on restart | Implemented |
+| Reclaim policy (retain/delete) | Implemented |
+
+### Configuration
+
+| Feature | Status |
+|---------|--------|
+| Config file templating | Implemented |
+| Service discovery in templates | Implemented |
+| Secret interpolation in templates | Implemented |
 
 ### Node Pools
 

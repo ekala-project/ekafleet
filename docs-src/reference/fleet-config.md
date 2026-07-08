@@ -27,6 +27,9 @@ services.<name> = {
   resources     = ResourceConfig;
   scheduling    = SchedulingConfig;
   environment   = { <key> = "value"; };
+  templates     = { <name> = TemplateConfig; };   # Config file templates (optional)
+  lifecycle     = LifecycleConfig;                 # Shutdown hooks (optional)
+  volumes       = [ VolumeConfig ];                # Persistent volumes (optional)
 };
 ```
 
@@ -37,9 +40,14 @@ ports.<name> = {
   port        = int;           # Port number (required)
   protocol    = "tcp";         # "tcp" or "udp" (default: tcp)
   hostname    = "string";      # For L7 proxy routing (optional)
-  healthCheck = HealthCheckConfig;
+  healthCheck = HealthCheckConfig;  # Unified health check (see also separate probes below)
+  liveness    = HealthCheckConfig;  # Liveness probe — failures trigger restart (optional)
+  readiness   = HealthCheckConfig;  # Readiness probe — failures remove from LB (optional)
+  startup     = HealthCheckConfig;  # Startup probe — suppresses liveness until passing (optional)
 };
 ```
+
+When `liveness`, `readiness`, or `startup` probes are specified, they take precedence over the unified `healthCheck`. If only `healthCheck` is specified, it is used for both liveness and readiness.
 
 ## HealthCheckConfig
 
@@ -95,20 +103,21 @@ resources = {
 
 ```nix
 scheduling = {
-  replicas        = 3;                    # Number of instances (default: 1)
-  type            = "service";            # Job type (default: "service")
-  priority        = 50;                   # 1-100, higher = first (default: 50)
-  pool            = "default";            # Node pool preference (soft, optional)
-  constraints     = [ Constraint ];
-  spread          = [ SpreadConfig ];
-  affinity        = [ AffinityConfig ];
-  serviceAffinity = [ ServiceAffinityConfig ];
-  tolerations     = [ Toleration ];
-  update          = UpdateConfig;
-  restart         = RestartConfig;
-  reschedule      = RescheduleConfig;
-  migrate         = MigrateConfig;
-  periodic        = PeriodicConfig;       # Batch/sysbatch only (optional)
+  replicas          = 3;                    # Number of instances (default: 1)
+  type              = "service";            # Job type (default: "service")
+  priority          = 50;                   # 1-100, higher = first (default: 50)
+  pool              = "default";            # Node pool preference (soft, optional)
+  constraints       = [ Constraint ];
+  spread            = [ SpreadConfig ];
+  affinity          = [ AffinityConfig ];
+  serviceAffinity   = [ ServiceAffinityConfig ];
+  tolerations       = [ Toleration ];
+  update            = UpdateConfig;
+  restart           = RestartConfig;
+  reschedule        = RescheduleConfig;
+  migrate           = MigrateConfig;
+  periodic          = PeriodicConfig;       # Batch/sysbatch only (optional)
+  disruptionBudget  = DisruptionBudget;     # Availability guarantee (optional)
 };
 ```
 
@@ -302,6 +311,86 @@ periodic = {
   failedJobsHistoryLimit     = 1;             # (default: 1)
 };
 ```
+
+## DisruptionBudget
+
+```nix
+disruptionBudget = {
+  # Specify one of minAvailable or maxUnavailable (not both):
+  minAvailable   = 4;        # Minimum instances that must stay up (absolute or "50%")
+  maxUnavailable = 1;        # Maximum instances that can be down (absolute or "25%")
+};
+```
+
+Values can be absolute counts (`2`) or percentage strings (`"50%"`). The deployer limits rolling update batch sizes to respect the budget.
+
+## TemplateConfig
+
+Configuration file templates rendered with fleet context and written to a destination path.
+
+```nix
+templates.nginx-conf = {
+  source   = ''
+    upstream backend {
+      {{ services "api-server" }}
+    }
+    server {
+      listen {{ env.PORT }};
+      server_name {{ meta.domain }};
+    }
+  '';
+  destPath = "/etc/nginx/nginx.conf";
+  perms    = "0644";                    # File permissions (default: "0644")
+  changeSignal = "SIGHUP";             # Signal to send on change (optional)
+};
+```
+
+### Template Syntax
+
+| Expression | Description |
+|------------|-------------|
+| `{{ service "name" }}` | First address of a service (e.g., `10.100.1.1:8080`) |
+| `{{ services "name" }}` | Comma-separated list of all addresses |
+| `{{ secret "name" }}` | Secret value |
+| `{{ meta.field }}` | Fleet metadata (e.g., `meta.fleet_name`, `meta.domain`) |
+| `{{ env.VAR }}` | Environment variable |
+
+## LifecycleConfig
+
+```nix
+lifecycle = {
+  preStop   = [ "/usr/bin/drain" "--timeout" "15" ];  # Command before stop signal (optional)
+  postStart = [ "/usr/bin/warm-cache" ];               # Command after start (optional)
+  stopSignal = "SIGTERM";                              # Shutdown signal (default: "SIGTERM")
+  terminationGracePeriodSeconds = 30;                  # Seconds before force-kill (default: 30)
+};
+```
+
+| Field | systemd Directive | Default |
+|-------|------------------|---------|
+| `preStop` | `ExecStop=` | none |
+| `postStart` | `ExecStartPost=` | none |
+| `stopSignal` | `KillSignal=` | `SIGTERM` |
+| `terminationGracePeriodSeconds` | `TimeoutStopSec=` | `30` |
+
+## VolumeConfig
+
+Persistent volumes for stateful services.
+
+```nix
+volumes = [
+  {
+    name         = "data";               # Volume name (unique within service)
+    mountPath    = "/var/lib/postgresql"; # Mount path
+    sizeMb       = 10240;                # Requested size in MB (default: 1024)
+    storageClass = "local";              # "local", "nfs", "zfs" (default: "local")
+    accessMode   = "ReadWriteOnce";      # "ReadWriteOnce" or "ReadWriteMany" (default: "ReadWriteOnce")
+    reclaimRetain = true;                # Keep data on service destroy (default: true)
+  }
+];
+```
+
+The agent's `VolumeManager` provisions directories at `/var/lib/ekafleet/volumes/<service>/<volume>/` and recovers existing volumes on startup.
 
 ## Machine
 

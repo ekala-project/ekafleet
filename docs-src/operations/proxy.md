@@ -1,20 +1,24 @@
 # Reverse Proxy & Ingress
 
-ekafleet includes a built-in L7 reverse proxy for routing external traffic to services.
+ekafleet includes a built-in reverse proxy supporting both L7 (HTTP) and L4 (TCP) proxying for routing external traffic to services.
 
 ## How It Works
 
-The proxy listener binds on HTTP ports (default 80/443) and routes requests based on hostname and path prefix, derived from service port contracts.
+The L7 proxy listener binds on HTTP ports (default 80/443) and routes requests based on hostname and path prefix, derived from service port contracts. All HTTP methods, headers, and request bodies are forwarded to upstreams via a hyper-based HTTP client.
 
 ```text
 Client → ekafleet proxy (80/443)
     ↓ (hostname + path matching)
 Route resolved via ProxyRouter
+    ↓ (circuit breaker check)
+Circuit breaker allows request?
     ↓ (round-robin selection)
 Upstream selected via UpstreamPool
-    ↓ (forwarded)
+    ↓ (forwarded with retries)
 Backend service
 ```
+
+For non-HTTP protocols (databases, gRPC, AMQP), the L4 TCP proxy performs bidirectional byte forwarding without protocol inspection.
 
 ## Port Contracts
 
@@ -63,6 +67,52 @@ The `TrafficSplitter` uses weighted random selection:
 
 Weights are adjusted automatically during canary progression.
 
+## L4 TCP Proxy
+
+For non-HTTP services (databases, gRPC, message brokers), the L4 proxy binds a TCP listener and forwards raw bytes to an upstream selected from the same `UpstreamPool`:
+
+```nix
+services.postgres = {
+  command = "${pkgs.postgresql}/bin/postgres";
+  ports.tcp = {
+    port = 5432;
+    protocol = "tcp";
+  };
+};
+```
+
+The L4 proxy performs bidirectional `tokio::io::copy` between inbound and outbound connections, with no protocol awareness. Upstream selection uses the same round-robin health-aware pool as the L7 proxy.
+
+## Circuit Breaking
+
+The proxy includes a per-service circuit breaker that protects against cascading failures:
+
+| State | Behavior |
+|-------|----------|
+| **Closed** | Requests flow normally. Failures are counted. |
+| **Open** | All requests immediately return 503. Entered after `failure_threshold` consecutive failures. |
+| **Half-Open** | One probe request is allowed through. If it succeeds, the circuit closes; if it fails, the circuit re-opens. |
+
+Configuration defaults:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `failure_threshold` | 5 | Consecutive failures to open the circuit |
+| `open_duration` | 30s | Time the circuit stays open before probing |
+| `success_threshold` | 2 | Successes in half-open state to close the circuit |
+
+## Retry Logic
+
+Failed upstream requests are automatically retried with exponential backoff:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `max_retries` | 2 | Maximum retry attempts (0 = no retries) |
+| `base_delay` | 100ms | Initial delay between retries |
+| `max_delay` | 2s | Maximum delay (caps exponential growth) |
+
+The retry delay for attempt N is `min(base_delay * 2^N, max_delay)`. After all attempts fail, the circuit breaker records the failure and the upstream is marked unhealthy.
+
 ## Upstream Health
 
 The `UpstreamPool` tracks backend health:
@@ -70,6 +120,7 @@ The `UpstreamPool` tracks backend health:
 - **Round-robin** selection among healthy endpoints
 - Backends marked unhealthy on connection failure (502)
 - Backends recover when health checks pass again
+- Circuit breaker records success/failure for threshold tracking
 
 ## mTLS Enforcement
 
@@ -87,6 +138,7 @@ This enforces identity-based access control at the application layer.
 | Scenario | Response |
 |----------|----------|
 | No matching route | 404 Not Found |
-| All backends unhealthy | 502 Bad Gateway |
-| Backend connection timeout | 502 Bad Gateway (backend marked unhealthy) |
+| Circuit breaker open | 503 Service Unavailable |
+| All backends unhealthy | 503 Service Unavailable |
+| All retry attempts failed | 502 Bad Gateway (backend marked unhealthy) |
 | Unauthorized caller (mTLS) | 403 Forbidden |

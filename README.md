@@ -4,8 +4,8 @@ A single Rust binary that replaces the HashiCorp stack (Nomad + Consul + Vault) 
 
 ## Two Modes
 
-- **`ekafleet server`** — control plane: priority-based scheduling, CA, secrets, DNS authority, deployment orchestration, Raft consensus, node attestation
-- **`ekafleet agent`** — data plane: service supervision, health checks, DNS resolver, secret injection, mesh networking, SPIFFE Workload API, L7 proxy
+- **`ekafleet server`** — control plane: priority-based scheduling, RBAC, CA, secrets, DNS authority, deployment orchestration with disruption budgets, event tracking, REST API, Raft consensus, node attestation
+- **`ekafleet agent`** — data plane: service supervision with lifecycle hooks, liveness/readiness/startup probes, config templating, DNS resolver, secret injection, mesh networking, SPIFFE Workload API, L7/L4 proxy with circuit breaking, persistent volumes
 
 Server mode embeds all agent capabilities and can run workloads directly.
 
@@ -19,7 +19,7 @@ Server mode embeds all agent capabilities and can run workloads directly.
 | SPIRE | `ca_root` + `attestation` + `workload_api` (SPIFFE Workload API, node attestation) |
 | cert-manager | `certs` (auto-renewal) |
 | external-dns | `dns_authority` |
-| nginx/Traefik | `proxy_l7` |
+| nginx/Traefik | `proxy_l7` + `proxy_l4` (circuit breaking, retries) |
 | deploy-rs | `deployer` + `nix_eval` |
 | Cilium/Calico | `nftables` |
 
@@ -63,7 +63,12 @@ Fleet configuration is pure Nix, consumed via `nix eval`:
 
     services.api-server = {
       command = "${pkgs.api-server}/bin/server";
-      ports.http = { port = 8080; healthCheck.path = "/ready"; };
+      ports.http = {
+        port = 8080;
+        liveness.path = "/healthz";      # restart if this fails
+        readiness.path = "/ready";       # stop routing if this fails
+        startup = { path = "/ready"; interval = 2; };  # suppress liveness during init
+      };
       resources = { cpu.request = 500; memory.request = 1024; };
       scheduling = {
         replicas = 3;
@@ -79,7 +84,24 @@ Fleet configuration is pure Nix, consumed via `nix eval`:
           autoRevert = true;
           autoPromote = true;
         };
+        disruptionBudget.minAvailable = 2;  # at least 2 must stay up during updates
       };
+      lifecycle = {
+        preStop = [ "/usr/bin/drain-connections" ];
+        terminationGracePeriodSeconds = 60;
+      };
+      templates.config = {
+        source = ''
+          db_url={{ secret "db-url" }}
+          cache={{ service "redis" }}
+        '';
+        destPath = "/etc/api-server/config.env";
+      };
+      volumes = [{
+        name = "cache";
+        mountPath = "/var/cache/api";
+        sizeMb = 2048;
+      }];
     };
 
     machines.app-1 = {

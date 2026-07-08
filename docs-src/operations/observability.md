@@ -60,6 +60,39 @@ View logs from all replicas of a service:
 ekafleet logs api-server
 ```
 
+## Event Timeline
+
+ekafleet records significant fleet events in an in-memory timeline, queryable via the REST API:
+
+```bash
+# All recent events
+curl -H "Authorization: Bearer $TOKEN" http://server:7402/v1/events
+
+# Filter by service
+curl -H "Authorization: Bearer $TOKEN" http://server:7402/v1/events?service=api-server&limit=20
+```
+
+Event categories: `deployment`, `scheduling`, `health`, `scaling`, `node_join`, `node_leave`, `drain`, `secret_rotation`, `attestation`.
+
+Each event includes a timestamp, severity level (info/warning/error), optional service and node context, and a human-readable message.
+
+## REST API
+
+The server exposes JSON REST endpoints alongside the gRPC API:
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /health` | Health check (unauthenticated) |
+| `GET /metrics` | Prometheus metrics |
+| `GET /v1/status` | Fleet health overview (nodes, services, pools) |
+| `GET /v1/services` | Service placement listing with instance details |
+| `GET /v1/capacity` | Resource utilization with per-pool breakdown |
+| `GET /v1/events` | Queryable event timeline (`?service=...&limit=...`) |
+| `GET /v1/deployments` | All deployment history |
+| `GET /v1/deployments/:service` | Per-service deployment history |
+
+All `/v1/` endpoints require a bearer token with at least `viewer` role permissions.
+
 ## Health Status
 
 ```bash

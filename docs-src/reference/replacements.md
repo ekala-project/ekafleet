@@ -14,7 +14,7 @@ ekafleet consolidates many separate tools into a single binary.
 | **SPIRE** | Workload attestation, Workload API | `ca_root` + `attestation` + `workload_api` (full SPIFFE Workload API, node attestation, CSR signing) |
 | **cert-manager** | TLS automation | `certs` (auto-renewal) |
 | **external-dns** | DNS record management | `dns_authority` |
-| **nginx / Traefik** | Reverse proxy, ingress | `proxy_l7` |
+| **nginx / Traefik** | Reverse proxy, ingress | `proxy_l7` + `proxy_l4` (circuit breaking, retries) |
 | **Prometheus** | Metrics collection | `metrics` |
 | **WireGuard tools** | Mesh networking | `wireguard` |
 | **Cilium / Calico** | Network policy | `nftables` |
@@ -28,7 +28,8 @@ ekafleet consolidates many separate tools into a single binary.
 - No separate Consul dependency for service discovery
 - Built-in secret management (no separate Vault)
 - Implements Nomad-equivalent scheduling: priority, constraints, affinities, spread, node pools
-- Adds Kubernetes-inspired features: taints/tolerations, topology spread constraints, inter-service affinity
+- Adds Kubernetes-inspired features: taints/tolerations, topology spread constraints, inter-service affinity, disruption budgets
+- Built-in RBAC with admin/operator/viewer roles
 
 ### vs. Kubernetes
 
@@ -36,11 +37,14 @@ ekafleet consolidates many separate tools into a single binary.
 - No container runtime required — services run directly via systemd
 - Nix-based configuration instead of YAML manifests
 - WireGuard mesh instead of overlay networks
-- Implements K8s-equivalent scheduling: taints/tolerations, topology spread constraints (maxSkew/minDomains), pod (service) affinity/anti-affinity
+- Implements K8s-equivalent features: taints/tolerations, topology spread constraints (maxSkew/minDomains), pod (service) affinity/anti-affinity, separate liveness/readiness/startup probes, disruption budgets, lifecycle hooks (preStop/postStart), persistent volumes, RBAC
 - Simpler resource model: no QoS classes, no runtime classes
+- Built-in config templating (similar to consul-template)
+- REST API alongside gRPC for CI/CD integration
 
 ### vs. deploy-rs
 
 - ekafleet adds scheduling, health checks, and rolling deployments
 - Continuous reconciliation rather than one-shot deployment
 - Built-in service discovery and secrets
+- Event timeline and deployment history tracking

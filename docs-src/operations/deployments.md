@@ -79,6 +79,37 @@ Health check modes:
 
 If the deadline expires before instances are healthy, the deployment fails. With `autoRevert = true`, ekafleet automatically rolls back to the previous version.
 
+## Disruption Budgets
+
+Disruption budgets guarantee minimum availability during voluntary disruptions (rolling updates, drains). The deployer limits batch sizes to respect the budget:
+
+```nix
+scheduling = {
+  replicas = 6;
+  disruptionBudget = {
+    minAvailable = 4;          # At least 4 instances must stay up
+    # OR
+    # maxUnavailable = 2;      # At most 2 can be down simultaneously
+    # OR
+    # maxUnavailable = "25%";  # Percentage of replicas
+  };
+};
+```
+
+If `maxParallel` exceeds the disruption budget's allowance, the effective batch size is reduced automatically. If the budget allows 0 disruptions (e.g., `minAvailable` equals the total replica count), the deployment is rejected.
+
+## Deployment History
+
+ekafleet tracks per-service deployment history including start time, completion time, strategy, instance count, store path, and outcome (succeeded, failed, rolled back). Query via the REST API:
+
+```bash
+# All deployments
+curl -H "Authorization: Bearer $TOKEN" http://server:7402/v1/deployments
+
+# Per-service history
+curl -H "Authorization: Bearer $TOKEN" http://server:7402/v1/deployments/api-server
+```
+
 ## Dependency Ordering
 
 Services are deployed in topological order based on their `identity.allowedTargets`. Services that call other services are deployed after their dependencies:

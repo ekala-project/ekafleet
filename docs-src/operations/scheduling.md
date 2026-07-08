@@ -215,6 +215,44 @@ scheduling.migrate = {
 };
 ```
 
+## Disruption Budgets
+
+Disruption budgets limit how many instances of a service can be unavailable during voluntary disruptions (rolling updates, node drains):
+
+```nix
+scheduling.disruptionBudget = {
+  # Specify one of:
+  minAvailable = 4;           # Absolute count
+  # minAvailable = "80%";     # Or percentage
+  # maxUnavailable = 1;       # Absolute count
+  # maxUnavailable = "25%";   # Or percentage
+};
+```
+
+The deployer enforces disruption budgets by limiting rolling update batch sizes. If `maxParallel` is larger than what the budget allows, the effective batch size is reduced.
+
+## Lifecycle Hooks
+
+Services can declare lifecycle hooks for graceful shutdown and initialization:
+
+```nix
+lifecycle = {
+  preStop  = [ "/usr/bin/drain-connections" "--timeout" "15" ];  # Run before stop signal
+  postStart = [ "/usr/bin/warm-cache" ];                         # Run after service starts
+  stopSignal = "SIGTERM";                        # Signal for graceful shutdown (default: SIGTERM)
+  terminationGracePeriodSeconds = 30;            # Seconds before force-kill (default: 30)
+};
+```
+
+These map to systemd unit directives:
+
+| Field | systemd Directive |
+|-------|------------------|
+| `preStop` | `ExecStop=` (runs before KillSignal) |
+| `postStart` | `ExecStartPost=` |
+| `stopSignal` | `KillSignal=` |
+| `terminationGracePeriodSeconds` | `TimeoutStopSec=` |
+
 ## Periodic Jobs
 
 Batch and sysbatch jobs can run on a cron schedule:

@@ -4,13 +4,16 @@ Start with `ekafleet server`. The server runs the control plane and can optional
 
 ## Responsibilities
 
-- **Scheduling** — Priority-based placement with constraints, affinities, taints/tolerations, node pools, and spread
-- **Deployment orchestration** — Manages rollouts with health gates
+- **Scheduling** — Priority-based placement with constraints, affinities, taints/tolerations, node pools, spread, and disruption budgets
+- **Deployment orchestration** — Manages rollouts with health gates and disruption budget enforcement
+- **RBAC** — Role-based access control with admin, operator, and viewer roles
 - **Certificate Authority** — Issues SPIFFE X.509-SVIDs, signs CSRs (private keys stay with workloads)
 - **Node attestation** — Validates join tokens, issues node SVIDs for mTLS bootstrap
 - **Secret management** — Stores and distributes encrypted secrets; distributes fleet encryption key
 - **DNS authority** — Authoritative DNS for the fleet domain
 - **Metrics aggregation** — Collects fleet-wide metrics for scaling decisions
+- **Event tracking** — Records deployment, scheduling, health, scaling, and node events
+- **REST API** — JSON endpoints for status, services, capacity, events, and deployment history
 - **Raft consensus** — Multi-server HA with consistent state replication
 
 ## High Availability

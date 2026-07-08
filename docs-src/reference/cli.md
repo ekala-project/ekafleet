@@ -145,7 +145,19 @@ SSH to a fleet machine. Queries fleet status for the machine's address and opens
 ekafleet ssh <MACHINE> [--server 127.0.0.1:7400]
 ```
 
-## Authentication
+## Authentication & RBAC
+
+ekafleet uses role-based access control (RBAC). Each bearer token maps to a role that determines what operations are permitted.
+
+### Roles
+
+| Role | Permissions |
+|------|-------------|
+| `admin` | Full access: deploy, drain, scale, manage tokens, read everything |
+| `operator` | Operational access: deploy, drain, scale, agent connections, read everything |
+| `viewer` | Read-only: status, services, capacity, logs, drift, events |
+
+The `--token` passed at server startup is registered as an `admin` token. Additional tokens with specific roles can be registered via the token store.
 
 ### `ekafleet token create`
 
@@ -160,3 +172,13 @@ ekafleet token create [OPTIONS]
 | `--type` | `agent` | Token type: `agent` or `server` |
 
 Output: 64-character hex string to stdout.
+
+### REST API Authentication
+
+All `/v1/` REST endpoints require a bearer token:
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" http://server:7402/v1/status
+```
+
+The token is validated against the RBAC token store. Viewers can access read endpoints; operators and admins can access write endpoints.

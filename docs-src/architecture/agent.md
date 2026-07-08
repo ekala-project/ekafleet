@@ -6,8 +6,8 @@ Start with `ekafleet agent --join <server>:7400 --join-token <TOKEN> --ca-cert <
 
 - **Node identity** — Bootstraps via SPIFFE node attestation; maintains a node SVID for mTLS
 - **System activation** — Activates EkaOS/NixOS system closures (full OS deployment)
-- **Service supervision** — Generates and manages systemd unit files (with `SPIFFE_ENDPOINT_SOCKET` and `EKAFLEET_SERVICE` env vars)
-- **Health checking** — Polls services with HTTP, TCP, or exec probes; reports to server
+- **Service supervision** — Generates and manages systemd unit files with lifecycle hooks (pre-stop, post-start, configurable stop signal, grace period), `SPIFFE_ENDPOINT_SOCKET`, and `EKAFLEET_SERVICE` env vars
+- **Health checking** — Separate liveness (restart?), readiness (route traffic?), and startup (initializing?) probes; reports to server
 - **SPIFFE identity** — Generates ECDSA P-256 keypairs, sends PKCS#10 CSRs, installs X.509-SVIDs (private keys never leave the agent)
 - **SPIFFE Workload API** — Serves SVIDs and trust bundles over Unix socket at `/run/ekafleet/workload-api.sock`
 - **Secret injection** — Decrypts and writes secrets to local files (mode 0400) using fleet encryption key
@@ -15,7 +15,9 @@ Start with `ekafleet agent --join <server>:7400 --join-token <TOKEN> --ca-cert <
 - **Mesh networking** — Manages kernel WireGuard interface and peers
 - **Network policy** — Applies nftables rules from identity contracts
 - **Metrics collection** — Scrapes Prometheus endpoints from local services
-- **L7 proxy** — HTTP reverse proxy for ingress routing with mTLS enforcement
+- **L7/L4 proxy** — HTTP reverse proxy with circuit breaking and retries, plus L4 TCP proxy for non-HTTP protocols
+- **Config templating** — Renders config file templates with fleet context (service discovery, secrets, metadata)
+- **Volume management** — Provisions and manages persistent volumes for stateful services
 
 ## Connection Lifecycle
 
