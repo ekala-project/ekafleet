@@ -145,8 +145,10 @@ mod tests {
 
         let result = attest(&store, b"test-token", "my-node-uuid").await.unwrap();
         assert_eq!(result.node_id, "my-node-uuid");
-        assert!(result
-            .selectors
-            .contains(&("attestation_type".to_string(), "join_token".to_string())));
+        assert!(
+            result
+                .selectors
+                .contains(&("attestation_type".to_string(), "join_token".to_string()))
+        );
     }
 }

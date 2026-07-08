@@ -123,8 +123,7 @@ impl SecretInjector {
 
     /// Update the encryption key (e.g., when the server distributes the fleet key).
     pub fn update_key(&mut self, new_key: &[u8; 32]) {
-        let unbound =
-            UnboundKey::new(&AES_256_GCM, new_key).expect("valid 256-bit key required");
+        let unbound = UnboundKey::new(&AES_256_GCM, new_key).expect("valid 256-bit key required");
         self.key = Arc::new(LessSafeKey::new(unbound));
         tracing::info!("Secret injector encryption key updated");
     }

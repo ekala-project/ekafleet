@@ -313,9 +313,7 @@ impl RootCa {
 
         let mut leaf_params = CertificateParams::new(vec![cn.to_string()])
             .map_err(|e| CaError::Signing(format!("leaf cert params: {e}")))?;
-        leaf_params
-            .distinguished_name
-            .push(DnType::CommonName, cn);
+        leaf_params.distinguished_name.push(DnType::CommonName, cn);
         leaf_params
             .distinguished_name
             .push(DnType::OrganizationName, "ekafleet");
@@ -603,8 +601,7 @@ mod tests {
         let ca = initialized_ca().await;
 
         // Generate a CSR
-        let csr_output =
-            crate::ca::csr::generate_service_csr("test.internal", "csr-svc").unwrap();
+        let csr_output = crate::ca::csr::generate_service_csr("test.internal", "csr-svc").unwrap();
 
         // Sign the CSR
         let (cert_pem, chain_pem, expires_at) = ca
@@ -645,8 +642,7 @@ mod tests {
         let cert_str = String::from_utf8(cert_pem).unwrap();
 
         // Extract SPIFFE ID from the cert
-        let spiffe_id =
-            crate::proxy::mtls::SpiffeAuthorizer::extract_spiffe_id_from_pem(&cert_str);
+        let spiffe_id = crate::proxy::mtls::SpiffeAuthorizer::extract_spiffe_id_from_pem(&cert_str);
         assert_eq!(
             spiffe_id.as_deref(),
             Some("spiffe://test.internal/server/srv-001")

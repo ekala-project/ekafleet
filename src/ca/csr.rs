@@ -22,10 +22,7 @@ pub struct CsrOutput {
 /// The generated keypair stays local — only the CSR (containing the public key)
 /// is sent to the CA. This follows the SPIFFE principle that private keys never
 /// leave the workload.
-pub fn generate_service_csr(
-    trust_domain: &str,
-    service_name: &str,
-) -> Result<CsrOutput, CaError> {
+pub fn generate_service_csr(trust_domain: &str, service_name: &str) -> Result<CsrOutput, CaError> {
     let keypair = KeyPair::generate()
         .map_err(|e| CaError::KeyGeneration(format!("CSR keypair generation: {e}")))?;
 
@@ -50,9 +47,7 @@ pub fn generate_service_csr(
     params
         .extended_key_usages
         .push(ExtendedKeyUsagePurpose::ClientAuth);
-    params
-        .key_usages
-        .push(KeyUsagePurpose::DigitalSignature);
+    params.key_usages.push(KeyUsagePurpose::DigitalSignature);
 
     let csr = params
         .serialize_request(&keypair)
@@ -92,9 +87,7 @@ pub fn generate_node_csr(trust_domain: &str, node_id: &str) -> Result<CsrOutput,
     params
         .extended_key_usages
         .push(ExtendedKeyUsagePurpose::ServerAuth);
-    params
-        .key_usages
-        .push(KeyUsagePurpose::DigitalSignature);
+    params.key_usages.push(KeyUsagePurpose::DigitalSignature);
 
     let csr = params
         .serialize_request(&keypair)
@@ -141,7 +134,14 @@ mod tests {
             .expect("CSR should be parseable by rcgen");
 
         // The parsed params should have our DN
-        assert!(!params.params.distinguished_name.iter().collect::<Vec<_>>().is_empty());
+        assert!(
+            !params
+                .params
+                .distinguished_name
+                .iter()
+                .collect::<Vec<_>>()
+                .is_empty()
+        );
     }
 
     #[test]

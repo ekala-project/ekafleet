@@ -85,9 +85,7 @@ mod tests {
         let mgr = Arc::new(WorkloadManager::new(dir.path(), "test.internal"));
 
         // Start the server in a background task
-        let handle = tokio::spawn(async move {
-            serve_workload_api(mgr, Some(&sock_str)).await
-        });
+        let handle = tokio::spawn(async move { serve_workload_api(mgr, Some(&sock_str)).await });
 
         // Give it a moment to bind
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;

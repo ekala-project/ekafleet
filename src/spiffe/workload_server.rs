@@ -9,9 +9,9 @@ use crate::spiffe::workload_api::WorkloadManager;
 use crate::spiffe::workload_attestor;
 use crate::workload_proto::spiffe_workload_api_server::SpiffeWorkloadApi;
 use crate::workload_proto::{
-    JwtBundlesRequest, JwtBundlesResponse, JwtsvidRequest, JwtsvidResponse,
-    ValidateJwtsvidRequest, ValidateJwtsvidResponse, X509BundlesRequest, X509BundlesResponse,
-    X509svid, X509svidRequest, X509svidResponse,
+    JwtBundlesRequest, JwtBundlesResponse, JwtsvidRequest, JwtsvidResponse, ValidateJwtsvidRequest,
+    ValidateJwtsvidResponse, X509BundlesRequest, X509BundlesResponse, X509svid, X509svidRequest,
+    X509svidResponse,
 };
 
 /// SPIFFE Workload API service implementation.
@@ -51,13 +51,11 @@ impl SpiffeWorkloadApi for WorkloadApiService {
         let pid = Self::extract_peer_pid(&request)
             .ok_or_else(|| Status::unauthenticated("unable to identify caller PID"))?;
 
-        let service_name = workload_attestor::attest_pid(pid)
-            .await
-            .ok_or_else(|| {
-                Status::permission_denied(format!(
-                    "PID {pid} does not belong to any ekafleet-managed service"
-                ))
-            })?;
+        let service_name = workload_attestor::attest_pid(pid).await.ok_or_else(|| {
+            Status::permission_denied(format!(
+                "PID {pid} does not belong to any ekafleet-managed service"
+            ))
+        })?;
 
         tracing::info!(
             pid,
