@@ -99,6 +99,16 @@ impl UpstreamPool {
         }
     }
 
+    /// Mark an endpoint as unhealthy (non-async version for use in sync closures).
+    /// Spawns the async operation on the current runtime.
+    pub fn mark_unhealthy_sync(&self, service_name: &str, addr: SocketAddr) {
+        let pool = self.clone();
+        let name = service_name.to_string();
+        tokio::spawn(async move {
+            pool.mark_unhealthy(&name, addr).await;
+        });
+    }
+
     /// Remove a service from the pool.
     pub async fn remove_service(&self, service_name: &str) {
         let mut state = self.inner.write().await;

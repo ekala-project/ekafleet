@@ -28,8 +28,11 @@ prost-types = "0.13"
 # Streaming
 tokio-stream = { version = "0.1", features = ["net"] }
 
-# HTTP API
+# HTTP API & proxy
 axum = "0.8"
+hyper = "1"
+hyper-util = { version = "0.1", features = ["client-legacy", "tokio", "http1", "http2"] }
+http-body-util = "0.1"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

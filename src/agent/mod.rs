@@ -36,6 +36,7 @@ pub struct NodeIdentity {
     data_dir: PathBuf,
 }
 
+#[allow(dead_code)]
 impl NodeIdentity {
     fn new(data_dir: &Path) -> Self {
         Self {
@@ -201,7 +202,8 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
         if use_mtls {
             if let (Some(cert), Some(key)) = (&node_cert_pem, &node_key_pem) {
                 tracing::info!("Using node SVID for mTLS authentication");
-                let identity = tonic::transport::Identity::from_pem(cert.as_bytes(), key.as_bytes());
+                let identity =
+                    tonic::transport::Identity::from_pem(cert.as_bytes(), key.as_bytes());
                 tls_config = tls_config.identity(identity);
             }
         }
@@ -352,15 +354,17 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
                     .unwrap_or_else(|| "fleet.internal".to_string());
                 match csr::generate_service_csr(&trust_domain, &service_name) {
                     Ok(csr_output) => {
-                        renewal_keys.write().await.store(&service_name, csr_output.keypair);
+                        renewal_keys
+                            .write()
+                            .await
+                            .store(&service_name, csr_output.keypair);
                         let _ = renewal_tx
                             .send(AgentMessage {
                                 payload: Some(Payload::CertRequest(CertificateRequest {
                                     node_id: renewal_node_id.clone(),
                                     service_name,
                                     csr: csr_output.csr_der,
-                                    request_type: crate::proto::CertRequestType::ServiceCert
-                                        as i32,
+                                    request_type: crate::proto::CertRequestType::ServiceCert as i32,
                                 })),
                             })
                             .await;
@@ -562,8 +566,7 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
                     service = %response.service_name,
                     "Received SVID certificate"
                 );
-                if let Err(e) =
-                    install_received_svid(&workload_mgr, &pending_keys, &response).await
+                if let Err(e) = install_received_svid(&workload_mgr, &pending_keys, &response).await
                 {
                     tracing::error!(error = %e, "Failed to install SVID");
                 }
@@ -613,13 +616,19 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
                 // Attestation challenges are handled via the Attest RPC flow, not the stream.
             }
             Some(ServerPayload::FleetKey(key_update)) => {
-                tracing::info!(version = key_update.version, "Received fleet encryption key");
+                tracing::info!(
+                    version = key_update.version,
+                    "Received fleet encryption key"
+                );
                 if key_update.encrypted_key.len() == 32 {
                     let mut key = [0u8; 32];
                     key.copy_from_slice(&key_update.encrypted_key);
                     let mut inj = secret_injector.write().await;
                     inj.update_key(&key);
-                    tracing::info!(version = key_update.version, "Fleet encryption key installed");
+                    tracing::info!(
+                        version = key_update.version,
+                        "Fleet encryption key installed"
+                    );
                 } else {
                     tracing::warn!(
                         len = key_update.encrypted_key.len(),
@@ -665,8 +674,14 @@ async fn install_received_svid(
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let key_pem = keypair.serialize_pem();
 
-        mgr.install_svid_split(&service_name, &cert_pem, &key_pem, &chain_pem, response.expires_at)
-            .await?;
+        mgr.install_svid_split(
+            &service_name,
+            &cert_pem,
+            &key_pem,
+            &chain_pem,
+            response.expires_at,
+        )
+        .await?;
     } else {
         // Legacy flow: cert+key combined from server
         mgr.install_svid(

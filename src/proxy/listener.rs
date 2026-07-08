@@ -2,17 +2,22 @@
 
 use std::net::SocketAddr;
 
+use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::http::{HeaderValue, StatusCode, Uri};
+use axum::response::{IntoResponse, Response};
 use axum::routing::any;
+
+use hyper_util::client::legacy::Client;
+use hyper_util::rt::TokioExecutor;
 
 use crate::proxy::mtls::SpiffeAuthorizer;
 use crate::proxy::router::ProxyRouter;
 use crate::proxy::upstream::UpstreamPool;
 
 /// HTTP reverse proxy listener that routes requests to backend services
-/// based on the ProxyRouter configuration.
+/// based on the ProxyRouter configuration. Supports all HTTP methods,
+/// headers, and request bodies.
 #[derive(Clone)]
 pub struct ProxyListener {
     router: ProxyRouter,
@@ -31,6 +36,8 @@ impl ProxyListener {
 
     /// Start the HTTP proxy listener on the given address.
     pub async fn start(self, bind_addr: SocketAddr) -> Result<(), std::io::Error> {
+        let http_client = Client::builder(TokioExecutor::new()).build_http();
+
         let app = axum::Router::new()
             .route("/{*path}", any(proxy_handler))
             .route("/", any(proxy_handler))
@@ -38,6 +45,7 @@ impl ProxyListener {
                 router: self.router,
                 upstream: self.upstream,
                 authorizer: self.authorizer,
+                client: http_client,
             });
 
         tracing::info!(addr = %bind_addr, "Proxy listener started");
@@ -56,11 +64,12 @@ struct ProxyState {
     router: ProxyRouter,
     upstream: UpstreamPool,
     authorizer: SpiffeAuthorizer,
+    client: Client<hyper_util::client::legacy::connect::HttpConnector, Body>,
 }
 
-/// Handle an incoming proxy request.
+/// Handle an incoming proxy request by forwarding it to the resolved upstream.
+/// Preserves HTTP method, headers, and body.
 async fn proxy_handler(State(state): State<ProxyState>, req: Request) -> impl IntoResponse {
-    // Extract Host header and path
     let host = req
         .headers()
         .get("host")
@@ -68,13 +77,14 @@ async fn proxy_handler(State(state): State<ProxyState>, req: Request) -> impl In
         .unwrap_or("")
         .to_string();
     let path = req.uri().path().to_string();
+    let query = req.uri().query().map(|q| q.to_string());
 
     // Resolve route
     let resolved = match state.router.resolve(&host, &path).await {
         Some(r) => r,
         None => {
             tracing::debug!(host = %host, path = %path, "No route found");
-            return StatusCode::BAD_GATEWAY.into_response();
+            return StatusCode::NOT_FOUND.into_response();
         }
     };
 
@@ -90,16 +100,15 @@ async fn proxy_handler(State(state): State<ProxyState>, req: Request) -> impl In
         }
     };
 
-    // Forward the request via TCP
-    match forward_request(endpoint, &host, &path).await {
-        Ok(body) => (StatusCode::OK, body).into_response(),
+    // Forward the full request to the upstream
+    match forward_request(&state.client, endpoint, req, &query).await {
+        Ok(resp) => resp.into_response(),
         Err(e) => {
             tracing::error!(
                 endpoint = %endpoint,
                 error = %e,
                 "Upstream request failed"
             );
-            // Mark endpoint as unhealthy on failure
             state
                 .upstream
                 .mark_unhealthy(&resolved.service_name, endpoint)
@@ -109,31 +118,47 @@ async fn proxy_handler(State(state): State<ProxyState>, req: Request) -> impl In
     }
 }
 
-/// Forward a request to an upstream endpoint.
+/// Forward a request to an upstream endpoint, preserving method, headers, and body.
 async fn forward_request(
+    client: &Client<hyper_util::client::legacy::connect::HttpConnector, Body>,
     endpoint: SocketAddr,
-    host: &str,
-    path: &str,
-) -> Result<String, std::io::Error> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpStream;
+    original: Request,
+    query: &Option<String>,
+) -> Result<Response, hyper_util::client::legacy::Error> {
+    let (parts, body) = original.into_parts();
 
-    let mut stream = TcpStream::connect(endpoint).await?;
+    // Build upstream URI
+    let path_and_query = match query {
+        Some(q) => format!("{}?{}", parts.uri.path(), q),
+        None => parts.uri.path().to_string(),
+    };
+    let uri = Uri::builder()
+        .scheme("http")
+        .authority(endpoint.to_string())
+        .path_and_query(path_and_query)
+        .build()
+        .expect("valid upstream URI");
 
-    // Reconstruct a simple HTTP/1.1 GET request
-    let request_line = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
-    stream.write_all(request_line.as_bytes()).await?;
-    stream.shutdown().await?;
+    // Reconstruct the request with all original headers and body
+    let mut upstream_req = Request::builder().method(parts.method).uri(uri);
 
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response).await?;
+    // Copy all headers, overriding Host to the upstream
+    for (name, value) in &parts.headers {
+        if name == "host" {
+            continue;
+        }
+        upstream_req = upstream_req.header(name, value);
+    }
+    upstream_req = upstream_req.header(
+        "host",
+        HeaderValue::from_str(&endpoint.to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("localhost")),
+    );
 
-    // Extract body from HTTP response (after \r\n\r\n)
-    let response_str = String::from_utf8_lossy(&response);
-    let body = response_str
-        .split_once("\r\n\r\n")
-        .map(|(_, b)| b.to_string())
-        .unwrap_or_default();
+    let upstream_req = upstream_req.body(body).expect("valid request body");
 
-    Ok(body)
+    client.request(upstream_req).await.map(|resp| {
+        let (parts, body) = resp.into_parts();
+        Response::from_parts(parts, Body::new(body))
+    })
 }
