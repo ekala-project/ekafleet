@@ -29,6 +29,9 @@ struct NodeInfo {
     last_heartbeat: Instant,
     services: HashMap<String, AgentServiceInfo>,
     tx: mpsc::Sender<ServerMessage>,
+    /// Whether this node is eligible for new scheduling.
+    /// Set to false during maintenance windows.
+    schedulable: bool,
 }
 
 struct AgentServiceInfo {
@@ -81,6 +84,7 @@ impl FleetState {
                 last_heartbeat: Instant::now(),
                 services: HashMap::new(),
                 tx,
+                schedulable: true,
             },
         );
 
@@ -253,5 +257,22 @@ impl FleetState {
     pub async fn connected_nodes(&self) -> Vec<String> {
         let state = self.inner.read().await;
         state.nodes.keys().cloned().collect()
+    }
+
+    /// Set whether a node is eligible for new scheduling.
+    /// Use `false` during maintenance windows to prevent new placements
+    /// without draining existing workloads.
+    pub async fn set_schedulable(&self, node_id: &str, schedulable: bool) {
+        let mut state = self.inner.write().await;
+        if let Some(node) = state.nodes.get_mut(node_id) {
+            node.schedulable = schedulable;
+            tracing::info!(node_id, schedulable, "Node scheduling eligibility updated");
+        }
+    }
+
+    /// Check if a node is eligible for scheduling.
+    pub async fn is_schedulable(&self, node_id: &str) -> bool {
+        let state = self.inner.read().await;
+        state.nodes.get(node_id).is_some_and(|n| n.schedulable)
     }
 }

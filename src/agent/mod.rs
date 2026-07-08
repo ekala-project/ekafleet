@@ -1,5 +1,9 @@
 pub mod activation;
+pub mod exec;
 pub mod health;
+pub mod logs;
+pub mod migrate;
+pub mod snapshot;
 pub mod storage;
 pub mod supervisor;
 pub mod template;

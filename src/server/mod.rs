@@ -2,6 +2,7 @@ pub mod api;
 pub mod audit;
 pub mod deployer;
 pub mod events;
+pub mod federation;
 pub mod namespace;
 pub mod nix;
 pub mod quota;
