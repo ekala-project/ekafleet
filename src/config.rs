@@ -38,8 +38,20 @@ pub struct PortConfig {
     pub protocol: Option<String>,
     #[serde(default)]
     pub hostname: Option<String>,
+    /// Unified health check (used when liveness/readiness are not specified separately).
     #[serde(default, rename = "healthCheck")]
     pub health_check: Option<HealthCheckConfig>,
+    /// Liveness probe: failures trigger a service restart.
+    #[serde(default)]
+    pub liveness: Option<HealthCheckConfig>,
+    /// Readiness probe: failures remove the instance from load balancing
+    /// but do not restart it.
+    #[serde(default)]
+    pub readiness: Option<HealthCheckConfig>,
+    /// Startup probe: suppresses liveness checks until the service finishes
+    /// initializing. Once the startup probe passes, liveness takes over.
+    #[serde(default)]
+    pub startup: Option<HealthCheckConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

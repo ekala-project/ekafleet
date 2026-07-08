@@ -56,9 +56,10 @@ message HealthReport {
 message ServiceHealth {
   string service_name = 1;
   string instance_id = 2;
-  HealthStatus status = 3;
+  HealthStatus status = 3;       // liveness status (should we restart?)
   string message = 4;
   uint64 checked_at = 5;
+  HealthStatus readiness = 6;    // readiness status (should we route traffic?)
 }
 
 enum HealthStatus {
@@ -155,6 +156,15 @@ message ServiceSpec {
   ResourceRequirements resources = 5;
   HealthCheckSpec health_check = 6;
   repeated PortSpec ports = 7;
+
+  // Separate liveness/readiness/startup probes (K8s-style).
+  // If set, these take precedence over the unified health_check field.
+  // - liveness: should the service be restarted? Failures trigger restart.
+  // - readiness: should we route traffic? Failures remove from load balancing.
+  // - startup: is the service still initializing? Suppresses liveness until passing.
+  HealthCheckSpec liveness_probe = 8;
+  HealthCheckSpec readiness_probe = 9;
+  HealthCheckSpec startup_probe = 10;
 }
 
 message ResourceRequirements {
