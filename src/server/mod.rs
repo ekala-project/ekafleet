@@ -1,5 +1,6 @@
 pub mod api;
 pub mod deployer;
+pub mod events;
 pub mod nix;
 pub mod rbac;
 pub mod reconciler;
