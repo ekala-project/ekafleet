@@ -107,7 +107,7 @@ pub async fn reconcile_loop(
 }
 
 /// Compare desired state with actual state to produce operations.
-async fn compute_plan(
+pub async fn compute_plan(
     desired: &FleetConfig,
     _current_nodes: &[String],
     state: &FleetState,

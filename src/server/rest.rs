@@ -1,11 +1,13 @@
 use std::net::SocketAddr;
 
 use axum::Router;
+use axum::response::IntoResponse;
 use axum::routing::get;
 
 use super::events::EventStore;
 use super::rbac::{Permission, TokenStore, extract_bearer_token};
 use super::state::FleetState;
+use crate::metrics::aggregator::MetricsAggregator;
 
 /// Shared state for the HTTP REST API.
 #[derive(Clone)]
@@ -13,6 +15,7 @@ pub struct HttpApiState {
     pub fleet_state: FleetState,
     pub event_store: EventStore,
     pub token_store: TokenStore,
+    pub metrics: MetricsAggregator,
 }
 
 /// Start the HTTP API server with REST endpoints for all operations.
@@ -22,6 +25,7 @@ pub async fn serve_http(
     fleet_state: FleetState,
     event_store: EventStore,
     token_store: TokenStore,
+    metrics: MetricsAggregator,
 ) -> anyhow::Result<()> {
     use axum::extract::State;
     use axum::http::StatusCode;
@@ -30,10 +34,11 @@ pub async fn serve_http(
         fleet_state,
         event_store,
         token_store: token_store.clone(),
+        metrics,
     };
 
     let authenticated_routes = Router::new()
-        .route("/metrics", get(metrics))
+        .route("/metrics", get(metrics_handler))
         .route("/v1/status", get(rest_status))
         .route("/v1/services", get(rest_services))
         .route("/v1/capacity", get(rest_capacity))
@@ -82,8 +87,18 @@ async fn health() -> &'static str {
     "ok"
 }
 
-async fn metrics() -> &'static str {
-    ""
+/// GET /metrics — Prometheus exposition format metrics.
+async fn metrics_handler(
+    axum::extract::State(state): axum::extract::State<HttpApiState>,
+) -> impl IntoResponse {
+    let body = state.metrics.export_prometheus().await;
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
 }
 
 /// GET /v1/status — Fleet health overview (JSON).

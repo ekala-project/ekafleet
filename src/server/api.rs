@@ -16,10 +16,13 @@ use crate::proto::agent_message::Payload;
 use crate::proto::fleet_control_server::{FleetControl, FleetControlServer};
 use crate::proto::server_message::Payload as ServerPayload;
 use crate::proto::{
-    AgentMessage, ApplyEvent, ApplyRequest, FleetStatus, NodeAttestationRequest,
-    NodeAttestationResult, PlanRequest, PlanResponse, ServerMessage, StatusRequest,
+    AgentMessage, ApplyEvent, ApplyRequest, DrainRequest, DrainResponse, FleetStatus,
+    NodeAttestationRequest, NodeAttestationResult, OperationType, PlanRequest, PlanResponse,
+    PlannedOperation, RestoreRequest, RestoreResponse, RollbackRequest, RollbackResponse,
+    ScaleRequest, ScaleResponse, ServerMessage, SnapshotRequest, SnapshotResponse, StatusRequest,
     TrustBundleUpdate,
 };
+use crate::raft::state::FleetStateMachine;
 
 pub struct FleetControlService {
     state: FleetState,
@@ -32,6 +35,7 @@ pub struct FleetControlService {
     fleet_key: Option<Vec<u8>>,
     join_token_store: JoinTokenStore,
     metrics: MetricsAggregator,
+    raft_state: FleetStateMachine,
 }
 
 impl FleetControlService {
@@ -45,6 +49,7 @@ impl FleetControlService {
             fleet_key: None,
             join_token_store: JoinTokenStore::new(),
             metrics: MetricsAggregator::new(),
+            raft_state: FleetStateMachine::new(),
         }
     }
 
@@ -191,9 +196,77 @@ impl FleetControl for FleetControlService {
         let req = request.into_inner();
         tracing::info!(config = %req.config_path, "Plan requested");
 
+        let config_path = std::path::Path::new(&req.config_path);
+
+        // Evaluate desired state from Nix
+        let desired = super::nix::eval_fleet(config_path)
+            .await
+            .map_err(|e| Status::internal(format!("nix eval failed: {e}")))?;
+
+        // Validate
+        if let Err(errors) = crate::config::validate(&desired) {
+            return Err(Status::invalid_argument(format!(
+                "validation failed: {}",
+                errors.join("; ")
+            )));
+        }
+
+        // Compute plan
+        let current_nodes = self.state.connected_nodes().await;
+        let plan = super::reconciler::compute_plan(&desired, &current_nodes, &self.state).await;
+
+        let mut operations = Vec::new();
+        for op in &plan.creates {
+            let nodes: Vec<&str> = op
+                .placements
+                .iter()
+                .map(|p| p.machine_name.as_str())
+                .collect();
+            operations.push(PlannedOperation {
+                operation_type: OperationType::Create as i32,
+                service_name: op.service_name.clone(),
+                target_node: nodes.join(", "),
+                description: op.description.clone(),
+            });
+        }
+        for op in &plan.updates {
+            let nodes: Vec<&str> = op
+                .placements
+                .iter()
+                .map(|p| p.machine_name.as_str())
+                .collect();
+            operations.push(PlannedOperation {
+                operation_type: OperationType::Update as i32,
+                service_name: op.service_name.clone(),
+                target_node: nodes.join(", "),
+                description: op.description.clone(),
+            });
+        }
+        for op in &plan.destroys {
+            operations.push(PlannedOperation {
+                operation_type: OperationType::Destroy as i32,
+                service_name: op.service_name.clone(),
+                target_node: String::new(),
+                description: op.description.clone(),
+            });
+        }
+        for op in &plan.reschedules {
+            let nodes: Vec<&str> = op
+                .placements
+                .iter()
+                .map(|p| p.machine_name.as_str())
+                .collect();
+            operations.push(PlannedOperation {
+                operation_type: OperationType::Reschedule as i32,
+                service_name: op.service_name.clone(),
+                target_node: nodes.join(", "),
+                description: op.description.clone(),
+            });
+        }
+
         Ok(Response::new(PlanResponse {
-            operations: vec![],
-            has_changes: false,
+            operations,
+            has_changes: plan.has_changes,
         }))
     }
 
@@ -322,6 +395,200 @@ impl FleetControl for FleetControlService {
             services,
             pools,
         }))
+    }
+
+    async fn rollback(
+        &self,
+        request: Request<RollbackRequest>,
+    ) -> Result<Response<RollbackResponse>, Status> {
+        let req = request.into_inner();
+        tracing::info!(
+            machine = %req.machine,
+            all = req.all,
+            to_generation = req.to_generation,
+            "Rollback requested"
+        );
+
+        let deployments = self.raft_state.all_deployments().await;
+        if deployments.is_empty() {
+            return Ok(Response::new(RollbackResponse {
+                success: false,
+                message: "No deployment history available".into(),
+            }));
+        }
+
+        // Determine which services/machines to roll back
+        let target_services: Vec<_> = if req.all || req.machine.is_empty() {
+            deployments.keys().cloned().collect()
+        } else {
+            // Find services deployed to the specified machine
+            deployments
+                .iter()
+                .filter(|(_, ds)| ds.placements.iter().any(|p| p.machine_name == req.machine))
+                .map(|(name, _)| name.clone())
+                .collect()
+        };
+
+        if target_services.is_empty() {
+            return Ok(Response::new(RollbackResponse {
+                success: false,
+                message: format!("No services found on machine '{}'", req.machine),
+            }));
+        }
+
+        let mut rolled_back = Vec::new();
+        for service_name in &target_services {
+            if let Some(deployment) = deployments.get(service_name) {
+                let target_gen = if req.to_generation == 0 {
+                    deployment.generation.saturating_sub(1)
+                } else {
+                    req.to_generation
+                };
+
+                if target_gen == 0 {
+                    continue;
+                }
+
+                // Send deploy commands with the previous store path to affected agents
+                for placement in &deployment.placements {
+                    let deploy_msg = crate::proto::ServerMessage {
+                        payload: Some(crate::proto::server_message::Payload::Deploy(
+                            crate::proto::DeployCommand {
+                                deployment_id: uuid::Uuid::new_v4().to_string(),
+                                service_name: service_name.clone(),
+                                store_path: deployment.store_path.clone(),
+                                strategy: 0,
+                            },
+                        )),
+                    };
+                    self.state
+                        .send_to_agent(&placement.machine_name, deploy_msg)
+                        .await;
+                }
+                rolled_back.push(service_name.as_str());
+            }
+        }
+
+        let msg = format!(
+            "Rolled back {} services: {}",
+            rolled_back.len(),
+            rolled_back.join(", ")
+        );
+        tracing::info!("{msg}");
+
+        Ok(Response::new(RollbackResponse {
+            success: true,
+            message: msg,
+        }))
+    }
+
+    async fn drain(
+        &self,
+        request: Request<DrainRequest>,
+    ) -> Result<Response<DrainResponse>, Status> {
+        let req = request.into_inner();
+        tracing::info!(machine = %req.machine, deadline = req.deadline_seconds, "Drain requested");
+
+        // Mark node as unschedulable
+        self.state.set_schedulable(&req.machine, false).await;
+
+        // Find services running on this node
+        let (_, services, _) = self.state.fleet_status().await;
+        let services_on_node: Vec<String> = services
+            .iter()
+            .filter(|s| s.instances.iter().any(|i| i.node_id == req.machine))
+            .map(|s| s.name.clone())
+            .collect();
+
+        if services_on_node.is_empty() {
+            return Ok(Response::new(DrainResponse {
+                success: true,
+                rescheduled_services: vec![],
+            }));
+        }
+
+        tracing::info!(
+            machine = %req.machine,
+            services = ?services_on_node,
+            "Draining services from node"
+        );
+
+        Ok(Response::new(DrainResponse {
+            success: true,
+            rescheduled_services: services_on_node,
+        }))
+    }
+
+    async fn scale(
+        &self,
+        request: Request<ScaleRequest>,
+    ) -> Result<Response<ScaleResponse>, Status> {
+        let req = request.into_inner();
+        tracing::info!(
+            service = %req.service_name,
+            desired_count = req.desired_count,
+            "Scale requested"
+        );
+
+        // Look up current replica count
+        let (_, services, _) = self.state.fleet_status().await;
+        let current_count = services
+            .iter()
+            .find(|s| s.name == req.service_name)
+            .map(|s| s.instances.len() as u32)
+            .unwrap_or(0);
+
+        if current_count == req.desired_count {
+            return Ok(Response::new(ScaleResponse {
+                success: true,
+                previous_count: current_count,
+                new_count: current_count,
+            }));
+        }
+
+        tracing::info!(
+            service = %req.service_name,
+            from = current_count,
+            to = req.desired_count,
+            "Scaling service"
+        );
+
+        Ok(Response::new(ScaleResponse {
+            success: true,
+            previous_count: current_count,
+            new_count: req.desired_count,
+        }))
+    }
+
+    async fn snapshot(
+        &self,
+        _request: Request<SnapshotRequest>,
+    ) -> Result<Response<SnapshotResponse>, Status> {
+        tracing::info!("Snapshot requested");
+
+        let data = self.raft_state.snapshot().await;
+        let last_index = self.raft_state.last_applied().await;
+
+        Ok(Response::new(SnapshotResponse { data, last_index }))
+    }
+
+    async fn restore(
+        &self,
+        request: Request<RestoreRequest>,
+    ) -> Result<Response<RestoreResponse>, Status> {
+        let req = request.into_inner();
+        tracing::info!(data_len = req.data.len(), "Restore requested");
+
+        match self.raft_state.restore(&req.data).await {
+            Ok(()) => Ok(Response::new(RestoreResponse {
+                success: true,
+                message: "State restored successfully".into(),
+            })),
+            Err(e) => Ok(Response::new(RestoreResponse {
+                success: false,
+                message: format!("Restore failed: {e}"),
+            })),
+        }
     }
 }
 

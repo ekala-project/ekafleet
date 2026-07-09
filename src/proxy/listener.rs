@@ -87,6 +87,15 @@ struct ProxyState {
     retry_config: RetryConfig,
 }
 
+/// Returns true if the HTTP method is idempotent and safe to retry.
+fn is_idempotent(method: &axum::http::Method) -> bool {
+    use axum::http::Method;
+    matches!(
+        *method,
+        Method::GET | Method::HEAD | Method::PUT | Method::DELETE | Method::OPTIONS
+    )
+}
+
 /// Handle an incoming proxy request by forwarding it to the resolved upstream.
 /// Preserves HTTP method, headers, and body. Applies circuit breaking and retries.
 async fn proxy_handler(State(state): State<ProxyState>, req: Request) -> impl IntoResponse {
@@ -98,6 +107,17 @@ async fn proxy_handler(State(state): State<ProxyState>, req: Request) -> impl In
         .to_string();
     let path = req.uri().path().to_string();
     let query = req.uri().query().map(|q| q.to_string());
+    let method = req.method().clone();
+
+    // Collect original headers (excluding "host", which is set to the upstream)
+    let mut original_headers = req.headers().clone();
+    original_headers.remove("host");
+
+    // Buffer the body so it can be replayed on retries
+    let body_bytes = match axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
 
     // Resolve route
     let resolved = match state.router.resolve(&host, &path).await {
@@ -138,6 +158,11 @@ async fn proxy_handler(State(state): State<ProxyState>, req: Request) -> impl In
     let mut last_error = None;
 
     for attempt in 0..max_attempts {
+        // Only retry idempotent methods after the first attempt
+        if attempt > 0 && !is_idempotent(&method) {
+            break;
+        }
+
         if attempt > 0 {
             let delay = state.retry_config.delay_for_attempt(attempt - 1);
             tracing::debug!(
@@ -149,7 +174,20 @@ async fn proxy_handler(State(state): State<ProxyState>, req: Request) -> impl In
             tokio::time::sleep(delay).await;
         }
 
-        match forward_request(&state.client, endpoint, &host, &path, &query).await {
+        match forward_request(
+            &state.client,
+            &ForwardParams {
+                endpoint,
+                host: &host,
+                path: &path,
+                query: &query,
+                method: &method,
+                headers: &original_headers,
+                body: &body_bytes,
+            },
+        )
+        .await
+        {
             Ok(resp) => {
                 state
                     .circuit_breakers
@@ -187,16 +225,32 @@ async fn proxy_handler(State(state): State<ProxyState>, req: Request) -> impl In
     StatusCode::BAD_GATEWAY.into_response()
 }
 
-/// Forward a request to an upstream endpoint.
-/// This constructs a minimal probe request (GET) for retry scenarios,
-/// since request bodies cannot be replayed.
+/// Details of an upstream request to forward.
+struct ForwardParams<'a> {
+    endpoint: SocketAddr,
+    host: &'a str,
+    path: &'a str,
+    query: &'a Option<String>,
+    method: &'a axum::http::Method,
+    headers: &'a axum::http::HeaderMap,
+    body: &'a [u8],
+}
+
+/// Forward a request to an upstream endpoint, preserving the original
+/// HTTP method, headers, and body.
 async fn forward_request(
     client: &Client<hyper_util::client::legacy::connect::HttpConnector, Body>,
-    endpoint: SocketAddr,
-    host: &str,
-    path: &str,
-    query: &Option<String>,
+    params: &ForwardParams<'_>,
 ) -> Result<Response, hyper_util::client::legacy::Error> {
+    let ForwardParams {
+        endpoint,
+        host,
+        path,
+        query,
+        method,
+        headers,
+        body,
+    } = params;
     let path_and_query = match query {
         Some(q) => format!("{path}?{q}"),
         None => path.to_string(),
@@ -208,14 +262,18 @@ async fn forward_request(
         .build()
         .expect("valid upstream URI");
 
-    let upstream_req = Request::builder()
-        .method("GET")
-        .uri(uri)
-        .header(
-            "host",
-            HeaderValue::from_str(host).unwrap_or_else(|_| HeaderValue::from_static("localhost")),
-        )
-        .body(Body::empty())
+    let mut builder = Request::builder().method(*method).uri(uri).header(
+        "host",
+        HeaderValue::from_str(host).unwrap_or_else(|_| HeaderValue::from_static("localhost")),
+    );
+
+    // Copy original headers (host was already removed by the caller)
+    for (name, value) in *headers {
+        builder = builder.header(name, value);
+    }
+
+    let upstream_req = builder
+        .body(Body::from(axum::body::Bytes::copy_from_slice(body)))
         .expect("valid request body");
 
     client.request(upstream_req).await.map(|resp| {

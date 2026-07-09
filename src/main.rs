@@ -168,6 +168,10 @@ enum Command {
         /// Machine to drain
         machine: String,
 
+        /// Deadline in seconds (0 = no deadline)
+        #[arg(long, default_value = "0")]
+        deadline: u64,
+
         /// Server address
         #[arg(long, default_value = "127.0.0.1:7400")]
         server: String,
@@ -235,9 +239,9 @@ enum Command {
         /// Path to the snapshot file
         input: std::path::PathBuf,
 
-        /// Data directory
-        #[arg(long, default_value = "/var/lib/ekafleet")]
-        data_dir: std::path::PathBuf,
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
     },
 }
 
@@ -304,14 +308,18 @@ async fn main() -> anyhow::Result<()> {
             machine,
             all,
             to,
-            server: _,
-        } => commands::cmd_rollback(machine, all, to).await?,
+            server,
+        } => commands::cmd_rollback(machine, all, to, server).await?,
 
         Command::Capacity { server } => commands::cmd_capacity(server).await?,
 
         Command::Services { server } => commands::cmd_services(server).await?,
 
-        Command::Drain { machine, server } => commands::cmd_drain(machine, server).await?,
+        Command::Drain {
+            machine,
+            deadline,
+            server,
+        } => commands::cmd_drain(machine, server, deadline).await?,
 
         Command::Scale {
             service,
@@ -329,9 +337,9 @@ async fn main() -> anyhow::Result<()> {
 
         Command::Completions { shell } => commands::cmd_completions(shell),
 
-        Command::Snapshot { output, server: _ } => commands::cmd_snapshot(output).await?,
+        Command::Snapshot { output, server } => commands::cmd_snapshot(output, server).await?,
 
-        Command::Restore { input, data_dir } => commands::cmd_restore(input, data_dir).await?,
+        Command::Restore { input, server } => commands::cmd_restore(input, server).await?,
     }
 
     Ok(())

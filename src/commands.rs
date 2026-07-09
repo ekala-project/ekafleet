@@ -1,5 +1,7 @@
 use ekafleet::proto::fleet_control_client::FleetControlClient;
-use ekafleet::proto::{PlanRequest, StatusRequest};
+use ekafleet::proto::{
+    DrainRequest, PlanRequest, RollbackRequest, ScaleRequest, SnapshotRequest, StatusRequest,
+};
 use ekafleet::{agent, server};
 
 use std::path::PathBuf;
@@ -256,19 +258,27 @@ pub async fn cmd_rollback(
     machine: Option<String>,
     all: bool,
     to: Option<u64>,
+    server: String,
 ) -> anyhow::Result<()> {
-    match (machine.as_deref(), all, to) {
-        (Some(m), _, Some(generation)) => {
-            println!("Rolling back {m} to generation {generation}")
-        }
-        (Some(m), _, None) => println!("Rolling back {m} to previous generation"),
-        (None, true, Some(generation)) => {
-            println!("Rolling back all machines to generation {generation}")
-        }
-        (None, true, None) => println!("Rolling back all machines to previous generation"),
-        _ => println!("Specify a machine name or --all"),
+    if machine.is_none() && !all {
+        anyhow::bail!("Specify a machine name or --all");
     }
-    eprintln!("rollback requires server-side generation tracking (not yet wired)");
+
+    let mut client = connect_server(&server).await?;
+    let resp = client
+        .rollback(RollbackRequest {
+            machine: machine.unwrap_or_default(),
+            all,
+            to_generation: to.unwrap_or(0),
+        })
+        .await?;
+    let result = resp.into_inner();
+
+    if result.success {
+        println!("{}", result.message);
+    } else {
+        anyhow::bail!("Rollback failed: {}", result.message);
+    }
     Ok(())
 }
 
@@ -337,52 +347,50 @@ pub async fn cmd_services(server: String) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn cmd_drain(machine: String, server: String) -> anyhow::Result<()> {
+pub async fn cmd_drain(machine: String, server: String, deadline: u64) -> anyhow::Result<()> {
     let mut client = connect_server(&server).await?;
-    let resp = client.status(StatusRequest {}).await?;
-    let status = resp.into_inner();
+    let resp = client
+        .drain(DrainRequest {
+            machine: machine.clone(),
+            deadline_seconds: deadline,
+        })
+        .await?;
+    let result = resp.into_inner();
 
-    let services_on_node: Vec<_> = status
-        .services
-        .iter()
-        .filter(|s| s.instances.iter().any(|i| i.node_id == machine))
-        .collect();
-
-    if services_on_node.is_empty() {
-        println!("No services running on {machine}.");
-    } else {
-        println!("Services to reschedule from {machine}:");
-        for svc in &services_on_node {
-            println!("  {}", svc.name);
+    if result.success {
+        if result.rescheduled_services.is_empty() {
+            println!("No services running on {machine}.");
+        } else {
+            println!("Drained {machine} — rescheduled services:");
+            for svc in &result.rescheduled_services {
+                println!("  {svc}");
+            }
         }
-        println!(
-            "\n{} services would be rescheduled.",
-            services_on_node.len()
-        );
-        eprintln!("drain execution requires reconciler integration (not yet wired)");
+    } else {
+        anyhow::bail!("Drain failed");
     }
     Ok(())
 }
 
 pub async fn cmd_scale(service: String, count: u32, server: String) -> anyhow::Result<()> {
     let mut client = connect_server(&server).await?;
-    let resp = client.status(StatusRequest {}).await?;
-    let status = resp.into_inner();
+    let resp = client
+        .scale(ScaleRequest {
+            service_name: service.clone(),
+            desired_count: count,
+        })
+        .await?;
+    let result = resp.into_inner();
 
-    let current = status
-        .services
-        .iter()
-        .find(|s| s.name == service)
-        .map(|s| s.instances.len())
-        .unwrap_or(0);
-
-    println!("Service: {service}");
-    println!("  Current instances: {current}");
-    println!("  Desired instances: {count}");
-    if current == count as usize {
-        println!("  Already at desired count.");
+    if result.success {
+        println!("Service: {service}");
+        println!("  Previous instances: {}", result.previous_count);
+        println!("  New instances: {}", result.new_count);
+        if result.previous_count == result.new_count {
+            println!("  Already at desired count.");
+        }
     } else {
-        eprintln!("scale execution requires reconciler integration (not yet wired)");
+        anyhow::bail!("Scale failed");
     }
     Ok(())
 }
@@ -446,18 +454,35 @@ pub fn cmd_completions(shell: clap_complete::Shell) {
     clap_complete::generate(shell, &mut cmd, "ekafleet", &mut std::io::stdout());
 }
 
-pub async fn cmd_snapshot(output: PathBuf) -> anyhow::Result<()> {
-    println!("Saving Raft snapshot to {}", output.display());
-    eprintln!("snapshot save requires server-side snapshot export (Raft snapshot method exists)");
+pub async fn cmd_snapshot(output: PathBuf, server: String) -> anyhow::Result<()> {
+    let mut client = connect_server(&server).await?;
+    let resp = client.snapshot(SnapshotRequest {}).await?;
+    let snapshot = resp.into_inner();
+
+    tokio::fs::write(&output, &snapshot.data).await?;
+    println!(
+        "Snapshot saved to {} ({} bytes, Raft index {})",
+        output.display(),
+        snapshot.data.len(),
+        snapshot.last_index
+    );
     Ok(())
 }
 
-pub async fn cmd_restore(input: PathBuf, data_dir: PathBuf) -> anyhow::Result<()> {
-    println!(
-        "Restoring from {} to {}",
-        input.display(),
-        data_dir.display()
-    );
-    eprintln!("snapshot restore requires server-side import (Raft restore method exists)");
+pub async fn cmd_restore(input: PathBuf, server: String) -> anyhow::Result<()> {
+    let data = tokio::fs::read(&input).await?;
+    println!("Restoring from {} ({} bytes)", input.display(), data.len());
+
+    let mut client = connect_server(&server).await?;
+    let resp = client
+        .restore(ekafleet::proto::RestoreRequest { data })
+        .await?;
+    let result = resp.into_inner();
+
+    if result.success {
+        println!("{}", result.message);
+    } else {
+        anyhow::bail!("Restore failed: {}", result.message);
+    }
     Ok(())
 }

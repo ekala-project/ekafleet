@@ -104,6 +104,16 @@ src/
 3. Define a `<Module>Error` enum with `thiserror` if the module can fail
 4. Run `nix fmt .` then `cargo clippy -- -D warnings`
 
+## Pre-Commit Checklist
+
+After every edit, before committing:
+
+1. `nix develop --command cargo build` — fix all warnings
+2. `nix develop --command cargo clippy -- -D warnings` — fix all clippy lints
+3. `nix fmt .` — format Rust and Nix files
+
+Do not commit with attribution lines (no `Co-Authored-By`).
+
 ## Key Details
 
 - **Branch**: `master` (not main)

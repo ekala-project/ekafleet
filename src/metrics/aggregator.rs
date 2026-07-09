@@ -100,6 +100,54 @@ impl MetricsAggregator {
         state.node_metrics.get(node_id).cloned().unwrap_or_default()
     }
 
+    /// Export all metrics in Prometheus exposition format.
+    pub async fn export_prometheus(&self) -> String {
+        let state = self.inner.read().await;
+        let mut out = String::new();
+
+        // Collect all node metric names
+        let mut node_metric_names: Vec<&String> =
+            state.node_metrics.values().flat_map(|m| m.keys()).collect();
+        node_metric_names.sort();
+        node_metric_names.dedup();
+
+        for metric_name in &node_metric_names {
+            use std::fmt::Write;
+            let _ = writeln!(out, "# TYPE {metric_name} gauge");
+            for (node_id, metrics) in &state.node_metrics {
+                if let Some(value) = metrics.get(*metric_name) {
+                    let _ = writeln!(out, "{metric_name}{{node=\"{node_id}\"}} {value}");
+                }
+            }
+        }
+
+        // Service-level metrics
+        let mut svc_metric_names: Vec<&String> = state
+            .service_metrics
+            .values()
+            .flat_map(|m| m.keys())
+            .collect();
+        svc_metric_names.sort();
+        svc_metric_names.dedup();
+
+        for metric_name in &svc_metric_names {
+            use std::fmt::Write;
+            let _ = writeln!(out, "# TYPE {metric_name} gauge");
+            for (service_name, metrics) in &state.service_metrics {
+                if let Some(values) = metrics.get(*metric_name) {
+                    for (node_id, value) in values {
+                        let _ = writeln!(
+                            out,
+                            "{metric_name}{{service=\"{service_name}\",node=\"{node_id}\"}} {value}"
+                        );
+                    }
+                }
+            }
+        }
+
+        out
+    }
+
     /// Get fleet-wide average for a node metric.
     pub async fn fleet_metric_avg(&self, metric_name: &str) -> Option<f64> {
         let state = self.inner.read().await;

@@ -19,6 +19,21 @@ service FleetControl {
   // Node attestation — unauthenticated, bypasses bearer token interceptor.
   // Used by new agents to bootstrap identity via SPIFFE-style attestation.
   rpc Attest(NodeAttestationRequest) returns (NodeAttestationResult);
+
+  // Rollback a machine (or all machines) to a previous deployment generation.
+  rpc Rollback(RollbackRequest) returns (RollbackResponse);
+
+  // Drain a node — mark unschedulable and reschedule its services elsewhere.
+  rpc Drain(DrainRequest) returns (DrainResponse);
+
+  // Scale a service to a desired replica count.
+  rpc Scale(ScaleRequest) returns (ScaleResponse);
+
+  // Take a Raft state snapshot for disaster recovery.
+  rpc Snapshot(SnapshotRequest) returns (SnapshotResponse);
+
+  // Restore Raft state from a snapshot.
+  rpc Restore(RestoreRequest) returns (RestoreResponse);
 }
 
 // --- Agent → Server messages ---
@@ -419,4 +434,60 @@ message InstanceStatus {
   string node_id = 2;
   ServiceState state = 3;
   HealthStatus health = 4;
+}
+
+// --- Rollback ---
+
+message RollbackRequest {
+  string machine = 1;     // empty = all (when `all` is true)
+  bool all = 2;
+  uint64 to_generation = 3; // 0 = previous generation
+}
+
+message RollbackResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// --- Drain ---
+
+message DrainRequest {
+  string machine = 1;
+  uint64 deadline_seconds = 2; // 0 = no deadline
+}
+
+message DrainResponse {
+  bool success = 1;
+  repeated string rescheduled_services = 2;
+}
+
+// --- Scale ---
+
+message ScaleRequest {
+  string service_name = 1;
+  uint32 desired_count = 2;
+}
+
+message ScaleResponse {
+  bool success = 1;
+  uint32 previous_count = 2;
+  uint32 new_count = 3;
+}
+
+// --- Snapshot / Restore ---
+
+message SnapshotRequest {}
+
+message SnapshotResponse {
+  bytes data = 1;
+  uint64 last_index = 2;
+}
+
+message RestoreRequest {
+  bytes data = 1;
+}
+
+message RestoreResponse {
+  bool success = 1;
+  string message = 2;
 }
