@@ -75,6 +75,12 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
         let ca_cert = tonic::transport::Certificate::from_pem(ca_pem);
         let mut tls_config = tonic::transport::ClientTlsConfig::new().ca_certificate(ca_cert);
 
+        // When connecting by IP address, override TLS hostname verification.
+        // The CA cert already validates the server's identity chain.
+        if config.server_addr.starts_with(|c: char| c.is_ascii_digit()) {
+            tls_config = tls_config.domain_name("ekafleet");
+        }
+
         // Use node SVID for mTLS if available
         if use_mtls && let (Some(cert), Some(key)) = (&node_cert_pem, &node_key_pem) {
             tracing::info!("Using node SVID for mTLS authentication");

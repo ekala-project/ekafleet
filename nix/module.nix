@@ -12,6 +12,12 @@ in
   options.services.ekafleet = {
     enable = lib.mkEnableOption "ekafleet fleet management";
 
+    package = lib.mkOption {
+      type = lib.types.package;
+      default = pkgs.ekaos-fleet;
+      description = "The ekafleet package to use.";
+    };
+
     mode = lib.mkOption {
       type = lib.types.enum [
         "server"
@@ -43,6 +49,30 @@ in
       default = [ ];
       description = "List of peer server addresses for HA (server mode only).";
     };
+
+    grpcListen = lib.mkOption {
+      type = lib.types.str;
+      default = "0.0.0.0:7400";
+      description = "gRPC listen address (server mode only).";
+    };
+
+    httpListen = lib.mkOption {
+      type = lib.types.str;
+      default = "0.0.0.0:7402";
+      description = "HTTP API listen address (server mode only).";
+    };
+
+    domain = lib.mkOption {
+      type = lib.types.str;
+      default = "fleet.internal";
+      description = "SPIFFE trust domain for fleet identities.";
+    };
+
+    caCert = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      description = "Path to CA certificate PEM for TLS verification (agent mode).";
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -63,9 +93,12 @@ in
             let
               peersArg = lib.optionalString (cfg.peers != [ ]) "--peers ${lib.concatStringsSep "," cfg.peers}";
             in
-            "${pkgs.ekafleet}/bin/ekafleet server --data-dir ${cfg.dataDir} --token ${cfg.token} ${peersArg}"
+            "${cfg.package}/bin/ekafleet server --data-dir ${cfg.dataDir} --token ${cfg.token} --listen ${cfg.grpcListen} --http-listen ${cfg.httpListen} --domain ${cfg.domain} ${peersArg}"
           else
-            "${pkgs.ekafleet}/bin/ekafleet agent --join ${cfg.serverAddr} --token ${cfg.token} --data-dir ${cfg.dataDir}";
+            let
+              caCertArg = lib.optionalString (cfg.caCert != null) "--ca-cert ${cfg.caCert}";
+            in
+            "${cfg.package}/bin/ekafleet agent --join ${cfg.serverAddr} --token ${cfg.token} --data-dir ${cfg.dataDir} ${caCertArg}";
 
         # Hardening
         DynamicUser = true;

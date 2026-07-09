@@ -311,7 +311,7 @@ impl RootCa {
         let leaf_keypair = KeyPair::generate()
             .map_err(|e| CaError::Signing(format!("leaf keypair generation: {e}")))?;
 
-        let mut leaf_params = CertificateParams::new(vec![cn.to_string()])
+        let mut leaf_params = CertificateParams::new(vec![cn.to_string(), "ekafleet".to_string()])
             .map_err(|e| CaError::Signing(format!("leaf cert params: {e}")))?;
         leaf_params.distinguished_name.push(DnType::CommonName, cn);
         leaf_params

@@ -46,7 +46,30 @@
     // {
       overlays.default = localOverlay;
 
-      # nixosModules.default = import ./nix/module.nix;
-      # nixosModules.ekapkgs-update = import ./nix/module.nix;
-    };
+      nixosModules.default = import ./nix/module.nix;
+      nixosModules.ekafleet = import ./nix/module.nix;
+    }
+    // (
+      let
+        testSystems = [
+          "x86_64-linux"
+          "aarch64-linux"
+        ];
+      in
+      utils.lib.eachSystem testSystems (
+        system:
+        let
+          pkgs = import nixpkgs {
+            inherit system;
+            overlays = [ localOverlay ];
+          };
+        in
+        {
+          checks = import ./nix/tests {
+            inherit pkgs;
+            inherit (pkgs) lib;
+          };
+        }
+      )
+    );
 }
