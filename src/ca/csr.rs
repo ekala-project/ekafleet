@@ -72,7 +72,7 @@ pub fn generate_node_csr(trust_domain: &str, node_id: &str) -> Result<CsrOutput,
         .map_err(|e| CaError::KeyGeneration(format!("node CSR params: {e}")))?;
     params
         .distinguished_name
-        .push(DnType::CommonName, &format!("agent-{node_id}"));
+        .push(DnType::CommonName, format!("agent-{node_id}"));
     params
         .distinguished_name
         .push(DnType::OrganizationName, "ekafleet");

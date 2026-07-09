@@ -66,37 +66,37 @@ impl QuotaEnforcer {
         let usage = self.usage.read().await;
         let current = usage.get(scope).cloned().unwrap_or_default();
 
-        if let Some(max_cpu) = quota.max_cpu {
-            if current.cpu + cpu > max_cpu {
-                return Err(format!(
-                    "CPU quota exceeded for '{scope}': {} + {} > {max_cpu}",
-                    current.cpu, cpu
-                ));
-            }
+        if let Some(max_cpu) = quota.max_cpu
+            && current.cpu + cpu > max_cpu
+        {
+            return Err(format!(
+                "CPU quota exceeded for '{scope}': {} + {} > {max_cpu}",
+                current.cpu, cpu
+            ));
         }
-        if let Some(max_mem) = quota.max_memory {
-            if current.memory + memory > max_mem {
-                return Err(format!(
-                    "memory quota exceeded for '{scope}': {} + {} > {max_mem}",
-                    current.memory, memory
-                ));
-            }
+        if let Some(max_mem) = quota.max_memory
+            && current.memory + memory > max_mem
+        {
+            return Err(format!(
+                "memory quota exceeded for '{scope}': {} + {} > {max_mem}",
+                current.memory, memory
+            ));
         }
-        if let Some(max_disk) = quota.max_disk {
-            if current.disk + disk > max_disk {
-                return Err(format!(
-                    "disk quota exceeded for '{scope}': {} + {} > {max_disk}",
-                    current.disk, disk
-                ));
-            }
+        if let Some(max_disk) = quota.max_disk
+            && current.disk + disk > max_disk
+        {
+            return Err(format!(
+                "disk quota exceeded for '{scope}': {} + {} > {max_disk}",
+                current.disk, disk
+            ));
         }
-        if let Some(max_inst) = quota.max_instances {
-            if current.instances + 1 > max_inst {
-                return Err(format!(
-                    "instance quota exceeded for '{scope}': {} >= {max_inst}",
-                    current.instances
-                ));
-            }
+        if let Some(max_inst) = quota.max_instances
+            && current.instances + 1 > max_inst
+        {
+            return Err(format!(
+                "instance quota exceeded for '{scope}': {} >= {max_inst}",
+                current.instances
+            ));
         }
 
         Ok(())

@@ -157,18 +157,18 @@ impl Supervisor {
         let mut extra_directives = Vec::new();
 
         // Post-start hook: ExecStartPost runs after the main process starts
-        if let Some(lc) = lifecycle {
-            if !lc.post_start.is_empty() {
-                extra_directives.push(format!("ExecStartPost={}", lc.post_start.join(" ")));
-            }
+        if let Some(lc) = lifecycle
+            && !lc.post_start.is_empty()
+        {
+            extra_directives.push(format!("ExecStartPost={}", lc.post_start.join(" ")));
         }
 
         // Pre-stop hook: ExecStop runs when systemd stops the unit.
         // We run the hook first, then let systemd send KillSignal to the main process.
-        if let Some(lc) = lifecycle {
-            if !lc.pre_stop.is_empty() {
-                extra_directives.push(format!("ExecStop={}", lc.pre_stop.join(" ")));
-            }
+        if let Some(lc) = lifecycle
+            && !lc.pre_stop.is_empty()
+        {
+            extra_directives.push(format!("ExecStop={}", lc.pre_stop.join(" ")));
         }
 
         // Custom kill signal and grace period

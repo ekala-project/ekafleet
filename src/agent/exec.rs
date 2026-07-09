@@ -18,7 +18,7 @@ pub async fn exec_in_service(
     // Use systemd-run --scope to execute in the same slice as the service
     let mut args = vec![
         "--scope".to_string(),
-        format!("--slice=system-ekafleet.slice"),
+        "--slice=system-ekafleet.slice".to_string(),
         "--property=Type=oneshot".to_string(),
         "--quiet".to_string(),
         "--".to_string(),

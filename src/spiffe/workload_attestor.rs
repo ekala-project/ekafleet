@@ -5,9 +5,9 @@
 /// SVID to serve to a given caller.
 ///
 /// Attestation strategies (tried in order):
-/// 1. Check `/proc/<pid>/cgroup` for `ekafleet-<name>.service` unit
-/// 2. Check `/proc/<pid>/environ` for `EKAFLEET_SERVICE=<name>` env var
-
+///   1. Check `/proc/<pid>/cgroup` for `ekafleet-<name>.service` unit
+///   2. Check `/proc/<pid>/environ` for `EKAFLEET_SERVICE=<name>` env var
+///
 /// Determine which ekafleet service a PID belongs to.
 /// Returns None if the PID is not part of any managed service.
 pub async fn attest_pid(pid: u32) -> Option<String> {

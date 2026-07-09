@@ -110,10 +110,10 @@ pub async fn render_to_file(
     let rendered = render(template, ctx);
 
     // Check if the file already has the same content (avoid unnecessary writes)
-    if let Ok(existing) = tokio::fs::read_to_string(dest_path).await {
-        if existing == rendered {
-            return Ok(false); // no change
-        }
+    if let Ok(existing) = tokio::fs::read_to_string(dest_path).await
+        && existing == rendered
+    {
+        return Ok(false); // no change
     }
 
     // Create parent directories if needed

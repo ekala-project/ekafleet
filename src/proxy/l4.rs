@@ -121,9 +121,8 @@ async fn handle_l4_connection(
 
     let outbound = tokio::net::TcpStream::connect(endpoint)
         .await
-        .map_err(|e| {
+        .inspect_err(|_| {
             upstream.mark_unhealthy_sync(service_name, endpoint);
-            e
         })?;
 
     let (mut ri, mut wi) = tokio::io::split(inbound);

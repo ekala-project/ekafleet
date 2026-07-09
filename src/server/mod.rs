@@ -1,3 +1,4 @@
+mod agent_msg;
 pub mod api;
 pub mod audit;
 pub mod deployer;
@@ -10,6 +11,7 @@ pub mod quota;
 pub mod rbac;
 pub mod rebalance;
 pub mod reconciler;
+pub mod rest;
 pub mod scaling;
 pub mod scheduler;
 pub mod state;
@@ -112,19 +114,19 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         .await;
 
     // Start gRPC and HTTP servers concurrently
+    let grpc_config = api::GrpcServerConfig {
+        addr: grpc_addr,
+        tls,
+        cert_issuer,
+        ca,
+        trust_bundle_pem,
+        domain: config.domain,
+        fleet_key,
+    };
+
     let (grpc_result, http_result) = tokio::join!(
-        api::serve_grpc(
-            grpc_addr,
-            fleet_state.clone(),
-            token_store.clone(),
-            &tls,
-            cert_issuer,
-            ca,
-            trust_bundle_pem,
-            &config.domain,
-            fleet_key,
-        ),
-        api::serve_http(http_addr, fleet_state, event_store, token_store),
+        api::serve_grpc(grpc_config, fleet_state.clone(), token_store.clone()),
+        rest::serve_http(http_addr, fleet_state, event_store, token_store),
     );
 
     grpc_result?;

@@ -62,11 +62,11 @@ pub struct MigrateResult {
 fn parse_rsync_bytes(output: &str) -> u64 {
     // Look for "total size is X" line
     for line in output.lines() {
-        if let Some(rest) = line.strip_prefix("total size is ") {
-            if let Some(num_str) = rest.split_whitespace().next() {
-                let cleaned: String = num_str.chars().filter(|c| c.is_ascii_digit()).collect();
-                return cleaned.parse().unwrap_or(0);
-            }
+        if let Some(rest) = line.strip_prefix("total size is ")
+            && let Some(num_str) = rest.split_whitespace().next()
+        {
+            let cleaned: String = num_str.chars().filter(|c| c.is_ascii_digit()).collect();
+            return cleaned.parse().unwrap_or(0);
         }
     }
     0

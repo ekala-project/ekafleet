@@ -21,6 +21,12 @@ struct TokenEntry {
     _bound_node_id: Option<String>,
 }
 
+impl Default for JoinTokenStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl JoinTokenStore {
     pub fn new() -> Self {
         Self {

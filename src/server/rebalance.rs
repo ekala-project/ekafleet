@@ -36,15 +36,15 @@ pub async fn evaluate_rebalance(
 
         // Find instances on nodes that are no longer in the ideal placement
         for actual_node in &actual_nodes {
-            if !ideal_nodes.contains(actual_node) {
-                if let Some(ideal_node) = ideal_nodes.iter().find(|n| !actual_nodes.contains(n)) {
-                    suggestions.push(RebalanceSuggestion {
-                        service_name: svc_status.name.clone(),
-                        from_node: actual_node.to_string(),
-                        to_node: ideal_node.to_string(),
-                        reason: "better placement available after cluster state change".to_string(),
-                    });
-                }
+            if !ideal_nodes.contains(actual_node)
+                && let Some(ideal_node) = ideal_nodes.iter().find(|n| !actual_nodes.contains(n))
+            {
+                suggestions.push(RebalanceSuggestion {
+                    service_name: svc_status.name.clone(),
+                    from_node: actual_node.to_string(),
+                    to_node: ideal_node.to_string(),
+                    reason: "better placement available after cluster state change".to_string(),
+                });
             }
         }
     }

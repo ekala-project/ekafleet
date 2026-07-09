@@ -3,7 +3,7 @@
 /// Trace context propagation through the reverse proxy.
 /// Supports W3C Trace Context (traceparent/tracestate headers)
 /// for integration with OpenTelemetry and Jaeger.
-
+///
 /// W3C Trace Context header names.
 pub const TRACEPARENT_HEADER: &str = "traceparent";
 pub const TRACESTATE_HEADER: &str = "tracestate";
