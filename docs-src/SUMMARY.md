@@ -37,3 +37,4 @@
 - [Ports & Protocols](./reference/ports.md)
 - [NixOS Module](./reference/nixos-module.md)
 - [What ekafleet Replaces](./reference/replacements.md)
+- [Feature Comparison](./reference/comparison.md)
