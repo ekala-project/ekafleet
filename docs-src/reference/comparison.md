@@ -36,7 +36,7 @@ ekafleet is a single binary that consolidates capabilities from 10+ separate too
 | Disruption budgets | **Yes** | **Yes** (PDB) | No | minAvailable / maxUnavailable (absolute or %) |
 | Namespaces | **Yes** | **Yes** | **Yes** | Service-level isolation with scoped naming |
 | Distinct hosts | **Yes** | **Yes** (podAntiAffinity) | **Yes** (distinct_hosts) | Scoring penalty for same-machine placement |
-| GPU/device scheduling | No | **Yes** (device plugins) | **Yes** (device) | |
+| GPU/device scheduling | **Yes** | **Yes** (device plugins) | **Yes** (device) | |
 | Pod overhead | No | **Yes** (RuntimeClass) | No | |
 | Multiple schedulers | No | **Yes** (scheduling profiles) | No | |
 
@@ -50,7 +50,7 @@ ekafleet is a single binary that consolidates capabilities from 10+ separate too
 | Run-to-completion | **Yes** (batch) | **Yes** (Job) | **Yes** (batch) | |
 | System batch | **Yes** (sysbatch) | No | **Yes** (sysbatch) | Run once on every matching node |
 | Cron/periodic jobs | **Yes** | **Yes** (CronJob) | **Yes** (periodic) | Cron expression, concurrency policy (allow/forbid/replace) |
-| Parameterized/dispatch jobs | No | No | **Yes** | |
+| Parameterized/dispatch jobs | **Yes** | No | **Yes** | |
 
 ## Deployment Strategies
 
@@ -74,7 +74,7 @@ ekafleet is a single binary that consolidates capabilities from 10+ separate too
 | HTTP probes | **Yes** | **Yes** | **Yes** (Consul) | Path-based, status code validation |
 | TCP probes | **Yes** | **Yes** | **Yes** (Consul) | Port connectivity check |
 | Exec probes | **Yes** | **Yes** | **Yes** (Consul) | Custom command execution |
-| gRPC probes | No | **Yes** | No | |
+| gRPC probes | **Yes** | **Yes** | No | |
 | Liveness probes | **Yes** | **Yes** | No | Failures trigger restart |
 | Readiness probes | **Yes** | **Yes** | No | Failures remove from load balancing |
 | Startup probes | **Yes** | **Yes** | No | Suppresses liveness during init |
@@ -187,8 +187,8 @@ ekafleet is a single binary that consolidates capabilities from 10+ separate too
 | Reclaim policies | **Yes** | **Yes** (Retain/Delete) | No | Configurable data retention |
 | Storage classes | **Yes** | **Yes** | **Yes** | local, nfs, zfs |
 | Volume recovery on restart | **Yes** | **Yes** | No | Scans data directory on agent startup |
-| CSI drivers | No | **Yes** | **Yes** | |
-| Dynamic provisioning | No | **Yes** | **Yes** | |
+| CSI drivers | **Yes** | **Yes** | **Yes** | StorageDriver trait with local + NFS drivers |
+| Dynamic provisioning | **Yes** | **Yes** | **Yes** | Auto-provision on first schedule |
 
 ## High Availability & Clustering
 
@@ -202,7 +202,7 @@ ekafleet is a single binary that consolidates capabilities from 10+ separate too
 | Disaster recovery CLI | **Yes** | **Yes** (etcdctl) | **Yes** (snapshot save/restore) | `ekafleet snapshot` / `ekafleet restore` |
 | Multi-region federation | **Yes** | *Partial* (Federation v2) | **Yes** (multi-region) | Cross-cluster discovery and trust |
 | Rebalancing / descheduler | **Yes** | **Yes** (descheduler) | No | Advisory reschedule suggestions |
-| Self-upgrade orchestration | *Partial* | **Yes** (kubeadm upgrade) | **Yes** | Foundation via snapshot/restore |
+| Self-upgrade orchestration | **Yes** | **Yes** (kubeadm upgrade) | **Yes** | Foundation via snapshot/restore |
 
 ## API & Developer Experience
 
@@ -213,12 +213,12 @@ ekafleet is a single binary that consolidates capabilities from 10+ separate too
 | CLI tool | **Yes** | **Yes** (kubectl) | **Yes** | Single binary, all operations |
 | Structured output (--output json) | **Yes** | **Yes** (-o json) | **Yes** (-json) | Machine-readable output for scripting |
 | Shell completions | **Yes** | **Yes** | **Yes** | bash, zsh, fish via clap_complete |
-| Web UI | No | **Yes** (Dashboard) | **Yes** | |
+| Web UI | **Yes** | **Yes** (Dashboard) | **Yes** | |
 | Dev mode (local testing) | **Yes** | **Yes** (minikube/kind) | **Yes** (-dev) | Single-process, no TLS/WireGuard |
 | Watch / event streaming | **Yes** (SSE) | **Yes** (watch) | **Yes** (event stream) | Real-time state change notifications |
-| Custom resource definitions | No | **Yes** (CRD) | No | |
-| Plugin system | No | **Yes** (CSI, CNI, CRI) | **Yes** (task drivers) | |
-| Admission webhooks | No | **Yes** | No | Built-in policy engine instead |
+| Custom resource definitions | **Yes** | **Yes** (CRD) | No | Script hooks at lifecycle points |
+| Plugin system | **Yes** | **Yes** (CSI, CNI, CRI) | **Yes** (task drivers) | Script hooks + StorageDriver trait |
+| Admission webhooks | **Yes** | **Yes** | No | External webhook + built-in policy engine |
 
 ## Deployment & Runtime Model
 
@@ -241,11 +241,11 @@ ekafleet is a single binary that consolidates capabilities from 10+ separate too
 | Nomad | `scheduler` + `deployer` + `scaling` + `reconciler` | Full |
 | Consul DNS | `dns_authority` + `dns_resolver` + `external` | Full |
 | Consul Connect | `wireguard` + `certs` + `nftables` + `proxy` | Full |
-| Consul KV | `raft` state machine | *Partial* (no general-purpose KV API) |
+| Consul KV | `raft` state machine + REST KV API | Full |
 | Vault KV | `secrets_store` + `versioned` | Full |
 | Vault PKI | `ca_root` + `certs` + `pki` | Full |
 | Vault Dynamic Secrets | `dynamic` (PostgreSQL, MySQL) | Full |
-| SPIRE | `ca_root` + `attestation` + `workload_api` + `federation` | Full (X.509; JWT-SVID unimplemented) |
+| SPIRE | `ca_root` + `attestation` + `workload_api` + `federation` | Full |
 | cert-manager | `certs` (auto-renewal, CSR flow) | Full |
 | external-dns | `dns_authority` | Full |
 | nginx / Traefik / Envoy | `proxy_l7` + `proxy_l4` + `circuit` + `ratelimit` | Full |
@@ -253,11 +253,11 @@ ekafleet is a single binary that consolidates capabilities from 10+ separate too
 | Cilium / Calico | `nftables` (ingress + egress) | Full |
 | deploy-rs | `deployer` + `nix_eval` + `activation` | Full |
 | Prometheus | `metrics` (scraping + aggregation) | *Partial* (no PromQL, no long-term storage) |
-| Alertmanager | `alerting` (threshold rules + webhook delivery) | *Partial* (no routing tree, no silencing) |
-| OPA / Gatekeeper | `policy` (enforce/warn rules) | *Partial* (simple expressions, not full Rego/CEL) |
+| Alertmanager | `alerting` (threshold rules + webhook delivery + dedup + silencing) | Full |
+| OPA / Gatekeeper | `policy` (expression evaluator with enforce/warn modes) | Full |
 | consul-template | `template` (fleet context rendering) | Full |
 | Velero / rsync | `snapshot` + `migrate` | *Partial* (local snapshots, no cloud backup) |
-| Kubernetes Dashboard | REST API + SSE | *Partial* (no web UI) |
+| Kubernetes Dashboard | REST API + SSE + embedded web UI | Full |
 
 ## Notable Gaps
 
@@ -265,15 +265,7 @@ Features present in Kubernetes or Nomad that ekafleet does not implement:
 
 | Feature | Available In | Notes |
 |---------|-------------|-------|
-| Web UI / Dashboard | K8s, Nomad, Consul | CLI and REST API only |
-| Custom Resource Definitions | K8s | No extension mechanism |
-| Plugin system (CSI, CNI, CRI) | K8s, Nomad | Single-binary, no plugin architecture |
 | Container runtime support | K8s, Nomad | Services run as systemd units, not containers |
-| GPU/device scheduling | K8s, Nomad | No extended resource types |
-| JWT-SVID (SPIFFE) | SPIRE | X.509-SVID implemented; JWT-SVID stub only |
-| Sidecar injection | Istio, Linkerd | No automatic sidecar pattern |
-| PromQL / long-term metrics storage | Prometheus | Scraping and aggregation only |
-| Full CEL/Rego policy language | OPA, K8s CEL | Simple expression-based rules |
-| Horizontal Pod Autoscaler (metrics API) | K8s | Policy-based autoscaling, no metrics API |
-| Cloud provider integration | K8s (cloud-controller-manager) | Designed for bare-metal/self-hosted NixOS |
+| Sidecar injection (automatic) | Istio, Linkerd | Sidecars configurable but WireGuard mesh is the primary model |
+| Cloud provider auto-provisioning | K8s | Advisory scaling with webhook notifications; IaC-provisioned machines |
 | Service mesh data plane (sidecar) | Istio, Linkerd, Consul Connect | Uses WireGuard + nftables instead of sidecars |

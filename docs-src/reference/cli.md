@@ -139,15 +139,22 @@ ekafleet services [--server 127.0.0.1:7400]
 
 ### `ekafleet drain <machine>`
 
-Identify services running on a machine that would need rescheduling (e.g., for maintenance).
+Drain a node — marks it unschedulable and reschedules services to other nodes.
 
 ```
-ekafleet drain <MACHINE> [--server 127.0.0.1:7400]
+ekafleet drain <MACHINE> [OPTIONS]
 ```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--deadline` | `0` | Deadline in seconds for drain to complete (0 = no deadline) |
+| `--server` | `127.0.0.1:7400` | Server address |
+
+Output lists the services drained from the node.
 
 ### `ekafleet scale <service> <count>`
 
-Show current vs desired replica count for a service.
+Scale a service to a desired replica count. Displays previous and new instance counts.
 
 ```
 ekafleet scale <SERVICE> <COUNT> [--server 127.0.0.1:7400]
@@ -160,6 +167,32 @@ Show service instances and journal hints for accessing logs on each node.
 ```
 ekafleet logs <SERVICE> [--server 127.0.0.1:7400]
 ```
+
+### `ekafleet dispatch`
+
+Dispatch a parameterized batch job with arguments.
+
+```
+ekafleet dispatch <SERVICE> [PARAMS...] [OPTIONS]
+```
+
+Parameters are passed as `KEY=VALUE` pairs and injected as `DISPATCH_<KEY>` environment variables.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--server` | `127.0.0.1:7400` | Server address |
+
+### `ekafleet upgrade`
+
+Orchestrate a rolling upgrade of ekafleet across the fleet. Takes a pre-upgrade snapshot, queries fleet status, and prints step-by-step instructions.
+
+```
+ekafleet upgrade <STORE_PATH> [OPTIONS]
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--server` | `127.0.0.1:7400` | Server address |
 
 ### `ekafleet ssh <machine>`
 
@@ -194,7 +227,7 @@ ekafleet restore <INPUT> [OPTIONS]
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--data-dir` | `/var/lib/ekafleet` | Data directory to restore into |
+| `--server` | `127.0.0.1:7400` | Server address |
 
 ## Shell Completions
 
@@ -250,3 +283,23 @@ curl -H "Authorization: Bearer $TOKEN" http://server:7402/v1/status
 ```
 
 The token is validated against the RBAC token store. Viewers can access read endpoints; operators and admins can access write endpoints.
+
+## REST API
+
+All endpoints are served on the HTTP listen address (default `0.0.0.0:7402`). All `/v1/` endpoints require a bearer token (see [REST API Authentication](#rest-api-authentication)).
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /v1/status` | Fleet status |
+| `GET /v1/services` | Service listing |
+| `GET /v1/capacity` | Resource utilization |
+| `GET /v1/query` | Metric query (params: `metric`, `service`, `node`) |
+| `GET /v1/kv/:key` | Read a key from the KV store |
+| `PUT /v1/kv/:key` | Write a key to the KV store |
+| `DELETE /v1/kv/:key` | Delete a key from the KV store |
+| `GET /v1/kv?prefix=...` | List keys by prefix |
+| `GET /v1/metrics/services/:name` | Service-level metrics for HPA |
+| `GET /v1/alerts/silences` | List alert silences |
+| `POST /v1/alerts/silences` | Create an alert silence |
+| `DELETE /v1/alerts/silences/:id` | Remove an alert silence |
+| `GET /ui/` | Web dashboard (embedded SPA) |

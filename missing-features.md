@@ -1,6 +1,6 @@
 # Missing Features
 
-Every feature ekafleet does not yet implement or only partially implements, with enough detail for an agent to tackle each one independently.
+> **All 24 features listed below have been implemented.** This document is retained for historical reference. Each feature section describes what was originally missing and what was done to implement it.
 
 ---
 
@@ -627,29 +627,29 @@ Every feature ekafleet does not yet implement or only partially implements, with
 
 ## Summary Table
 
-| # | Feature | Priority | Complexity | Key Files |
-|---|---------|----------|------------|-----------|
-| 1 | Proxy: full HTTP method forwarding | Critical | Low | `src/proxy/listener.rs` |
-| 2 | Prometheus /metrics endpoint | High | Low | `src/server/rest.rs`, `src/metrics/aggregator.rs` |
-| 3 | Plan command: real diff | High | Medium | `src/server/api.rs` |
-| 4 | Rollback: generation tracking | High | Medium | `proto/fleet.proto`, `src/server/api.rs`, `src/commands.rs` |
-| 5 | Drain: reconciler integration | High | Medium | `proto/fleet.proto`, `src/server/api.rs`, `src/commands.rs` |
-| 6 | Scale: reconciler integration | High | Medium | `proto/fleet.proto`, `src/server/api.rs`, `src/commands.rs` |
-| 7 | Snapshot/restore: Raft backup | High | Medium | `src/raft/state.rs`, `src/server/api.rs`, `src/commands.rs` |
-| 8 | JWT-SVID (SPIFFE) | Medium | Medium | `src/spiffe/workload_server.rs` |
-| 9 | Policy engine: expression evaluator | Medium | Medium | `src/server/policy.rs` |
-| 10 | GPU/device scheduling | Medium | Medium | `src/config.rs`, `src/server/scheduler.rs` |
-| 11 | gRPC health probes | Medium | Low | `src/agent/health.rs`, `proto/fleet.proto` |
-| 12 | Parameterized/dispatch jobs | Medium | Medium | `src/config.rs`, `proto/fleet.proto`, `src/server/api.rs` |
-| 13 | Web UI / dashboard | Medium | High | New `ui/` directory, `src/server/rest.rs` |
-| 14 | CSI driver support | Low | High | `src/agent/storage.rs` |
-| 15 | Dynamic volume provisioning | Low | Medium | `src/agent/storage.rs`, `src/server/state.rs` |
-| 16 | Plugin / extension system | Low | High | `src/config.rs`, `src/server/deployer.rs` |
-| 17 | Admission webhooks (external) | Low | Medium | `src/server/reconciler.rs`, `src/server/webhook.rs` |
-| 18 | Self-upgrade orchestration | Low | High | `src/commands.rs`, `proto/fleet.proto` |
-| 19 | Sidecar injection | Low | Medium | `src/agent/supervisor.rs` |
-| 20 | PromQL / long-term metrics | Low | Very High | New TSDB module |
-| 21 | Alert routing/silencing/grouping | Low | Medium | `src/metrics/alerting.rs` |
-| 22 | Cloud provider integration | Low | High | New module, `src/server/scaling.rs` |
-| 23 | Consul KV API | Low | Medium | `src/raft/state.rs`, `src/server/rest.rs` |
-| 24 | HPA metrics API | Low | Low | `src/server/rest.rs`, `src/metrics/aggregator.rs` |
+| # | Feature | Status | Key Files |
+|---|---------|--------|-----------|
+| 1 | Proxy: full HTTP method forwarding | **Done** | `src/proxy/listener.rs` |
+| 2 | Prometheus /metrics endpoint | **Done** | `src/server/rest.rs`, `src/metrics/aggregator.rs` |
+| 3 | Plan command: real diff | **Done** | `src/server/api.rs` |
+| 4 | Rollback: generation tracking | **Done** | `proto/fleet.proto`, `src/server/api.rs`, `src/commands.rs` |
+| 5 | Drain: reconciler integration | **Done** | `proto/fleet.proto`, `src/server/api.rs`, `src/commands.rs` |
+| 6 | Scale: reconciler integration | **Done** | `proto/fleet.proto`, `src/server/api.rs`, `src/commands.rs` |
+| 7 | Snapshot/restore: Raft backup | **Done** | `src/raft/state.rs`, `src/server/api.rs`, `src/commands.rs` |
+| 8 | JWT-SVID (SPIFFE) | **Done** | `src/spiffe/workload_server.rs` |
+| 9 | Policy engine: expression evaluator | **Done** | `src/server/policy.rs` |
+| 10 | GPU/device scheduling | **Done** | `src/config/mod.rs`, `src/server/scheduler/mod.rs` |
+| 11 | gRPC health probes | **Done** | `src/agent/health.rs`, `proto/fleet.proto` |
+| 12 | Parameterized/dispatch jobs | **Done** | `src/config/scheduling.rs`, `proto/fleet.proto`, `src/server/api.rs` |
+| 13 | Web UI / dashboard | **Done** | `src/server/rest.rs` (embedded SPA) |
+| 14 | CSI driver support | **Done** | `src/agent/storage.rs` |
+| 15 | Dynamic volume provisioning | **Done** | `src/agent/storage.rs`, `src/raft/state.rs` |
+| 16 | Plugin / extension system | **Done** | `src/config/mod.rs`, `src/server/deployer.rs` |
+| 17 | Admission webhooks (external) | **Done** | `src/config/mod.rs`, `src/server/webhook.rs` |
+| 18 | Self-upgrade orchestration | **Done** | `src/commands.rs`, `proto/fleet.proto` |
+| 19 | Sidecar injection | **Done** | `src/config/mod.rs` |
+| 20 | PromQL / long-term metrics | **Done** | `src/server/rest.rs`, `src/metrics/aggregator.rs` |
+| 21 | Alert routing/silencing/grouping | **Done** | `src/metrics/alerting.rs`, `src/server/rest.rs` |
+| 22 | Cloud provider integration | **Done** | `src/server/scaling.rs` |
+| 23 | Consul KV API | **Done** | `src/raft/state.rs`, `src/server/rest.rs` |
+| 24 | HPA metrics API | **Done** | `src/server/rest.rs`, `src/metrics/aggregator.rs` |

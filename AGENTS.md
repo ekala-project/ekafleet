@@ -122,6 +122,6 @@ Do not commit with attribution lines (no `Co-Authored-By`).
   Don't change dependency versions without reason.
 - **`#[allow(dead_code)]`** on modules in `lib.rs` is intentional during buildout.
   Do not remove these unless you've verified all items in the module are used.
-- **Stub commands**: `plan`, `apply`, `status`, `drift`, `rollback`, `capacity`,
-  `services`, `drain`, `scale`, `logs` — all print "not yet implemented".
-  Only `server`, `agent`, and `token create` are functional.
+- **CLI commands**: `server`, `agent`, `dev`, `plan`, `apply`, `status`, `drift`,
+  `rollback`, `capacity`, `services`, `drain`, `scale`, `logs`, `ssh`, `snapshot`,
+  `restore`, `upgrade`, `dispatch`, `token create`, `completions` — all functional.

@@ -120,6 +120,60 @@ Tier 2: api-server              (depends on postgres)
 Tier 3: web-frontend            (depends on api-server)
 ```
 
+## Deployment Hooks
+
+Fleet-level hooks execute custom scripts at deployment lifecycle points:
+
+```nix
+hooks = {
+  preDeploy  = [ "/usr/local/bin/notify" "deploy-start" ];
+  postDeploy = [ "/usr/local/bin/notify" "deploy-done" ];
+};
+```
+
+Hooks receive `EKAFLEET_SERVICE` and `EKAFLEET_ACTION` environment variables.
+
+## Admission Webhooks
+
+External admission webhooks validate deployments before execution:
+
+```nix
+admissionWebhooks = [
+  {
+    name = "security-review";
+    url = "http://policy-server:8080/validate";
+    failPolicy = "fail";
+    timeoutSeconds = 10;
+  }
+];
+```
+
+Each webhook receives a JSON POST with the planned operations and must return `{"allowed": true}` to proceed. If any webhook with `failPolicy = "fail"` rejects, the deployment is blocked.
+
+## Dispatch Jobs
+
+Parameterized batch jobs can be triggered with arguments:
+
+```bash
+ekafleet dispatch backup db=production table=users limit=1000
+```
+
+Parameters are injected as `DISPATCH_<KEY>` environment variables (e.g., `DISPATCH_DB=production`). Only `batch` and `sysbatch` job types support dispatch.
+
+Configure parameterized jobs in the fleet config:
+
+```nix
+services.backup = {
+  scheduling = {
+    type = "batch";
+    parameterized = {
+      requiredParams = [ "db" "table" ];
+      optionalParams = [ "limit" ];
+    };
+  };
+};
+```
+
 ## Manual Operations
 
 ```bash

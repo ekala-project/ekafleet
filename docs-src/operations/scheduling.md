@@ -93,6 +93,28 @@ services.ml-training = {
 | `preferNoSchedule` | Soft: scoring penalty (-50) for non-tolerating services |
 | `noExecute` | Hard: evict running non-tolerating services |
 
+### Extended Resources (GPU, FPGA)
+
+Machines can declare extended resources for device scheduling:
+
+```nix
+machines.gpu-1 = {
+  capacity = { cpu = 8000; memory = 32768; };
+  extendedResources = { gpu = 4; fpga = 2; };
+};
+```
+
+Services request extended resources:
+
+```nix
+resources = {
+  cpu = { request = 1000; };
+  extended = { gpu = 1; };
+};
+```
+
+The scheduler filters machines that lack sufficient extended resources and deducts allocated amounts during placement.
+
 ## Phase 2: Score
 
 Remaining candidates are ranked by a weighted scoring function:

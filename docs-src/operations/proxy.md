@@ -113,6 +113,8 @@ Failed upstream requests are automatically retried with exponential backoff:
 
 The retry delay for attempt N is `min(base_delay * 2^N, max_delay)`. After all attempts fail, the circuit breaker records the failure and the upstream is marked unhealthy.
 
+Non-idempotent methods (`POST`, `PATCH`) are not retried after the first attempt to avoid duplicate side effects. Only idempotent methods (`GET`, `HEAD`, `PUT`, `DELETE`, `OPTIONS`) are eligible for retry.
+
 ## Upstream Health
 
 The `UpstreamPool` tracks backend health:

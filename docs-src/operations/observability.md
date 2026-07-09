@@ -90,8 +90,82 @@ The server exposes JSON REST endpoints alongside the gRPC API:
 | `GET /v1/events` | Queryable event timeline (`?service=...&limit=...`) |
 | `GET /v1/deployments` | All deployment history |
 | `GET /v1/deployments/:service` | Per-service deployment history |
+| `GET /v1/query` | Metric query (`?metric=...&service=...` or `?metric=...&node=...`) |
+| `GET /v1/kv/:key` | Key-value store read |
+| `PUT /v1/kv/:key` | Key-value store write |
+| `DELETE /v1/kv/:key` | Key-value store delete |
+| `GET /v1/kv?prefix=...` | Key-value store prefix listing |
+| `GET /v1/metrics/services/:name` | Per-service metrics for HPA integration |
+| `GET /v1/alerts/silences` | List active alert silences |
+| `POST /v1/alerts/silences` | Create an alert silence |
+| `DELETE /v1/alerts/silences/:id` | Remove an alert silence |
+| `GET /ui/` | Embedded web dashboard |
 
 All `/v1/` endpoints require a bearer token with at least `viewer` role permissions.
+
+## Web Dashboard
+
+ekafleet includes an embedded web dashboard accessible at:
+
+```
+http://<server>:7402/ui/
+```
+
+The dashboard provides a real-time view of the fleet with five pages:
+
+- **Overview** — Node count, service count, health summary
+- **Nodes** — Table of nodes with health status, pool, and resources
+- **Services** — Table of services with instance details and health
+- **Events** — Live event feed with historical event browsing
+- **Deployments** — Deployment history timeline
+
+The dashboard uses the same REST API endpoints as the CLI and requires authentication via bearer token.
+
+## Key-Value Store
+
+ekafleet provides a general-purpose key-value store (similar to Consul KV) for coordination primitives:
+
+```bash
+# Write a key
+curl -X PUT -H "Authorization: Bearer $TOKEN" \
+  -d 'my-value' http://server:7402/v1/kv/my-key
+
+# Read a key
+curl -H "Authorization: Bearer $TOKEN" http://server:7402/v1/kv/my-key
+
+# List keys by prefix
+curl -H "Authorization: Bearer $TOKEN" http://server:7402/v1/kv?prefix=config/
+
+# Delete a key
+curl -X DELETE -H "Authorization: Bearer $TOKEN" http://server:7402/v1/kv/my-key
+```
+
+Use the KV store for leader election, distributed locks, feature flags, and configuration sharing.
+
+## Metric Queries
+
+Query current metric values for services and nodes:
+
+```bash
+# Service metric
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://server:7402/v1/query?metric=cpu_usage&service=api-server"
+
+# Node metric
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://server:7402/v1/query?metric=node_cpu_usage_ratio&node=app-1"
+```
+
+### HPA Metrics API
+
+External autoscaling tools can query per-service metrics:
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  http://server:7402/v1/metrics/services/api-server
+```
+
+Returns all metrics for the service with per-node breakdowns in JSON format.
 
 ### Event Streaming (SSE)
 
@@ -139,6 +213,33 @@ alerting.rules = [
 ```
 
 When an alert fires, ekafleet logs it at `WARN` level and optionally sends a webhook notification to the configured URL.
+
+### Alert Deduplication
+
+Alerts are deduplicated — only state transitions generate notifications:
+- **ok → firing**: Alert notification sent
+- **firing → ok**: Resolved notification sent (with `resolved: true`)
+- **firing → firing**: No duplicate notification
+
+### Alert Silencing
+
+Silence alerts during planned maintenance via the REST API:
+
+```bash
+# Create a silence (matches alerts with label service=api-server)
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"matchers":[["service","api-server"]],"starts_at":1720000000,"ends_at":1720003600,"comment":"maintenance window"}' \
+  http://server:7402/v1/alerts/silences
+
+# List active silences
+curl -H "Authorization: Bearer $TOKEN" http://server:7402/v1/alerts/silences
+
+# Remove a silence
+curl -X DELETE -H "Authorization: Bearer $TOKEN" http://server:7402/v1/alerts/silences/0
+```
+
+Silenced alerts are suppressed during the specified time window. Silencing does not affect metric collection or threshold evaluation — only notification delivery.
 
 ## Webhook Notifications
 

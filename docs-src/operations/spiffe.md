@@ -74,9 +74,9 @@ ekafleet exposes the standard SPIFFE Workload API v2 over a Unix domain socket a
 |-----|--------|
 | `FetchX509SVID` | Implemented (streaming) |
 | `FetchX509Bundles` | Implemented (streaming) |
-| `FetchJWTSVID` | Not yet implemented |
-| `ValidateJWTSVID` | Not yet implemented |
-| `FetchJWTBundles` | Not yet implemented |
+| `FetchJWTSVID` | Implemented |
+| `ValidateJWTSVID` | Implemented |
+| `FetchJWTBundles` | Implemented (streaming) |
 
 ### Workload Attestation
 
@@ -119,6 +119,29 @@ use spiffe::WorkloadApiClient;
 let mut client = WorkloadApiClient::default().await?;
 let svids = client.fetch_x509_svid().await?;
 ```
+
+## JWT-SVID
+
+In addition to X.509-SVIDs, ekafleet supports JWT-SVIDs for token-based authentication between services.
+
+### Fetching a JWT-SVID
+
+```bash
+# Via the Workload API (programmatic)
+# The FetchJWTSVID RPC returns a signed JWT with the workload's SPIFFE ID
+```
+
+JWT claims:
+- `sub` — SPIFFE ID (e.g., `spiffe://fleet.internal/service/my-app`)
+- `aud` — Requested audience(s)
+- `iat` — Issued at (Unix timestamp)
+- `exp` — Expiration (1 hour TTL)
+
+JWTs are signed with HMAC-SHA256 using the fleet signing key. Validation is performed via the `ValidateJWTSVID` RPC, which verifies the signature, expiration, and audience.
+
+### JWT Bundles
+
+The `FetchJWTBundles` RPC returns a JWKS (JSON Web Key Set) stream identifying the signing key. Clients use this to discover key material for local validation.
 
 ### Filesystem Access
 

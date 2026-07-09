@@ -70,10 +70,10 @@ Pool scaling decisions are advisory — they produce events and log recommendati
 To remove a machine from the fleet (e.g., for maintenance):
 
 ```bash
-ekafleet drain app-1
+ekafleet drain app-1 --deadline 300
 ```
 
-This reschedules all services off the machine. The migration policy on each service controls the pacing:
+This marks the node as unschedulable and reschedules all services to other nodes. The optional `--deadline` flag (in seconds) sets a time limit for the drain operation. The migration policy on each service controls the pacing:
 
 ```nix
 scheduling.migrate = {

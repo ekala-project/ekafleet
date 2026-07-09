@@ -96,6 +96,10 @@ resources = {
     request = 5000;    # MB requested (used for scheduling)
     limit   = 10000;   # MB limit (optional)
   };
+  extended = {
+    gpu = 1;       # Extended/device resources
+    fpga = 2;
+  };
 };
 ```
 
@@ -118,6 +122,10 @@ scheduling = {
   migrate           = MigrateConfig;
   periodic          = PeriodicConfig;       # Batch/sysbatch only (optional)
   disruptionBudget  = DisruptionBudget;     # Availability guarantee (optional)
+  parameterized     = {                     # For batch/sysbatch jobs only (optional)
+    requiredParams = [ "db" "table" ];
+    optionalParams = [ "limit" ];
+  };
 };
 ```
 
@@ -392,6 +400,37 @@ volumes = [
 
 The agent's `VolumeManager` provisions directories at `/var/lib/ekafleet/volumes/<service>/<volume>/` and recovers existing volumes on startup.
 
+## SidecarConfig
+
+Sidecar processes that run alongside the main service.
+
+```nix
+sidecars = [
+  {
+    name = "log-shipper";
+    command = "${pkgs.fluent-bit}/bin/fluent-bit";
+    environment = {
+      OUTPUT = "stdout";
+    };
+  }
+];
+```
+
+## HookConfig
+
+Script hooks executed at deployment lifecycle points.
+
+```nix
+hooks = {
+  preDeploy  = [ "/usr/local/bin/notify" "deploy-start" ];
+  postDeploy = [ "/usr/local/bin/notify" "deploy-done" ];
+  preDrain   = [ "/usr/local/bin/check-maintenance" ];
+  postDrain  = [ "/usr/local/bin/notify" "drain-done" ];
+};
+```
+
+Hooks are executed with `EKAFLEET_SERVICE` and `EKAFLEET_ACTION` environment variables.
+
 ## Machine
 
 ```nix
@@ -414,6 +453,10 @@ machines.<name> = {
   taints = [                    # Repel non-tolerating services
     { key = "dedicated"; value = "api"; effect = "noSchedule"; }
   ];
+  extendedResources = {
+    gpu = 4;        # Extended resources available on this machine
+    fpga = 2;
+  };
 };
 ```
 
@@ -473,6 +516,22 @@ policies = [
 ];
 ```
 
+### Expression Paths
+
+| Path | Description |
+|------|-------------|
+| `service.replicas` | Replica count |
+| `service.priority` | Scheduling priority |
+| `service.type` | Job type |
+| `service.pool` | Pool preference |
+| `service.resources.cpu.request` | CPU request |
+| `service.resources.memory.request` | Memory request |
+| `service.resources.disk.request` | Disk request |
+| `service.resources.cpu.limit` | CPU limit |
+| `service.resources.memory.limit` | Memory limit |
+
+Operators: `>=`, `>`, `<=`, `<`, `==`, `!=`
+
 ## WebhookConfig
 
 Outbound webhook notifications triggered by fleet events:
@@ -488,6 +547,23 @@ webhooks = [
 ];
 ```
 
+## AdmissionWebhook
+
+External admission webhooks for validating deployments before execution.
+
+```nix
+admissionWebhooks = [
+  {
+    name = "security-review";
+    url = "http://policy-server:8080/validate";
+    failPolicy = "fail";      # "fail" or "ignore" (default: "fail")
+    timeoutSeconds = 10;      # Request timeout (default: 10)
+  }
+];
+```
+
+The webhook receives a JSON POST with the planned operations. It must return `{"allowed": true}` or `{"allowed": false, "message": "reason"}`.
+
 ## AlertRule
 
 Threshold-based alerting on collected metrics:
@@ -495,15 +571,35 @@ Threshold-based alerting on collected metrics:
 ```nix
 alerting.rules = [
   {
-    name = "high-memory";
-    metric = "node_memory_usage_ratio";
+    name = "high-cpu";
+    metric = "node_cpu_usage_ratio";
     threshold = 0.9;
     op = "gt";
     forSeconds = 300;
     severity = "critical";
     webhook_url = "http://alertmanager:9093/api/v1/alerts";
+    labels = { team = "platform"; };     # Labels for routing (optional)
+    route = "http://slack-hook:8080";     # Override webhook URL (optional)
   }
 ];
+```
+
+### Alert Silencing
+
+Silence alerts during maintenance windows via the REST API:
+
+```bash
+# Create a silence
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"matchers":[["service","api-server"]],"starts_at":1720000000,"ends_at":1720003600,"comment":"maintenance"}' \
+  http://server:7402/v1/alerts/silences
+
+# List silences
+curl -H "Authorization: Bearer $TOKEN" http://server:7402/v1/alerts/silences
+
+# Remove a silence
+curl -X DELETE -H "Authorization: Bearer $TOKEN" http://server:7402/v1/alerts/silences/0
 ```
 
 ## FederatedCluster
