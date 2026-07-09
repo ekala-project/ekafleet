@@ -138,6 +138,7 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
             timestamp: now_epoch(),
             available_resources: Some(collect_resources()),
             pool: String::new(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
         })),
     })
     .await?;
@@ -173,6 +174,7 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
                     timestamp: now_epoch(),
                     available_resources: Some(collect_resources()),
                     pool: String::new(),
+                    version: env!("CARGO_PKG_VERSION").to_string(),
                 })),
             };
             if heartbeat_tx.send(msg).await.is_err() {

@@ -27,6 +27,13 @@ pub struct AlertRule {
     /// Severity level.
     #[serde(default)]
     pub severity: AlertSeverity,
+    /// Labels for routing (e.g., `{"team": "platform"}`).
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
+    /// Route webhook URL by label match. If set, overrides `webhook_url`
+    /// when the alert's labels match.
+    #[serde(default)]
+    pub route: Option<String>,
 }
 
 fn default_op() -> String {
@@ -44,6 +51,21 @@ pub enum AlertSeverity {
     Critical,
 }
 
+/// A silence rule that suppresses alerts matching certain criteria.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AlertSilence {
+    /// Label matchers: alert labels must contain all of these key-value pairs.
+    #[serde(default)]
+    pub matchers: HashMap<String, String>,
+    /// Unix timestamp when the silence starts.
+    pub starts_at: u64,
+    /// Unix timestamp when the silence ends.
+    pub ends_at: u64,
+    /// Human-readable comment explaining the silence.
+    #[serde(default)]
+    pub comment: String,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct FiredAlert {
     pub rule_name: String,
@@ -52,6 +74,8 @@ pub struct FiredAlert {
     pub threshold: f64,
     pub severity: AlertSeverity,
     pub fired_at: u64,
+    /// Whether this alert has been resolved (condition cleared).
+    pub resolved: bool,
 }
 
 /// Evaluates alert rules against collected metrics.
@@ -61,6 +85,10 @@ pub struct AlertEvaluator {
     fired: Arc<RwLock<Vec<FiredAlert>>>,
     /// Tracks how long each rule's condition has been true.
     pending: Arc<RwLock<HashMap<String, std::time::Instant>>>,
+    /// Silence rules that suppress matching alerts.
+    silences: Arc<RwLock<Vec<AlertSilence>>>,
+    /// Currently active (firing) alerts, keyed by rule name, for deduplication.
+    active_alerts: Arc<RwLock<HashMap<String, FiredAlert>>>,
 }
 
 impl Default for AlertEvaluator {
@@ -75,6 +103,8 @@ impl AlertEvaluator {
             rules: Arc::new(RwLock::new(Vec::new())),
             fired: Arc::new(RwLock::new(Vec::new())),
             pending: Arc::new(RwLock::new(HashMap::new())),
+            silences: Arc::new(RwLock::new(Vec::new())),
+            active_alerts: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -85,18 +115,38 @@ impl AlertEvaluator {
     }
 
     /// Evaluate all rules against current metric values.
-    /// Returns newly fired alerts.
+    /// Returns newly fired alerts (including "resolved" entries when conditions clear).
+    /// Supports deduplication (only fires on ok→firing transitions) and silencing.
     pub async fn evaluate(&self, metrics: &HashMap<String, f64>) -> Vec<FiredAlert> {
         let rules = self.rules.read().await;
         let mut pending = self.pending.write().await;
         let mut fired = self.fired.write().await;
+        let silences = self.silences.read().await;
+        let mut active = self.active_alerts.write().await;
         let mut new_alerts = Vec::new();
         let now = std::time::Instant::now();
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
 
         for rule in rules.iter() {
             let value = match metrics.get(&rule.metric) {
                 Some(v) => *v,
-                None => continue,
+                None => {
+                    // If the metric is absent and the rule was previously active, resolve it
+                    if let Some(mut prev) = active.remove(&rule.name) {
+                        prev.resolved = true;
+                        tracing::info!(
+                            rule = %rule.name,
+                            "Alert resolved (metric absent)"
+                        );
+                        new_alerts.push(prev.clone());
+                        fired.push(prev);
+                        pending.remove(&rule.name);
+                    }
+                    continue;
+                }
             };
 
             let condition_met = match rule.op.as_str() {
@@ -111,16 +161,37 @@ impl AlertEvaluator {
             if condition_met {
                 let first_seen = pending.entry(rule.name.clone()).or_insert(now);
                 if first_seen.elapsed() >= Duration::from_secs(rule.for_seconds) {
+                    // Deduplication: only fire on state transition (ok → firing)
+                    if active.contains_key(&rule.name) {
+                        continue;
+                    }
+
+                    // Check silences: skip if any active silence matches
+                    let is_silenced = silences.iter().any(|s| {
+                        if now_unix < s.starts_at || now_unix > s.ends_at {
+                            return false;
+                        }
+                        s.matchers
+                            .iter()
+                            .all(|(k, v)| rule.labels.get(k) == Some(v))
+                    });
+
+                    if is_silenced {
+                        tracing::debug!(
+                            rule = %rule.name,
+                            "Alert suppressed by silence"
+                        );
+                        continue;
+                    }
+
                     let alert = FiredAlert {
                         rule_name: rule.name.clone(),
                         metric: rule.metric.clone(),
                         current_value: value,
                         threshold: rule.threshold,
                         severity: rule.severity,
-                        fired_at: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs(),
+                        fired_at: now_unix,
+                        resolved: false,
                     };
                     tracing::warn!(
                         rule = %rule.name,
@@ -130,11 +201,25 @@ impl AlertEvaluator {
                         severity = ?rule.severity,
                         "Alert fired"
                     );
+                    active.insert(rule.name.clone(), alert.clone());
                     new_alerts.push(alert.clone());
                     fired.push(alert);
                 }
             } else {
                 pending.remove(&rule.name);
+                // Generate "resolved" entry when condition clears
+                if let Some(mut prev) = active.remove(&rule.name) {
+                    prev.resolved = true;
+                    prev.current_value = value;
+                    tracing::info!(
+                        rule = %rule.name,
+                        metric = %rule.metric,
+                        value,
+                        "Alert resolved"
+                    );
+                    new_alerts.push(prev.clone());
+                    fired.push(prev);
+                }
             }
         }
 
@@ -144,6 +229,33 @@ impl AlertEvaluator {
     /// Get all fired alerts.
     pub async fn fired_alerts(&self) -> Vec<FiredAlert> {
         self.fired.read().await.clone()
+    }
+
+    /// Add a silence rule to suppress matching alerts.
+    pub async fn add_silence(&self, silence: AlertSilence) {
+        tracing::info!(
+            comment = %silence.comment,
+            matchers = ?silence.matchers,
+            "Silence added"
+        );
+        self.silences.write().await.push(silence);
+    }
+
+    /// Remove a silence by index.
+    pub async fn remove_silence(&self, index: usize) {
+        let mut silences = self.silences.write().await;
+        if index < silences.len() {
+            let removed = silences.remove(index);
+            tracing::info!(
+                comment = %removed.comment,
+                "Silence removed"
+            );
+        }
+    }
+
+    /// List all active silences.
+    pub async fn list_silences(&self) -> Vec<AlertSilence> {
+        self.silences.read().await.clone()
     }
 }
 
@@ -164,6 +276,8 @@ mod tests {
                 service: None,
                 webhook_url: None,
                 severity: AlertSeverity::Warning,
+                labels: HashMap::new(),
+                route: None,
             }])
             .await;
 
@@ -173,6 +287,7 @@ mod tests {
         let alerts = evaluator.evaluate(&metrics).await;
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0].rule_name, "high-cpu");
+        assert!(!alerts[0].resolved);
     }
 
     #[tokio::test]
@@ -188,6 +303,8 @@ mod tests {
                 service: None,
                 webhook_url: None,
                 severity: AlertSeverity::Warning,
+                labels: HashMap::new(),
+                route: None,
             }])
             .await;
 
@@ -196,5 +313,66 @@ mod tests {
 
         let alerts = evaluator.evaluate(&metrics).await;
         assert!(alerts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deduplication_only_fires_once() {
+        let evaluator = AlertEvaluator::new();
+        evaluator
+            .set_rules(vec![AlertRule {
+                name: "high-cpu".into(),
+                metric: "cpu_usage".into(),
+                threshold: 0.8,
+                op: "gt".into(),
+                for_seconds: 0,
+                service: None,
+                webhook_url: None,
+                severity: AlertSeverity::Warning,
+                labels: HashMap::new(),
+                route: None,
+            }])
+            .await;
+
+        let mut metrics = HashMap::new();
+        metrics.insert("cpu_usage".to_string(), 0.95);
+
+        let alerts1 = evaluator.evaluate(&metrics).await;
+        assert_eq!(alerts1.len(), 1);
+
+        // Second evaluation should not fire again (dedup)
+        let alerts2 = evaluator.evaluate(&metrics).await;
+        assert!(alerts2.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolved_when_condition_clears() {
+        let evaluator = AlertEvaluator::new();
+        evaluator
+            .set_rules(vec![AlertRule {
+                name: "high-cpu".into(),
+                metric: "cpu_usage".into(),
+                threshold: 0.8,
+                op: "gt".into(),
+                for_seconds: 0,
+                service: None,
+                webhook_url: None,
+                severity: AlertSeverity::Warning,
+                labels: HashMap::new(),
+                route: None,
+            }])
+            .await;
+
+        let mut metrics = HashMap::new();
+        metrics.insert("cpu_usage".to_string(), 0.95);
+
+        let alerts = evaluator.evaluate(&metrics).await;
+        assert_eq!(alerts.len(), 1);
+        assert!(!alerts[0].resolved);
+
+        // Condition clears
+        metrics.insert("cpu_usage".to_string(), 0.5);
+        let resolved = evaluator.evaluate(&metrics).await;
+        assert_eq!(resolved.len(), 1);
+        assert!(resolved[0].resolved);
     }
 }

@@ -517,3 +517,58 @@ pub async fn cmd_restore(input: PathBuf, server: String) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+pub async fn cmd_upgrade(store_path: String, server: String) -> anyhow::Result<()> {
+    let mut client = connect_server(&server).await?;
+
+    // Step 1: Take a safety snapshot before upgrading
+    println!("Taking pre-upgrade snapshot...");
+    let snap_resp = client.snapshot(SnapshotRequest {}).await?;
+    let snapshot = snap_resp.into_inner();
+    let snapshot_file = format!(
+        "ekafleet-pre-upgrade-{}.bin",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    );
+    tokio::fs::write(&snapshot_file, &snapshot.data).await?;
+    println!(
+        "Snapshot saved to {} ({} bytes, Raft index {})",
+        snapshot_file,
+        snapshot.data.len(),
+        snapshot.last_index
+    );
+
+    // Step 2: Query current fleet status for upgrade plan
+    let status_resp = client.status(StatusRequest {}).await?;
+    let status = status_resp.into_inner();
+
+    println!();
+    println!("Upgrade plan:");
+    println!("  New binary: {store_path}");
+    println!("  Nodes to upgrade ({}):", status.nodes.len());
+    for node in &status.nodes {
+        let health = if node.healthy { "healthy" } else { "unhealthy" };
+        println!("    {} ({}) - {}", node.node_id, node.address, health);
+    }
+
+    println!();
+    println!("To complete the upgrade:");
+    println!("  1. Deploy the new store path to each node:");
+    for node in &status.nodes {
+        println!(
+            "     nix-copy-closure --to {} {store_path}",
+            node.address.split(':').next().unwrap_or(&node.address)
+        );
+    }
+    println!("  2. Restart ekafleet on each node (rolling, one at a time):");
+    println!("     - Drain the node: ekafleet drain <node>");
+    println!("     - Switch the binary: nix-env -i {store_path}");
+    println!("     - Restart the service: systemctl restart ekafleet");
+    println!("     - Verify health: ekafleet status");
+    println!("  3. If anything goes wrong, restore from the snapshot:");
+    println!("     ekafleet restore {snapshot_file}");
+
+    Ok(())
+}

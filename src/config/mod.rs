@@ -15,6 +15,59 @@ pub struct FleetConfig {
     pub machines: HashMap<String, MachineConfig>,
     #[serde(default, rename = "nodePools")]
     pub node_pools: HashMap<String, NodePoolConfig>,
+    /// Script hooks executed at deployment lifecycle points.
+    #[serde(default)]
+    pub hooks: HookConfig,
+    /// Admission webhooks for validating deployments.
+    #[serde(default, rename = "admissionWebhooks")]
+    pub admission_webhooks: Vec<AdmissionWebhook>,
+}
+
+/// Script hooks executed at various deployment lifecycle points.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HookConfig {
+    /// Command executed before deploying a service.
+    #[serde(default, rename = "preDeploy")]
+    pub pre_deploy: Option<Vec<String>>,
+    /// Command executed after deploying a service.
+    #[serde(default, rename = "postDeploy")]
+    pub post_deploy: Option<Vec<String>>,
+    /// Command executed before draining a node.
+    #[serde(default, rename = "preDrain")]
+    pub pre_drain: Option<Vec<String>>,
+    /// Command executed after draining a node.
+    #[serde(default, rename = "postDrain")]
+    pub post_drain: Option<Vec<String>>,
+}
+
+/// Configuration for an admission webhook that validates deployments.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdmissionWebhook {
+    /// Unique name for this webhook.
+    pub name: String,
+    /// URL to POST admission review requests to.
+    pub url: String,
+    /// Policy when the webhook is unreachable or returns an error.
+    #[serde(default, rename = "failPolicy")]
+    pub fail_policy: FailPolicy,
+    /// Request timeout in seconds.
+    #[serde(default = "default_webhook_timeout", rename = "timeoutSeconds")]
+    pub timeout_seconds: u64,
+}
+
+/// Policy for handling webhook failures (unreachable, timeout, error).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FailPolicy {
+    /// Reject the request if the webhook fails.
+    #[default]
+    Fail,
+    /// Allow the request even if the webhook fails.
+    Ignore,
+}
+
+fn default_webhook_timeout() -> u64 {
+    10
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,6 +95,9 @@ pub struct ServiceConfig {
     /// Persistent volumes to attach to this service.
     #[serde(default)]
     pub volumes: Vec<VolumeConfig>,
+    /// Sidecar processes to run alongside this service.
+    #[serde(default)]
+    pub sidecars: Vec<SidecarConfig>,
 }
 
 /// A persistent volume to attach to a stateful service.
@@ -293,6 +349,19 @@ fn default_stop_signal() -> String {
 }
 fn default_grace_period() -> u64 {
     30
+}
+
+/// A sidecar process that runs alongside the main service.
+/// Sidecars share the same lifecycle and are started after the main process.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SidecarConfig {
+    /// Sidecar name (unique within the service).
+    pub name: String,
+    /// Command to execute for this sidecar.
+    pub command: String,
+    /// Environment variables for the sidecar process.
+    #[serde(default)]
+    pub environment: HashMap<String, String>,
 }
 
 /// Validate a fleet configuration for consistency.

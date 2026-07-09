@@ -91,6 +91,7 @@ fn make_service(name: &str, cpu: u64, memory: u64, replicas: u32) -> (String, Se
             templates: HashMap::new(),
             lifecycle: Default::default(),
             volumes: Vec::new(),
+            sidecars: Vec::new(),
         },
     )
 }
@@ -161,6 +162,7 @@ fn constraint_filtering() {
             templates: HashMap::new(),
             lifecycle: Default::default(),
             volumes: Vec::new(),
+            sidecars: Vec::new(),
         },
     )]
     .into();
@@ -207,6 +209,7 @@ fn system_job_all_nodes() {
             templates: HashMap::new(),
             lifecycle: Default::default(),
             volumes: Vec::new(),
+            sidecars: Vec::new(),
         },
     )]
     .into();
@@ -283,6 +286,7 @@ fn pool_affinity_prefers_correct_pool() {
             templates: HashMap::new(),
             lifecycle: Default::default(),
             volumes: Vec::new(),
+            sidecars: Vec::new(),
         },
     )]
     .into();
@@ -351,6 +355,7 @@ fn pool_affinity_spills_when_full() {
             templates: HashMap::new(),
             lifecycle: Default::default(),
             volumes: Vec::new(),
+            sidecars: Vec::new(),
         },
     )]
     .into();
@@ -425,6 +430,7 @@ fn pool_hard_constraint_blocks_spillover() {
             templates: HashMap::new(),
             lifecycle: Default::default(),
             volumes: Vec::new(),
+            sidecars: Vec::new(),
         },
     )]
     .into();
@@ -537,6 +543,7 @@ fn pool_labels_merged() {
             templates: HashMap::new(),
             lifecycle: Default::default(),
             volumes: Vec::new(),
+            sidecars: Vec::new(),
         },
     )]
     .into();
@@ -626,6 +633,7 @@ fn system_job_on_pool() {
             templates: HashMap::new(),
             lifecycle: Default::default(),
             volumes: Vec::new(),
+            sidecars: Vec::new(),
         },
     )]
     .into();
@@ -678,6 +686,7 @@ fn constraint_numeric_operators() {
             templates: HashMap::new(),
             lifecycle: Default::default(),
             volumes: Vec::new(),
+            sidecars: Vec::new(),
         },
     )]
     .into();
@@ -727,6 +736,7 @@ fn constraint_regexp() {
             templates: HashMap::new(),
             lifecycle: Default::default(),
             volumes: Vec::new(),
+            sidecars: Vec::new(),
         },
     )]
     .into();
@@ -776,6 +786,7 @@ fn constraint_is_set() {
             templates: HashMap::new(),
             lifecycle: Default::default(),
             volumes: Vec::new(),
+            sidecars: Vec::new(),
         },
     )]
     .into();
@@ -842,6 +853,7 @@ fn multiple_spread_blocks() {
             templates: HashMap::new(),
             lifecycle: Default::default(),
             volumes: Vec::new(),
+            sidecars: Vec::new(),
         },
     )]
     .into();
@@ -895,6 +907,7 @@ fn priority_ordering() {
                 templates: HashMap::new(),
                 lifecycle: Default::default(),
                 volumes: Vec::new(),
+                sidecars: Vec::new(),
             },
         ),
         (
@@ -925,6 +938,7 @@ fn priority_ordering() {
                 templates: HashMap::new(),
                 lifecycle: Default::default(),
                 volumes: Vec::new(),
+                sidecars: Vec::new(),
             },
         ),
     ]
@@ -1005,6 +1019,7 @@ fn taint_blocks_non_tolerating_service() {
             templates: HashMap::new(),
             lifecycle: Default::default(),
             volumes: Vec::new(),
+            sidecars: Vec::new(),
         },
     )]
     .into();
@@ -1048,6 +1063,7 @@ fn sysbatch_runs_on_all_nodes() {
             templates: HashMap::new(),
             lifecycle: Default::default(),
             volumes: Vec::new(),
+            sidecars: Vec::new(),
         },
     )]
     .into();

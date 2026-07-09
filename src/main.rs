@@ -257,6 +257,16 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:7400")]
         server: String,
     },
+
+    /// Orchestrate a rolling upgrade of the ekafleet binary across the fleet
+    Upgrade {
+        /// Nix store path of the new ekafleet binary
+        store_path: String,
+
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -360,6 +370,10 @@ async fn main() -> anyhow::Result<()> {
         Command::Snapshot { output, server } => commands::cmd_snapshot(output, server).await?,
 
         Command::Restore { input, server } => commands::cmd_restore(input, server).await?,
+
+        Command::Upgrade { store_path, server } => {
+            commands::cmd_upgrade(store_path, server).await?
+        }
     }
 
     Ok(())

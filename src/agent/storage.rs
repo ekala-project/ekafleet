@@ -6,6 +6,153 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
+/// Trait for pluggable storage backends (CSI-style driver interface).
+pub trait StorageDriver: Send + Sync {
+    /// Create a new volume with the given name and size.
+    fn create_volume(
+        &self,
+        name: &str,
+        size_mb: u64,
+    ) -> impl std::future::Future<Output = Result<String, std::io::Error>> + Send;
+
+    /// Delete an existing volume by ID.
+    fn delete_volume(
+        &self,
+        volume_id: &str,
+    ) -> impl std::future::Future<Output = Result<(), std::io::Error>> + Send;
+
+    /// Attach a volume to a node, returning the mount path.
+    fn attach_volume(
+        &self,
+        volume_id: &str,
+        node: &str,
+    ) -> impl std::future::Future<Output = Result<String, std::io::Error>> + Send;
+
+    /// Detach a volume from a node.
+    fn detach_volume(
+        &self,
+        volume_id: &str,
+        node: &str,
+    ) -> impl std::future::Future<Output = Result<(), std::io::Error>> + Send;
+}
+
+/// Local storage driver that creates directories on the local filesystem.
+pub struct LocalStorageDriver {
+    base_dir: PathBuf,
+}
+
+impl LocalStorageDriver {
+    pub fn new(base_dir: PathBuf) -> Self {
+        Self { base_dir }
+    }
+}
+
+impl StorageDriver for LocalStorageDriver {
+    async fn create_volume(&self, name: &str, _size_mb: u64) -> Result<String, std::io::Error> {
+        let vol_path = self.base_dir.join(name);
+        tokio::fs::create_dir_all(&vol_path).await?;
+        Ok(vol_path.display().to_string())
+    }
+
+    async fn delete_volume(&self, volume_id: &str) -> Result<(), std::io::Error> {
+        let path = PathBuf::from(volume_id);
+        if path.exists() {
+            tokio::fs::remove_dir_all(&path).await?;
+        }
+        Ok(())
+    }
+
+    async fn attach_volume(&self, volume_id: &str, _node: &str) -> Result<String, std::io::Error> {
+        // Local volumes are already on-node; just return the path.
+        Ok(volume_id.to_string())
+    }
+
+    async fn detach_volume(&self, _volume_id: &str, _node: &str) -> Result<(), std::io::Error> {
+        // Local volumes don't need explicit detach.
+        Ok(())
+    }
+}
+
+/// NFS storage driver that mounts NFS shares.
+pub struct NfsStorageDriver {
+    /// NFS server address (e.g., "10.0.0.1:/exports").
+    server: String,
+    mount_base: PathBuf,
+}
+
+impl NfsStorageDriver {
+    pub fn new(server: String, mount_base: PathBuf) -> Self {
+        Self { server, mount_base }
+    }
+}
+
+impl StorageDriver for NfsStorageDriver {
+    async fn create_volume(&self, name: &str, _size_mb: u64) -> Result<String, std::io::Error> {
+        // NFS volumes are directories on the NFS export. Create the mount point.
+        let mount_point = self.mount_base.join(name);
+        tokio::fs::create_dir_all(&mount_point).await?;
+        Ok(mount_point.display().to_string())
+    }
+
+    async fn delete_volume(&self, volume_id: &str) -> Result<(), std::io::Error> {
+        // Unmount first, then remove mount point.
+        let output = tokio::process::Command::new("umount")
+            .arg(volume_id)
+            .output()
+            .await?;
+        if !output.status.success() {
+            tracing::warn!(
+                volume_id,
+                stderr = %String::from_utf8_lossy(&output.stderr),
+                "umount failed (may already be unmounted)"
+            );
+        }
+        let path = PathBuf::from(volume_id);
+        if path.exists() {
+            tokio::fs::remove_dir_all(&path).await?;
+        }
+        Ok(())
+    }
+
+    async fn attach_volume(&self, volume_id: &str, _node: &str) -> Result<String, std::io::Error> {
+        let nfs_source = format!("{}/{}", self.server, volume_id);
+        let mount_point = PathBuf::from(volume_id);
+        tokio::fs::create_dir_all(&mount_point).await?;
+
+        let output = tokio::process::Command::new("mount")
+            .args(["-t", "nfs"])
+            .arg(&nfs_source)
+            .arg(&mount_point)
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            return Err(std::io::Error::other(format!(
+                "NFS mount failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+
+        Ok(mount_point.display().to_string())
+    }
+
+    async fn detach_volume(&self, volume_id: &str, _node: &str) -> Result<(), std::io::Error> {
+        let output = tokio::process::Command::new("umount")
+            .arg(volume_id)
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            return Err(std::io::Error::other(format!(
+                "NFS umount failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+
+        Ok(())
+    }
+}
+
 /// Manages persistent volumes for stateful services.
 /// Handles creation, mounting, cleanup, and tracking of volume state.
 #[derive(Clone)]
@@ -35,6 +182,8 @@ impl VolumeManager {
 
     /// Provision a volume for a service. Creates the directory and tracks state.
     /// Returns the host path where the volume data is stored.
+    /// Checks if the volume already exists on disk before creating, and logs
+    /// whether this is a new provision or a re-attach.
     pub async fn provision(
         &self,
         service_name: &str,
@@ -46,8 +195,37 @@ impl VolumeManager {
         let key = volume_key(service_name, volume_name);
         let host_path = self.base_dir.join(service_name).join(volume_name);
 
-        // Create the volume directory if it doesn't exist
-        tokio::fs::create_dir_all(&host_path).await?;
+        // Check if the volume already exists on disk
+        let already_exists = host_path.exists();
+
+        if already_exists {
+            tracing::info!(
+                service = %service_name,
+                volume = %volume_name,
+                path = %host_path.display(),
+                "Re-attaching existing volume"
+            );
+        } else {
+            // Create the volume directory using the appropriate storage driver
+            match storage_class {
+                "nfs" => {
+                    // For NFS, we still create the local mount point
+                    tokio::fs::create_dir_all(&host_path).await?;
+                }
+                _ => {
+                    // Default to local storage
+                    tokio::fs::create_dir_all(&host_path).await?;
+                }
+            }
+            tracing::info!(
+                service = %service_name,
+                volume = %volume_name,
+                path = %host_path.display(),
+                size_mb,
+                storage_class,
+                "New volume provisioned"
+            );
+        }
 
         let mut volumes = self.volumes.write().await;
         volumes.insert(
@@ -60,14 +238,6 @@ impl VolumeManager {
                 size_mb,
                 created: true,
             },
-        );
-
-        tracing::info!(
-            service = %service_name,
-            volume = %volume_name,
-            path = %host_path.display(),
-            size_mb,
-            "Volume provisioned"
         );
 
         Ok(host_path)

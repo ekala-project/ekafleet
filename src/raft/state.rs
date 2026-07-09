@@ -19,6 +19,9 @@ struct StateMachineInner {
     secrets: HashMap<String, HashMap<String, Vec<u8>>>,
     /// DNS zone data
     dns_zones: HashMap<String, Vec<DnsEntry>>,
+    /// General-purpose key-value store (used for volume tracking, etc.)
+    #[serde(default)]
+    kv: HashMap<String, Vec<u8>>,
     /// Last applied log index
     last_applied: u64,
 }
@@ -69,6 +72,13 @@ pub enum Command {
     UpdateDns {
         zone: String,
         entries: Vec<(String, String, Vec<String>, u32)>,
+    },
+    KvPut {
+        key: String,
+        value: Vec<u8>,
+    },
+    KvDelete {
+        key: String,
     },
 }
 
@@ -155,6 +165,12 @@ impl FleetStateMachine {
                     .collect();
                 state.dns_zones.insert(zone, dns_entries);
             }
+            Command::KvPut { key, value } => {
+                state.kv.insert(key, value);
+            }
+            Command::KvDelete { key } => {
+                state.kv.remove(&key);
+            }
         }
 
         state.last_applied = index;
@@ -190,5 +206,22 @@ impl FleetStateMachine {
     pub async fn last_applied(&self) -> u64 {
         let state = self.inner.read().await;
         state.last_applied
+    }
+
+    /// Get a value from the key-value store.
+    pub async fn kv_get(&self, key: &str) -> Option<Vec<u8>> {
+        let state = self.inner.read().await;
+        state.kv.get(key).cloned()
+    }
+
+    /// List all key-value pairs matching a given key prefix.
+    pub async fn kv_list_prefix(&self, prefix: &str) -> Vec<(String, Vec<u8>)> {
+        let state = self.inner.read().await;
+        state
+            .kv
+            .iter()
+            .filter(|(k, _)| k.starts_with(prefix))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 }

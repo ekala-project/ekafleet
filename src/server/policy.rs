@@ -250,6 +250,7 @@ mod tests {
             templates: HashMap::new(),
             lifecycle: Default::default(),
             volumes: Vec::new(),
+            sidecars: Vec::new(),
         }
     }
 

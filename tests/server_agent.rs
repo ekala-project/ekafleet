@@ -245,6 +245,7 @@ async fn grpc_rejects_unauthenticated_client() {
                 timestamp: 0,
                 available_resources: None,
                 pool: String::new(),
+                version: String::new(),
             },
         )),
     })
@@ -299,6 +300,7 @@ async fn grpc_rejects_wrong_token() {
                 timestamp: 0,
                 available_resources: None,
                 pool: String::new(),
+                version: String::new(),
             },
         )),
     })
@@ -335,6 +337,7 @@ async fn agent_connects_and_registers_via_heartbeat() {
                     disk_mb: 100000,
                 }),
                 pool: String::new(),
+                version: String::new(),
             },
         )),
     })

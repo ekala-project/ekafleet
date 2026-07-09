@@ -134,3 +134,101 @@ fn parse_http_url(url: &str) -> Result<(String, String), std::io::Error> {
     let path = format!("/{path}");
     Ok((host_port.to_string(), path))
 }
+
+/// Call all configured admission webhooks with the given payload.
+///
+/// POSTs the payload to each webhook URL and expects a JSON response of the form:
+/// `{"allowed": true/false, "message": "..."}`.
+///
+/// If any webhook with `FailPolicy::Fail` rejects (allowed=false) or errors,
+/// the request is denied. Webhooks with `FailPolicy::Ignore` are best-effort.
+pub async fn call_admission_webhooks(
+    webhooks: &[crate::config::AdmissionWebhook],
+    payload: &serde_json::Value,
+) -> Result<(), String> {
+    for webhook in webhooks {
+        let result = call_single_admission_webhook(webhook, payload).await;
+        match result {
+            Ok(()) => {}
+            Err(e) => match webhook.fail_policy {
+                crate::config::FailPolicy::Fail => {
+                    return Err(format!("admission webhook '{}' denied: {e}", webhook.name));
+                }
+                crate::config::FailPolicy::Ignore => {
+                    tracing::warn!(
+                        webhook = %webhook.name,
+                        error = %e,
+                        "Admission webhook failed but fail policy is Ignore"
+                    );
+                }
+            },
+        }
+    }
+    Ok(())
+}
+
+async fn call_single_admission_webhook(
+    webhook: &crate::config::AdmissionWebhook,
+    payload: &serde_json::Value,
+) -> Result<(), String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let body_str = serde_json::to_string(payload).map_err(|e| e.to_string())?;
+    let timeout = Duration::from_secs(webhook.timeout_seconds);
+
+    let result = tokio::time::timeout(timeout, async {
+        let (host_port, path) = parse_http_url(&webhook.url).map_err(|e| e.to_string())?;
+
+        let mut stream = tokio::net::TcpStream::connect(&host_port)
+            .await
+            .map_err(|e| format!("connection failed: {e}"))?;
+
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: {host_port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body_str}",
+            body_str.len(),
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .map_err(|e| format!("write failed: {e}"))?;
+
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .await
+            .map_err(|e| format!("read failed: {e}"))?;
+
+        let response_str = String::from_utf8_lossy(&response);
+
+        // Parse HTTP response — find the body after \r\n\r\n
+        let body = response_str
+            .split_once("\r\n\r\n")
+            .map(|(_, b)| b)
+            .unwrap_or(&response_str);
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(body).map_err(|e| format!("invalid response JSON: {e}"))?;
+
+        let allowed = parsed
+            .get("allowed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let message = parsed
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        if allowed {
+            Ok(())
+        } else {
+            Err(message)
+        }
+    })
+    .await;
+
+    match result {
+        Ok(inner) => inner,
+        Err(_) => Err("webhook request timed out".to_string()),
+    }
+}

@@ -148,6 +148,23 @@ impl MetricsAggregator {
         out
     }
 
+    /// Get a single node metric value by name.
+    pub async fn node_metric(&self, node_id: &str, metric_name: &str) -> Option<f64> {
+        let state = self.inner.read().await;
+        state.node_metrics.get(node_id)?.get(metric_name).copied()
+    }
+
+    /// Get all metrics for a service, keyed by metric name with values as
+    /// `(node_id, value)` pairs. Used by the HPA metrics API.
+    pub async fn service_metrics(&self, service_name: &str) -> HashMap<String, Vec<(String, f64)>> {
+        let state = self.inner.read().await;
+        state
+            .service_metrics
+            .get(service_name)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// Get fleet-wide average for a node metric.
     pub async fn fleet_metric_avg(&self, metric_name: &str) -> Option<f64> {
         let state = self.inner.read().await;

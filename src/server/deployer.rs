@@ -370,6 +370,64 @@ async fn wait_healthy(
     }
 }
 
+/// Execute a deployment lifecycle hook script.
+///
+/// The hook command is executed with the following environment variables:
+/// - `EKAFLEET_SERVICE`: the name of the service being deployed
+/// - `EKAFLEET_ACTION`: the lifecycle action (e.g., "pre-deploy", "post-deploy")
+pub async fn run_hook(
+    hook: &[String],
+    service_name: &str,
+    action: &str,
+) -> Result<(), DeployError> {
+    if hook.is_empty() {
+        return Ok(());
+    }
+
+    let program = &hook[0];
+    let args = &hook[1..];
+
+    tracing::info!(
+        service = %service_name,
+        action = %action,
+        command = %program,
+        "Executing deployment hook"
+    );
+
+    let output = tokio::process::Command::new(program)
+        .args(args)
+        .env("EKAFLEET_SERVICE", service_name)
+        .env("EKAFLEET_ACTION", action)
+        .output()
+        .await
+        .map_err(|e| DeployError::NodeFailed {
+            node: "hook".to_string(),
+            reason: format!("failed to execute hook: {e}"),
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::error!(
+            service = %service_name,
+            action = %action,
+            stderr = %stderr,
+            "Hook failed"
+        );
+        return Err(DeployError::NodeFailed {
+            node: "hook".to_string(),
+            reason: format!("hook '{action}' failed: {stderr}"),
+        });
+    }
+
+    tracing::info!(
+        service = %service_name,
+        action = %action,
+        "Hook completed successfully"
+    );
+
+    Ok(())
+}
+
 /// Compute a dependency-ordered deployment sequence.
 /// Services with dependencies are deployed after their dependencies.
 pub fn compute_deploy_order(

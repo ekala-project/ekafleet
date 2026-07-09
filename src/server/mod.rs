@@ -107,6 +107,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     let fleet_state = FleetState::new();
     let event_store = events::EventStore::new();
     let metrics = crate::metrics::aggregator::MetricsAggregator::new();
+    let alert_evaluator = crate::metrics::alerting::AlertEvaluator::new();
 
     // Initialize RBAC token store with the startup token as admin
     let token_store = rbac::TokenStore::new();
@@ -127,7 +128,14 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
 
     let (grpc_result, http_result) = tokio::join!(
         api::serve_grpc(grpc_config, fleet_state.clone(), token_store.clone()),
-        rest::serve_http(http_addr, fleet_state, event_store, token_store, metrics),
+        rest::serve_http(
+            http_addr,
+            fleet_state,
+            event_store,
+            token_store,
+            metrics,
+            alert_evaluator
+        ),
     );
 
     grpc_result?;
