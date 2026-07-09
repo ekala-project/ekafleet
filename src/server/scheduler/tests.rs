@@ -24,6 +24,7 @@ fn make_machine(
             pool: "default".to_string(),
             reserved: CapacityConfig::default(),
             taints: vec![],
+            extended_resources: HashMap::new(),
         },
     )
 }
@@ -57,6 +58,7 @@ fn make_machine_in_pool(
                 disk: 0,
             },
             taints: vec![],
+            extended_resources: HashMap::new(),
         },
     )
 }
@@ -79,6 +81,7 @@ fn make_service(name: &str, cpu: u64, memory: u64, replicas: u32) -> (String, Se
                     limit: None,
                 }),
                 disk: None,
+                extended: HashMap::new(),
             },
             scheduling: SchedulingConfig {
                 replicas,
@@ -143,6 +146,7 @@ fn constraint_filtering() {
                     limit: None,
                 }),
                 disk: None,
+                extended: HashMap::new(),
             },
             scheduling: SchedulingConfig {
                 replicas: 1,
@@ -192,6 +196,7 @@ fn system_job_all_nodes() {
                     limit: None,
                 }),
                 disk: None,
+                extended: HashMap::new(),
             },
             scheduling: SchedulingConfig {
                 replicas: 1,
@@ -267,6 +272,7 @@ fn pool_affinity_prefers_correct_pool() {
                     limit: None,
                 }),
                 disk: None,
+                extended: HashMap::new(),
             },
             scheduling: SchedulingConfig {
                 replicas: 1,
@@ -334,6 +340,7 @@ fn pool_affinity_spills_when_full() {
                     limit: None,
                 }),
                 disk: None,
+                extended: HashMap::new(),
             },
             scheduling: SchedulingConfig {
                 replicas: 2,
@@ -403,6 +410,7 @@ fn pool_hard_constraint_blocks_spillover() {
                     limit: None,
                 }),
                 disk: None,
+                extended: HashMap::new(),
             },
             scheduling: SchedulingConfig {
                 replicas: 2,
@@ -514,6 +522,7 @@ fn pool_labels_merged() {
                     limit: None,
                 }),
                 disk: None,
+                extended: HashMap::new(),
             },
             scheduling: SchedulingConfig {
                 replicas: 1,
@@ -601,6 +610,7 @@ fn system_job_on_pool() {
                     limit: None,
                 }),
                 disk: None,
+                extended: HashMap::new(),
             },
             scheduling: SchedulingConfig {
                 replicas: 1,
@@ -653,6 +663,7 @@ fn constraint_numeric_operators() {
                     limit: None,
                 }),
                 disk: None,
+                extended: HashMap::new(),
             },
             scheduling: SchedulingConfig {
                 replicas: 1,
@@ -701,6 +712,7 @@ fn constraint_regexp() {
                     limit: None,
                 }),
                 disk: None,
+                extended: HashMap::new(),
             },
             scheduling: SchedulingConfig {
                 replicas: 1,
@@ -749,6 +761,7 @@ fn constraint_is_set() {
                     limit: None,
                 }),
                 disk: None,
+                extended: HashMap::new(),
             },
             scheduling: SchedulingConfig {
                 replicas: 1,
@@ -801,6 +814,7 @@ fn multiple_spread_blocks() {
                     limit: None,
                 }),
                 disk: None,
+                extended: HashMap::new(),
             },
             scheduling: SchedulingConfig {
                 replicas: 4,
@@ -870,6 +884,7 @@ fn priority_ordering() {
                         limit: None,
                     }),
                     disk: None,
+                    extended: HashMap::new(),
                 },
                 scheduling: SchedulingConfig {
                     replicas: 1,
@@ -899,6 +914,7 @@ fn priority_ordering() {
                         limit: None,
                     }),
                     disk: None,
+                    extended: HashMap::new(),
                 },
                 scheduling: SchedulingConfig {
                     replicas: 1,
@@ -943,6 +959,7 @@ fn taint_blocks_non_tolerating_service() {
                 value: Some("gpu".into()),
                 effect: TaintEffect::NoSchedule,
             }],
+            extended_resources: HashMap::new(),
         },
     )]
     .into();
@@ -971,6 +988,7 @@ fn taint_blocks_non_tolerating_service() {
                     limit: None,
                 }),
                 disk: None,
+                extended: HashMap::new(),
             },
             scheduling: SchedulingConfig {
                 replicas: 1,
@@ -1019,6 +1037,7 @@ fn sysbatch_runs_on_all_nodes() {
                     limit: None,
                 }),
                 disk: None,
+                extended: HashMap::new(),
             },
             scheduling: SchedulingConfig {
                 replicas: 1,

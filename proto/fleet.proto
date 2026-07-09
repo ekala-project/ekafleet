@@ -34,6 +34,9 @@ service FleetControl {
 
   // Restore Raft state from a snapshot.
   rpc Restore(RestoreRequest) returns (RestoreResponse);
+
+  // Dispatch a parameterized batch job with arguments.
+  rpc Dispatch(DispatchRequest) returns (DispatchResponse);
 }
 
 // --- Agent → Server messages ---
@@ -220,6 +223,7 @@ message HealthCheckSpec {
     HttpProbe http = 1;
     TcpProbe tcp = 2;
     ExecProbe exec = 3;
+    GrpcProbe grpc = 8;
   }
   uint32 interval_seconds = 4;
   uint32 timeout_seconds = 5;
@@ -238,6 +242,11 @@ message TcpProbe {
 
 message ExecProbe {
   repeated string command = 1;
+}
+
+message GrpcProbe {
+  uint32 port = 1;
+  string service = 2;  // gRPC service name for health check (optional)
 }
 
 message PortSpec {
@@ -490,4 +499,17 @@ message RestoreRequest {
 message RestoreResponse {
   bool success = 1;
   string message = 2;
+}
+
+// --- Dispatch ---
+
+message DispatchRequest {
+  string service_name = 1;
+  map<string, string> params = 2;
+}
+
+message DispatchResponse {
+  string instance_id = 1;
+  bool success = 2;
+  string message = 3;
 }

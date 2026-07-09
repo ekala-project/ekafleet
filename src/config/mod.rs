@@ -179,6 +179,9 @@ pub struct ResourceConfig {
     pub memory: Option<ResourceValue>,
     #[serde(default)]
     pub disk: Option<ResourceValue>,
+    /// Extended/device resources (e.g., `{"gpu": 1, "fpga": 2}`).
+    #[serde(default)]
+    pub extended: HashMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -206,6 +209,9 @@ pub struct MachineConfig {
     /// Taints repel services that don't tolerate them.
     #[serde(default)]
     pub taints: Vec<Taint>,
+    /// Extended/device resources available on this machine (e.g., `{"gpu": 4, "fpga": 2}`).
+    #[serde(default, rename = "extendedResources")]
+    pub extended_resources: HashMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

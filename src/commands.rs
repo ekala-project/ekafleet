@@ -448,6 +448,37 @@ pub async fn cmd_ssh(machine: String, server: String) -> anyhow::Result<()> {
     }
 }
 
+pub async fn cmd_dispatch(
+    service: String,
+    params: Vec<String>,
+    server: String,
+) -> anyhow::Result<()> {
+    let mut client = connect_server(&server).await?;
+
+    let param_map: std::collections::HashMap<String, String> = params
+        .iter()
+        .filter_map(|p| {
+            let (k, v) = p.split_once('=')?;
+            Some((k.to_string(), v.to_string()))
+        })
+        .collect();
+
+    let resp = client
+        .dispatch(ekafleet::proto::DispatchRequest {
+            service_name: service.clone(),
+            params: param_map,
+        })
+        .await?;
+    let result = resp.into_inner();
+
+    if result.success {
+        println!("Dispatched {service} → instance {}", result.instance_id);
+    } else {
+        anyhow::bail!("Dispatch failed: {}", result.message);
+    }
+    Ok(())
+}
+
 pub fn cmd_completions(shell: clap_complete::Shell) {
     use clap::CommandFactory;
     let mut cmd = super::Cli::command();

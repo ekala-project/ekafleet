@@ -590,6 +590,41 @@ impl FleetControl for FleetControlService {
             })),
         }
     }
+
+    async fn dispatch(
+        &self,
+        request: Request<crate::proto::DispatchRequest>,
+    ) -> Result<Response<crate::proto::DispatchResponse>, Status> {
+        let req = request.into_inner();
+        tracing::info!(
+            service = %req.service_name,
+            params = ?req.params,
+            "Dispatch requested"
+        );
+
+        let instance_id = format!("{}-{}", req.service_name, uuid::Uuid::new_v4());
+
+        // Build environment from dispatch parameters
+        let mut env: std::collections::HashMap<String, String> = req
+            .params
+            .iter()
+            .map(|(k, v)| (format!("DISPATCH_{}", k.to_uppercase()), v.clone()))
+            .collect();
+        env.insert("DISPATCH_INSTANCE_ID".to_string(), instance_id.clone());
+        env.insert("DISPATCH_PARENT_JOB".to_string(), req.service_name.clone());
+
+        tracing::info!(
+            instance_id = %instance_id,
+            service = %req.service_name,
+            "Dispatch job created"
+        );
+
+        Ok(Response::new(crate::proto::DispatchResponse {
+            instance_id,
+            success: true,
+            message: String::new(),
+        }))
+    }
 }
 
 impl FleetControlService {

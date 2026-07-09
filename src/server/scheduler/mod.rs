@@ -46,11 +46,12 @@ pub struct Preemption {
 }
 
 /// Flattened resource requirements extracted from a service's ResourceConfig.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ResourceRequirements {
     pub cpu: u64,
     pub memory: u64,
     pub disk: u64,
+    pub extended: HashMap<String, u64>,
 }
 
 impl ResourceRequirements {
@@ -59,6 +60,7 @@ impl ResourceRequirements {
             cpu: resources.cpu.as_ref().map(|r| r.request).unwrap_or(0),
             memory: resources.memory.as_ref().map(|r| r.request).unwrap_or(0),
             disk: resources.disk.as_ref().map(|r| r.request).unwrap_or(0),
+            extended: resources.extended.clone(),
         }
     }
 }
@@ -77,6 +79,8 @@ struct Candidate {
     pub(crate) allocated_memory: u64,
     pub(crate) allocated_disk: u64,
     pub(crate) assigned_services: Vec<String>,
+    pub(crate) extended_resources: HashMap<String, u64>,
+    pub(crate) allocated_extended: HashMap<String, u64>,
 }
 
 impl Candidate {
@@ -115,6 +119,9 @@ impl Candidate {
         self.allocated_cpu += reqs.cpu;
         self.allocated_memory += reqs.memory;
         self.allocated_disk += reqs.disk;
+        for (key, val) in &reqs.extended {
+            *self.allocated_extended.entry(key.clone()).or_insert(0) += val;
+        }
         self.assigned_services.push(service_name.to_string());
     }
 
@@ -123,6 +130,11 @@ impl Candidate {
         self.allocated_cpu = self.allocated_cpu.saturating_sub(reqs.cpu);
         self.allocated_memory = self.allocated_memory.saturating_sub(reqs.memory);
         self.allocated_disk = self.allocated_disk.saturating_sub(reqs.disk);
+        for (key, val) in &reqs.extended {
+            if let Some(alloc) = self.allocated_extended.get_mut(key) {
+                *alloc = alloc.saturating_sub(*val);
+            }
+        }
         self.assigned_services.retain(|s| s != service_name);
     }
 
@@ -131,6 +143,11 @@ impl Candidate {
         self.available_cpu() >= reqs.cpu
             && self.available_memory() >= reqs.memory
             && self.available_disk() >= reqs.disk
+            && reqs.extended.iter().all(|(key, needed)| {
+                let total = self.extended_resources.get(key).copied().unwrap_or(0);
+                let used = self.allocated_extended.get(key).copied().unwrap_or(0);
+                total.saturating_sub(used) >= *needed
+            })
     }
 }
 
@@ -160,11 +177,13 @@ pub fn schedule(
                     .memory
                     .saturating_sub(config.reserved.memory),
                 schedulable_disk: config.capacity.disk.saturating_sub(config.reserved.disk),
+                extended_resources: config.extended_resources.clone(),
                 config: config.clone(),
                 allocated_cpu: 0,
                 allocated_memory: 0,
                 allocated_disk: 0,
                 assigned_services: Vec::new(),
+                allocated_extended: HashMap::new(),
             }
         })
         .collect();

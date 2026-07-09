@@ -44,6 +44,22 @@ pub struct SchedulingConfig {
     /// (node drain, rolling updates, scaling down).
     #[serde(default, rename = "disruptionBudget")]
     pub disruption_budget: Option<DisruptionBudget>,
+    /// Parameterized job configuration. When set, this job can be dispatched
+    /// with parameters that are injected as environment variables.
+    /// Only valid for `batch` and `sysbatch` job types.
+    #[serde(default)]
+    pub parameterized: Option<ParameterizedConfig>,
+}
+
+/// Configuration for parameterized (dispatchable) batch jobs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParameterizedConfig {
+    /// Parameters that must be provided at dispatch time.
+    #[serde(default, rename = "requiredParams")]
+    pub required_params: Vec<String>,
+    /// Parameters that have defaults and are optional at dispatch time.
+    #[serde(default, rename = "optionalParams")]
+    pub optional_params: Vec<String>,
 }
 
 impl Default for SchedulingConfig {
@@ -64,6 +80,7 @@ impl Default for SchedulingConfig {
             periodic: None,
             service_affinity: Vec::new(),
             disruption_budget: None,
+            parameterized: None,
         }
     }
 }

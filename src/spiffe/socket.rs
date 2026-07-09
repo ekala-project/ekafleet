@@ -18,6 +18,7 @@ pub const DEFAULT_SOCKET_PATH: &str = "/run/ekafleet/workload-api.sock";
 pub async fn serve_workload_api(
     workload_mgr: Arc<WorkloadManager>,
     socket_path: Option<&str>,
+    jwt_key_material: &[u8],
 ) -> anyhow::Result<()> {
     let path = PathBuf::from(socket_path.unwrap_or(DEFAULT_SOCKET_PATH));
 
@@ -46,7 +47,7 @@ pub async fn serve_workload_api(
         "SPIFFE Workload API listening on Unix socket"
     );
 
-    let service = WorkloadApiService::new(workload_mgr);
+    let service = WorkloadApiService::new(workload_mgr, jwt_key_material);
     let uds_stream = UnixListenerStream::new(listener);
 
     tonic::transport::Server::builder()
@@ -85,7 +86,9 @@ mod tests {
         let mgr = Arc::new(WorkloadManager::new(dir.path(), "test.internal"));
 
         // Start the server in a background task
-        let handle = tokio::spawn(async move { serve_workload_api(mgr, Some(&sock_str)).await });
+        let handle = tokio::spawn(async move {
+            serve_workload_api(mgr, Some(&sock_str), b"test-jwt-key-material-32bytes!!").await
+        });
 
         // Give it a moment to bind
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;

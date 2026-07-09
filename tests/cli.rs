@@ -296,8 +296,8 @@ fn rollback_without_args_gives_guidance() {
     ekafleet()
         .args(["rollback"])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("Specify a machine name or --all"));
+        .failure()
+        .stderr(predicate::str::contains("Specify a machine name or --all"));
 }
 
 // ─── Capacity subcommand ────────────────────────────────────────────

@@ -216,6 +216,20 @@ enum Command {
         server: String,
     },
 
+    /// Dispatch a parameterized batch job
+    Dispatch {
+        /// Service name (must be a parameterized batch job)
+        service: String,
+
+        /// Parameters as KEY=VALUE pairs
+        #[arg(trailing_var_arg = true)]
+        params: Vec<String>,
+
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+
     /// Generate shell completions
     Completions {
         /// Shell to generate completions for
@@ -334,6 +348,12 @@ async fn main() -> anyhow::Result<()> {
         Command::Logs { service, server } => commands::cmd_logs(service, server).await?,
 
         Command::Ssh { machine, server } => commands::cmd_ssh(machine, server).await?,
+
+        Command::Dispatch {
+            service,
+            params,
+            server,
+        } => commands::cmd_dispatch(service, params, server).await?,
 
         Command::Completions { shell } => commands::cmd_completions(shell),
 

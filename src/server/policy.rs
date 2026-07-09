@@ -99,7 +99,89 @@ impl PolicyEngine {
     }
 }
 
-/// Evaluate a single policy rule using simple pattern matching.
+/// Resolve a dotted path to a value from a ServiceConfig.
+fn resolve_path(service: &crate::config::ServiceConfig, path: &str) -> Option<PolicyValue> {
+    match path {
+        "service.replicas" => Some(PolicyValue::Uint(service.scheduling.replicas as u64)),
+        "service.priority" => Some(PolicyValue::Uint(service.scheduling.priority as u64)),
+        "service.type" => Some(PolicyValue::Str(format!(
+            "{:?}",
+            service.scheduling.job_type
+        ))),
+        "service.pool" => service
+            .scheduling
+            .pool
+            .as_ref()
+            .map(|p| PolicyValue::Str(p.clone())),
+        "service.resources.cpu.request" => Some(PolicyValue::Uint(
+            service
+                .resources
+                .cpu
+                .as_ref()
+                .map(|r| r.request)
+                .unwrap_or(0),
+        )),
+        "service.resources.memory.request" => Some(PolicyValue::Uint(
+            service
+                .resources
+                .memory
+                .as_ref()
+                .map(|r| r.request)
+                .unwrap_or(0),
+        )),
+        "service.resources.disk.request" => Some(PolicyValue::Uint(
+            service
+                .resources
+                .disk
+                .as_ref()
+                .map(|r| r.request)
+                .unwrap_or(0),
+        )),
+        "service.resources.cpu.limit" => service
+            .resources
+            .cpu
+            .as_ref()
+            .and_then(|r| r.limit)
+            .map(PolicyValue::Uint),
+        "service.resources.memory.limit" => service
+            .resources
+            .memory
+            .as_ref()
+            .and_then(|r| r.limit)
+            .map(PolicyValue::Uint),
+        _ => None,
+    }
+}
+
+/// Intermediate value type for policy evaluation.
+#[derive(Debug)]
+enum PolicyValue {
+    Uint(u64),
+    Str(String),
+}
+
+/// Parse a policy expression of the form `<path> <op> <value>`.
+fn parse_expression(expr: &str) -> Option<(&str, &str, &str)> {
+    // Try two-character operators first
+    for op in &[">=", "<=", "!=", "=="] {
+        if let Some(idx) = expr.find(op) {
+            let path = expr[..idx].trim();
+            let value = expr[idx + op.len()..].trim();
+            return Some((path, op, value));
+        }
+    }
+    // Single-character operators
+    for op in &[">", "<", "="] {
+        if let Some(idx) = expr.find(op) {
+            let path = expr[..idx].trim();
+            let value = expr[idx + op.len()..].trim();
+            return Some((path, op, value));
+        }
+    }
+    None
+}
+
+/// Evaluate a single policy rule by parsing the expression and comparing resolved values.
 fn evaluate_rule(
     rule: &PolicyRule,
     service_name: &str,
@@ -107,33 +189,35 @@ fn evaluate_rule(
 ) -> Option<PolicyViolation> {
     let expr = &rule.expression;
 
-    // Simple built-in policy expressions
-    let violated = if expr == "service.replicas >= 2" {
-        service.scheduling.replicas < 2
-    } else if expr == "service.resources.cpu.request > 0" {
-        service
-            .resources
-            .cpu
-            .as_ref()
-            .map(|r| r.request)
-            .unwrap_or(0)
-            == 0
-    } else if expr == "service.resources.memory.request > 0" {
-        service
-            .resources
-            .memory
-            .as_ref()
-            .map(|r| r.request)
-            .unwrap_or(0)
-            == 0
-    } else if let Some(min_str) = expr.strip_prefix("service.replicas >= ") {
-        let min: u32 = min_str.trim().parse().unwrap_or(1);
-        service.scheduling.replicas < min
-    } else {
-        false // Unknown expression — no violation
+    let (path, op, expected) = parse_expression(expr)?;
+    let actual = resolve_path(service, path)?;
+
+    // The expression describes the *desired* condition.
+    // A violation occurs when the condition is *not* met.
+    let condition_met = match actual {
+        PolicyValue::Uint(actual_val) => {
+            let expected_val: u64 = match expected.parse() {
+                Ok(v) => v,
+                Err(_) => return None,
+            };
+            match op {
+                ">=" | "gte" => actual_val >= expected_val,
+                ">" | "gt" => actual_val > expected_val,
+                "<=" | "lte" => actual_val <= expected_val,
+                "<" | "lt" => actual_val < expected_val,
+                "==" | "=" => actual_val == expected_val,
+                "!=" => actual_val != expected_val,
+                _ => return None,
+            }
+        }
+        PolicyValue::Str(actual_str) => match op {
+            "==" | "=" => actual_str == expected,
+            "!=" => actual_str != expected,
+            _ => return None,
+        },
     };
 
-    if violated {
+    if !condition_met {
         Some(PolicyViolation {
             rule_name: rule.name.clone(),
             service_name: service_name.to_string(),
