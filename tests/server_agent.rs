@@ -53,6 +53,7 @@ async fn start_server() -> (SocketAddr, SocketAddr, String, String) {
         join_token_store,
         raft_state,
         instance_tracker,
+        "127.0.0.1:7400",
     );
 
     let expected_token = format!("Bearer {token}");

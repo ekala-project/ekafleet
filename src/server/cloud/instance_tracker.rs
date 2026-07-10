@@ -156,3 +156,104 @@ impl InstanceTracker {
         instances.into_iter().next()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_tracker() -> InstanceTracker {
+        let raft = FleetStateMachine::new();
+        InstanceTracker::new(raft)
+    }
+
+    #[tokio::test]
+    async fn track_and_retrieve() {
+        let tracker = make_tracker();
+        tracker.track("i-abc", "aws", "workers", Some("10.0.1.5")).await;
+
+        let all = tracker.all().await;
+        assert_eq!(all.len(), 1);
+        let inst = &all["i-abc"];
+        assert_eq!(inst.provider, "aws");
+        assert_eq!(inst.pool, "workers");
+        assert_eq!(inst.private_ip.as_deref(), Some("10.0.1.5"));
+        assert!(inst.fleet_node_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn associate_node_sets_fleet_id() {
+        let tracker = make_tracker();
+        tracker.track("i-abc", "aws", "workers", Some("10.0.1.5")).await;
+        tracker.associate_node("i-abc", "node-uuid-1").await;
+
+        let inst = tracker.all().await;
+        assert_eq!(
+            inst["i-abc"].fleet_node_id.as_deref(),
+            Some("node-uuid-1")
+        );
+        assert!(inst["i-abc"].joined_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn find_by_ip() {
+        let tracker = make_tracker();
+        tracker.track("i-abc", "aws", "workers", Some("10.0.1.5")).await;
+        tracker.track("i-def", "aws", "workers", Some("10.0.1.6")).await;
+
+        let found = tracker.find_by_ip("10.0.1.5").await;
+        assert_eq!(found.unwrap().cloud_instance_id, "i-abc");
+
+        let missing = tracker.find_by_ip("10.0.1.99").await;
+        assert!(missing.is_none());
+    }
+
+    #[tokio::test]
+    async fn untrack_removes_instance() {
+        let tracker = make_tracker();
+        tracker.track("i-abc", "aws", "workers", None).await;
+        assert_eq!(tracker.active_count_for_pool("workers").await, 1);
+
+        tracker.untrack("i-abc").await;
+        assert_eq!(tracker.active_count_for_pool("workers").await, 0);
+    }
+
+    #[tokio::test]
+    async fn for_pool_filters_correctly() {
+        let tracker = make_tracker();
+        tracker.track("i-1", "aws", "workers", None).await;
+        tracker.track("i-2", "aws", "compute", None).await;
+        tracker.track("i-3", "gcp", "workers", None).await;
+
+        assert_eq!(tracker.active_count_for_pool("workers").await, 2);
+        assert_eq!(tracker.active_count_for_pool("compute").await, 1);
+        assert_eq!(tracker.active_count_for_pool("missing").await, 0);
+    }
+
+    #[tokio::test]
+    async fn joined_node_ids_only_returns_associated() {
+        let tracker = make_tracker();
+        tracker.track("i-1", "aws", "workers", None).await;
+        tracker.track("i-2", "aws", "workers", None).await;
+        tracker.associate_node("i-1", "node-A").await;
+
+        let joined = tracker.joined_node_ids_for_pool("workers").await;
+        assert_eq!(joined, vec!["node-A"]);
+    }
+
+    #[tokio::test]
+    async fn scaledown_prefers_unjoined() {
+        let tracker = make_tracker();
+        tracker.track("i-joined", "aws", "workers", None).await;
+        tracker.associate_node("i-joined", "node-A").await;
+        tracker.track("i-unjoined", "aws", "workers", None).await;
+
+        let candidate = tracker.select_scaledown_candidate("workers").await.unwrap();
+        assert_eq!(candidate.cloud_instance_id, "i-unjoined");
+    }
+
+    #[tokio::test]
+    async fn scaledown_empty_pool_returns_none() {
+        let tracker = make_tracker();
+        assert!(tracker.select_scaledown_candidate("workers").await.is_none());
+    }
+}

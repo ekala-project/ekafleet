@@ -40,6 +40,8 @@ pub struct FleetControlService {
     /// Tracks cloud-provisioned machine instances for agent correlation
     /// and dynamic scheduling.
     instance_tracker: InstanceTracker,
+    /// gRPC listen address for agent bootstrap user-data.
+    grpc_addr: String,
 }
 
 impl FleetControlService {
@@ -49,6 +51,7 @@ impl FleetControlService {
         join_token_store: JoinTokenStore,
         raft_state: FleetStateMachine,
         instance_tracker: InstanceTracker,
+        grpc_addr: &str,
     ) -> Self {
         Self {
             state,
@@ -61,6 +64,7 @@ impl FleetControlService {
             metrics: MetricsAggregator::new(),
             raft_state,
             instance_tracker,
+            grpc_addr: grpc_addr.to_string(),
         }
     }
 
@@ -316,6 +320,11 @@ impl FleetControl for FleetControlService {
         let join_tokens = self.join_token_store.clone();
         let config_path = std::path::PathBuf::from(&req.config_path);
         let watch = req.watch;
+        let grpc_addr = self.grpc_addr.clone();
+        let ca_cert_pem = self
+            .trust_bundle_pem
+            .clone()
+            .unwrap_or_default();
 
         tokio::spawn(async move {
             // Run a single reconciliation cycle
@@ -366,8 +375,8 @@ impl FleetControl for FleetControlService {
                                 }
                             }
 
-                            let ca_cert_pem = String::new(); // Will be filled from server config
-                            let server_addr = String::new(); // Will be filled from server config
+                            let server_addr = grpc_addr.clone();
+                            let ca_cert = ca_cert_pem.clone();
 
                             let mut actuator =
                                 super::cloud::actuator::ScalingActuator::new(
@@ -375,9 +384,10 @@ impl FleetControl for FleetControlService {
                                     providers,
                                     tracker.clone(),
                                     join_tokens,
+                                    state.clone(),
                                     fleet_config,
                                     server_addr,
-                                    ca_cert_pem,
+                                    ca_cert,
                                 );
 
                             // Run scaling actuator alongside reconciliation
@@ -904,11 +914,18 @@ pub async fn serve_grpc(
         .identity(identity)
         .client_ca_root(Certificate::from_pem(&tls.ca_cert_pem));
 
-    let service =
-        FleetControlService::new(state, &domain, join_token_store, raft_state, instance_tracker)
-            .with_cert_issuer(cert_issuer, trust_bundle_pem)
-            .with_ca(ca)
-            .with_fleet_key(fleet_key);
+    let addr_str = addr.to_string();
+    let service = FleetControlService::new(
+        state,
+        &domain,
+        join_token_store,
+        raft_state,
+        instance_tracker,
+        &addr_str,
+    )
+    .with_cert_issuer(cert_issuer, trust_bundle_pem)
+    .with_ca(ca)
+    .with_fleet_key(fleet_key);
 
     tonic::transport::Server::builder()
         .tls_config(tls_config)?

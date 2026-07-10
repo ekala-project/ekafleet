@@ -105,6 +105,11 @@ impl CloudProviderRegistry {
         Self { providers }
     }
 
+    /// Build a registry from pre-constructed providers.
+    pub fn from_raw(providers: HashMap<String, Box<dyn CloudProviderDyn>>) -> Self {
+        Self { providers }
+    }
+
     /// Get the cloud provider for a given pool, if one is configured.
     pub fn get(&self, pool: &str) -> Option<&dyn CloudProviderDyn> {
         self.providers.get(pool).map(|p| p.as_ref())

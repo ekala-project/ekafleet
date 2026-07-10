@@ -285,7 +285,7 @@ async fn apply_plan(
 ///
 /// Cloud machines that have joined the fleet (have a `fleet_node_id`) are
 /// converted to [`MachineConfig`] using the pool's `machineCapacity`.
-async fn merge_dynamic_machines(
+pub(crate) async fn merge_dynamic_machines(
     config: &FleetConfig,
     instance_tracker: Option<&InstanceTracker>,
 ) -> HashMap<String, MachineConfig> {
@@ -343,4 +343,138 @@ async fn merge_dynamic_machines(
     }
 
     machines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{
+        CapacityConfig, CloudProviderConfig, CloudProviderType, NodePoolConfig,
+    };
+    use crate::raft::state::FleetStateMachine;
+
+    fn empty_fleet_config() -> FleetConfig {
+        FleetConfig {
+            name: "test".into(),
+            domain: "fleet.internal".into(),
+            services: HashMap::new(),
+            machines: HashMap::new(),
+            node_pools: HashMap::new(),
+            hooks: Default::default(),
+            admission_webhooks: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn merge_without_tracker_returns_static_only() {
+        let mut config = empty_fleet_config();
+        config.machines.insert(
+            "static-1".into(),
+            MachineConfig {
+                target_host: "10.0.0.1".into(),
+                labels: HashMap::new(),
+                capacity: CapacityConfig::default(),
+                pool: "default".into(),
+                reserved: CapacityConfig::default(),
+                taints: vec![],
+                extended_resources: HashMap::new(),
+            },
+        );
+
+        let result = merge_dynamic_machines(&config, None).await;
+        assert_eq!(result.len(), 1);
+        assert!(result.contains_key("static-1"));
+    }
+
+    #[tokio::test]
+    async fn merge_adds_joined_cloud_machines() {
+        let mut config = empty_fleet_config();
+        config.node_pools.insert(
+            "workers".into(),
+            NodePoolConfig {
+                labels: HashMap::new(),
+                scaling: None,
+                scheduler_algorithm: None,
+                memory_oversubscription: false,
+                cloud: Some(CloudProviderConfig {
+                    provider: CloudProviderType::Aws,
+                    region: "us-east-1".into(),
+                    instance_type: "t3.large".into(),
+                    image_id: "ami-123".into(),
+                    subnet_id: None,
+                    security_group_ids: vec![],
+                    ssh_key_name: None,
+                    zone: None,
+                    disk_size_gb: None,
+                    resource_group: None,
+                    project: None,
+                    machine_capacity: CapacityConfig {
+                        cpu: 2000,
+                        memory: 4096,
+                        disk: 50000,
+                    },
+                }),
+            },
+        );
+
+        let raft = FleetStateMachine::new();
+        let tracker = InstanceTracker::new(raft);
+        tracker.track("i-abc", "aws", "workers", Some("10.0.1.5")).await;
+        tracker.associate_node("i-abc", "node-cloud-1").await;
+
+        let result = merge_dynamic_machines(&config, Some(&tracker)).await;
+        assert_eq!(result.len(), 1);
+
+        let machine = &result["node-cloud-1"];
+        assert_eq!(machine.target_host, "10.0.1.5");
+        assert_eq!(machine.pool, "workers");
+        assert_eq!(machine.capacity.cpu, 2000);
+        assert_eq!(machine.capacity.memory, 4096);
+    }
+
+    #[tokio::test]
+    async fn merge_skips_unjoined_cloud_machines() {
+        let config = empty_fleet_config();
+
+        let raft = FleetStateMachine::new();
+        let tracker = InstanceTracker::new(raft);
+        // Tracked but not joined — no fleet_node_id
+        tracker.track("i-pending", "aws", "workers", Some("10.0.1.5")).await;
+
+        let result = merge_dynamic_machines(&config, Some(&tracker)).await;
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn merge_does_not_overwrite_static_machines() {
+        let mut config = empty_fleet_config();
+        config.machines.insert(
+            "node-1".into(),
+            MachineConfig {
+                target_host: "10.0.0.1".into(),
+                labels: HashMap::new(),
+                capacity: CapacityConfig {
+                    cpu: 8000,
+                    memory: 16384,
+                    disk: 100000,
+                },
+                pool: "default".into(),
+                reserved: CapacityConfig::default(),
+                taints: vec![],
+                extended_resources: HashMap::new(),
+            },
+        );
+
+        let raft = FleetStateMachine::new();
+        let tracker = InstanceTracker::new(raft);
+        // Cloud instance joined with same node_id as a static machine
+        tracker.track("i-dup", "aws", "default", Some("10.0.0.99")).await;
+        tracker.associate_node("i-dup", "node-1").await;
+
+        let result = merge_dynamic_machines(&config, Some(&tracker)).await;
+        assert_eq!(result.len(), 1);
+        // Should keep the static machine's config, not overwrite
+        assert_eq!(result["node-1"].target_host, "10.0.0.1");
+        assert_eq!(result["node-1"].capacity.cpu, 8000);
+    }
 }
