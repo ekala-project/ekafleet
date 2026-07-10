@@ -477,8 +477,51 @@ nodePools.<name> = {
       scaleDownThreshold = 0.5;
     }];
   };
+  cloud = CloudProviderConfig;     # Cloud autoscaling (optional)
 };
 ```
+
+## CloudProviderConfig
+
+Cloud provider configuration for automatic VM provisioning during pool autoscaling. When present alongside `scaling`, the scaling actuator provisions and destroys cloud VMs instead of producing advisory-only decisions.
+
+```nix
+cloud = {
+  provider         = "aws";              # "aws", "azure", or "gcp" (required)
+  region           = "us-east-1";        # Cloud region (required)
+  instanceType     = "c6i.xlarge";       # VM size (required)
+  imageId          = "ami-0123456789";   # NixOS machine image (required)
+  subnetId         = "subnet-abc";       # Network subnet (optional)
+  securityGroupIds = [ "sg-xyz" ];       # Security groups — AWS only (optional)
+  sshKeyName       = "fleet-key";        # SSH key for access (optional)
+  zone             = "us-east-1a";       # Availability zone (optional)
+  diskSizeGb       = 50;                 # Root disk size in GB (optional)
+  resourceGroup    = "my-rg";            # Azure resource group — required for Azure
+  project          = "my-project";       # GCP project ID — required for GCP
+  machineCapacity  = {                   # Expected capacity for scheduling (required)
+    cpu    = 4000;                       # Millicores
+    memory = 8192;                       # MB
+    disk   = 100000;                     # MB
+  };
+};
+```
+
+| Field | Required | Provider | Description |
+|-------|----------|----------|-------------|
+| `provider` | yes | all | Cloud provider: `"aws"`, `"azure"`, or `"gcp"` |
+| `region` | yes | all | Cloud region |
+| `instanceType` | yes | all | Instance type / VM size |
+| `imageId` | yes | all | NixOS machine image with ekafleet agent |
+| `machineCapacity` | yes | all | Expected CPU/memory/disk for scheduler |
+| `subnetId` | no | AWS, GCP | Network subnet placement |
+| `securityGroupIds` | no | AWS | Security group IDs |
+| `sshKeyName` | no | all | SSH key for instance access |
+| `zone` | no | all | Availability zone |
+| `diskSizeGb` | no | all | Root disk size in GB |
+| `resourceGroup` | Azure | Azure | Azure resource group name |
+| `project` | GCP | GCP | GCP project ID |
+
+The `machineCapacity` is used by the scheduler to account for cloud machines before the agent connects and reports actual resources. Once the agent joins, real resource data takes over.
 
 ## ResourceQuota
 

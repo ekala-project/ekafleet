@@ -76,7 +76,7 @@ ekafleet plan [OPTIONS]
 
 ### `ekafleet apply`
 
-Execute a deployment plan. Streams operation progress in real-time.
+Execute a deployment plan. Streams operation progress in real-time. In watch mode, runs continuous reconciliation and starts the cloud scaling actuator for pools with cloud provider configuration.
 
 ```
 ekafleet apply [OPTIONS]
@@ -86,7 +86,7 @@ ekafleet apply [OPTIONS]
 |--------|---------|-------------|
 | `--config` | `fleet.nix` | Path to fleet configuration |
 | `--auto-approve` | `false` | Skip confirmation prompt |
-| `--watch` | `false` | Continuous reconciliation mode |
+| `--watch` | `false` | Continuous reconciliation + cloud autoscaling |
 | `--server` | `127.0.0.1:7400` | Server address |
 
 ### `ekafleet rollback`

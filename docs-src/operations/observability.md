@@ -96,6 +96,7 @@ The server exposes JSON REST endpoints alongside the gRPC API:
 | `DELETE /v1/kv/:key` | Key-value store delete |
 | `GET /v1/kv?prefix=...` | Key-value store prefix listing |
 | `GET /v1/metrics/services/:name` | Per-service metrics for HPA integration |
+| `GET /v1/cloud/instances` | List tracked cloud-provisioned VM instances |
 | `GET /v1/alerts/silences` | List active alert silences |
 | `POST /v1/alerts/silences` | Create an alert silence |
 | `DELETE /v1/alerts/silences/:id` | Remove an alert silence |

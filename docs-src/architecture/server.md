@@ -12,8 +12,9 @@ Start with `ekafleet server`. The server runs the control plane and can optional
 - **Secret management** — Stores and distributes encrypted secrets; distributes fleet encryption key
 - **DNS authority** — Authoritative DNS for the fleet domain
 - **Metrics aggregation** — Collects fleet-wide metrics for scaling decisions
+- **Cloud provider management** — Provisions and destroys AWS, Azure, and GCP VMs for pool autoscaling; tracks cloud instances in Raft state; correlates agents with cloud VMs by IP
 - **Event tracking** — Records deployment, scheduling, health, scaling, and node events
-- **REST API** — JSON endpoints for status, services, capacity, events, and deployment history
+- **REST API** — JSON endpoints for status, services, capacity, events, deployment history, and cloud instances
 - **Raft consensus** — Multi-server HA with consistent state replication
 
 ## High Availability
@@ -33,6 +34,7 @@ The Raft state machine stores:
 - Encrypted secrets
 - Scheduling plans
 - DNS zone data
+- Cloud instance tracking (cloud VM ID to fleet node ID mappings)
 
 ## State Persistence
 

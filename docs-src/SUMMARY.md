@@ -21,6 +21,7 @@
 - [System Activation](./operations/system-activation.md)
 - [Scheduling](./operations/scheduling.md)
 - [Scaling](./operations/scaling.md)
+- [Cloud Providers](./operations/cloud-providers.md)
 - [DNS & Service Discovery](./operations/dns.md)
 - [Secrets Management](./operations/secrets.md)
 - [SPIFFE & Workload Identity](./operations/spiffe.md)
