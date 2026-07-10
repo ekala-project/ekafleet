@@ -89,13 +89,20 @@ src/
 - Main RPC: `StreamControl` — bidirectional agent↔server channel
 - Auth: `Bearer <token>` in the `authorization` metadata header
 - Proto module carries `#![allow(clippy::result_large_err)]` in `lib.rs`
+- `ServerMessage` has 19 variants: 10 fire-and-forget + 9 correlated commands
+- `AgentMessage` has 8 variants: 7 reports + `AgentCommandResponse` (with nested result oneof)
+- Request-response pattern: server sends command with `correlation_id`, agent returns
+  `AgentCommandResponse` with the same ID. Correlation managed by `FleetState::send_command()`
 
 ## Testing
 
+- Unit tests: inline `#[cfg(test)]` modules (state, reconciler, scheduler, policy, etc.)
 - Integration tests: `tests/cli.rs` (assert_cmd) and `tests/server_agent.rs` (gRPC workflows)
+- NixOS VM tests: `nix/tests/` (module-basic, rest-api, cli-operations, server-agent)
 - Helpers: `free_port()` (bind port 0), `start_server()` (spawn with tempdir)
 - Always use `tempfile::tempdir()` for isolation — never write to fixed paths
 - `doCheck = false` in `nix/package.nix` — tests run via `cargo test`, not nix build
+- Run NixOS VM tests: `nix flake check` (requires KVM)
 
 ## Adding a New Module
 
@@ -124,4 +131,6 @@ Do not commit with attribution lines (no `Co-Authored-By`).
   Do not remove these unless you've verified all items in the module are used.
 - **CLI commands**: `server`, `agent`, `dev`, `plan`, `apply`, `status`, `drift`,
   `rollback`, `capacity`, `services`, `drain`, `scale`, `logs`, `ssh`, `snapshot`,
-  `restore`, `upgrade`, `dispatch`, `token create`, `completions` — all functional.
+  `restore`, `upgrade`, `dispatch`, `exec`, `inspect`, `events`, `top`, `node`,
+  `acl token create/list/revoke`, `generation list/switch/diff`,
+  `system gc/reboot/rebuild`, `token create`, `completions` — all functional.

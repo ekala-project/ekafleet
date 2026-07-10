@@ -1,6 +1,6 @@
-# Missing Features
+# Missing Features (Historical)
 
-> **All 24 features listed below have been implemented.** This document is retained for historical reference. Each feature section describes what was originally missing and what was done to implement it.
+> **All 24 features listed below have been implemented.** This document is retained for historical reference only. Each section describes the *original* gap and the approach taken to resolve it. Status labels like "Stub" or "Regression" reflect the state *before* implementation, not the current state of the code.
 
 ---
 

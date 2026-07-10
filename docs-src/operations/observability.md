@@ -76,6 +76,8 @@ Event categories: `deployment`, `scheduling`, `health`, `scaling`, `node_join`, 
 
 Each event includes a timestamp, severity level (info/warning/error), optional service and node context, and a human-readable message.
 
+Events are queryable via both the REST API (`/v1/events`) and the gRPC `Events` RPC with the same category, service, and limit filters. Both interfaces read from the same in-memory EventStore.
+
 ## REST API
 
 The server exposes JSON REST endpoints alongside the gRPC API:

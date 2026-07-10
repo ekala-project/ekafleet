@@ -74,3 +74,20 @@ The server handles SPIFFE-style node attestation via the `Attest` RPC:
 ## Fleet Encryption Key
 
 The server generates a 256-bit AES-256-GCM encryption key on first start (persisted at `<data-dir>/fleet-key`). This key is distributed to agents over the mTLS channel for secret decryption.
+
+## Agent Command Relay
+
+The server can relay operational commands to individual agents through the bidirectional gRPC stream and await correlated responses. This powers the `exec`, `logs`, `inspect`, `generation`, `system gc`, `system reboot`, and `system rebuild` commands. Each request carries a unique `correlation_id`; the server registers a oneshot channel and awaits the agent's response with a per-command timeout.
+
+For fleet-wide operations like `system gc` and `system rebuild`, the server fans out commands to all connected nodes concurrently. For `system reboot`, the server orchestrates a rolling reboot in configurable batches, waiting for each batch of nodes to reconnect before proceeding to the next.
+
+## Policy Enforcement
+
+During `plan` and `apply`, the server evaluates organizational policy rules from the fleet configuration against each service. Policies use a simple expression language (e.g., `service.replicas >= 2`) with two enforcement levels:
+
+- **enforce** — Violations block the service from being created or updated
+- **warn** — Violations are logged but do not block deployment
+
+## ACL Token Management
+
+The server maintains an RBAC token store with three roles: **admin**, **operator**, and **viewer**. Tokens can be created, listed, and revoked via both the gRPC API and the `ekafleet acl token` CLI commands. The token store is shared between the gRPC and REST API layers, so tokens created via gRPC are immediately valid for REST API authentication and vice versa.

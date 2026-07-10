@@ -16,6 +16,12 @@ The primary communication channel is a bidirectional gRPC stream over TCP port 7
 | `Nack` | Reject an invalid server command |
 | `NodeAttestationResponse` | Response to attestation challenge (TPM, future) |
 
+### Agent → Server Messages (continued)
+
+| Message | Purpose |
+|---------|---------|
+| `AgentCommandResponse` | Response to any server-initiated command (exec, logs, inspect, etc.) with correlation ID |
+
 ### Server → Agent Messages
 
 | Message | Purpose |
@@ -30,16 +36,72 @@ The primary communication channel is a bidirectional gRPC stream over TCP port 7
 | `TrustBundleUpdate` | CA certificate + trust domain |
 | `NodeAttestationChallenge` | Server challenge during attestation |
 | `FleetKeyUpdate` | Fleet encryption key for secret decryption |
+| `ExecCommand` | Execute a command in a service's cgroup context |
+| `LogsCommand` | Read or stream journal logs from a service |
+| `ListGenerationsCommand` | List NixOS system generations |
+| `SwitchGenerationCommand` | Switch/boot/test a NixOS generation |
+| `DiffGenerationsCommand` | Diff two NixOS generations |
+| `SystemGCCommand` | Run nix-collect-garbage |
+| `SystemRebootCommand` | Initiate a system reboot |
+| `SystemRebuildCommand` | Run nixos-rebuild switch |
+| `InspectServiceCommand` | Query systemd unit properties and cgroup accounting |
+
+### Request-Response Correlation
+
+Server-initiated commands use a `correlation_id` field to match responses. The server sends a command with a unique ID, registers a oneshot channel, and awaits the agent's `AgentCommandResponse` with the same ID. Timeouts are enforced per-command (default 30s, up to 600s for GC).
 
 ### RPC Methods
 
 ```protobuf
 service FleetControl {
+  // Bidirectional agent ↔ server stream
   rpc StreamControl(stream AgentMessage) returns (stream ServerMessage);
+
+  // Deployment lifecycle
   rpc Plan(PlanRequest) returns (PlanResponse);
   rpc Apply(ApplyRequest) returns (stream ApplyEvent);
   rpc Status(StatusRequest) returns (FleetStatus);
+
+  // Node attestation (unauthenticated)
   rpc Attest(NodeAttestationRequest) returns (NodeAttestationResult);
+
+  // Cluster operations
+  rpc Rollback(RollbackRequest) returns (RollbackResponse);
+  rpc Drain(DrainRequest) returns (DrainResponse);
+  rpc Scale(ScaleRequest) returns (ScaleResponse);
+  rpc Snapshot(SnapshotRequest) returns (SnapshotResponse);
+  rpc Restore(RestoreRequest) returns (RestoreResponse);
+  rpc Dispatch(DispatchRequest) returns (DispatchResponse);
+
+  // Agent-relayed operations
+  rpc Exec(ExecRequest) returns (ExecResponse);
+  rpc Logs(LogsRequest) returns (stream LogsChunk);
+  rpc InspectService(InspectServiceRequest) returns (InspectServiceResponse);
+
+  // Fleet queries
+  rpc Events(EventsRequest) returns (EventsResponse);
+  rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
+  rpc GetNode(GetNodeRequest) returns (NodeDetail);
+  rpc UpdateNode(UpdateNodeRequest) returns (UpdateNodeResponse);
+  rpc Top(TopRequest) returns (TopResponse);
+  rpc ListDeployments(ListDeploymentsRequest) returns (ListDeploymentsResponse);
+  rpc PromoteDeployment(PromoteRequest) returns (PromoteResponse);
+  rpc FailDeployment(FailDeploymentRequest) returns (FailDeploymentResponse);
+
+  // ACL token management
+  rpc CreateACLToken(CreateACLTokenRequest) returns (CreateACLTokenResponse);
+  rpc RevokeACLToken(RevokeACLTokenRequest) returns (RevokeACLTokenResponse);
+  rpc ListACLTokens(ListACLTokensRequest) returns (ListACLTokensResponse);
+
+  // NixOS generation management
+  rpc ListGenerations(ListGenerationsRequest) returns (ListGenerationsResponse);
+  rpc SwitchGeneration(SwitchGenerationRequest) returns (SwitchGenerationResponse);
+  rpc DiffGenerations(DiffGenerationsRequest) returns (DiffGenerationsResponse);
+
+  // System-wide operations
+  rpc SystemGC(SystemGCRequest) returns (SystemGCResponse);
+  rpc SystemReboot(SystemRebootRequest) returns (SystemRebootResponse);
+  rpc SystemRebuild(SystemRebuildRequest) returns (SystemRebuildResponse);
 }
 ```
 
@@ -68,7 +130,24 @@ The gossip layer works independently of the server, providing continued service 
 
 ## HTTP API
 
-Port 7402. Provides:
+Port 7402. Public endpoints:
 
-- `GET /health` — Server health check
+- `GET /health` — Server health check (unauthenticated)
+
+Authenticated endpoints (require `Authorization: Bearer <token>` header):
+
 - `GET /metrics` — Prometheus-compatible metrics endpoint
+- `GET /v1/status` — Fleet status (nodes, services, pools)
+- `GET /v1/services` — Service listing
+- `GET /v1/capacity` — Cluster capacity summary
+- `GET /v1/events` — Event timeline with category/service/limit filters
+- `GET /v1/deployments` — Deployment history
+- `GET /v1/watch` — Server-Sent Events stream for real-time updates
+- `GET /v1/query` — PromQL-style metrics query
+- `GET/PUT/DELETE /v1/kv/{key}` — Key-value store CRUD
+- `GET /v1/kv?prefix=` — KV prefix listing
+- `GET/POST /v1/alerts/silences` — Alert silence management
+- `DELETE /v1/alerts/silences/{id}` — Remove a silence
+- `GET /v1/metrics/services/{name}` — Per-service metrics
+- `GET /v1/cloud/instances` — Cloud instance tracking
+- `GET /ui/` — Embedded web dashboard

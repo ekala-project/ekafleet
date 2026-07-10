@@ -63,6 +63,24 @@ Other messages:
 | `Peers` | Add/update/remove WireGuard peers |
 | `Policy` | Generate and apply nftables rules |
 
+### Server-Initiated Commands
+
+The server can relay operational commands to agents and await responses via a correlation-based request-response mechanism. Each command carries a `correlation_id`; the agent executes the operation and returns an `AgentCommandResponse` with the same ID.
+
+| Command | Handler |
+|---------|---------|
+| `ExecCommand` | Execute a command in a service's cgroup via `systemd-run --scope` |
+| `LogsCommand` | Read journal logs for a service via `journalctl` (tail or follow) |
+| `ListGenerationsCommand` | List NixOS system generations from `/nix/var/nix/profiles/` |
+| `SwitchGenerationCommand` | Switch to a generation via `nix-env --switch-generation` then activate |
+| `DiffGenerationsCommand` | Diff two generations via `nix store diff-closures` |
+| `SystemGCCommand` | Run `nix-collect-garbage -d` and report freed bytes |
+| `SystemRebootCommand` | Initiate `systemctl reboot` (response sent before reboot) |
+| `SystemRebuildCommand` | Run `nixos-rebuild switch` and return output |
+| `InspectServiceCommand` | Query `systemctl show` + `systemctl cat` for unit properties |
+
+All command handlers run in spawned tasks to avoid blocking the main message loop. Long-running operations (GC, rebuild) have longer server-side timeouts (up to 600s).
+
 ## System Resources
 
 The agent reads actual system resources from `/proc` and reports them:
