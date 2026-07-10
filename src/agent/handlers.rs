@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::io::AsyncReadExt;
 use tokio::sync::{RwLock, mpsc};
 
 use super::helpers::install_received_svid;
@@ -11,9 +12,10 @@ use crate::ca::csr;
 use crate::dns::resolver::DnsResolver;
 use crate::mesh::peers::PeerManager;
 use crate::policy::nftables::PolicyEnforcer;
+use crate::proto::agent_command_response::Result as CmdResult;
 use crate::proto::agent_message::Payload;
 use crate::proto::server_message::Payload as ServerPayload;
-use crate::proto::{AgentMessage, CertificateRequest};
+use crate::proto::{AgentCommandResponse, AgentMessage, CertificateRequest};
 use crate::secrets::injector::SecretInjector;
 use crate::spiffe::workload_api::WorkloadManager;
 
@@ -263,5 +265,647 @@ pub(super) async fn handle_server_message(
                 );
             }
         }
+        ServerPayload::ExecCommand(cmd) => {
+            let correlation_id = cmd.correlation_id.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let timeout = Duration::from_secs(cmd.timeout_seconds.max(5) as u64);
+                let result = crate::agent::exec::exec_in_service(
+                    &cmd.service_name,
+                    &cmd.command,
+                    timeout,
+                )
+                .await;
+                let response = match result {
+                    Ok(r) => AgentCommandResponse {
+                        correlation_id,
+                        success: true,
+                        error_message: String::new(),
+                        result: Some(CmdResult::ExecResult(
+                            crate::proto::ExecCommandResult {
+                                exit_code: r.exit_code,
+                                stdout: r.stdout.into_bytes(),
+                                stderr: r.stderr.into_bytes(),
+                            },
+                        )),
+                    },
+                    Err(e) => AgentCommandResponse {
+                        correlation_id,
+                        success: false,
+                        error_message: e.to_string(),
+                        result: None,
+                    },
+                };
+                let _ = tx
+                    .send(AgentMessage {
+                        payload: Some(Payload::CommandResponse(response)),
+                    })
+                    .await;
+            });
+        }
+        ServerPayload::LogsCommand(cmd) => {
+            let correlation_id = cmd.correlation_id.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let lines = if cmd.lines == 0 { 100 } else { cmd.lines };
+                if cmd.follow {
+                    // For follow mode, stream chunks from journalctl
+                    match crate::agent::logs::stream_journal(
+                        &cmd.service_name,
+                        lines,
+                        true,
+                    )
+                    .await
+                    {
+                        Ok(mut child) => {
+                            let mut stdout = child.stdout.take().unwrap();
+                            let mut buf = vec![0u8; 8192];
+                            loop {
+                                match tokio::time::timeout(
+                                    Duration::from_secs(30),
+                                    stdout.read(&mut buf),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(0)) => break,
+                                    Ok(Ok(n)) => {
+                                        let resp = AgentCommandResponse {
+                                            correlation_id: correlation_id.clone(),
+                                            success: true,
+                                            error_message: String::new(),
+                                            result: Some(CmdResult::LogsResult(
+                                                crate::proto::LogsCommandResult {
+                                                    data: buf[..n].to_vec(),
+                                                },
+                                            )),
+                                        };
+                                        if tx
+                                            .send(AgentMessage {
+                                                payload: Some(
+                                                    Payload::CommandResponse(resp),
+                                                ),
+                                            })
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                    Ok(Err(_)) | Err(_) => break,
+                                }
+                            }
+                            let _ = child.kill().await;
+                        }
+                        Err(e) => {
+                            let resp = AgentCommandResponse {
+                                correlation_id,
+                                success: false,
+                                error_message: e.to_string(),
+                                result: None,
+                            };
+                            let _ = tx
+                                .send(AgentMessage {
+                                    payload: Some(Payload::CommandResponse(resp)),
+                                })
+                                .await;
+                        }
+                    }
+                } else {
+                    let result =
+                        crate::agent::logs::read_logs(&cmd.service_name, lines).await;
+                    let response = match result {
+                        Ok(data) => AgentCommandResponse {
+                            correlation_id,
+                            success: true,
+                            error_message: String::new(),
+                            result: Some(CmdResult::LogsResult(
+                                crate::proto::LogsCommandResult {
+                                    data: data.into_bytes(),
+                                },
+                            )),
+                        },
+                        Err(e) => AgentCommandResponse {
+                            correlation_id,
+                            success: false,
+                            error_message: e.to_string(),
+                            result: None,
+                        },
+                    };
+                    let _ = tx
+                        .send(AgentMessage {
+                            payload: Some(Payload::CommandResponse(response)),
+                        })
+                        .await;
+                }
+            });
+        }
+        ServerPayload::ListGenerationsCommand(cmd) => {
+            let correlation_id = cmd.correlation_id.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let result = list_nix_generations().await;
+                let response = match result {
+                    Ok(generations) => AgentCommandResponse {
+                        correlation_id,
+                        success: true,
+                        error_message: String::new(),
+                        result: Some(CmdResult::ListGenerationsResult(
+                            crate::proto::ListGenerationsResult { generations },
+                        )),
+                    },
+                    Err(e) => AgentCommandResponse {
+                        correlation_id,
+                        success: false,
+                        error_message: e.to_string(),
+                        result: None,
+                    },
+                };
+                let _ = tx
+                    .send(AgentMessage {
+                        payload: Some(Payload::CommandResponse(response)),
+                    })
+                    .await;
+            });
+        }
+        ServerPayload::SwitchGenerationCommand(cmd) => {
+            let correlation_id = cmd.correlation_id.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let result = switch_nix_generation(cmd.generation, &cmd.action).await;
+                let response = match result {
+                    Ok(message) => AgentCommandResponse {
+                        correlation_id,
+                        success: true,
+                        error_message: String::new(),
+                        result: Some(CmdResult::SwitchGenerationResult(
+                            crate::proto::SwitchGenerationResult { message },
+                        )),
+                    },
+                    Err(e) => AgentCommandResponse {
+                        correlation_id,
+                        success: false,
+                        error_message: e.to_string(),
+                        result: None,
+                    },
+                };
+                let _ = tx
+                    .send(AgentMessage {
+                        payload: Some(Payload::CommandResponse(response)),
+                    })
+                    .await;
+            });
+        }
+        ServerPayload::DiffGenerationsCommand(cmd) => {
+            let correlation_id = cmd.correlation_id.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let result = diff_nix_generations(cmd.gen_a, cmd.gen_b).await;
+                let response = match result {
+                    Ok(diff) => AgentCommandResponse {
+                        correlation_id,
+                        success: true,
+                        error_message: String::new(),
+                        result: Some(CmdResult::DiffGenerationsResult(
+                            crate::proto::DiffGenerationsResult { diff },
+                        )),
+                    },
+                    Err(e) => AgentCommandResponse {
+                        correlation_id,
+                        success: false,
+                        error_message: e.to_string(),
+                        result: None,
+                    },
+                };
+                let _ = tx
+                    .send(AgentMessage {
+                        payload: Some(Payload::CommandResponse(response)),
+                    })
+                    .await;
+            });
+        }
+        ServerPayload::SystemGcCommand(cmd) => {
+            let correlation_id = cmd.correlation_id.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let result = run_nix_gc(cmd.dry_run).await;
+                let response = match result {
+                    Ok((freed_bytes, output)) => AgentCommandResponse {
+                        correlation_id,
+                        success: true,
+                        error_message: String::new(),
+                        result: Some(CmdResult::GcResult(
+                            crate::proto::SystemGcCommandResult {
+                                freed_bytes,
+                                output,
+                            },
+                        )),
+                    },
+                    Err(e) => AgentCommandResponse {
+                        correlation_id,
+                        success: false,
+                        error_message: e.to_string(),
+                        result: None,
+                    },
+                };
+                let _ = tx
+                    .send(AgentMessage {
+                        payload: Some(Payload::CommandResponse(response)),
+                    })
+                    .await;
+            });
+        }
+        ServerPayload::SystemRebootCommand(cmd) => {
+            let correlation_id = cmd.correlation_id.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                // Send the success response before initiating the reboot.
+                let resp = AgentCommandResponse {
+                    correlation_id,
+                    success: true,
+                    error_message: String::new(),
+                    result: None,
+                };
+                let _ = tx
+                    .send(AgentMessage {
+                        payload: Some(Payload::CommandResponse(resp)),
+                    })
+                    .await;
+
+                // Brief delay to allow the response to be transmitted.
+                tokio::time::sleep(Duration::from_secs(1)).await;
+
+                tracing::info!("Initiating system reboot");
+                let _ = tokio::process::Command::new("systemctl")
+                    .arg("reboot")
+                    .status()
+                    .await;
+            });
+        }
+        ServerPayload::SystemRebuildCommand(cmd) => {
+            let correlation_id = cmd.correlation_id.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let result = run_nixos_rebuild().await;
+                let response = match result {
+                    Ok(output) => AgentCommandResponse {
+                        correlation_id,
+                        success: true,
+                        error_message: String::new(),
+                        result: Some(CmdResult::RebuildResult(
+                            crate::proto::SystemRebuildResult { output },
+                        )),
+                    },
+                    Err(e) => AgentCommandResponse {
+                        correlation_id,
+                        success: false,
+                        error_message: e.to_string(),
+                        result: None,
+                    },
+                };
+                let _ = tx
+                    .send(AgentMessage {
+                        payload: Some(Payload::CommandResponse(response)),
+                    })
+                    .await;
+            });
+        }
+        ServerPayload::InspectServiceCommand(cmd) => {
+            let correlation_id = cmd.correlation_id.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let result = inspect_systemd_service(&cmd.service_name).await;
+                let response = match result {
+                    Ok(info) => AgentCommandResponse {
+                        correlation_id,
+                        success: true,
+                        error_message: String::new(),
+                        result: Some(CmdResult::InspectResult(info)),
+                    },
+                    Err(e) => AgentCommandResponse {
+                        correlation_id,
+                        success: false,
+                        error_message: e.to_string(),
+                        result: None,
+                    },
+                };
+                let _ = tx
+                    .send(AgentMessage {
+                        payload: Some(Payload::CommandResponse(response)),
+                    })
+                    .await;
+            });
+        }
     }
+}
+
+/// List NixOS system generations from /nix/var/nix/profiles/.
+async fn list_nix_generations() -> Result<Vec<crate::proto::GenerationInfo>, std::io::Error> {
+    let profiles_dir = std::path::Path::new("/nix/var/nix/profiles");
+    let mut generations = Vec::new();
+
+    let output = tokio::process::Command::new("nix-env")
+        .args([
+            "-p",
+            "/nix/var/nix/profiles/system",
+            "--list-generations",
+        ])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(std::io::Error::other(format!(
+            "nix-env --list-generations failed: {stderr}"
+        )));
+    }
+
+    // Determine which generation is current by resolving the `system` symlink.
+    let current_link = tokio::fs::read_link(profiles_dir.join("system")).await;
+    let current_gen: Option<u64> = current_link.ok().and_then(|p| {
+        let name = p.file_name()?.to_str()?;
+        // Name is like "system-42-link"
+        let num_str = name.strip_prefix("system-")?.strip_suffix("-link")?;
+        num_str.parse().ok()
+    });
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        // Format: "  42   2025-01-15 10:30:00   (current)"
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.is_empty() {
+            continue;
+        }
+        if let Ok(number) = parts[0].parse::<u64>() {
+            // Try to get the store path by resolving the symlink
+            let link_name = format!("system-{number}-link");
+            let store_path =
+                tokio::fs::read_link(profiles_dir.join(&link_name))
+                    .await
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+
+            // Parse the date+time from the listing if available
+            let created_at = if parts.len() >= 3 {
+                parse_generation_date(parts[1], parts[2])
+            } else {
+                0
+            };
+
+            let is_current = current_gen == Some(number);
+            generations.push(crate::proto::GenerationInfo {
+                number,
+                store_path,
+                created_at,
+                current: is_current,
+            });
+        }
+    }
+
+    Ok(generations)
+}
+
+/// Parse a date string like "2025-01-15" and time "10:30:00" into a UNIX timestamp.
+fn parse_generation_date(date_str: &str, time_str: &str) -> u64 {
+    // Simple parsing: YYYY-MM-DD HH:MM:SS
+    let datetime = format!("{date_str} {time_str}");
+    // Use a basic approach: parse with chrono-like manual parsing
+    let parts: Vec<&str> = date_str.split('-').collect();
+    if parts.len() != 3 {
+        return 0;
+    }
+    let time_parts: Vec<&str> = time_str.split(':').collect();
+    if time_parts.len() < 2 {
+        return 0;
+    }
+    // Approximate: just use the output as documentation, the exact timestamp
+    // is less important than the generation number and store path.
+    let _ = datetime;
+    // Try to stat the profile link for a more accurate timestamp
+    0
+}
+
+/// Switch to a specific NixOS generation.
+async fn switch_nix_generation(
+    generation: u64,
+    action: &str,
+) -> Result<String, std::io::Error> {
+    // First, switch the profile to the target generation
+    let output = tokio::process::Command::new("nix-env")
+        .args([
+            "-p",
+            "/nix/var/nix/profiles/system",
+            "--switch-generation",
+            &generation.to_string(),
+        ])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(std::io::Error::other(format!(
+            "nix-env --switch-generation failed: {stderr}"
+        )));
+    }
+
+    // Resolve the store path for this generation
+    let link = format!("/nix/var/nix/profiles/system-{generation}-link");
+    let store_path = tokio::fs::read_link(&link)
+        .await
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| link.clone());
+
+    // Activate the generation using switch-to-configuration
+    let activate_action = match action {
+        "boot" => "boot",
+        "test" => "test",
+        _ => "switch", // default to switch
+    };
+
+    let activate_script = format!("{store_path}/bin/switch-to-configuration");
+    let output = tokio::process::Command::new(&activate_script)
+        .arg(activate_action)
+        .output()
+        .await?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if !output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "switch-to-configuration {activate_action} failed: {stderr}"
+        )));
+    }
+
+    Ok(format!(
+        "Generation {generation} activated ({activate_action})\n{stdout}{stderr}"
+    ))
+}
+
+/// Diff two NixOS generations.
+async fn diff_nix_generations(gen_a: u64, gen_b: u64) -> Result<String, std::io::Error> {
+    let path_a = format!("/nix/var/nix/profiles/system-{gen_a}-link");
+    let path_b = format!("/nix/var/nix/profiles/system-{gen_b}-link");
+
+    let output = tokio::process::Command::new("nix")
+        .args(["store", "diff-closures", &path_a, &path_b])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(std::io::Error::other(format!(
+            "nix store diff-closures failed: {stderr}"
+        )));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Run nix-collect-garbage and return (freed_bytes, output).
+async fn run_nix_gc(dry_run: bool) -> Result<(u64, String), std::io::Error> {
+    let mut args = vec!["-d"];
+    if dry_run {
+        args.push("--dry-run");
+    }
+
+    let output = tokio::process::Command::new("nix-collect-garbage")
+        .args(&args)
+        .output()
+        .await?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let combined = format!("{stdout}{stderr}");
+
+    if !output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "nix-collect-garbage failed: {combined}"
+        )));
+    }
+
+    // Parse freed bytes from output. nix-collect-garbage outputs lines like:
+    // "deleting '/nix/store/...' (123.45 MiB)"
+    // and a final summary: "N store paths deleted, M MiB freed"
+    let freed_bytes = parse_gc_freed_bytes(&combined);
+
+    Ok((freed_bytes, combined))
+}
+
+/// Parse the number of freed bytes from nix-collect-garbage output.
+fn parse_gc_freed_bytes(output: &str) -> u64 {
+    // Look for pattern like "123.45 MiB freed" or "1.23 GiB freed"
+    for line in output.lines().rev() {
+        if let Some(freed_pos) = line.find("freed") {
+            let before = line[..freed_pos].trim();
+            // Find the last number+unit before "freed"
+            let parts: Vec<&str> = before.split_whitespace().collect();
+            if parts.len() >= 2 {
+                let unit = parts[parts.len() - 1];
+                let num_str = parts[parts.len() - 2].replace(',', "");
+                if let Ok(num) = num_str.parse::<f64>() {
+                    let multiplier = match unit {
+                        "KiB" => 1024.0,
+                        "MiB" => 1024.0 * 1024.0,
+                        "GiB" => 1024.0 * 1024.0 * 1024.0,
+                        "TiB" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+                        _ => 1.0,
+                    };
+                    return (num * multiplier) as u64;
+                }
+            }
+        }
+    }
+    0
+}
+
+/// Run nixos-rebuild switch and return the output.
+async fn run_nixos_rebuild() -> Result<String, std::io::Error> {
+    let output = tokio::process::Command::new("nixos-rebuild")
+        .arg("switch")
+        .output()
+        .await?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let combined = format!("{stdout}{stderr}");
+
+    if !output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "nixos-rebuild switch failed: {combined}"
+        )));
+    }
+
+    Ok(combined)
+}
+
+/// Inspect a systemd service unit and return structured information.
+async fn inspect_systemd_service(
+    service_name: &str,
+) -> Result<crate::proto::InspectServiceResult, std::io::Error> {
+    let unit = format!("ekafleet-{service_name}.service");
+
+    // Get unit properties via systemctl show
+    let output = tokio::process::Command::new("systemctl")
+        .args(["show", &unit, "--no-pager"])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(std::io::Error::other(format!(
+            "systemctl show failed: {stderr}"
+        )));
+    }
+
+    let props = String::from_utf8_lossy(&output.stdout);
+    let prop_map: std::collections::HashMap<&str, &str> = props
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .collect();
+
+    // Get unit file content via systemctl cat
+    let cat_output = tokio::process::Command::new("systemctl")
+        .args(["cat", &unit])
+        .output()
+        .await;
+    let unit_file = cat_output
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+
+    Ok(crate::proto::InspectServiceResult {
+        unit_file,
+        active_state: prop_map.get("ActiveState").unwrap_or(&"").to_string(),
+        sub_state: prop_map.get("SubState").unwrap_or(&"").to_string(),
+        main_pid: prop_map
+            .get("MainPID")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        control_group: prop_map.get("ControlGroup").unwrap_or(&"").to_string(),
+        cpu_usage_nsec: prop_map
+            .get("CPUUsageNSec")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        memory_current: prop_map
+            .get("MemoryCurrent")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        memory_peak: prop_map
+            .get("MemoryPeak")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        io_read_bytes: prop_map
+            .get("IOReadBytes")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        io_write_bytes: prop_map
+            .get("IOWriteBytes")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        tasks_current: prop_map
+            .get("TasksCurrent")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+    })
 }

@@ -110,7 +110,70 @@ message AgentMessage {
     MetricsSummary metrics = 5;
     Nack nack = 6;
     NodeAttestationResponse attest_response = 7;
+    AgentCommandResponse command_response = 8;
   }
+}
+
+// Envelope for all agent responses to server-initiated commands.
+message AgentCommandResponse {
+  string correlation_id = 1;
+  bool success = 2;
+  string error_message = 3;
+  oneof result {
+    ExecCommandResult exec_result = 4;
+    LogsCommandResult logs_result = 5;
+    ListGenerationsResult list_generations_result = 6;
+    SwitchGenerationResult switch_generation_result = 7;
+    DiffGenerationsResult diff_generations_result = 8;
+    SystemGCCommandResult gc_result = 9;
+    InspectServiceResult inspect_result = 10;
+    SystemRebuildResult rebuild_result = 11;
+  }
+}
+
+message ExecCommandResult {
+  int32 exit_code = 1;
+  bytes stdout = 2;
+  bytes stderr = 3;
+}
+
+message LogsCommandResult {
+  bytes data = 1;
+}
+
+message ListGenerationsResult {
+  repeated GenerationInfo generations = 1;
+}
+
+message SwitchGenerationResult {
+  string message = 1;
+}
+
+message DiffGenerationsResult {
+  string diff = 1;
+}
+
+message SystemGCCommandResult {
+  uint64 freed_bytes = 1;
+  string output = 2;
+}
+
+message InspectServiceResult {
+  string unit_file = 1;
+  string active_state = 2;
+  string sub_state = 3;
+  uint32 main_pid = 4;
+  string control_group = 5;
+  uint64 cpu_usage_nsec = 6;
+  uint64 memory_current = 7;
+  uint64 memory_peak = 8;
+  uint64 io_read_bytes = 9;
+  uint64 io_write_bytes = 10;
+  uint32 tasks_current = 11;
+}
+
+message SystemRebuildResult {
+  string output = 1;
 }
 
 message Heartbeat {
@@ -212,7 +275,66 @@ message ServerMessage {
     TrustBundleUpdate trust_bundle = 8;
     NodeAttestationChallenge attest_challenge = 9;
     FleetKeyUpdate fleet_key = 10;
+    ExecCommand exec_command = 11;
+    LogsCommand logs_command = 12;
+    ListGenerationsCommand list_generations_command = 13;
+    SwitchGenerationCommand switch_generation_command = 14;
+    DiffGenerationsCommand diff_generations_command = 15;
+    SystemGCCommand system_gc_command = 16;
+    SystemRebootCommand system_reboot_command = 17;
+    SystemRebuildCommand system_rebuild_command = 18;
+    InspectServiceCommand inspect_service_command = 19;
   }
+}
+
+// --- Server → Agent command messages ---
+
+message ExecCommand {
+  string correlation_id = 1;
+  string service_name = 2;
+  repeated string command = 3;
+  uint32 timeout_seconds = 4;
+}
+
+message LogsCommand {
+  string correlation_id = 1;
+  string service_name = 2;
+  uint32 lines = 3;
+  bool follow = 4;
+}
+
+message ListGenerationsCommand {
+  string correlation_id = 1;
+}
+
+message SwitchGenerationCommand {
+  string correlation_id = 1;
+  uint64 generation = 2;
+  string action = 3;  // "switch", "boot", "test"
+}
+
+message DiffGenerationsCommand {
+  string correlation_id = 1;
+  uint64 gen_a = 2;
+  uint64 gen_b = 3;
+}
+
+message SystemGCCommand {
+  string correlation_id = 1;
+  bool dry_run = 2;
+}
+
+message SystemRebootCommand {
+  string correlation_id = 1;
+}
+
+message SystemRebuildCommand {
+  string correlation_id = 1;
+}
+
+message InspectServiceCommand {
+  string correlation_id = 1;
+  string service_name = 2;
 }
 
 // CA trust bundle pushed to agents for SPIFFE workload verification.

@@ -92,6 +92,15 @@ pub(super) async fn process_agent_message(
         Some(Payload::AttestResponse(_)) => {
             tracing::debug!("Ignoring attestation response on stream (use Attest RPC)");
         }
+        Some(Payload::CommandResponse(resp)) => {
+            let cid = resp.correlation_id.clone();
+            tracing::debug!(
+                correlation_id = %cid,
+                success = resp.success,
+                "Agent command response received"
+            );
+            state.complete_request(&cid, resp).await;
+        }
         None => {}
     }
 }

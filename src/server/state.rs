@@ -2,9 +2,10 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{RwLock, mpsc, oneshot};
+use tonic::Status;
 
 use crate::proto::{
     HealthStatus, NodeResources, NodeStatus, PoolStatus, ServerMessage, ServiceHealth,
@@ -19,6 +20,9 @@ pub struct FleetState {
 
 struct FleetStateInner {
     nodes: HashMap<String, NodeInfo>,
+    /// Pending request-response correlations for agent commands.
+    pending_requests:
+        HashMap<String, oneshot::Sender<crate::proto::AgentCommandResponse>>,
 }
 
 struct NodeInfo {
@@ -52,6 +56,7 @@ impl FleetState {
         Self {
             inner: Arc::new(RwLock::new(FleetStateInner {
                 nodes: HashMap::new(),
+                pending_requests: HashMap::new(),
             })),
         }
     }
@@ -274,5 +279,80 @@ impl FleetState {
     pub async fn is_schedulable(&self, node_id: &str) -> bool {
         let state = self.inner.read().await;
         state.nodes.get(node_id).is_some_and(|n| n.schedulable)
+    }
+
+    /// Send a command to an agent and wait for the correlated response.
+    ///
+    /// Inserts a oneshot channel keyed by `correlation_id`, sends the message
+    /// to the agent, and awaits the response with a timeout. Returns an error
+    /// status if the agent is unreachable or the response times out.
+    pub async fn send_command(
+        &self,
+        node_id: &str,
+        msg: ServerMessage,
+        correlation_id: String,
+        timeout: Duration,
+    ) -> Result<crate::proto::AgentCommandResponse, Status> {
+        let (tx, rx) = oneshot::channel();
+
+        {
+            let mut state = self.inner.write().await;
+            state.pending_requests.insert(correlation_id.clone(), tx);
+        }
+
+        if !self.send_to_agent(node_id, msg).await {
+            let mut state = self.inner.write().await;
+            state.pending_requests.remove(&correlation_id);
+            return Err(Status::unavailable(format!(
+                "agent '{node_id}' is not connected"
+            )));
+        }
+
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(_)) => {
+                // Sender was dropped (agent disconnected)
+                Err(Status::unavailable(format!(
+                    "agent '{node_id}' disconnected before responding"
+                )))
+            }
+            Err(_) => {
+                // Timeout — clean up the pending entry
+                let mut state = self.inner.write().await;
+                state.pending_requests.remove(&correlation_id);
+                Err(Status::deadline_exceeded(format!(
+                    "agent '{node_id}' did not respond within {timeout:?}"
+                )))
+            }
+        }
+    }
+
+    /// Complete a pending request-response correlation.
+    ///
+    /// Called when the server receives an `AgentCommandResponse` from an agent.
+    /// If the correlation_id matches a pending request, the response is forwarded
+    /// to the waiting handler. Otherwise a warning is logged (the request may
+    /// have timed out).
+    pub async fn complete_request(
+        &self,
+        correlation_id: &str,
+        response: crate::proto::AgentCommandResponse,
+    ) {
+        let sender = {
+            let mut state = self.inner.write().await;
+            state.pending_requests.remove(correlation_id)
+        };
+
+        match sender {
+            Some(tx) => {
+                let _ = tx.send(response);
+            }
+            None => {
+                tracing::warn!(
+                    correlation_id,
+                    "Received response for unknown or timed-out correlation"
+                );
+            }
+        }
     }
 }
