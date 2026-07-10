@@ -356,3 +356,115 @@ impl FleetState {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::server_message::Payload as ServerPayload;
+
+    #[tokio::test]
+    async fn send_command_returns_response() {
+        let state = FleetState::new();
+        let _rx = state
+            .register_agent("node-1", "127.0.0.1:5000".into(), "default".into())
+            .await;
+
+        let cid = "test-correlation-1".to_string();
+        let msg = ServerMessage {
+            payload: Some(ServerPayload::ListGenerationsCommand(
+                crate::proto::ListGenerationsCommand {
+                    correlation_id: cid.clone(),
+                },
+            )),
+        };
+
+        let state2 = state.clone();
+        let cid2 = cid.clone();
+        // Complete the request from another task after a short delay.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let cid_for_response = cid2.clone();
+            state2
+                .complete_request(
+                    &cid2,
+                    crate::proto::AgentCommandResponse {
+                        correlation_id: cid_for_response,
+                        success: true,
+                        error_message: String::new(),
+                        result: None,
+                    },
+                )
+                .await;
+        });
+
+        let resp = state
+            .send_command(&"node-1", msg, cid, Duration::from_secs(5))
+            .await;
+        assert!(resp.is_ok());
+        assert!(resp.unwrap().success);
+    }
+
+    #[tokio::test]
+    async fn send_command_times_out() {
+        let state = FleetState::new();
+        let _rx = state
+            .register_agent("node-1", "127.0.0.1:5000".into(), "default".into())
+            .await;
+
+        let cid = "timeout-test".to_string();
+        let msg = ServerMessage {
+            payload: Some(ServerPayload::ListGenerationsCommand(
+                crate::proto::ListGenerationsCommand {
+                    correlation_id: cid.clone(),
+                },
+            )),
+        };
+
+        // Don't complete the request — it should time out.
+        let resp = state
+            .send_command(&"node-1", msg, cid, Duration::from_millis(100))
+            .await;
+        assert!(resp.is_err());
+        let status = resp.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
+    }
+
+    #[tokio::test]
+    async fn send_command_fails_for_disconnected_agent() {
+        let state = FleetState::new();
+        // Don't register any agent.
+        let cid = "no-agent".to_string();
+        let msg = ServerMessage {
+            payload: Some(ServerPayload::ListGenerationsCommand(
+                crate::proto::ListGenerationsCommand {
+                    correlation_id: cid.clone(),
+                },
+            )),
+        };
+
+        let resp = state
+            .send_command(&"nonexistent", msg, cid, Duration::from_secs(5))
+            .await;
+        assert!(resp.is_err());
+        let status = resp.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn complete_unknown_correlation_does_not_panic() {
+        let state = FleetState::new();
+        // Complete a request with no pending entries — should just log a warning.
+        state
+            .complete_request(
+                "unknown-id",
+                crate::proto::AgentCommandResponse {
+                    correlation_id: "unknown-id".to_string(),
+                    success: true,
+                    error_message: String::new(),
+                    result: None,
+                },
+            )
+            .await;
+        // No panic = success.
+    }
+}

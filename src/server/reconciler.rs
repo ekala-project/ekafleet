@@ -388,6 +388,7 @@ mod tests {
     use super::*;
     use crate::config::{
         CapacityConfig, CloudProviderConfig, CloudProviderType, NodePoolConfig,
+        SchedulingConfig, ServiceConfig,
     };
     use crate::raft::state::FleetStateMachine;
 
@@ -515,5 +516,75 @@ mod tests {
         // Should keep the static machine's config, not overwrite
         assert_eq!(result["node-1"].target_host, "10.0.0.1");
         assert_eq!(result["node-1"].capacity.cpu, 8000);
+    }
+
+    #[tokio::test]
+    async fn policy_violations_block_service_creation() {
+        use crate::server::policy::{PolicyEnforcement, PolicyRule};
+
+        let state = FleetState::new();
+        // Register a node so scheduling has somewhere to place services.
+        let _rx = state
+            .register_agent("node-1", "127.0.0.1:5000".into(), "default".into())
+            .await;
+        // Report resources so the scheduler sees capacity.
+        state
+            .update_heartbeat(
+                "node-1",
+                Some(crate::proto::NodeResources {
+                    cpu_millicores: 4000,
+                    memory_mb: 8192,
+                    disk_mb: 100_000,
+                }),
+            )
+            .await;
+
+        let mut config = empty_fleet_config();
+        config.machines.insert(
+            "node-1".into(),
+            MachineConfig {
+                target_host: "127.0.0.1".into(),
+                labels: HashMap::new(),
+                capacity: CapacityConfig {
+                    cpu: 4000,
+                    memory: 8192,
+                    disk: 100_000,
+                },
+                pool: "default".into(),
+                reserved: CapacityConfig::default(),
+                taints: vec![],
+                extended_resources: HashMap::new(),
+            },
+        );
+        config.services.insert(
+            "blocked-svc".into(),
+            ServiceConfig {
+                command: "/bin/svc".into(),
+                ports: HashMap::new(),
+                secrets: HashMap::new(),
+                identity: Default::default(),
+                resources: Default::default(),
+                scheduling: SchedulingConfig {
+                    replicas: 1,
+                    ..Default::default()
+                },
+                environment: HashMap::new(),
+                templates: HashMap::new(),
+                lifecycle: Default::default(),
+                volumes: vec![],
+                sidecars: vec![],
+            },
+        );
+        // Policy: requires at least 2 replicas.
+        config.policies.push(PolicyRule {
+            name: "min-replicas".into(),
+            expression: "service.replicas >= 2".into(),
+            message: "Must have at least 2 replicas".into(),
+            enforcement: PolicyEnforcement::Enforce,
+        });
+
+        let plan = compute_plan(&config, &["node-1".to_string()], &state, None).await;
+        // The service should be blocked by the policy.
+        assert!(plan.creates.is_empty(), "blocked-svc should not be created");
     }
 }
