@@ -238,6 +238,45 @@ pub struct ResourceConfig {
     /// Extended/device resources (e.g., `{"gpu": 1, "fpga": 2}`).
     #[serde(default)]
     pub extended: HashMap<String, u64>,
+    /// Systemd cgroup v2 resource controls for fine-grained resource management.
+    #[serde(default, rename = "cgroupControls")]
+    pub cgroup_controls: Option<CgroupControlsConfig>,
+}
+
+/// Systemd cgroup v2 resource controls. These are translated directly into
+/// systemd unit directives for per-service resource management.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CgroupControlsConfig {
+    /// CPU scheduling weight (1-10000, default: 100).
+    /// Higher values get more CPU time relative to other services.
+    #[serde(default = "default_cpu_weight", rename = "cpuWeight")]
+    pub cpu_weight: u32,
+    /// Soft memory limit in MB. When exceeded, the kernel reclaims memory
+    /// under pressure but does not kill the process.
+    #[serde(default, rename = "memoryHigh")]
+    pub memory_high: Option<u64>,
+    /// Hard memory limit in MB. Exceeding this triggers OOM based on oomPolicy.
+    #[serde(default, rename = "memoryMax")]
+    pub memory_max: Option<u64>,
+    /// IO scheduling weight (1-10000, default: 100).
+    #[serde(default = "default_io_weight", rename = "ioWeight")]
+    pub io_weight: u32,
+    /// Maximum number of tasks (threads + processes) for this service.
+    #[serde(default, rename = "tasksMax")]
+    pub tasks_max: Option<u32>,
+    /// OOM policy: "stop" (default), "kill", or "continue".
+    #[serde(default = "default_oom_policy", rename = "oomPolicy")]
+    pub oom_policy: String,
+}
+
+fn default_cpu_weight() -> u32 {
+    100
+}
+fn default_io_weight() -> u32 {
+    100
+}
+fn default_oom_policy() -> String {
+    "stop".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

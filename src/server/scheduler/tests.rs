@@ -82,6 +82,7 @@ fn make_service(name: &str, cpu: u64, memory: u64, replicas: u32) -> (String, Se
                 }),
                 disk: None,
                 extended: HashMap::new(),
+                cgroup_controls: None,
             },
             scheduling: SchedulingConfig {
                 replicas,
@@ -148,6 +149,7 @@ fn constraint_filtering() {
                 }),
                 disk: None,
                 extended: HashMap::new(),
+                cgroup_controls: None,
             },
             scheduling: SchedulingConfig {
                 replicas: 1,
@@ -199,6 +201,7 @@ fn system_job_all_nodes() {
                 }),
                 disk: None,
                 extended: HashMap::new(),
+                cgroup_controls: None,
             },
             scheduling: SchedulingConfig {
                 replicas: 1,
@@ -278,6 +281,7 @@ fn pool_affinity_prefers_correct_pool() {
                 }),
                 disk: None,
                 extended: HashMap::new(),
+                cgroup_controls: None,
             },
             scheduling: SchedulingConfig {
                 replicas: 1,
@@ -349,6 +353,7 @@ fn pool_affinity_spills_when_full() {
                 }),
                 disk: None,
                 extended: HashMap::new(),
+                cgroup_controls: None,
             },
             scheduling: SchedulingConfig {
                 replicas: 2,
@@ -421,6 +426,7 @@ fn pool_hard_constraint_blocks_spillover() {
                 }),
                 disk: None,
                 extended: HashMap::new(),
+                cgroup_controls: None,
             },
             scheduling: SchedulingConfig {
                 replicas: 2,
@@ -535,6 +541,7 @@ fn pool_labels_merged() {
                 }),
                 disk: None,
                 extended: HashMap::new(),
+                cgroup_controls: None,
             },
             scheduling: SchedulingConfig {
                 replicas: 1,
@@ -626,6 +633,7 @@ fn system_job_on_pool() {
                 }),
                 disk: None,
                 extended: HashMap::new(),
+                cgroup_controls: None,
             },
             scheduling: SchedulingConfig {
                 replicas: 1,
@@ -680,6 +688,7 @@ fn constraint_numeric_operators() {
                 }),
                 disk: None,
                 extended: HashMap::new(),
+                cgroup_controls: None,
             },
             scheduling: SchedulingConfig {
                 replicas: 1,
@@ -730,6 +739,7 @@ fn constraint_regexp() {
                 }),
                 disk: None,
                 extended: HashMap::new(),
+                cgroup_controls: None,
             },
             scheduling: SchedulingConfig {
                 replicas: 1,
@@ -780,6 +790,7 @@ fn constraint_is_set() {
                 }),
                 disk: None,
                 extended: HashMap::new(),
+                cgroup_controls: None,
             },
             scheduling: SchedulingConfig {
                 replicas: 1,
@@ -834,6 +845,7 @@ fn multiple_spread_blocks() {
                 }),
                 disk: None,
                 extended: HashMap::new(),
+                cgroup_controls: None,
             },
             scheduling: SchedulingConfig {
                 replicas: 4,
@@ -905,6 +917,7 @@ fn priority_ordering() {
                     }),
                     disk: None,
                     extended: HashMap::new(),
+                    cgroup_controls: None,
                 },
                 scheduling: SchedulingConfig {
                     replicas: 1,
@@ -936,6 +949,7 @@ fn priority_ordering() {
                     }),
                     disk: None,
                     extended: HashMap::new(),
+                    cgroup_controls: None,
                 },
                 scheduling: SchedulingConfig {
                     replicas: 1,
@@ -1011,6 +1025,7 @@ fn taint_blocks_non_tolerating_service() {
                 }),
                 disk: None,
                 extended: HashMap::new(),
+                cgroup_controls: None,
             },
             scheduling: SchedulingConfig {
                 replicas: 1,
@@ -1061,6 +1076,7 @@ fn sysbatch_runs_on_all_nodes() {
                 }),
                 disk: None,
                 extended: HashMap::new(),
+                cgroup_controls: None,
             },
             scheduling: SchedulingConfig {
                 replicas: 1,

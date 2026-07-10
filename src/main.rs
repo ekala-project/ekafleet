@@ -163,6 +163,12 @@ enum Command {
         server: String,
     },
 
+    /// Service introspection (systemd unit, cgroup accounting)
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+
     /// Reschedule services off a machine
     Drain {
         /// Machine to drain
@@ -316,6 +322,24 @@ enum Command {
         /// Server address
         #[arg(long, default_value = "127.0.0.1:7400")]
         server: String,
+    },
+
+    /// Nix store closure analysis
+    Closure {
+        #[command(subcommand)]
+        action: ClosureAction,
+    },
+
+    /// NixOS generation management
+    Generation {
+        #[command(subcommand)]
+        action: GenerationAction,
+    },
+
+    /// System-wide operations
+    System {
+        #[command(subcommand)]
+        action: SystemAction,
     },
 
     /// Generate shell completions
@@ -496,6 +520,135 @@ enum AclTokenAction {
     },
 }
 
+#[derive(Subcommand)]
+enum ServiceAction {
+    /// Show systemd unit file, cgroup accounting, and resource usage
+    Inspect {
+        /// Service name
+        service: String,
+        /// Target a specific node
+        #[arg(long)]
+        node: Option<String>,
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ClosureAction {
+    /// Diff two Nix store paths (show changed packages)
+    Diff {
+        /// First store path
+        path_a: String,
+        /// Second store path
+        path_b: String,
+    },
+    /// Show full dependency tree of a store path
+    Deps {
+        /// Nix store path
+        path: String,
+        /// Show as tree instead of flat list
+        #[arg(long)]
+        tree: bool,
+    },
+    /// Calculate closure size
+    Size {
+        /// Nix store path
+        path: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum GenerationAction {
+    /// List NixOS generations on a machine
+    List {
+        /// Machine to query
+        machine: String,
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+    /// Activate a generation and set as boot default
+    Switch {
+        /// Machine to target
+        machine: String,
+        /// Generation number
+        generation: u64,
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+    /// Set a generation as boot default only (next reboot)
+    Boot {
+        /// Machine to target
+        machine: String,
+        /// Generation number
+        generation: u64,
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+    /// Activate a generation in current session only (reverts on reboot)
+    Test {
+        /// Machine to target
+        machine: String,
+        /// Generation number
+        generation: u64,
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+    /// Diff two generations on a machine
+    Diff {
+        /// Machine to query
+        machine: String,
+        /// First generation number
+        gen_a: u64,
+        /// Second generation number
+        gen_b: u64,
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum SystemAction {
+    /// Garbage-collect unused Nix store paths across the fleet
+    Gc {
+        /// Show what would be collected without actually collecting
+        #[arg(long)]
+        dry_run: bool,
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+    /// Coordinated rolling reboot of fleet machines
+    Reboot {
+        /// Limit to a specific pool
+        #[arg(long)]
+        pool: Option<String>,
+        /// Maximum concurrent reboots
+        #[arg(long, default_value = "1")]
+        max_parallel: u32,
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+    /// Trigger NixOS rebuild on a machine
+    Rebuild {
+        /// Machine to rebuild
+        machine: Option<String>,
+        /// Rebuild all machines
+        #[arg(long)]
+        all: bool,
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -555,6 +708,14 @@ async fn main() -> anyhow::Result<()> {
         Command::Capacity { server } => commands::cmd_capacity(server).await?,
 
         Command::Services { server } => commands::cmd_services(server).await?,
+
+        Command::Service { action } => match action {
+            ServiceAction::Inspect {
+                service,
+                node,
+                server,
+            } => commands::cmd_service_inspect(service, node, server).await?,
+        },
 
         Command::Drain {
             machine,
@@ -666,6 +827,59 @@ async fn main() -> anyhow::Result<()> {
             timeout,
             server,
         } => commands::cmd_exec(service, command, node, timeout, server).await?,
+
+        Command::Closure { action } => match action {
+            ClosureAction::Diff { path_a, path_b } => {
+                commands::cmd_closure_diff(path_a, path_b).await?
+            }
+            ClosureAction::Deps { path, tree } => {
+                commands::cmd_closure_deps(path, tree).await?
+            }
+            ClosureAction::Size { path } => commands::cmd_closure_size(path).await?,
+        },
+
+        Command::Generation { action } => match action {
+            GenerationAction::List { machine, server } => {
+                commands::cmd_generation_list(machine, server).await?
+            }
+            GenerationAction::Switch {
+                machine,
+                generation,
+                server,
+            } => commands::cmd_generation_switch(machine, generation, "switch", server).await?,
+            GenerationAction::Boot {
+                machine,
+                generation,
+                server,
+            } => commands::cmd_generation_switch(machine, generation, "boot", server).await?,
+            GenerationAction::Test {
+                machine,
+                generation,
+                server,
+            } => commands::cmd_generation_switch(machine, generation, "test", server).await?,
+            GenerationAction::Diff {
+                machine,
+                gen_a,
+                gen_b,
+                server,
+            } => commands::cmd_generation_diff(machine, gen_a, gen_b, server).await?,
+        },
+
+        Command::System { action } => match action {
+            SystemAction::Gc { dry_run, server } => {
+                commands::cmd_system_gc(dry_run, server).await?
+            }
+            SystemAction::Reboot {
+                pool,
+                max_parallel,
+                server,
+            } => commands::cmd_system_reboot(pool, max_parallel, server).await?,
+            SystemAction::Rebuild {
+                machine,
+                all,
+                server,
+            } => commands::cmd_system_rebuild(machine, all, server).await?,
+        },
     }
 
     Ok(())

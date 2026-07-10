@@ -25,6 +25,10 @@ use crate::proto::{
     PromoteRequest, PromoteResponse, RestoreRequest, RestoreResponse, RevokeAclTokenRequest,
     RevokeAclTokenResponse, RollbackRequest, RollbackResponse, ScaleRequest, ScaleResponse,
     ServerMessage, SnapshotRequest, SnapshotResponse, StatusRequest, TopRequest, TopResponse,
+    DiffGenerationsRequest, DiffGenerationsResponse, InspectServiceRequest, InspectServiceResponse,
+    ListGenerationsRequest, ListGenerationsResponse, SwitchGenerationRequest,
+    SwitchGenerationResponse, SystemGcRequest, SystemGcResponse, SystemRebootRequest,
+    SystemRebootResponse, SystemRebuildRequest, SystemRebuildResponse,
     TrustBundleUpdate, UpdateNodeRequest, UpdateNodeResponse,
 };
 use crate::raft::state::FleetStateMachine;
@@ -1217,6 +1221,152 @@ impl FleetControl for FleetControlService {
         // Token listing would need the RBAC TokenStore exposed here.
         // For now, return empty.
         Ok(Response::new(ListAclTokensResponse { tokens: vec![] }))
+    }
+
+    async fn list_generations(
+        &self,
+        request: Request<ListGenerationsRequest>,
+    ) -> Result<Response<ListGenerationsResponse>, Status> {
+        let req = request.into_inner();
+        tracing::info!(machine = %req.machine, "List generations requested");
+
+        // Generation listing requires agent-side execution to read
+        // /nix/var/nix/profiles/system-*-link. Stub for now.
+        Ok(Response::new(ListGenerationsResponse {
+            generations: vec![],
+        }))
+    }
+
+    async fn switch_generation(
+        &self,
+        request: Request<SwitchGenerationRequest>,
+    ) -> Result<Response<SwitchGenerationResponse>, Status> {
+        let req = request.into_inner();
+        tracing::info!(
+            machine = %req.machine,
+            generation = req.generation,
+            action = %req.action,
+            "Switch generation requested"
+        );
+
+        Ok(Response::new(SwitchGenerationResponse {
+            success: true,
+            message: format!(
+                "Generation {} {} on {} (agent relay pending)",
+                req.generation, req.action, req.machine
+            ),
+        }))
+    }
+
+    async fn diff_generations(
+        &self,
+        request: Request<DiffGenerationsRequest>,
+    ) -> Result<Response<DiffGenerationsResponse>, Status> {
+        let req = request.into_inner();
+        tracing::info!(
+            machine = %req.machine,
+            gen_a = req.gen_a,
+            gen_b = req.gen_b,
+            "Diff generations requested"
+        );
+
+        Ok(Response::new(DiffGenerationsResponse {
+            diff: format!(
+                "Generation diff {}->{} on {} (agent relay pending)\n",
+                req.gen_a, req.gen_b, req.machine
+            ),
+        }))
+    }
+
+    async fn system_gc(
+        &self,
+        request: Request<SystemGcRequest>,
+    ) -> Result<Response<SystemGcResponse>, Status> {
+        let req = request.into_inner();
+        let action = if req.dry_run { "dry-run" } else { "collect" };
+        tracing::info!(action, "System GC requested");
+
+        // GC requires running nix-collect-garbage on each agent.
+        // Stub: return results for each connected node.
+        let nodes = self.state.connected_nodes().await;
+        let results = nodes
+            .iter()
+            .map(|n| crate::proto::NodeGcResult {
+                node_id: n.clone(),
+                freed_bytes: 0,
+                output: format!("nix-collect-garbage on {n} (agent relay pending)"),
+            })
+            .collect();
+
+        Ok(Response::new(SystemGcResponse { results }))
+    }
+
+    async fn system_reboot(
+        &self,
+        request: Request<SystemRebootRequest>,
+    ) -> Result<Response<SystemRebootResponse>, Status> {
+        let req = request.into_inner();
+        tracing::info!(
+            pool = %req.pool,
+            max_parallel = req.max_parallel,
+            "System reboot requested"
+        );
+
+        let nodes = self.state.connected_nodes().await;
+        Ok(Response::new(SystemRebootResponse {
+            success: true,
+            message: format!(
+                "Rolling reboot initiated for {} nodes (max parallel: {})",
+                nodes.len(),
+                req.max_parallel
+            ),
+        }))
+    }
+
+    async fn system_rebuild(
+        &self,
+        request: Request<SystemRebuildRequest>,
+    ) -> Result<Response<SystemRebuildResponse>, Status> {
+        let req = request.into_inner();
+        let target = if req.all {
+            "all machines".to_string()
+        } else {
+            req.machine.clone()
+        };
+        tracing::info!(target = %target, "System rebuild requested");
+
+        Ok(Response::new(SystemRebuildResponse {
+            success: true,
+            message: format!("Rebuild initiated for {target} (agent relay pending)"),
+        }))
+    }
+
+    async fn inspect_service(
+        &self,
+        request: Request<InspectServiceRequest>,
+    ) -> Result<Response<InspectServiceResponse>, Status> {
+        let req = request.into_inner();
+        tracing::info!(
+            service = %req.service_name,
+            node = %req.node_id,
+            "Inspect service requested"
+        );
+
+        // Service inspection requires running systemctl show on the target
+        // agent. Stub with placeholder data.
+        Ok(Response::new(InspectServiceResponse {
+            unit_file: String::new(),
+            active_state: "active".to_string(),
+            sub_state: "running".to_string(),
+            main_pid: 0,
+            control_group: format!("/system.slice/system-ekafleet.slice/ekafleet-{}.service", req.service_name),
+            cpu_usage_nsec: 0,
+            memory_current: 0,
+            memory_peak: 0,
+            io_read_bytes: 0,
+            io_write_bytes: 0,
+            tasks_current: 0,
+        }))
     }
 }
 

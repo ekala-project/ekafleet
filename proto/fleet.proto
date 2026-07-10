@@ -76,6 +76,27 @@ service FleetControl {
 
   // List ACL tokens.
   rpc ListACLTokens(ListACLTokensRequest) returns (ListACLTokensResponse);
+
+  // List NixOS generations on a machine.
+  rpc ListGenerations(ListGenerationsRequest) returns (ListGenerationsResponse);
+
+  // Switch/boot/test a NixOS generation on a machine.
+  rpc SwitchGeneration(SwitchGenerationRequest) returns (SwitchGenerationResponse);
+
+  // Diff two NixOS generations on a machine.
+  rpc DiffGenerations(DiffGenerationsRequest) returns (DiffGenerationsResponse);
+
+  // Garbage-collect unused Nix store paths across the fleet.
+  rpc SystemGC(SystemGCRequest) returns (SystemGCResponse);
+
+  // Coordinated rolling reboot of fleet machines.
+  rpc SystemReboot(SystemRebootRequest) returns (SystemRebootResponse);
+
+  // Trigger NixOS rebuild on machines.
+  rpc SystemRebuild(SystemRebuildRequest) returns (SystemRebuildResponse);
+
+  // Inspect a service's systemd unit and cgroup accounting.
+  rpc InspectService(InspectServiceRequest) returns (InspectServiceResponse);
 }
 
 // --- Agent → Server messages ---
@@ -229,6 +250,9 @@ message ServiceSpec {
 
   // Persistent volumes attached to this service.
   repeated VolumeMount volumes = 12;
+
+  // Cgroup v2 resource controls for systemd unit generation.
+  CgroupControls cgroup_controls = 13;
 }
 
 message VolumeMount {
@@ -737,4 +761,110 @@ message ListACLTokensResponse {
 message ACLTokenInfo {
   string description = 1;
   string role = 2;
+}
+
+// --- NixOS Generation Management ---
+
+message ListGenerationsRequest {
+  string machine = 1;
+}
+
+message ListGenerationsResponse {
+  repeated GenerationInfo generations = 1;
+}
+
+message GenerationInfo {
+  uint64 number = 1;
+  string store_path = 2;
+  uint64 created_at = 3;
+  bool current = 4;
+}
+
+message SwitchGenerationRequest {
+  string machine = 1;
+  uint64 generation = 2;
+  string action = 3;  // "switch", "boot", or "test"
+}
+
+message SwitchGenerationResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message DiffGenerationsRequest {
+  string machine = 1;
+  uint64 gen_a = 2;
+  uint64 gen_b = 3;
+}
+
+message DiffGenerationsResponse {
+  string diff = 1;
+}
+
+// --- System-Wide Operations ---
+
+message SystemGCRequest {
+  bool dry_run = 1;
+}
+
+message SystemGCResponse {
+  repeated NodeGCResult results = 1;
+}
+
+message NodeGCResult {
+  string node_id = 1;
+  uint64 freed_bytes = 2;
+  string output = 3;
+}
+
+message SystemRebootRequest {
+  string pool = 1;
+  uint32 max_parallel = 2;
+}
+
+message SystemRebootResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message SystemRebuildRequest {
+  string machine = 1;
+  bool all = 2;
+}
+
+message SystemRebuildResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// --- Service Introspection ---
+
+message InspectServiceRequest {
+  string service_name = 1;
+  string node_id = 2;
+}
+
+message InspectServiceResponse {
+  string unit_file = 1;
+  string active_state = 2;
+  string sub_state = 3;
+  uint32 main_pid = 4;
+  string control_group = 5;
+  uint64 cpu_usage_nsec = 6;
+  uint64 memory_current = 7;
+  uint64 memory_peak = 8;
+  uint64 io_read_bytes = 9;
+  uint64 io_write_bytes = 10;
+  uint32 tasks_current = 11;
+}
+
+// --- Cgroup v2 Resource Controls ---
+
+message CgroupControls {
+  uint32 cpu_weight = 1;
+  uint64 memory_high_mb = 2;
+  uint64 memory_max_mb = 3;
+  uint32 io_weight = 4;
+  uint32 tasks_max = 5;
+  string oom_policy = 6;
 }

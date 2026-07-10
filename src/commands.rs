@@ -952,6 +952,249 @@ pub async fn cmd_exec(
     Ok(())
 }
 
+// --- Closure analysis (local, no server) ---
+
+pub async fn cmd_closure_diff(path_a: String, path_b: String) -> anyhow::Result<()> {
+    let output = tokio::process::Command::new("nix")
+        .args(["store", "diff-closures", &path_a, &path_b])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("nix store diff-closures failed: {stderr}");
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    if text.is_empty() {
+        println!("No differences between closures.");
+    } else {
+        print!("{text}");
+    }
+    Ok(())
+}
+
+pub async fn cmd_closure_deps(path: String, tree: bool) -> anyhow::Result<()> {
+    let args = if tree {
+        vec!["--query", "--tree", &path]
+    } else {
+        vec!["--query", "--requisites", &path]
+    };
+
+    let output = tokio::process::Command::new("nix-store")
+        .args(&args)
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("nix-store query failed: {stderr}");
+    }
+
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+    Ok(())
+}
+
+pub async fn cmd_closure_size(path: String) -> anyhow::Result<()> {
+    let output = tokio::process::Command::new("nix")
+        .args(["path-info", "--closure-size", "--human-readable", &path])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("nix path-info failed: {stderr}");
+    }
+
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+    Ok(())
+}
+
+// --- Generation management ---
+
+pub async fn cmd_generation_list(machine: String, server: String) -> anyhow::Result<()> {
+    let mut client = connect_server(&server).await?;
+    let resp = client
+        .list_generations(ekafleet::proto::ListGenerationsRequest {
+            machine: machine.clone(),
+        })
+        .await?;
+    let result = resp.into_inner();
+
+    if result.generations.is_empty() {
+        println!("No generations found on {machine}.");
+    } else {
+        println!("{:>5}  {:>10}  {:<60}  {}", "GEN", "DATE", "STORE PATH", "");
+        for entry in &result.generations {
+            let current = if entry.current { " (current)" } else { "" };
+            println!(
+                "{:>5}  {:>10}  {:<60}  {}",
+                entry.number, entry.created_at, entry.store_path, current
+            );
+        }
+    }
+    Ok(())
+}
+
+pub async fn cmd_generation_switch(
+    machine: String,
+    generation: u64,
+    action: &str,
+    server: String,
+) -> anyhow::Result<()> {
+    let mut client = connect_server(&server).await?;
+    let resp = client
+        .switch_generation(ekafleet::proto::SwitchGenerationRequest {
+            machine: machine.clone(),
+            generation,
+            action: action.to_string(),
+        })
+        .await?;
+    let result = resp.into_inner();
+
+    if result.success {
+        println!("{}", result.message);
+    } else {
+        anyhow::bail!("{}", result.message);
+    }
+    Ok(())
+}
+
+pub async fn cmd_generation_diff(
+    machine: String,
+    gen_a: u64,
+    gen_b: u64,
+    server: String,
+) -> anyhow::Result<()> {
+    let mut client = connect_server(&server).await?;
+    let resp = client
+        .diff_generations(ekafleet::proto::DiffGenerationsRequest {
+            machine: machine.clone(),
+            gen_a,
+            gen_b,
+        })
+        .await?;
+    let result = resp.into_inner();
+
+    if result.diff.is_empty() {
+        println!("No differences between generations {gen_a} and {gen_b} on {machine}.");
+    } else {
+        print!("{}", result.diff);
+    }
+    Ok(())
+}
+
+// --- System-wide operations ---
+
+pub async fn cmd_system_gc(dry_run: bool, server: String) -> anyhow::Result<()> {
+    let mut client = connect_server(&server).await?;
+    let resp = client
+        .system_gc(ekafleet::proto::SystemGcRequest { dry_run })
+        .await?;
+    let result = resp.into_inner();
+
+    if result.results.is_empty() {
+        println!("No nodes to garbage-collect.");
+    } else {
+        let action = if dry_run { "would free" } else { "freed" };
+        for r in &result.results {
+            let mb = r.freed_bytes / (1024 * 1024);
+            println!("{}: {action} {mb}MB", r.node_id);
+            if !r.output.is_empty() {
+                for line in r.output.lines() {
+                    println!("  {line}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub async fn cmd_system_reboot(
+    pool: Option<String>,
+    max_parallel: u32,
+    server: String,
+) -> anyhow::Result<()> {
+    let mut client = connect_server(&server).await?;
+    let resp = client
+        .system_reboot(ekafleet::proto::SystemRebootRequest {
+            pool: pool.unwrap_or_default(),
+            max_parallel,
+        })
+        .await?;
+    let result = resp.into_inner();
+
+    if result.success {
+        println!("{}", result.message);
+    } else {
+        anyhow::bail!("{}", result.message);
+    }
+    Ok(())
+}
+
+pub async fn cmd_system_rebuild(
+    machine: Option<String>,
+    all: bool,
+    server: String,
+) -> anyhow::Result<()> {
+    if machine.is_none() && !all {
+        anyhow::bail!("Specify a machine name or --all");
+    }
+
+    let mut client = connect_server(&server).await?;
+    let resp = client
+        .system_rebuild(ekafleet::proto::SystemRebuildRequest {
+            machine: machine.unwrap_or_default(),
+            all,
+        })
+        .await?;
+    let result = resp.into_inner();
+
+    if result.success {
+        println!("{}", result.message);
+    } else {
+        anyhow::bail!("{}", result.message);
+    }
+    Ok(())
+}
+
+// --- Service introspection ---
+
+pub async fn cmd_service_inspect(
+    service: String,
+    node: Option<String>,
+    server: String,
+) -> anyhow::Result<()> {
+    let mut client = connect_server(&server).await?;
+    let resp = client
+        .inspect_service(ekafleet::proto::InspectServiceRequest {
+            service_name: service.clone(),
+            node_id: node.unwrap_or_default(),
+        })
+        .await?;
+    let info = resp.into_inner();
+
+    println!("Service: {service}");
+    println!("  State:         {} ({})", info.active_state, info.sub_state);
+    println!("  Main PID:      {}", info.main_pid);
+    println!("  Control Group: {}", info.control_group);
+    println!();
+    println!("Resource Accounting:");
+    println!("  CPU Usage:     {:.2}s", info.cpu_usage_nsec as f64 / 1e9);
+    println!("  Memory:        {}MB (peak {}MB)", info.memory_current / (1024 * 1024), info.memory_peak / (1024 * 1024));
+    println!("  IO Read:       {}MB", info.io_read_bytes / (1024 * 1024));
+    println!("  IO Write:      {}MB", info.io_write_bytes / (1024 * 1024));
+    println!("  Tasks:         {}", info.tasks_current);
+    if !info.unit_file.is_empty() {
+        println!();
+        println!("Unit File:");
+        for line in info.unit_file.lines() {
+            println!("  {line}");
+        }
+    }
+    Ok(())
+}
+
 pub async fn cmd_upgrade(store_path: String, server: String) -> anyhow::Result<()> {
     let mut client = connect_server(&server).await?;
 

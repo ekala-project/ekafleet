@@ -175,6 +175,29 @@ impl Supervisor {
         extra_directives.push(format!("KillSignal={stop_signal}"));
         extra_directives.push(format!("TimeoutStopSec={grace_period}"));
 
+        // Cgroup v2 resource controls
+        if let Some(cg) = &spec.cgroup_controls {
+            extra_directives.push(format!("Slice=system-ekafleet.slice"));
+            if cg.cpu_weight > 0 {
+                extra_directives.push(format!("CPUWeight={}", cg.cpu_weight));
+            }
+            if cg.memory_high_mb > 0 {
+                extra_directives.push(format!("MemoryHigh={}M", cg.memory_high_mb));
+            }
+            if cg.memory_max_mb > 0 {
+                extra_directives.push(format!("MemoryMax={}M", cg.memory_max_mb));
+            }
+            if cg.io_weight > 0 {
+                extra_directives.push(format!("IOWeight={}", cg.io_weight));
+            }
+            if cg.tasks_max > 0 {
+                extra_directives.push(format!("TasksMax={}", cg.tasks_max));
+            }
+            if !cg.oom_policy.is_empty() {
+                extra_directives.push(format!("OOMPolicy={}", cg.oom_policy));
+            }
+        }
+
         let extra_lines = extra_directives.join("\n");
 
         let unit_content = format!(
