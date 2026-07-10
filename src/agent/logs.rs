@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use tokio::process::Command;
 
 /// Stream logs from a service's systemd journal in real-time.

@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::time::Duration;
 
 /// Execute a command in the context of a running service's systemd unit.
