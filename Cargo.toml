@@ -53,6 +53,9 @@ thiserror = "2"
 # Unique IDs
 uuid = { version = "1", features = ["v4", "serde"] }
 
+# Derive helpers
+derive_more = { version = "1", features = ["deref", "display", "from", "into", "as_ref"] }
+
 # Time (required by rcgen for certificate validity)
 time = "0.3"
 

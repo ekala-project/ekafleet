@@ -14,6 +14,7 @@ pub struct PeerManager {
 struct PeerInfo {
     public_key: String,
     endpoint: String,
+    #[allow(dead_code)] // TODO: needed for route table management once mesh routing is wired
     allowed_ip: Ipv4Addr,
 }
 

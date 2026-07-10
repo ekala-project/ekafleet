@@ -11,6 +11,7 @@ pub struct CertClient {
 }
 
 struct CertState {
+    #[allow(dead_code)] // TODO: used for certificate request identity once CertClient is wired
     node_id: String,
     certificates: Vec<ManagedCert>,
 }

@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -11,6 +9,7 @@ use crate::proto::{
     HealthStatus, NodeResources, NodeStatus, PoolStatus, ServerMessage, ServiceHealth,
     ServiceState, ServiceStatus,
 };
+use crate::types::NodeId;
 
 /// Shared server state, accessible from gRPC handlers and background tasks.
 #[derive(Clone)]
@@ -19,7 +18,7 @@ pub struct FleetState {
 }
 
 struct FleetStateInner {
-    nodes: HashMap<String, NodeInfo>,
+    nodes: HashMap<NodeId, NodeInfo>,
     /// Pending request-response correlations for agent commands.
     pending_requests:
         HashMap<String, oneshot::Sender<crate::proto::AgentCommandResponse>>,
@@ -40,6 +39,7 @@ struct NodeInfo {
 
 struct AgentServiceInfo {
     instance_id: String,
+    #[allow(dead_code)] // TODO: used for drift detection and generation tracking
     store_path: String,
     state: ServiceState,
     health: HealthStatus,
@@ -72,7 +72,7 @@ impl FleetState {
         let mut state = self.inner.write().await;
 
         state.nodes.insert(
-            node_id.to_string(),
+            NodeId::new(node_id),
             NodeInfo {
                 address,
                 pool,
@@ -161,7 +161,7 @@ impl FleetState {
     /// Clones senders under a read lock, then sends outside the lock to avoid
     /// holding it across .await points.
     pub async fn broadcast(&self, msg: ServerMessage) {
-        let senders: Vec<(String, mpsc::Sender<ServerMessage>)> = {
+        let senders: Vec<(NodeId, mpsc::Sender<ServerMessage>)> = {
             let state = self.inner.read().await;
             state
                 .nodes
@@ -172,7 +172,7 @@ impl FleetState {
 
         for (node_id, tx) in senders {
             if tx.send(msg.clone()).await.is_err() {
-                tracing::warn!(node_id, "Failed to send to agent");
+                tracing::warn!(%node_id, "Failed to send to agent");
             }
         }
     }
@@ -197,7 +197,7 @@ impl FleetState {
                 .nodes
                 .iter()
                 .map(|(id, info)| NodeSnapshot {
-                    node_id: id.clone(),
+                    node_id: id.to_string(),
                     address: info.address.clone(),
                     pool: info.pool.clone(),
                     total_resources: info.total_resources,
@@ -301,7 +301,7 @@ impl FleetState {
     /// Get list of connected node IDs.
     pub async fn connected_nodes(&self) -> Vec<String> {
         let state = self.inner.read().await;
-        state.nodes.keys().cloned().collect()
+        state.nodes.keys().map(|id| id.to_string()).collect()
     }
 
     /// Set whether a node is eligible for new scheduling.

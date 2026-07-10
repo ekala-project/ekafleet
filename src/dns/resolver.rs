@@ -16,6 +16,7 @@ pub struct DnsResolver {
 
 struct ResolverState {
     cache: HashMap<String, CacheEntry>,
+    #[allow(dead_code)] // TODO: used for forwarding non-fleet queries once DNS listener is wired
     upstream: Vec<String>,
 }
 

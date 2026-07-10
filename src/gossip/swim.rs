@@ -21,6 +21,7 @@ pub struct SwimMembership {
 }
 
 struct MembershipState {
+    #[allow(dead_code)] // TODO: used to identify self in outbound SWIM messages
     node_id: String,
     bind_addr: SocketAddr,
     members: HashMap<String, MemberInfo>,
@@ -35,6 +36,7 @@ struct MemberInfo {
     addr: SocketAddr,
     status: MemberStatus,
     last_seen: Instant,
+    #[allow(dead_code)] // TODO: used for SWIM protocol conflict resolution
     incarnation: u64,
 }
 
@@ -72,6 +74,7 @@ impl SwimMembership {
 
     /// Sign a message payload with HMAC-SHA256.
     /// Returns payload || hmac_tag (32 bytes).
+    #[cfg(test)]
     fn sign(&self, payload: &[u8]) -> Vec<u8> {
         let tag = hmac::sign(&self.hmac_key, payload);
         let mut signed = Vec::with_capacity(payload.len() + HMAC_LEN);
@@ -82,6 +85,7 @@ impl SwimMembership {
 
     /// Verify and strip HMAC tag from a received message.
     /// Returns the payload if verification succeeds.
+    #[cfg(test)]
     fn verify<'a>(&self, data: &'a [u8]) -> Option<&'a [u8]> {
         if data.len() < HMAC_LEN {
             return None;
@@ -257,16 +261,6 @@ async fn handle_message(
             tracing::trace!(src = %src, type_byte = data[0], "Unknown SWIM message");
         }
     }
-}
-
-/// Sign a message payload with a given HMAC key (for testing).
-#[cfg(test)]
-fn sign_with_key(key: &hmac::Key, payload: &[u8]) -> Vec<u8> {
-    let tag = hmac::sign(key, payload);
-    let mut signed = Vec::with_capacity(payload.len() + HMAC_LEN);
-    signed.extend_from_slice(payload);
-    signed.extend_from_slice(tag.as_ref());
-    signed
 }
 
 /// Run one probe cycle: check for suspects and dead members.
