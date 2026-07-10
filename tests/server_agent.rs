@@ -47,6 +47,8 @@ async fn start_server() -> (SocketAddr, SocketAddr, String, String) {
     let join_token_store = ekafleet::attestation::join_token::JoinTokenStore::new();
     let instance_tracker =
         ekafleet::server::cloud::instance_tracker::InstanceTracker::new(raft_state.clone());
+    let event_store = ekafleet::server::events::EventStore::new();
+    let token_store = ekafleet::server::rbac::TokenStore::new();
     let service = ekafleet::server::api::FleetControlService::new(
         fleet_state.clone(),
         "fleet.internal",
@@ -54,6 +56,8 @@ async fn start_server() -> (SocketAddr, SocketAddr, String, String) {
         raft_state,
         instance_tracker,
         "127.0.0.1:7400",
+        event_store,
+        token_store,
     );
 
     let expected_token = format!("Bearer {token}");

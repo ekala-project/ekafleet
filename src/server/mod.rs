@@ -138,6 +138,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         join_token_store,
         raft_state,
         instance_tracker: instance_tracker.clone(),
+        event_store: event_store.clone(),
     };
 
     let (grpc_result, http_result) = tokio::join!(

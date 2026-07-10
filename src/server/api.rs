@@ -1,10 +1,12 @@
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::time::Duration;
 
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 use tonic::{Request, Response, Status, Streaming};
 
+use super::events::EventStore;
 use super::rbac::{TokenStore, extract_bearer_token};
 use super::state::FleetState;
 use crate::attestation::join_token::JoinTokenStore;
@@ -51,9 +53,12 @@ pub struct FleetControlService {
     instance_tracker: InstanceTracker,
     /// gRPC listen address for agent bootstrap user-data.
     grpc_addr: String,
+    event_store: EventStore,
+    token_store: TokenStore,
 }
 
 impl FleetControlService {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         state: FleetState,
         domain: &str,
@@ -61,6 +66,8 @@ impl FleetControlService {
         raft_state: FleetStateMachine,
         instance_tracker: InstanceTracker,
         grpc_addr: &str,
+        event_store: EventStore,
+        token_store: TokenStore,
     ) -> Self {
         Self {
             state,
@@ -74,6 +81,8 @@ impl FleetControlService {
             raft_state,
             instance_tracker,
             grpc_addr: grpc_addr.to_string(),
+            event_store,
+            token_store,
         }
     }
 
@@ -838,24 +847,52 @@ impl FleetControl for FleetControlService {
             None => None,
         };
 
-        let Some(_node_id) = target_node else {
+        let Some(node_id) = target_node else {
             return Err(Status::not_found(format!(
                 "no running instance of service '{}'",
                 req.service_name
             )));
         };
 
-        // For now, return a stub indicating the exec infrastructure is in place.
-        // Full implementation requires agent-side message handling for exec commands.
-        Ok(Response::new(ExecResponse {
-            exit_code: 0,
-            stdout: format!(
-                "exec: service={} command={:?} (agent relay pending)\n",
-                req.service_name, req.command
+        let correlation_id = uuid::Uuid::new_v4().to_string();
+        let timeout_secs = if req.timeout_seconds == 0 {
+            30
+        } else {
+            req.timeout_seconds
+        };
+        let msg = ServerMessage {
+            payload: Some(ServerPayload::ExecCommand(crate::proto::ExecCommand {
+                correlation_id: correlation_id.clone(),
+                service_name: req.service_name.clone(),
+                command: req.command.clone(),
+                timeout_seconds: timeout_secs,
+            })),
+        };
+
+        let resp = self
+            .state
+            .send_command(
+                &node_id,
+                msg,
+                correlation_id,
+                Duration::from_secs(timeout_secs as u64 + 5),
             )
-            .into_bytes(),
-            stderr: Vec::new(),
-        }))
+            .await?;
+
+        if !resp.success {
+            return Err(Status::internal(resp.error_message));
+        }
+
+        match resp.result {
+            Some(crate::proto::agent_command_response::Result::ExecResult(r)) => {
+                Ok(Response::new(ExecResponse {
+                    exit_code: r.exit_code,
+                    stdout: r.stdout,
+                    stderr: r.stderr,
+                }))
+            }
+            _ => Err(Status::internal("unexpected response type from agent")),
+        }
     }
 
     async fn logs(
@@ -887,18 +924,11 @@ impl FleetControl for FleetControlService {
             .unwrap_or_default();
 
         let service_name = req.service_name.clone();
+        let lines = if req.lines == 0 { 100 } else { req.lines };
+        let follow = req.follow;
+        let state = self.state.clone();
+
         tokio::spawn(async move {
-            for (node_id, _instance_id) in &instances {
-                let _ = tx
-                    .send(Ok(LogsChunk {
-                        node_id: node_id.clone(),
-                        data: format!(
-                            "--- logs from {service_name} on {node_id} (agent relay pending) ---\n"
-                        )
-                        .into_bytes(),
-                    }))
-                    .await;
-            }
             if instances.is_empty() {
                 let _ = tx
                     .send(Ok(LogsChunk {
@@ -907,6 +937,62 @@ impl FleetControl for FleetControlService {
                             .into_bytes(),
                     }))
                     .await;
+                return;
+            }
+
+            for (node_id, _instance_id) in &instances {
+                let correlation_id = uuid::Uuid::new_v4().to_string();
+                let msg = ServerMessage {
+                    payload: Some(ServerPayload::LogsCommand(crate::proto::LogsCommand {
+                        correlation_id: correlation_id.clone(),
+                        service_name: service_name.clone(),
+                        lines,
+                        follow,
+                    })),
+                };
+
+                match state
+                    .send_command(
+                        node_id,
+                        msg,
+                        correlation_id,
+                        Duration::from_secs(30),
+                    )
+                    .await
+                {
+                    Ok(resp) if resp.success => {
+                        if let Some(crate::proto::agent_command_response::Result::LogsResult(r)) =
+                            resp.result
+                        {
+                            let _ = tx
+                                .send(Ok(LogsChunk {
+                                    node_id: node_id.clone(),
+                                    data: r.data,
+                                }))
+                                .await;
+                        }
+                    }
+                    Ok(resp) => {
+                        let _ = tx
+                            .send(Ok(LogsChunk {
+                                node_id: node_id.clone(),
+                                data: format!(
+                                    "Error from {node_id}: {}\n",
+                                    resp.error_message
+                                )
+                                .into_bytes(),
+                            }))
+                            .await;
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(Ok(LogsChunk {
+                                node_id: node_id.clone(),
+                                data: format!("Error reaching {node_id}: {e}\n").into_bytes(),
+                            }))
+                            .await;
+                    }
+                }
             }
         });
 
@@ -918,10 +1004,10 @@ impl FleetControl for FleetControlService {
         request: Request<EventsRequest>,
     ) -> Result<Response<EventsResponse>, Status> {
         let req = request.into_inner();
-        let _limit = if req.limit == 0 { 50 } else { req.limit as usize };
+        let limit = if req.limit == 0 { 50 } else { req.limit as usize };
 
         // Parse category filter
-        let _category = if req.category.is_empty() {
+        let category = if req.category.is_empty() {
             None
         } else {
             use super::events::EventCategory;
@@ -939,16 +1025,28 @@ impl FleetControl for FleetControlService {
             }
         };
 
-        let _service = if req.service.is_empty() {
+        let service = if req.service.is_empty() {
             None
         } else {
             Some(req.service.as_str())
         };
 
-        // Query events from the event store via the REST API state
-        // For now, return empty since EventStore isn't directly on FleetControlService.
-        // The events are queryable via the REST API at /v1/events.
-        Ok(Response::new(EventsResponse { events: vec![] }))
+        let events = self.event_store.query(category, service, limit).await;
+        let proto_events = events
+            .iter()
+            .map(|e| crate::proto::FleetEventProto {
+                timestamp: e.timestamp,
+                level: format!("{:?}", e.level).to_lowercase(),
+                category: format!("{:?}", e.category),
+                service: e.service.clone().unwrap_or_default(),
+                node: e.node.clone().unwrap_or_default(),
+                message: e.message.clone(),
+            })
+            .collect();
+
+        Ok(Response::new(EventsResponse {
+            events: proto_events,
+        }))
     }
 
     async fn list_nodes(
@@ -1171,7 +1269,7 @@ impl FleetControl for FleetControlService {
     ) -> Result<Response<CreateAclTokenResponse>, Status> {
         let req = request.into_inner();
 
-        let _role = match req.role.as_str() {
+        let role = match req.role.as_str() {
             "admin" => super::rbac::Role::Admin,
             "operator" => super::rbac::Role::Operator,
             "viewer" => super::rbac::Role::Viewer,
@@ -1186,8 +1284,8 @@ impl FleetControl for FleetControlService {
             .map_err(|_| Status::internal("RNG failure"))?;
         let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
 
-        self.join_token_store
-            .register(&token) // Reuse token store for ACL tokens
+        self.token_store
+            .register(&token, role, &req.description)
             .await;
 
         tracing::info!(
@@ -1206,21 +1304,26 @@ impl FleetControl for FleetControlService {
         &self,
         request: Request<RevokeAclTokenRequest>,
     ) -> Result<Response<RevokeAclTokenResponse>, Status> {
-        let _req = request.into_inner();
-        tracing::info!("ACL token revoke requested");
+        let req = request.into_inner();
+        tracing::info!(token_prefix = %&req.token[..8.min(req.token.len())], "ACL token revoke requested");
 
-        // Token revocation would need the RBAC TokenStore exposed here.
-        // For now, acknowledge the request.
-        Ok(Response::new(RevokeAclTokenResponse { success: true }))
+        let revoked = self.token_store.revoke(&req.token).await;
+        Ok(Response::new(RevokeAclTokenResponse { success: revoked }))
     }
 
     async fn list_acl_tokens(
         &self,
         _request: Request<ListAclTokensRequest>,
     ) -> Result<Response<ListAclTokensResponse>, Status> {
-        // Token listing would need the RBAC TokenStore exposed here.
-        // For now, return empty.
-        Ok(Response::new(ListAclTokensResponse { tokens: vec![] }))
+        let tokens = self.token_store.list().await;
+        let infos = tokens
+            .into_iter()
+            .map(|(description, role)| crate::proto::AclTokenInfo {
+                description,
+                role: format!("{role:?}").to_lowercase(),
+            })
+            .collect();
+        Ok(Response::new(ListAclTokensResponse { tokens: infos }))
     }
 
     async fn list_generations(
@@ -1230,11 +1333,32 @@ impl FleetControl for FleetControlService {
         let req = request.into_inner();
         tracing::info!(machine = %req.machine, "List generations requested");
 
-        // Generation listing requires agent-side execution to read
-        // /nix/var/nix/profiles/system-*-link. Stub for now.
-        Ok(Response::new(ListGenerationsResponse {
-            generations: vec![],
-        }))
+        let correlation_id = uuid::Uuid::new_v4().to_string();
+        let msg = ServerMessage {
+            payload: Some(ServerPayload::ListGenerationsCommand(
+                crate::proto::ListGenerationsCommand {
+                    correlation_id: correlation_id.clone(),
+                },
+            )),
+        };
+
+        let resp = self
+            .state
+            .send_command(&req.machine, msg, correlation_id, Duration::from_secs(30))
+            .await?;
+
+        if !resp.success {
+            return Err(Status::internal(resp.error_message));
+        }
+
+        match resp.result {
+            Some(crate::proto::agent_command_response::Result::ListGenerationsResult(r)) => {
+                Ok(Response::new(ListGenerationsResponse {
+                    generations: r.generations,
+                }))
+            }
+            _ => Err(Status::internal("unexpected response type from agent")),
+        }
     }
 
     async fn switch_generation(
@@ -1249,13 +1373,44 @@ impl FleetControl for FleetControlService {
             "Switch generation requested"
         );
 
-        Ok(Response::new(SwitchGenerationResponse {
-            success: true,
-            message: format!(
-                "Generation {} {} on {} (agent relay pending)",
-                req.generation, req.action, req.machine
-            ),
-        }))
+        let correlation_id = uuid::Uuid::new_v4().to_string();
+        let msg = ServerMessage {
+            payload: Some(ServerPayload::SwitchGenerationCommand(
+                crate::proto::SwitchGenerationCommand {
+                    correlation_id: correlation_id.clone(),
+                    generation: req.generation,
+                    action: req.action.clone(),
+                },
+            )),
+        };
+
+        let resp = self
+            .state
+            .send_command(&req.machine, msg, correlation_id, Duration::from_secs(120))
+            .await?;
+
+        if !resp.success {
+            return Ok(Response::new(SwitchGenerationResponse {
+                success: false,
+                message: resp.error_message,
+            }));
+        }
+
+        match resp.result {
+            Some(crate::proto::agent_command_response::Result::SwitchGenerationResult(r)) => {
+                Ok(Response::new(SwitchGenerationResponse {
+                    success: true,
+                    message: r.message,
+                }))
+            }
+            _ => Ok(Response::new(SwitchGenerationResponse {
+                success: true,
+                message: format!(
+                    "Generation {} {} on {}",
+                    req.generation, req.action, req.machine
+                ),
+            })),
+        }
     }
 
     async fn diff_generations(
@@ -1270,12 +1425,32 @@ impl FleetControl for FleetControlService {
             "Diff generations requested"
         );
 
-        Ok(Response::new(DiffGenerationsResponse {
-            diff: format!(
-                "Generation diff {}->{} on {} (agent relay pending)\n",
-                req.gen_a, req.gen_b, req.machine
-            ),
-        }))
+        let correlation_id = uuid::Uuid::new_v4().to_string();
+        let msg = ServerMessage {
+            payload: Some(ServerPayload::DiffGenerationsCommand(
+                crate::proto::DiffGenerationsCommand {
+                    correlation_id: correlation_id.clone(),
+                    gen_a: req.gen_a,
+                    gen_b: req.gen_b,
+                },
+            )),
+        };
+
+        let resp = self
+            .state
+            .send_command(&req.machine, msg, correlation_id, Duration::from_secs(30))
+            .await?;
+
+        if !resp.success {
+            return Err(Status::internal(resp.error_message));
+        }
+
+        match resp.result {
+            Some(crate::proto::agent_command_response::Result::DiffGenerationsResult(r)) => {
+                Ok(Response::new(DiffGenerationsResponse { diff: r.diff }))
+            }
+            _ => Err(Status::internal("unexpected response type from agent")),
+        }
     }
 
     async fn system_gc(
@@ -1286,17 +1461,72 @@ impl FleetControl for FleetControlService {
         let action = if req.dry_run { "dry-run" } else { "collect" };
         tracing::info!(action, "System GC requested");
 
-        // GC requires running nix-collect-garbage on each agent.
-        // Stub: return results for each connected node.
         let nodes = self.state.connected_nodes().await;
-        let results = nodes
-            .iter()
-            .map(|n| crate::proto::NodeGcResult {
-                node_id: n.clone(),
-                freed_bytes: 0,
-                output: format!("nix-collect-garbage on {n} (agent relay pending)"),
-            })
-            .collect();
+        if nodes.is_empty() {
+            return Ok(Response::new(SystemGcResponse { results: vec![] }));
+        }
+
+        // Fan out GC commands to all connected nodes concurrently.
+        let mut handles = Vec::with_capacity(nodes.len());
+        for node_id in &nodes {
+            let correlation_id = uuid::Uuid::new_v4().to_string();
+            let msg = ServerMessage {
+                payload: Some(ServerPayload::SystemGcCommand(
+                    crate::proto::SystemGcCommand {
+                        correlation_id: correlation_id.clone(),
+                        dry_run: req.dry_run,
+                    },
+                )),
+            };
+            let state = self.state.clone();
+            let nid = node_id.clone();
+            handles.push(tokio::spawn(async move {
+                let resp = state
+                    .send_command(&nid, msg, correlation_id, Duration::from_secs(600))
+                    .await;
+                (nid, resp)
+            }));
+        }
+
+        let mut results = Vec::with_capacity(handles.len());
+        for handle in handles {
+            let (node_id, resp) = handle
+                .await
+                .map_err(|e| Status::internal(format!("task join error: {e}")))?;
+            match resp {
+                Ok(r) if r.success => {
+                    if let Some(crate::proto::agent_command_response::Result::GcResult(gc)) =
+                        r.result
+                    {
+                        results.push(crate::proto::NodeGcResult {
+                            node_id,
+                            freed_bytes: gc.freed_bytes,
+                            output: gc.output,
+                        });
+                    } else {
+                        results.push(crate::proto::NodeGcResult {
+                            node_id,
+                            freed_bytes: 0,
+                            output: "GC completed (no details)".to_string(),
+                        });
+                    }
+                }
+                Ok(r) => {
+                    results.push(crate::proto::NodeGcResult {
+                        node_id,
+                        freed_bytes: 0,
+                        output: format!("Error: {}", r.error_message),
+                    });
+                }
+                Err(e) => {
+                    results.push(crate::proto::NodeGcResult {
+                        node_id,
+                        freed_bytes: 0,
+                        output: format!("Error: {e}"),
+                    });
+                }
+            }
+        }
 
         Ok(Response::new(SystemGcResponse { results }))
     }
@@ -1306,20 +1536,117 @@ impl FleetControl for FleetControlService {
         request: Request<SystemRebootRequest>,
     ) -> Result<Response<SystemRebootResponse>, Status> {
         let req = request.into_inner();
+        let max_parallel = if req.max_parallel == 0 {
+            1
+        } else {
+            req.max_parallel as usize
+        };
         tracing::info!(
             pool = %req.pool,
-            max_parallel = req.max_parallel,
+            max_parallel,
             "System reboot requested"
         );
 
-        let nodes = self.state.connected_nodes().await;
+        let all_nodes = self.state.connected_nodes().await;
+        // Filter by pool if specified (requires node info)
+        let nodes = if req.pool.is_empty() {
+            all_nodes
+        } else {
+            // For pool filtering, we'd need to check node pool membership.
+            // Currently connected_nodes() returns all; filter via fleet_status.
+            let (status_nodes, _, _) = self.state.fleet_status().await;
+            status_nodes
+                .iter()
+                .filter(|n| req.pool.is_empty() || n.pool == req.pool)
+                .map(|n| n.node_id.clone())
+                .collect()
+        };
+
+        if nodes.is_empty() {
+            return Ok(Response::new(SystemRebootResponse {
+                success: true,
+                message: "No nodes to reboot".to_string(),
+            }));
+        }
+
+        let total = nodes.len();
+        let mut rebooted = 0;
+        let mut errors = Vec::new();
+
+        // Process nodes in batches of max_parallel for rolling reboot.
+        for batch in nodes.chunks(max_parallel) {
+            let mut handles = Vec::with_capacity(batch.len());
+            for node_id in batch {
+                let correlation_id = uuid::Uuid::new_v4().to_string();
+                let msg = ServerMessage {
+                    payload: Some(ServerPayload::SystemRebootCommand(
+                        crate::proto::SystemRebootCommand {
+                            correlation_id: correlation_id.clone(),
+                        },
+                    )),
+                };
+                let state = self.state.clone();
+                let nid = node_id.clone();
+                handles.push(tokio::spawn(async move {
+                    let resp = state
+                        .send_command(&nid, msg, correlation_id, Duration::from_secs(30))
+                        .await;
+                    (nid, resp)
+                }));
+            }
+
+            for handle in handles {
+                let (node_id, resp) = handle
+                    .await
+                    .map_err(|e| Status::internal(format!("task join error: {e}")))?;
+                match resp {
+                    Ok(r) if r.success => {
+                        rebooted += 1;
+                        tracing::info!(node_id = %node_id, "Reboot command accepted");
+                    }
+                    Ok(r) => {
+                        errors.push(format!("{node_id}: {}", r.error_message));
+                    }
+                    Err(e) => {
+                        errors.push(format!("{node_id}: {e}"));
+                    }
+                }
+            }
+
+            // Wait for nodes to come back online before proceeding to next batch.
+            // The agent will reconnect after rebooting; we poll for reconnection.
+            if !batch.is_empty() {
+                tracing::info!(
+                    batch_size = batch.len(),
+                    "Waiting for rebooted nodes to reconnect"
+                );
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                // Poll for reconnection with timeout
+                let deadline =
+                    tokio::time::Instant::now() + Duration::from_secs(300);
+                loop {
+                    let connected = self.state.connected_nodes().await;
+                    let all_back = batch.iter().all(|n| connected.contains(n));
+                    if all_back || tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            }
+        }
+
+        let message = if errors.is_empty() {
+            format!("Rolling reboot completed: {rebooted}/{total} nodes rebooted")
+        } else {
+            format!(
+                "Rolling reboot completed with errors: {rebooted}/{total} rebooted, errors: {}",
+                errors.join("; ")
+            )
+        };
+
         Ok(Response::new(SystemRebootResponse {
-            success: true,
-            message: format!(
-                "Rolling reboot initiated for {} nodes (max parallel: {})",
-                nodes.len(),
-                req.max_parallel
-            ),
+            success: errors.is_empty(),
+            message,
         }))
     }
 
@@ -1335,9 +1662,74 @@ impl FleetControl for FleetControlService {
         };
         tracing::info!(target = %target, "System rebuild requested");
 
+        let target_nodes = if req.all {
+            self.state.connected_nodes().await
+        } else if req.machine.is_empty() {
+            return Err(Status::invalid_argument(
+                "machine must be specified (or set all=true)",
+            ));
+        } else {
+            vec![req.machine.clone()]
+        };
+
+        if target_nodes.is_empty() {
+            return Ok(Response::new(SystemRebuildResponse {
+                success: true,
+                message: "No nodes to rebuild".to_string(),
+            }));
+        }
+
+        // Fan out rebuild commands to all target nodes.
+        let mut handles = Vec::with_capacity(target_nodes.len());
+        for node_id in &target_nodes {
+            let correlation_id = uuid::Uuid::new_v4().to_string();
+            let msg = ServerMessage {
+                payload: Some(ServerPayload::SystemRebuildCommand(
+                    crate::proto::SystemRebuildCommand {
+                        correlation_id: correlation_id.clone(),
+                    },
+                )),
+            };
+            let state = self.state.clone();
+            let nid = node_id.clone();
+            handles.push(tokio::spawn(async move {
+                let resp = state
+                    .send_command(&nid, msg, correlation_id, Duration::from_secs(300))
+                    .await;
+                (nid, resp)
+            }));
+        }
+
+        let mut outputs = Vec::new();
+        let mut all_success = true;
+        for handle in handles {
+            let (node_id, resp) = handle
+                .await
+                .map_err(|e| Status::internal(format!("task join error: {e}")))?;
+            match resp {
+                Ok(r) if r.success => {
+                    let output = match r.result {
+                        Some(crate::proto::agent_command_response::Result::RebuildResult(rb)) => {
+                            rb.output
+                        }
+                        _ => "Rebuild completed".to_string(),
+                    };
+                    outputs.push(format!("{node_id}: {output}"));
+                }
+                Ok(r) => {
+                    all_success = false;
+                    outputs.push(format!("{node_id}: Error: {}", r.error_message));
+                }
+                Err(e) => {
+                    all_success = false;
+                    outputs.push(format!("{node_id}: Error: {e}"));
+                }
+            }
+        }
+
         Ok(Response::new(SystemRebuildResponse {
-            success: true,
-            message: format!("Rebuild initiated for {target} (agent relay pending)"),
+            success: all_success,
+            message: outputs.join("\n"),
         }))
     }
 
@@ -1352,21 +1744,47 @@ impl FleetControl for FleetControlService {
             "Inspect service requested"
         );
 
-        // Service inspection requires running systemctl show on the target
-        // agent. Stub with placeholder data.
-        Ok(Response::new(InspectServiceResponse {
-            unit_file: String::new(),
-            active_state: "active".to_string(),
-            sub_state: "running".to_string(),
-            main_pid: 0,
-            control_group: format!("/system.slice/system-ekafleet.slice/ekafleet-{}.service", req.service_name),
-            cpu_usage_nsec: 0,
-            memory_current: 0,
-            memory_peak: 0,
-            io_read_bytes: 0,
-            io_write_bytes: 0,
-            tasks_current: 0,
-        }))
+        if req.node_id.is_empty() {
+            return Err(Status::invalid_argument("node_id is required"));
+        }
+
+        let correlation_id = uuid::Uuid::new_v4().to_string();
+        let msg = ServerMessage {
+            payload: Some(ServerPayload::InspectServiceCommand(
+                crate::proto::InspectServiceCommand {
+                    correlation_id: correlation_id.clone(),
+                    service_name: req.service_name.clone(),
+                },
+            )),
+        };
+
+        let resp = self
+            .state
+            .send_command(&req.node_id, msg, correlation_id, Duration::from_secs(30))
+            .await?;
+
+        if !resp.success {
+            return Err(Status::internal(resp.error_message));
+        }
+
+        match resp.result {
+            Some(crate::proto::agent_command_response::Result::InspectResult(r)) => {
+                Ok(Response::new(InspectServiceResponse {
+                    unit_file: r.unit_file,
+                    active_state: r.active_state,
+                    sub_state: r.sub_state,
+                    main_pid: r.main_pid,
+                    control_group: r.control_group,
+                    cpu_usage_nsec: r.cpu_usage_nsec,
+                    memory_current: r.memory_current,
+                    memory_peak: r.memory_peak,
+                    io_read_bytes: r.io_read_bytes,
+                    io_write_bytes: r.io_write_bytes,
+                    tasks_current: r.tasks_current,
+                }))
+            }
+            _ => Err(Status::internal("unexpected response type from agent")),
+        }
     }
 }
 
@@ -1404,6 +1822,7 @@ pub struct GrpcServerConfig {
     pub join_token_store: JoinTokenStore,
     pub raft_state: FleetStateMachine,
     pub instance_tracker: InstanceTracker,
+    pub event_store: EventStore,
 }
 
 /// Start the gRPC server with TLS and RBAC-based authentication.
@@ -1423,10 +1842,12 @@ pub async fn serve_grpc(
         join_token_store,
         raft_state,
         instance_tracker,
+        event_store,
     } = config;
 
     tracing::info!(%addr, domain = %domain, "gRPC server listening (TLS + RBAC + SPIFFE)");
 
+    let service_token_store = token_store.clone();
     #[allow(clippy::result_large_err)]
     let interceptor = move |req: Request<()>| -> Result<Request<()>, Status> {
         // Allow unauthenticated access to the Attest RPC.
@@ -1491,6 +1912,8 @@ pub async fn serve_grpc(
         raft_state,
         instance_tracker,
         &addr_str,
+        event_store,
+        service_token_store,
     )
     .with_cert_issuer(cert_issuer, trust_bundle_pem)
     .with_ca(ca)
