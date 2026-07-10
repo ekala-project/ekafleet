@@ -162,11 +162,18 @@ ekafleet scale <SERVICE> <COUNT> [--server 127.0.0.1:7400]
 
 ### `ekafleet logs <service>`
 
-Show service instances and journal hints for accessing logs on each node.
+Stream logs from service replicas. Replaces the old hint-only behavior with actual log streaming via gRPC.
 
 ```
-ekafleet logs <SERVICE> [--server 127.0.0.1:7400]
+ekafleet logs <SERVICE> [OPTIONS]
 ```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--follow` / `-f` | `false` | Stream logs continuously |
+| `--tail` | `100` | Number of lines to show |
+| `--node` | | Target a specific node |
+| `--server` | `127.0.0.1:7400` | Server address |
 
 ### `ekafleet dispatch`
 
@@ -229,6 +236,129 @@ ekafleet restore <INPUT> [OPTIONS]
 |--------|---------|-------------|
 | `--server` | `127.0.0.1:7400` | Server address |
 
+### `ekafleet validate`
+
+Validate fleet configuration offline without connecting to a server. Runs `nix eval` and checks for consistency errors.
+
+```
+ekafleet validate [OPTIONS]
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--config` | `fleet.nix` | Path to fleet configuration |
+
+### `ekafleet events`
+
+Query fleet events with filtering.
+
+```
+ekafleet events [OPTIONS]
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--category` | | Filter by category (deployment, scaling, health, drain, etc.) |
+| `--service` | | Filter by service name |
+| `--node` | | Filter by node ID |
+| `--limit` | `50` | Maximum events to show |
+| `--server` | `127.0.0.1:7400` | Server address |
+
+### `ekafleet exec`
+
+Execute a command in a running service's context (systemd-run scope with cgroup inheritance).
+
+```
+ekafleet exec <SERVICE> [OPTIONS] -- <COMMAND...>
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--node` | | Target a specific node |
+| `--timeout` | `30` | Execution timeout in seconds |
+| `--server` | `127.0.0.1:7400` | Server address |
+
+### `ekafleet node`
+
+Node management subcommands.
+
+| Subcommand | Description |
+|------------|-------------|
+| `node list` | List all nodes with health, pool, scheduling status |
+| `node status <NODE>` | Detailed node info (resources, services, heartbeat) |
+| `node cordon <NODE>` | Mark node as unschedulable |
+| `node uncordon <NODE>` | Mark node as schedulable |
+
+### `ekafleet top`
+
+Real-time resource usage.
+
+| Subcommand | Description |
+|------------|-------------|
+| `top nodes` | CPU/memory usage per node with utilization percentages |
+| `top services` | Resource requests per service with instance counts |
+
+### `ekafleet deployment`
+
+Deployment management subcommands.
+
+| Subcommand | Description |
+|------------|-------------|
+| `deployment list [--service X]` | List recent deployments |
+| `deployment status <SERVICE>` | Deployment history for a service |
+| `deployment promote <SERVICE>` | Promote a canary deployment to full rollout |
+| `deployment fail <SERVICE>` | Mark deployment as failed (triggers rollback) |
+
+### `ekafleet acl`
+
+ACL token management.
+
+| Subcommand | Description |
+|------------|-------------|
+| `acl token create --role <ROLE>` | Create a token (admin, operator, viewer) |
+| `acl token revoke <TOKEN>` | Revoke a token |
+| `acl token list` | List registered tokens |
+
+### `ekafleet service`
+
+Service introspection (systemd-specific).
+
+| Subcommand | Description |
+|------------|-------------|
+| `service inspect <SERVICE>` | Show systemd unit file, cgroup accounting, resource usage |
+
+### `ekafleet closure`
+
+Nix store closure analysis (runs locally, no server needed).
+
+| Subcommand | Description |
+|------------|-------------|
+| `closure diff <A> <B>` | Diff two store paths (package changes) |
+| `closure deps <PATH>` | Show dependency list (add `--tree` for tree view) |
+| `closure size <PATH>` | Calculate total closure size |
+
+### `ekafleet generation`
+
+NixOS generation management.
+
+| Subcommand | Description |
+|------------|-------------|
+| `generation list <MACHINE>` | List NixOS generations |
+| `generation switch <MACHINE> <GEN>` | Activate + set boot default |
+| `generation boot <MACHINE> <GEN>` | Set boot default only |
+| `generation test <MACHINE> <GEN>` | Activate in current session (reverts on reboot) |
+| `generation diff <MACHINE> <A> <B>` | Diff two generations |
+
+### `ekafleet system`
+
+System-wide fleet operations.
+
+| Subcommand | Description |
+|------------|-------------|
+| `system gc [--dry-run]` | Nix store garbage collection across fleet |
+| `system reboot [--pool X] [--max-parallel N]` | Coordinated rolling reboot |
+| `system rebuild <MACHINE> [--all]` | Trigger NixOS rebuild |
+
 ## Shell Completions
 
 ### `ekafleet completions`
@@ -290,9 +420,15 @@ All endpoints are served on the HTTP listen address (default `0.0.0.0:7402`). Al
 
 | Endpoint | Description |
 |----------|-------------|
+| `GET /health` | Health check (no auth required) |
 | `GET /v1/status` | Fleet status |
 | `GET /v1/services` | Service listing |
 | `GET /v1/capacity` | Resource utilization |
+| `GET /v1/events` | Fleet event timeline |
+| `GET /v1/deployments` | Deployment history |
+| `GET /v1/deployments/:service` | Per-service deployment history |
+| `GET /v1/cloud/instances` | Cloud-provisioned VM instances |
+| `GET /v1/watch` | SSE event stream |
 | `GET /v1/query` | Metric query (params: `metric`, `service`, `node`) |
 | `GET /v1/kv/:key` | Read a key from the KV store |
 | `PUT /v1/kv/:key` | Write a key to the KV store |
@@ -302,4 +438,5 @@ All endpoints are served on the HTTP listen address (default `0.0.0.0:7402`). Al
 | `GET /v1/alerts/silences` | List alert silences |
 | `POST /v1/alerts/silences` | Create an alert silence |
 | `DELETE /v1/alerts/silences/:id` | Remove an alert silence |
+| `GET /metrics` | Prometheus exposition format |
 | `GET /ui/` | Web dashboard (embedded SPA) |

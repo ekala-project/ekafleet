@@ -6,6 +6,7 @@
 
 - [Installation](./getting-started/installation.md)
 - [Quick Start](./getting-started/quickstart.md)
+- [Tutorial](./getting-started/tutorial.md)
 - [Configuration](./getting-started/configuration.md)
 
 # Architecture
@@ -33,6 +34,7 @@
 # Reference
 
 - [CLI](./reference/cli.md)
+- [Cheat Sheet](./reference/cheat-sheet.md)
 - [Fleet Configuration](./reference/fleet-config.md)
 - [Scheduling Reference](./reference/scheduling.md)
 - [Ports & Protocols](./reference/ports.md)
