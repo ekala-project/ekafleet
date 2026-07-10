@@ -1,11 +1,14 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 /// Role-based access control for the fleet API.
 /// Each token maps to a role that grants specific permissions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     /// Full access: deploy, drain, scale, manage tokens, read everything.
@@ -54,11 +57,36 @@ impl Role {
     }
 }
 
-/// Token store that maps bearer tokens to roles.
+/// Metadata for a registered token.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenEntry {
+    role: Role,
+    description: String,
+    /// Unix timestamp when the token was created.
+    created_at: u64,
+    /// Optional Unix timestamp when the token expires. None = never expires.
+    expires_at: Option<u64>,
+}
+
+impl TokenEntry {
+    fn is_expired(&self) -> bool {
+        if let Some(exp) = self.expires_at {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            now >= exp
+        } else {
+            false
+        }
+    }
+}
+
+/// Token store that maps bearer tokens to roles with persistence.
 #[derive(Clone)]
 pub struct TokenStore {
-    tokens: Arc<RwLock<HashMap<String, Role>>>,
-    descriptions: Arc<RwLock<HashMap<String, String>>>,
+    tokens: Arc<RwLock<HashMap<String, TokenEntry>>>,
+    persist_path: Option<PathBuf>,
 }
 
 impl Default for TokenStore {
@@ -67,54 +95,141 @@ impl Default for TokenStore {
     }
 }
 
+fn now_epoch() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 impl TokenStore {
     pub fn new() -> Self {
         Self {
             tokens: Arc::new(RwLock::new(HashMap::new())),
-            descriptions: Arc::new(RwLock::new(HashMap::new())),
+            persist_path: None,
+        }
+    }
+
+    /// Create a token store that persists tokens to the given directory.
+    pub fn with_persistence(data_dir: &Path) -> Self {
+        Self {
+            tokens: Arc::new(RwLock::new(HashMap::new())),
+            persist_path: Some(data_dir.join("tokens.json")),
+        }
+    }
+
+    /// Load persisted tokens from disk. Expired tokens are discarded.
+    pub async fn load(&self) -> anyhow::Result<()> {
+        let Some(path) = &self.persist_path else {
+            return Ok(());
+        };
+        if !path.exists() {
+            return Ok(());
+        }
+
+        let data = tokio::fs::read_to_string(path).await?;
+        let loaded: HashMap<String, TokenEntry> = serde_json::from_str(&data)?;
+
+        let mut tokens = self.tokens.write().await;
+        let mut count = 0;
+        for (token, entry) in loaded {
+            if !entry.is_expired() {
+                tokens.insert(token, entry);
+                count += 1;
+            }
+        }
+        tracing::info!(count, "Loaded persisted ACL tokens");
+        Ok(())
+    }
+
+    /// Persist current tokens to disk.
+    async fn persist(&self) {
+        let Some(path) = &self.persist_path else {
+            return;
+        };
+        let tokens = self.tokens.read().await;
+        match serde_json::to_string_pretty(&*tokens) {
+            Ok(data) => {
+                if let Err(e) = tokio::fs::write(path, data).await {
+                    tracing::warn!(error = %e, "Failed to persist tokens");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to serialize tokens");
+            }
         }
     }
 
     /// Register a token with a role. The initial admin token is registered at startup.
     pub async fn register(&self, token: &str, role: Role, description: &str) {
-        self.tokens.write().await.insert(token.to_string(), role);
-        self.descriptions
+        self.register_with_ttl(token, role, description, None).await;
+    }
+
+    /// Register a token with a role and optional TTL in seconds.
+    pub async fn register_with_ttl(
+        &self,
+        token: &str,
+        role: Role,
+        description: &str,
+        ttl_secs: Option<u64>,
+    ) {
+        let now = now_epoch();
+        let entry = TokenEntry {
+            role,
+            description: description.to_string(),
+            created_at: now,
+            expires_at: ttl_secs.map(|ttl| now + ttl),
+        };
+        self.tokens
             .write()
             .await
-            .insert(token.to_string(), description.to_string());
+            .insert(token.to_string(), entry);
         tracing::info!(role = ?role, description = %description, "Token registered");
+        self.persist().await;
     }
 
     /// Get a reference to the inner token map for synchronous access (e.g., interceptors).
-    pub fn inner_ref(&self) -> &Arc<RwLock<HashMap<String, Role>>> {
+    /// The interceptor must check expiration separately via `is_valid_sync`.
+    pub fn inner_ref(&self) -> &Arc<RwLock<HashMap<String, TokenEntry>>> {
         &self.tokens
+    }
+
+    /// Synchronous token validation for use in interceptors.
+    /// Returns the role if the token exists and is not expired.
+    pub fn authenticate_sync(
+        tokens: &HashMap<String, TokenEntry>,
+        token: &str,
+    ) -> Option<Role> {
+        let entry = tokens.get(token)?;
+        if entry.is_expired() {
+            None
+        } else {
+            Some(entry.role)
+        }
     }
 
     /// Look up the role for a bearer token.
     pub async fn authenticate(&self, token: &str) -> Option<Role> {
         let store = self.tokens.read().await;
-        store.get(token).copied()
+        Self::authenticate_sync(&store, token)
     }
 
     /// Revoke a token.
     pub async fn revoke(&self, token: &str) -> bool {
-        self.descriptions.write().await.remove(token);
-        self.tokens.write().await.remove(token).is_some()
+        let removed = self.tokens.write().await.remove(token).is_some();
+        if removed {
+            self.persist().await;
+        }
+        removed
     }
 
     /// List all tokens (returns description and role, not the token value itself).
     pub async fn list(&self) -> Vec<(String, Role)> {
         let tokens = self.tokens.read().await;
-        let descriptions = self.descriptions.read().await;
         tokens
-            .iter()
-            .map(|(k, r)| {
-                let desc = descriptions
-                    .get(k)
-                    .cloned()
-                    .unwrap_or_else(|| "unknown".to_string());
-                (desc, *r)
-            })
+            .values()
+            .filter(|e| !e.is_expired())
+            .map(|e| (e.description.clone(), e.role))
             .collect()
     }
 }
@@ -180,6 +295,56 @@ mod tests {
         assert!(store.revoke("tok").await);
         assert!(store.authenticate("tok").await.is_none());
         assert!(!store.revoke("tok").await);
+    }
+
+    #[tokio::test]
+    async fn expired_token_is_rejected() {
+        let store = TokenStore::new();
+        // Register a token that expired 1 second ago
+        let now = now_epoch();
+        let entry = TokenEntry {
+            role: Role::Admin,
+            description: "expired".to_string(),
+            created_at: now.saturating_sub(100),
+            expires_at: Some(now.saturating_sub(1)),
+        };
+        store
+            .tokens
+            .write()
+            .await
+            .insert("expired-tok".to_string(), entry);
+
+        assert!(store.authenticate("expired-tok").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn non_expired_token_works() {
+        let store = TokenStore::new();
+        store
+            .register_with_ttl("ttl-tok", Role::Operator, "short-lived", Some(3600))
+            .await;
+
+        assert_eq!(
+            store.authenticate("ttl-tok").await,
+            Some(Role::Operator)
+        );
+    }
+
+    #[tokio::test]
+    async fn persistence_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TokenStore::with_persistence(dir.path());
+        store
+            .register("persist-tok", Role::Admin, "persisted token")
+            .await;
+
+        // Create a new store pointing to the same directory and load
+        let store2 = TokenStore::with_persistence(dir.path());
+        store2.load().await.unwrap();
+        assert_eq!(
+            store2.authenticate("persist-tok").await,
+            Some(Role::Admin)
+        );
     }
 
     #[test]

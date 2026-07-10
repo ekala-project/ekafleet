@@ -91,6 +91,9 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
 
         tonic::transport::Endpoint::from_shared(endpoint)?
             .tls_config(tls_config)?
+            .http2_keep_alive_interval(Duration::from_secs(20))
+            .keep_alive_timeout(Duration::from_secs(10))
+            .tcp_keepalive(Some(Duration::from_secs(60)))
             .connect()
             .await?
     } else {
@@ -98,6 +101,9 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
         tracing::warn!("Connecting without TLS — use --ca-cert in production");
         let endpoint = format!("http://{}", config.server_addr);
         tonic::transport::Endpoint::from_shared(endpoint)?
+            .http2_keep_alive_interval(Duration::from_secs(20))
+            .keep_alive_timeout(Duration::from_secs(10))
+            .tcp_keepalive(Some(Duration::from_secs(60)))
             .connect()
             .await?
     };
@@ -135,6 +141,9 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
     let peer_manager = Arc::new(RwLock::new(PeerManager::new(wg_manager)));
     let policy_enforcer = Arc::new(PolicyEnforcer::new());
 
+    // Pre-allocate strings used in every heartbeat to avoid per-tick allocations
+    let version: Arc<str> = Arc::from(env!("CARGO_PKG_VERSION"));
+
     // Channel for outgoing messages to server
     let (tx, rx) = mpsc::channel::<AgentMessage>(64);
 
@@ -145,7 +154,7 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
             timestamp: now_epoch(),
             available_resources: Some(collect_resources()),
             pool: String::new(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: version.to_string(),
         })),
     })
     .await?;
@@ -175,7 +184,8 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
 
     // Spawn heartbeat sender
     let heartbeat_tx = tx.clone();
-    let hb_node_id = node_id.clone();
+    let hb_node_id: Arc<str> = Arc::from(node_id.as_str());
+    let hb_version = version.clone();
     let hb_shutdown = shutdown.child_token();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
@@ -186,11 +196,11 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
             }
             let msg = AgentMessage {
                 payload: Some(Payload::Heartbeat(Heartbeat {
-                    node_id: hb_node_id.clone(),
+                    node_id: hb_node_id.to_string(),
                     timestamp: now_epoch(),
                     available_resources: Some(collect_resources()),
                     pool: String::new(),
-                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    version: hb_version.to_string(),
                 })),
             };
             if heartbeat_tx.send(msg).await.is_err() {
@@ -201,7 +211,7 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
 
     // Spawn periodic status reporter
     let status_tx = tx.clone();
-    let status_node_id = node_id.clone();
+    let status_node_id: Arc<str> = Arc::from(node_id.as_str());
     let status_state = local_state.clone();
     let status_shutdown = shutdown.child_token();
     tokio::spawn(async move {
@@ -226,7 +236,7 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
 
             let msg = AgentMessage {
                 payload: Some(Payload::Status(StatusReport {
-                    node_id: status_node_id.clone(),
+                    node_id: status_node_id.to_string(),
                     running_services: running,
                     current_system_path: String::new(),
                 })),
@@ -239,7 +249,7 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
 
     // Spawn SVID renewal checker
     let renewal_tx = tx.clone();
-    let renewal_node_id = node_id.clone();
+    let renewal_node_id: Arc<str> = Arc::from(node_id.as_str());
     let renewal_mgr = workload_mgr.clone();
     let renewal_keys = pending_keys.clone();
     let renewal_shutdown = shutdown.child_token();
@@ -267,7 +277,7 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
                         let _ = renewal_tx
                             .send(AgentMessage {
                                 payload: Some(Payload::CertRequest(CertificateRequest {
-                                    node_id: renewal_node_id.clone(),
+                                    node_id: renewal_node_id.to_string(),
                                     service_name,
                                     csr: csr_output.csr_der,
                                     request_type: crate::proto::CertRequestType::ServiceCert as i32,
@@ -289,7 +299,7 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
 
     // Spawn periodic health reporter
     let health_tx = tx.clone();
-    let health_node_id = node_id.clone();
+    let health_node_id: Arc<str> = Arc::from(node_id.as_str());
     let health_checker_clone = health_checker.clone();
     let health_shutdown = shutdown.child_token();
     tokio::spawn(async move {
@@ -305,7 +315,7 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
             }
             let msg = AgentMessage {
                 payload: Some(Payload::Health(HealthReport {
-                    node_id: health_node_id.clone(),
+                    node_id: health_node_id.to_string(),
                     services,
                 })),
             };

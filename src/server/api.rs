@@ -1473,11 +1473,9 @@ pub async fn serve_grpc(
         // TokenStore::authenticate is async but interceptors are sync.
         // We use blocking_read() for non-blocking access — the store is rarely written to.
         let tokens = token_store.inner_ref();
-        let role = tokens
-            .blocking_read()
-            .get(raw_token)
-            .copied()
-            .ok_or_else(|| Status::unauthenticated("invalid token"))?;
+        let guard = tokens.blocking_read();
+        let role = super::rbac::TokenStore::authenticate_sync(&guard, raw_token)
+            .ok_or_else(|| Status::unauthenticated("invalid or expired token"))?;
 
         // Stash the role in request extensions so RPC handlers can check permissions.
         let mut req = req;
@@ -1510,6 +1508,9 @@ pub async fn serve_grpc(
 
     tonic::transport::Server::builder()
         .tls_config(tls_config)?
+        .http2_keepalive_interval(Some(Duration::from_secs(20)))
+        .http2_keepalive_timeout(Some(Duration::from_secs(10)))
+        .tcp_keepalive(Some(Duration::from_secs(60)))
         .add_service(FleetControlServer::with_interceptor(service, interceptor))
         .serve_with_shutdown(addr, shutdown.cancelled())
         .await?;

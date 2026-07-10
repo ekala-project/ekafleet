@@ -114,8 +114,11 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     let metrics = crate::metrics::aggregator::MetricsAggregator::new();
     let alert_evaluator = crate::metrics::alerting::AlertEvaluator::new();
 
-    // Initialize RBAC token store with the startup token as admin
-    let token_store = rbac::TokenStore::new();
+    // Initialize RBAC token store with persistence and load any saved tokens
+    let token_store = rbac::TokenStore::with_persistence(&config.data_dir);
+    if let Err(e) = token_store.load().await {
+        tracing::warn!(error = %e, "Failed to load persisted tokens, starting fresh");
+    }
     token_store
         .register(&config.token, rbac::Role::Admin, "initial admin token")
         .await;
