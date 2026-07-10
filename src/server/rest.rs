@@ -185,6 +185,7 @@ pub async fn serve_http(
     token_store: TokenStore,
     metrics: MetricsAggregator,
     alert_evaluator: AlertEvaluator,
+    instance_tracker: Option<super::cloud::instance_tracker::InstanceTracker>,
 ) -> anyhow::Result<()> {
     use axum::extract::State;
     use axum::http::StatusCode;
@@ -196,7 +197,7 @@ pub async fn serve_http(
         metrics,
         alert_evaluator,
         kv_store: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-        instance_tracker: None,
+        instance_tracker,
     };
 
     let authenticated_routes = Router::new()

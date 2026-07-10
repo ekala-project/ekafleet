@@ -320,9 +320,9 @@ async fn main() -> anyhow::Result<()> {
         Command::Apply {
             config,
             auto_approve,
-            watch: _,
+            watch,
             server,
-        } => commands::cmd_apply(config, auto_approve, server).await?,
+        } => commands::cmd_apply(config, auto_approve, watch, server).await?,
 
         Command::Status { server } => commands::cmd_status(server, &cli.output).await?,
 

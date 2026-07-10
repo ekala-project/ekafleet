@@ -23,6 +23,7 @@ use crate::proto::{
     TrustBundleUpdate,
 };
 use crate::raft::state::FleetStateMachine;
+use crate::server::cloud::instance_tracker::InstanceTracker;
 
 pub struct FleetControlService {
     state: FleetState,
@@ -36,10 +37,19 @@ pub struct FleetControlService {
     join_token_store: JoinTokenStore,
     metrics: MetricsAggregator,
     raft_state: FleetStateMachine,
+    /// Tracks cloud-provisioned machine instances for agent correlation
+    /// and dynamic scheduling.
+    instance_tracker: InstanceTracker,
 }
 
 impl FleetControlService {
-    pub fn new(state: FleetState, domain: &str) -> Self {
+    pub fn new(
+        state: FleetState,
+        domain: &str,
+        join_token_store: JoinTokenStore,
+        raft_state: FleetStateMachine,
+        instance_tracker: InstanceTracker,
+    ) -> Self {
         Self {
             state,
             cert_issuer: None,
@@ -47,9 +57,10 @@ impl FleetControlService {
             trust_bundle_pem: None,
             domain: domain.to_string(),
             fleet_key: None,
-            join_token_store: JoinTokenStore::new(),
+            join_token_store,
             metrics: MetricsAggregator::new(),
-            raft_state: FleetStateMachine::new(),
+            raft_state,
+            instance_tracker,
         }
     }
 
@@ -118,7 +129,24 @@ impl FleetControl for FleetControlService {
         } else {
             pool
         };
-        let rx = self.state.register_agent(&node_id, remote, pool_name).await;
+        let rx = self
+            .state
+            .register_agent(&node_id, remote.clone(), pool_name)
+            .await;
+
+        // Correlate agent IP with a tracked cloud instance.
+        // The remote address is "ip:port", so extract just the IP part.
+        let agent_ip = remote.rsplit_once(':').map(|(ip, _)| ip).unwrap_or(&remote);
+        if let Some(tracked) = self.instance_tracker.find_by_ip(agent_ip).await {
+            self.instance_tracker
+                .associate_node(&tracked.cloud_instance_id, &node_id)
+                .await;
+            tracing::info!(
+                node_id = %node_id,
+                cloud_instance = %tracked.cloud_instance_id,
+                "Correlated agent with cloud instance"
+            );
+        }
 
         // Push trust bundle to newly connected agent
         if let Some(bundle_pem) = &self.trust_bundle_pem {
@@ -213,7 +241,7 @@ impl FleetControl for FleetControlService {
 
         // Compute plan
         let current_nodes = self.state.connected_nodes().await;
-        let plan = super::reconciler::compute_plan(&desired, &current_nodes, &self.state, None).await;
+        let plan = super::reconciler::compute_plan(&desired, &current_nodes, &self.state, Some(&self.instance_tracker)).await;
 
         let mut operations = Vec::new();
         for op in &plan.creates {
@@ -278,10 +306,146 @@ impl FleetControl for FleetControlService {
         tracing::info!(
             config = %req.config_path,
             auto_approve = %req.auto_approve,
+            watch = %req.watch,
             "Apply requested"
         );
 
-        let (_tx, rx) = tokio::sync::mpsc::channel(64);
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let state = self.state.clone();
+        let tracker = self.instance_tracker.clone();
+        let join_tokens = self.join_token_store.clone();
+        let config_path = std::path::PathBuf::from(&req.config_path);
+        let watch = req.watch;
+
+        tokio::spawn(async move {
+            // Run a single reconciliation cycle
+            match super::reconciler::reconcile_once(
+                &config_path,
+                &state,
+                true,
+                Some(&tracker),
+            )
+            .await
+            {
+                Ok(plan) => {
+                    let msg = if plan.has_changes {
+                        format!(
+                            "Applied: {} creates, {} updates, {} destroys, {} reschedules",
+                            plan.creates.len(),
+                            plan.updates.len(),
+                            plan.destroys.len(),
+                            plan.reschedules.len(),
+                        )
+                    } else {
+                        "No changes detected".to_string()
+                    };
+                    let _ = tx
+                        .send(Ok(ApplyEvent {
+                            operation_id: uuid::Uuid::new_v4().to_string(),
+                            status: crate::proto::ApplyStatus::ApplySucceeded as i32,
+                            message: msg,
+                        }))
+                        .await;
+
+                    // If watch mode, start continuous reconciliation and scaling actuator
+                    if watch {
+                        // Evaluate config to build the scaling actuator
+                        if let Ok(fleet_config) = super::nix::eval_fleet(&config_path).await {
+                            let providers =
+                                super::cloud::CloudProviderRegistry::from_pool_configs(
+                                    &fleet_config.node_pools,
+                                );
+                            let pool_engine =
+                                crate::server::scaling::PoolScalingEngine::new(state.clone());
+
+                            // Register pool scaling policies from config
+                            let mut pool_engine = pool_engine;
+                            for (pool_name, pool_config) in &fleet_config.node_pools {
+                                if let Some(scaling) = &pool_config.scaling {
+                                    pool_engine.register_policy(pool_name, scaling.clone());
+                                }
+                            }
+
+                            let ca_cert_pem = String::new(); // Will be filled from server config
+                            let server_addr = String::new(); // Will be filled from server config
+
+                            let mut actuator =
+                                super::cloud::actuator::ScalingActuator::new(
+                                    pool_engine,
+                                    providers,
+                                    tracker.clone(),
+                                    join_tokens,
+                                    fleet_config,
+                                    server_addr,
+                                    ca_cert_pem,
+                                );
+
+                            // Run scaling actuator alongside reconciliation
+                            let tx_watch = tx.clone();
+                            let reconcile_tracker = tracker.clone();
+                            let reconcile_state = state.clone();
+                            let reconcile_path = config_path.clone();
+
+                            tokio::spawn(async move {
+                                let mut interval =
+                                    tokio::time::interval(std::time::Duration::from_secs(30));
+                                loop {
+                                    interval.tick().await;
+
+                                    // Run scaling cycle
+                                    actuator.run_cycle().await;
+
+                                    // Run reconciliation cycle
+                                    match super::reconciler::reconcile_once(
+                                        &reconcile_path,
+                                        &reconcile_state,
+                                        true,
+                                        Some(&reconcile_tracker),
+                                    )
+                                    .await
+                                    {
+                                        Ok(plan) if plan.has_changes => {
+                                            let _ = tx_watch
+                                                .send(Ok(ApplyEvent {
+                                                    operation_id: uuid::Uuid::new_v4().to_string(),
+                                                    status: crate::proto::ApplyStatus::ApplySucceeded as i32,
+                                                    message: format!(
+                                                        "Reconciled: {} changes applied",
+                                                        plan.creates.len()
+                                                            + plan.updates.len()
+                                                            + plan.destroys.len()
+                                                    ),
+                                                }))
+                                                .await;
+                                        }
+                                        Err(e) => {
+                                            let _ = tx_watch
+                                                .send(Ok(ApplyEvent {
+                                                    operation_id: uuid::Uuid::new_v4().to_string(),
+                                                    status: crate::proto::ApplyStatus::ApplyFailed as i32,
+                                                    message: format!("Reconciliation failed: {e}"),
+                                                }))
+                                                .await;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(Ok(ApplyEvent {
+                            operation_id: uuid::Uuid::new_v4().to_string(),
+                            status: crate::proto::ApplyStatus::ApplyFailed as i32,
+                            message: format!("Apply failed: {e}"),
+                        }))
+                        .await;
+                }
+            }
+        });
+
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 
@@ -658,6 +822,9 @@ pub struct GrpcServerConfig {
     pub trust_bundle_pem: String,
     pub domain: String,
     pub fleet_key: Vec<u8>,
+    pub join_token_store: JoinTokenStore,
+    pub raft_state: FleetStateMachine,
+    pub instance_tracker: InstanceTracker,
 }
 
 /// Start the gRPC server with TLS and RBAC-based authentication.
@@ -674,6 +841,9 @@ pub async fn serve_grpc(
         trust_bundle_pem,
         domain,
         fleet_key,
+        join_token_store,
+        raft_state,
+        instance_tracker,
     } = config;
 
     tracing::info!(%addr, domain = %domain, "gRPC server listening (TLS + RBAC + SPIFFE)");
@@ -734,10 +904,11 @@ pub async fn serve_grpc(
         .identity(identity)
         .client_ca_root(Certificate::from_pem(&tls.ca_cert_pem));
 
-    let service = FleetControlService::new(state, &domain)
-        .with_cert_issuer(cert_issuer, trust_bundle_pem)
-        .with_ca(ca)
-        .with_fleet_key(fleet_key);
+    let service =
+        FleetControlService::new(state, &domain, join_token_store, raft_state, instance_tracker)
+            .with_cert_issuer(cert_issuer, trust_bundle_pem)
+            .with_ca(ca)
+            .with_fleet_key(fleet_key);
 
     tonic::transport::Server::builder()
         .tls_config(tls_config)?

@@ -123,8 +123,8 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     // (via `ekafleet apply --watch`), since it needs the pool/cloud configuration
     // from the evaluated Nix config. See cloud::actuator::ScalingActuator.
     let raft_state = FleetStateMachine::new();
-    let _instance_tracker = cloud::instance_tracker::InstanceTracker::new(raft_state);
-    let _join_token_store = JoinTokenStore::new();
+    let instance_tracker = cloud::instance_tracker::InstanceTracker::new(raft_state.clone());
+    let join_token_store = JoinTokenStore::new();
 
     // Start gRPC and HTTP servers concurrently
     let grpc_config = api::GrpcServerConfig {
@@ -135,6 +135,9 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         trust_bundle_pem,
         domain: config.domain,
         fleet_key,
+        join_token_store,
+        raft_state,
+        instance_tracker: instance_tracker.clone(),
     };
 
     let (grpc_result, http_result) = tokio::join!(
@@ -145,7 +148,8 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
             event_store,
             token_store,
             metrics,
-            alert_evaluator
+            alert_evaluator,
+            Some(instance_tracker)
         ),
     );
 

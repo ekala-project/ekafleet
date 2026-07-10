@@ -387,6 +387,8 @@ enum OperationType {
 message ApplyRequest {
   string config_path = 1;
   bool auto_approve = 2;
+  // If true, continue watching for changes and run scaling actuator.
+  bool watch = 3;
 }
 
 message ApplyEvent {
