@@ -173,6 +173,7 @@ pub struct HttpApiState {
     pub metrics: MetricsAggregator,
     pub alert_evaluator: AlertEvaluator,
     pub kv_store: Arc<tokio::sync::RwLock<HashMap<String, Vec<u8>>>>,
+    pub instance_tracker: Option<super::cloud::instance_tracker::InstanceTracker>,
 }
 
 /// Start the HTTP API server with REST endpoints for all operations.
@@ -195,6 +196,7 @@ pub async fn serve_http(
         metrics,
         alert_evaluator,
         kv_store: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+        instance_tracker: None,
     };
 
     let authenticated_routes = Router::new()
@@ -218,6 +220,7 @@ pub async fn serve_http(
         )
         .route("/v1/kv", get(rest_kv_list))
         .route("/v1/metrics/services/{name}", get(rest_service_metrics))
+        .route("/v1/cloud/instances", get(rest_cloud_instances))
         .route("/ui/", get(ui_handler))
         .route("/ui/{*path}", get(ui_handler))
         .with_state(api_state)
@@ -624,5 +627,34 @@ async fn rest_service_metrics(
     axum::Json(serde_json::json!({
         "service": name,
         "metrics": metrics,
+    }))
+}
+
+/// GET /v1/cloud/instances — List all tracked cloud-provisioned machine instances.
+async fn rest_cloud_instances(
+    axum::extract::State(state): axum::extract::State<HttpApiState>,
+) -> axum::Json<serde_json::Value> {
+    let instances = if let Some(tracker) = &state.instance_tracker {
+        let all = tracker.all().await;
+        all.values()
+            .map(|i| {
+                serde_json::json!({
+                    "instance_id": i.cloud_instance_id,
+                    "provider": i.provider,
+                    "pool": i.pool,
+                    "private_ip": i.private_ip,
+                    "fleet_node_id": i.fleet_node_id,
+                    "created_at": i.created_at,
+                    "joined_at": i.joined_at,
+                })
+            })
+            .collect::<Vec<_>>()
+    } else {
+        vec![]
+    };
+
+    axum::Json(serde_json::json!({
+        "cloud_instances": instances,
+        "count": instances.len(),
     }))
 }

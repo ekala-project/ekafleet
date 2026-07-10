@@ -22,8 +22,25 @@ struct StateMachineInner {
     /// General-purpose key-value store (used for volume tracking, etc.)
     #[serde(default)]
     kv: HashMap<String, Vec<u8>>,
+    /// Cloud-provisioned machine instances tracked across the fleet.
+    #[serde(default)]
+    cloud_instances: HashMap<String, TrackedCloudInstance>,
     /// Last applied log index
     last_applied: u64,
+}
+
+/// A cloud-provisioned machine instance tracked in Raft state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrackedCloudInstance {
+    pub cloud_instance_id: String,
+    pub provider: String,
+    pub pool: String,
+    pub private_ip: Option<String>,
+    pub created_at: u64,
+    /// Set when the agent running on this instance joins the fleet.
+    pub fleet_node_id: Option<String>,
+    /// Set when the agent joins.
+    pub joined_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +96,20 @@ pub enum Command {
     },
     KvDelete {
         key: String,
+    },
+    TrackCloudInstance {
+        instance_id: String,
+        provider: String,
+        pool: String,
+        private_ip: Option<String>,
+        created_at: u64,
+    },
+    UpdateCloudInstance {
+        instance_id: String,
+        fleet_node_id: String,
+    },
+    UntrackCloudInstance {
+        instance_id: String,
     },
 }
 
@@ -171,6 +202,43 @@ impl FleetStateMachine {
             Command::KvDelete { key } => {
                 state.kv.remove(&key);
             }
+            Command::TrackCloudInstance {
+                instance_id,
+                provider,
+                pool,
+                private_ip,
+                created_at,
+            } => {
+                state.cloud_instances.insert(
+                    instance_id.clone(),
+                    TrackedCloudInstance {
+                        cloud_instance_id: instance_id,
+                        provider,
+                        pool,
+                        private_ip,
+                        created_at,
+                        fleet_node_id: None,
+                        joined_at: None,
+                    },
+                );
+            }
+            Command::UpdateCloudInstance {
+                instance_id,
+                fleet_node_id,
+            } => {
+                if let Some(inst) = state.cloud_instances.get_mut(&instance_id) {
+                    inst.fleet_node_id = Some(fleet_node_id);
+                    inst.joined_at = Some(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                    );
+                }
+            }
+            Command::UntrackCloudInstance { instance_id } => {
+                state.cloud_instances.remove(&instance_id);
+            }
         }
 
         state.last_applied = index;
@@ -223,5 +291,32 @@ impl FleetStateMachine {
             .filter(|(k, _)| k.starts_with(prefix))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
+    }
+
+    /// Get all tracked cloud instances.
+    pub async fn cloud_instances(&self) -> HashMap<String, TrackedCloudInstance> {
+        let state = self.inner.read().await;
+        state.cloud_instances.clone()
+    }
+
+    /// Get tracked cloud instances for a specific pool.
+    pub async fn cloud_instances_for_pool(&self, pool: &str) -> Vec<TrackedCloudInstance> {
+        let state = self.inner.read().await;
+        state
+            .cloud_instances
+            .values()
+            .filter(|i| i.pool == pool)
+            .cloned()
+            .collect()
+    }
+
+    /// Find a tracked cloud instance by its private IP.
+    pub async fn cloud_instance_by_ip(&self, ip: &str) -> Option<TrackedCloudInstance> {
+        let state = self.inner.read().await;
+        state
+            .cloud_instances
+            .values()
+            .find(|i| i.private_ip.as_deref() == Some(ip))
+            .cloned()
     }
 }

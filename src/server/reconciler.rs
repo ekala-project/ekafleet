@@ -4,11 +4,12 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
+use super::cloud::instance_tracker::InstanceTracker;
 use super::deployer::{self, DeploymentPlan};
 use super::nix;
 use super::scheduler::{self, Placement};
 use super::state::FleetState;
-use crate::config::{self, FleetConfig};
+use crate::config::{self, CapacityConfig, FleetConfig, MachineConfig};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReconcileError {
@@ -42,6 +43,7 @@ pub async fn reconcile_once(
     config_path: &Path,
     state: &FleetState,
     auto_approve: bool,
+    instance_tracker: Option<&InstanceTracker>,
 ) -> Result<ReconcilePlan, ReconcileError> {
     // 1. Evaluate: get desired state from Nix
     tracing::info!(config = %config_path.display(), "Evaluating fleet configuration");
@@ -57,7 +59,7 @@ pub async fn reconcile_once(
     tracing::info!(nodes = current_nodes.len(), "Current fleet state refreshed");
 
     // 3. Plan: diff desired vs actual
-    let plan = compute_plan(&desired, &current_nodes, state).await;
+    let plan = compute_plan(&desired, &current_nodes, state, instance_tracker).await;
 
     if !plan.has_changes {
         tracing::info!("No changes detected");
@@ -88,6 +90,7 @@ pub async fn reconcile_loop(
     config_path: &Path,
     state: &FleetState,
     interval: Duration,
+    instance_tracker: Option<&InstanceTracker>,
 ) -> Result<(), ReconcileError> {
     tracing::info!(
         interval = ?interval,
@@ -97,7 +100,7 @@ pub async fn reconcile_loop(
     let mut tick = tokio::time::interval(interval);
     loop {
         tick.tick().await;
-        match reconcile_once(config_path, state, true).await {
+        match reconcile_once(config_path, state, true, instance_tracker).await {
             Ok(_) => {}
             Err(e) => {
                 tracing::error!(error = %e, "Reconciliation cycle failed");
@@ -111,10 +114,14 @@ pub async fn compute_plan(
     desired: &FleetConfig,
     _current_nodes: &[String],
     state: &FleetState,
+    instance_tracker: Option<&InstanceTracker>,
 ) -> ReconcilePlan {
-    // Schedule services across machines
+    // Merge static machines with cloud-provisioned dynamic machines
+    let machines = merge_dynamic_machines(desired, instance_tracker).await;
+
+    // Schedule services across all machines (static + cloud)
     let placement_plan =
-        scheduler::schedule(&desired.services, &desired.machines, &desired.node_pools);
+        scheduler::schedule(&desired.services, &machines, &desired.node_pools);
 
     // Log blocked placements
     for b in &placement_plan.blocked {
@@ -272,4 +279,68 @@ async fn apply_plan(
     }
 
     Ok(())
+}
+
+/// Merge statically declared machines with cloud-provisioned dynamic machines.
+///
+/// Cloud machines that have joined the fleet (have a `fleet_node_id`) are
+/// converted to [`MachineConfig`] using the pool's `machineCapacity`.
+async fn merge_dynamic_machines(
+    config: &FleetConfig,
+    instance_tracker: Option<&InstanceTracker>,
+) -> HashMap<String, MachineConfig> {
+    let mut machines = config.machines.clone();
+
+    let Some(tracker) = instance_tracker else {
+        return machines;
+    };
+
+    let tracked = tracker.all().await;
+
+    for (instance_id, instance) in &tracked {
+        // Only include instances that have joined the fleet
+        let Some(node_id) = &instance.fleet_node_id else {
+            continue;
+        };
+
+        // Skip if already represented in static config
+        if machines.contains_key(node_id) {
+            continue;
+        }
+
+        // Look up the pool's expected machine capacity
+        let capacity = config
+            .node_pools
+            .get(&instance.pool)
+            .and_then(|p| p.cloud.as_ref())
+            .map(|c| c.machine_capacity.clone())
+            .unwrap_or_default();
+
+        let target_host = instance
+            .private_ip
+            .clone()
+            .unwrap_or_else(|| node_id.clone());
+
+        machines.insert(
+            node_id.clone(),
+            MachineConfig {
+                target_host,
+                labels: HashMap::new(),
+                capacity,
+                pool: instance.pool.clone(),
+                reserved: CapacityConfig::default(),
+                taints: vec![],
+                extended_resources: HashMap::new(),
+            },
+        );
+
+        tracing::debug!(
+            node_id = %node_id,
+            cloud_instance = %instance_id,
+            pool = %instance.pool,
+            "Merged cloud-provisioned machine into scheduler"
+        );
+    }
+
+    machines
 }

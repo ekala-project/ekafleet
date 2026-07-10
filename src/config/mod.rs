@@ -295,6 +295,59 @@ pub struct NodePoolConfig {
     pub scheduler_algorithm: Option<SchedulerAlgorithm>,
     #[serde(default, rename = "memoryOversubscription")]
     pub memory_oversubscription: bool,
+    /// Cloud provider configuration for autoscaling this pool.
+    /// When set, pool scaling decisions will provision/destroy cloud VMs.
+    #[serde(default)]
+    pub cloud: Option<CloudProviderConfig>,
+}
+
+/// Cloud provider configuration for a node pool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudProviderConfig {
+    /// Cloud provider type: "aws", "azure", or "gcp".
+    pub provider: CloudProviderType,
+    /// Cloud region (e.g., "us-east-1", "eastus", "us-central1").
+    pub region: String,
+    /// Instance type / VM size (e.g., "c6i.xlarge", "Standard_D4s_v3", "n2-standard-4").
+    #[serde(rename = "instanceType")]
+    pub instance_type: String,
+    /// Machine image ID (e.g., AMI ID, managed image name, GCE image name).
+    #[serde(rename = "imageId")]
+    pub image_id: String,
+    /// Subnet ID for network placement (AWS/GCP).
+    #[serde(default, rename = "subnetId")]
+    pub subnet_id: Option<String>,
+    /// Security group IDs (AWS).
+    #[serde(default, rename = "securityGroupIds")]
+    pub security_group_ids: Vec<String>,
+    /// SSH key name for instance access.
+    #[serde(default, rename = "sshKeyName")]
+    pub ssh_key_name: Option<String>,
+    /// Availability zone (e.g., "us-east-1a", "us-central1-a").
+    #[serde(default)]
+    pub zone: Option<String>,
+    /// Root disk size in GB.
+    #[serde(default, rename = "diskSizeGb")]
+    pub disk_size_gb: Option<u64>,
+    /// Azure resource group name (required for Azure).
+    #[serde(default, rename = "resourceGroup")]
+    pub resource_group: Option<String>,
+    /// GCP project ID (required for GCP).
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Expected machine capacity for scheduling before the agent reports
+    /// real resources. CPU in millicores, memory/disk in MB.
+    #[serde(rename = "machineCapacity")]
+    pub machine_capacity: CapacityConfig,
+}
+
+/// Supported cloud provider types.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CloudProviderType {
+    Aws,
+    Azure,
+    Gcp,
 }
 
 /// Autoscaling configuration for a node pool.
@@ -397,6 +450,30 @@ pub fn validate(config: &FleetConfig) -> Result<(), Vec<String>> {
                 "service '{}' prefers undefined pool '{}'",
                 name, pool
             ));
+        }
+    }
+
+    // Validate cloud provider configuration
+    for (name, pool) in &config.node_pools {
+        if let Some(cloud) = &pool.cloud {
+            if cloud.provider == CloudProviderType::Azure && cloud.resource_group.is_none() {
+                errors.push(format!(
+                    "pool '{}' uses Azure provider but missing 'resourceGroup'",
+                    name
+                ));
+            }
+            if cloud.provider == CloudProviderType::Gcp && cloud.project.is_none() {
+                errors.push(format!(
+                    "pool '{}' uses GCP provider but missing 'project'",
+                    name
+                ));
+            }
+            if pool.scaling.is_none() {
+                errors.push(format!(
+                    "pool '{}' has cloud provider config but no scaling config",
+                    name
+                ));
+            }
         }
     }
 

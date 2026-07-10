@@ -3,6 +3,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 use crate::metrics::aggregator::MetricsAggregator;
 
 /// Autoscaling engine. Evaluates scaling policies against collected
@@ -248,23 +250,86 @@ impl PoolScalingEngine {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Cloud provider abstraction
+// ---------------------------------------------------------------------------
+
+/// Request to create a new machine in a cloud provider.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateMachineRequest {
+    pub pool: String,
+    pub labels: HashMap<String, String>,
+    pub instance_type: String,
+    pub image_id: String,
+    /// Base64-encoded or raw user-data script for agent bootstrap.
+    pub user_data: String,
+    pub region: String,
+    pub zone: Option<String>,
+    pub fleet_name: String,
+    pub subnet_id: Option<String>,
+    pub security_group_ids: Vec<String>,
+    pub ssh_key_name: Option<String>,
+    pub disk_size_gb: Option<u64>,
+    /// Azure-specific: resource group name.
+    pub resource_group: Option<String>,
+    /// GCP-specific: project ID.
+    pub project: Option<String>,
+}
+
+/// A cloud machine instance returned by provider operations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MachineInstance {
+    pub instance_id: String,
+    pub provider: String,
+    pub state: MachineState,
+    pub public_ip: Option<String>,
+    pub private_ip: Option<String>,
+    pub labels: HashMap<String, String>,
+    pub pool: String,
+    pub created_at: u64,
+}
+
+/// Lifecycle state of a cloud machine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MachineState {
+    Pending,
+    Running,
+    Stopping,
+    Terminated,
+    Unknown,
+}
+
 /// Cloud provider abstraction for machine lifecycle management.
 /// Implementations handle provisioning and deprovisioning of machines
 /// in response to pool scaling decisions.
 pub trait CloudProvider: Send + Sync {
-    /// Create a new machine in the given pool with the specified labels.
-    /// Returns the instance ID of the newly created machine.
+    /// Create a new machine with the given parameters.
+    /// Returns a [`MachineInstance`] describing the newly created machine.
     fn create_machine(
         &self,
-        pool: &str,
-        labels: &HashMap<String, String>,
-    ) -> impl std::future::Future<Output = Result<String, anyhow::Error>> + Send;
+        request: &CreateMachineRequest,
+    ) -> impl std::future::Future<Output = Result<MachineInstance, anyhow::Error>> + Send;
 
     /// Destroy a machine by its instance ID.
     fn destroy_machine(
         &self,
         instance_id: &str,
     ) -> impl std::future::Future<Output = Result<(), anyhow::Error>> + Send;
+
+    /// Describe a single machine instance. Returns `None` if the instance
+    /// does not exist or has been terminated.
+    fn describe_machine(
+        &self,
+        instance_id: &str,
+    ) -> impl std::future::Future<Output = Result<Option<MachineInstance>, anyhow::Error>> + Send;
+
+    /// List all machines in the given fleet and pool that are tagged as
+    /// managed by ekafleet.
+    fn list_fleet_machines(
+        &self,
+        fleet_name: &str,
+        pool: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<MachineInstance>, anyhow::Error>> + Send;
 }
 
 /// Advisory cloud provider that notifies an external system via webhooks.
@@ -283,24 +348,25 @@ impl WebhookCloudProvider {
 impl CloudProvider for WebhookCloudProvider {
     async fn create_machine(
         &self,
-        pool: &str,
-        labels: &HashMap<String, String>,
-    ) -> Result<String, anyhow::Error> {
+        request: &CreateMachineRequest,
+    ) -> Result<MachineInstance, anyhow::Error> {
         let payload = serde_json::json!({
             "action": "create",
-            "pool": pool,
-            "labels": labels,
+            "pool": request.pool,
+            "labels": request.labels,
+            "instance_type": request.instance_type,
+            "image_id": request.image_id,
+            "region": request.region,
         });
 
         tracing::info!(
-            pool = %pool,
+            pool = %request.pool,
             url = %self.webhook_url,
             "Sending advisory create_machine webhook"
         );
 
         let response = post_webhook_json(&self.webhook_url, &payload).await?;
 
-        // Try to parse instance_id from the response
         let parsed: serde_json::Value = serde_json::from_str(&response).unwrap_or_default();
         let instance_id = parsed
             .get("instance_id")
@@ -308,7 +374,19 @@ impl CloudProvider for WebhookCloudProvider {
             .unwrap_or("advisory-no-id")
             .to_string();
 
-        Ok(instance_id)
+        Ok(MachineInstance {
+            instance_id,
+            provider: "webhook".to_string(),
+            state: MachineState::Pending,
+            public_ip: None,
+            private_ip: None,
+            labels: request.labels.clone(),
+            pool: request.pool.clone(),
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        })
     }
 
     async fn destroy_machine(&self, instance_id: &str) -> Result<(), anyhow::Error> {
@@ -325,6 +403,23 @@ impl CloudProvider for WebhookCloudProvider {
 
         post_webhook_json(&self.webhook_url, &payload).await?;
         Ok(())
+    }
+
+    async fn describe_machine(
+        &self,
+        _instance_id: &str,
+    ) -> Result<Option<MachineInstance>, anyhow::Error> {
+        // Webhook provider is advisory-only; it cannot query instance state.
+        Ok(None)
+    }
+
+    async fn list_fleet_machines(
+        &self,
+        _fleet_name: &str,
+        _pool: &str,
+    ) -> Result<Vec<MachineInstance>, anyhow::Error> {
+        // Webhook provider is advisory-only; it cannot list instances.
+        Ok(vec![])
     }
 }
 

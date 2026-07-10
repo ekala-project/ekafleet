@@ -213,7 +213,7 @@ impl FleetControl for FleetControlService {
 
         // Compute plan
         let current_nodes = self.state.connected_nodes().await;
-        let plan = super::reconciler::compute_plan(&desired, &current_nodes, &self.state).await;
+        let plan = super::reconciler::compute_plan(&desired, &current_nodes, &self.state, None).await;
 
         let mut operations = Vec::new();
         for op in &plan.creates {

@@ -238,6 +238,7 @@ fn pool_affinity_prefers_correct_pool() {
                 scaling: None,
                 scheduler_algorithm: None,
                 memory_oversubscription: false,
+                cloud: None,
             },
         ),
         (
@@ -247,6 +248,7 @@ fn pool_affinity_prefers_correct_pool() {
                 scaling: None,
                 scheduler_algorithm: None,
                 memory_oversubscription: false,
+                cloud: None,
             },
         ),
     ]
@@ -306,6 +308,7 @@ fn pool_affinity_spills_when_full() {
                 scaling: None,
                 scheduler_algorithm: None,
                 memory_oversubscription: false,
+                cloud: None,
             },
         ),
         (
@@ -315,6 +318,7 @@ fn pool_affinity_spills_when_full() {
                 scaling: None,
                 scheduler_algorithm: None,
                 memory_oversubscription: false,
+                cloud: None,
             },
         ),
     ]
@@ -387,6 +391,7 @@ fn pool_hard_constraint_blocks_spillover() {
             scaling: None,
             scheduler_algorithm: None,
             memory_oversubscription: false,
+            cloud: None,
         },
     )]
     .into();
@@ -494,6 +499,7 @@ fn pool_labels_merged() {
             scaling: None,
             scheduler_algorithm: None,
             memory_oversubscription: false,
+            cloud: None,
         },
     )]
     .into();
@@ -578,6 +584,7 @@ fn system_job_on_pool() {
                 scaling: None,
                 scheduler_algorithm: None,
                 memory_oversubscription: false,
+                cloud: None,
             },
         ),
         (
@@ -587,6 +594,7 @@ fn system_job_on_pool() {
                 scaling: None,
                 scheduler_algorithm: None,
                 memory_oversubscription: false,
+                cloud: None,
             },
         ),
     ]

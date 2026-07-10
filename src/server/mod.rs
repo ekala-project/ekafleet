@@ -1,6 +1,7 @@
 mod agent_msg;
 pub mod api;
 pub mod audit;
+pub mod cloud;
 pub mod deployer;
 pub mod events;
 pub mod federation;
@@ -21,8 +22,10 @@ use std::path::{Path, PathBuf};
 
 use state::FleetState;
 
+use crate::attestation::join_token::JoinTokenStore;
 use crate::ca::issuer::CertIssuer;
 use crate::ca::root::RootCa;
+use crate::raft::state::FleetStateMachine;
 
 pub struct ServerConfig {
     pub data_dir: PathBuf,
@@ -114,6 +117,14 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     token_store
         .register(&config.token, rbac::Role::Admin, "initial admin token")
         .await;
+
+    // Initialize Raft state machine and cloud infrastructure.
+    // The ScalingActuator is started later when a fleet config is available
+    // (via `ekafleet apply --watch`), since it needs the pool/cloud configuration
+    // from the evaluated Nix config. See cloud::actuator::ScalingActuator.
+    let raft_state = FleetStateMachine::new();
+    let _instance_tracker = cloud::instance_tracker::InstanceTracker::new(raft_state);
+    let _join_token_store = JoinTokenStore::new();
 
     // Start gRPC and HTTP servers concurrently
     let grpc_config = api::GrpcServerConfig {
