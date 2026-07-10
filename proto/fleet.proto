@@ -37,6 +37,45 @@ service FleetControl {
 
   // Dispatch a parameterized batch job with arguments.
   rpc Dispatch(DispatchRequest) returns (DispatchResponse);
+
+  // Execute a command in a running service's context.
+  rpc Exec(ExecRequest) returns (ExecResponse);
+
+  // Stream logs from a service.
+  rpc Logs(LogsRequest) returns (stream LogsChunk);
+
+  // Query fleet events with filtering.
+  rpc Events(EventsRequest) returns (EventsResponse);
+
+  // List all connected nodes with details.
+  rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
+
+  // Get detailed information about a specific node.
+  rpc GetNode(GetNodeRequest) returns (NodeDetail);
+
+  // Update node properties (e.g., cordon/uncordon).
+  rpc UpdateNode(UpdateNodeRequest) returns (UpdateNodeResponse);
+
+  // Query real-time resource usage for nodes and services.
+  rpc Top(TopRequest) returns (TopResponse);
+
+  // List deployment history.
+  rpc ListDeployments(ListDeploymentsRequest) returns (ListDeploymentsResponse);
+
+  // Promote a canary deployment.
+  rpc PromoteDeployment(PromoteRequest) returns (PromoteResponse);
+
+  // Fail a stuck deployment (triggers rollback).
+  rpc FailDeployment(FailDeploymentRequest) returns (FailDeploymentResponse);
+
+  // Create an ACL token.
+  rpc CreateACLToken(CreateACLTokenRequest) returns (CreateACLTokenResponse);
+
+  // Revoke an ACL token.
+  rpc RevokeACLToken(RevokeACLTokenRequest) returns (RevokeACLTokenResponse);
+
+  // List ACL tokens.
+  rpc ListACLTokens(ListACLTokensRequest) returns (ListACLTokensResponse);
 }
 
 // --- Agent → Server messages ---
@@ -515,4 +554,187 @@ message DispatchResponse {
   string instance_id = 1;
   bool success = 2;
   string message = 3;
+}
+
+// --- Exec ---
+
+message ExecRequest {
+  string service_name = 1;
+  repeated string command = 2;
+  uint32 timeout_seconds = 3;
+  string node_id = 4;
+}
+
+message ExecResponse {
+  int32 exit_code = 1;
+  bytes stdout = 2;
+  bytes stderr = 3;
+}
+
+// --- Logs ---
+
+message LogsRequest {
+  string service_name = 1;
+  uint32 lines = 2;
+  bool follow = 3;
+  string node_id = 4;
+}
+
+message LogsChunk {
+  string node_id = 1;
+  bytes data = 2;
+}
+
+// --- Events ---
+
+message EventsRequest {
+  string category = 1;
+  string service = 2;
+  string node = 3;
+  uint32 limit = 4;
+}
+
+message EventsResponse {
+  repeated FleetEventProto events = 1;
+}
+
+message FleetEventProto {
+  uint64 timestamp = 1;
+  string level = 2;
+  string category = 3;
+  string service = 4;
+  string node = 5;
+  string message = 6;
+}
+
+// --- Node Management ---
+
+message ListNodesRequest {}
+
+message ListNodesResponse {
+  repeated NodeDetail nodes = 1;
+}
+
+message GetNodeRequest {
+  string node_id = 1;
+}
+
+message NodeDetail {
+  string node_id = 1;
+  string address = 2;
+  string pool = 3;
+  bool healthy = 4;
+  bool schedulable = 5;
+  NodeResources total_resources = 6;
+  NodeResources available_resources = 7;
+  uint64 last_heartbeat = 8;
+  repeated ServiceInstance running_services = 9;
+}
+
+message UpdateNodeRequest {
+  string node_id = 1;
+  bool schedulable = 2;
+}
+
+message UpdateNodeResponse {
+  bool success = 1;
+}
+
+// --- Top (resource usage) ---
+
+message TopRequest {
+  string mode = 1;
+}
+
+message TopResponse {
+  repeated NodeResourceUsage nodes = 1;
+  repeated ServiceResourceUsage services = 2;
+}
+
+message NodeResourceUsage {
+  string node_id = 1;
+  string pool = 2;
+  uint64 cpu_used = 3;
+  uint64 cpu_total = 4;
+  uint64 memory_used = 5;
+  uint64 memory_total = 6;
+  uint32 service_count = 7;
+}
+
+message ServiceResourceUsage {
+  string service_name = 1;
+  uint32 instance_count = 2;
+  uint64 cpu_request = 3;
+  uint64 memory_request = 4;
+}
+
+// --- Deployment Management ---
+
+message ListDeploymentsRequest {
+  string service = 1;
+  uint32 limit = 2;
+}
+
+message ListDeploymentsResponse {
+  repeated DeploymentRecord deployments = 1;
+}
+
+message DeploymentRecord {
+  string deployment_id = 1;
+  string service_name = 2;
+  uint64 started_at = 3;
+  uint64 completed_at = 4;
+  string status = 5;
+  string strategy = 6;
+  uint32 instance_count = 7;
+  string store_path = 8;
+}
+
+message PromoteRequest {
+  string service_name = 1;
+}
+
+message PromoteResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message FailDeploymentRequest {
+  string service_name = 1;
+}
+
+message FailDeploymentResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// --- ACL Token Management ---
+
+message CreateACLTokenRequest {
+  string role = 1;
+  string description = 2;
+}
+
+message CreateACLTokenResponse {
+  string token = 1;
+  string role = 2;
+}
+
+message RevokeACLTokenRequest {
+  string token = 1;
+}
+
+message RevokeACLTokenResponse {
+  bool success = 1;
+}
+
+message ListACLTokensRequest {}
+
+message ListACLTokensResponse {
+  repeated ACLTokenInfo tokens = 1;
+}
+
+message ACLTokenInfo {
+  string description = 1;
+  string role = 2;
 }

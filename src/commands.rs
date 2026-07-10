@@ -408,23 +408,33 @@ pub async fn cmd_token_create(type_str: String) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn cmd_logs(service: String, server: String) -> anyhow::Result<()> {
+pub async fn cmd_logs(
+    service: String,
+    follow: bool,
+    tail: u32,
+    node: Option<String>,
+    server: String,
+) -> anyhow::Result<()> {
     let mut client = connect_server(&server).await?;
-    let resp = client.status(StatusRequest {}).await?;
-    let status = resp.into_inner();
+    let mut stream = client
+        .logs(ekafleet::proto::LogsRequest {
+            service_name: service.clone(),
+            lines: tail,
+            follow,
+            node_id: node.unwrap_or_default(),
+        })
+        .await?
+        .into_inner();
 
-    let svc = status.services.iter().find(|s| s.name == service);
-    match svc {
-        Some(s) => {
-            println!("Service {} has {} instances:", service, s.instances.len());
-            for inst in &s.instances {
-                println!(
-                    "  {} on {} — use `journalctl -u ekafleet-{}` on that node",
-                    inst.instance_id, inst.node_id, service
-                );
+    while let Some(chunk) = stream.message().await? {
+        let text = String::from_utf8_lossy(&chunk.data);
+        if !chunk.node_id.is_empty() {
+            for line in text.lines() {
+                println!("[{}] {}", chunk.node_id, line);
             }
+        } else {
+            print!("{text}");
         }
-        None => println!("Service '{service}' not found in fleet."),
     }
     Ok(())
 }
@@ -520,6 +530,424 @@ pub async fn cmd_restore(input: PathBuf, server: String) -> anyhow::Result<()> {
         println!("{}", result.message);
     } else {
         anyhow::bail!("Restore failed: {}", result.message);
+    }
+    Ok(())
+}
+
+pub async fn cmd_validate(config: PathBuf) -> anyhow::Result<()> {
+    let fleet_config = ekafleet::server::nix::eval_fleet(&config).await?;
+    match ekafleet::config::validate(&fleet_config) {
+        Ok(()) => {
+            println!(
+                "Configuration valid: {} services, {} machines, {} pools",
+                fleet_config.services.len(),
+                fleet_config.machines.len(),
+                fleet_config.node_pools.len()
+            );
+        }
+        Err(errors) => {
+            eprintln!("Configuration errors:");
+            for err in &errors {
+                eprintln!("  - {err}");
+            }
+            anyhow::bail!("{} validation error(s)", errors.len());
+        }
+    }
+    Ok(())
+}
+
+pub async fn cmd_events(
+    category: Option<String>,
+    service: Option<String>,
+    node: Option<String>,
+    limit: u32,
+    server: String,
+) -> anyhow::Result<()> {
+    let mut client = connect_server(&server).await?;
+    let resp = client
+        .events(ekafleet::proto::EventsRequest {
+            category: category.unwrap_or_default(),
+            service: service.unwrap_or_default(),
+            node: node.unwrap_or_default(),
+            limit,
+        })
+        .await?;
+    let result = resp.into_inner();
+
+    if result.events.is_empty() {
+        println!("No events found.");
+    } else {
+        for event in &result.events {
+            let svc = if event.service.is_empty() {
+                String::new()
+            } else {
+                format!(" service={}", event.service)
+            };
+            let node = if event.node.is_empty() {
+                String::new()
+            } else {
+                format!(" node={}", event.node)
+            };
+            println!(
+                "[{}] {} {}{}{} — {}",
+                event.timestamp, event.level, event.category, svc, node, event.message
+            );
+        }
+    }
+    Ok(())
+}
+
+pub async fn cmd_node_list(server: String) -> anyhow::Result<()> {
+    let mut client = connect_server(&server).await?;
+    let resp = client
+        .list_nodes(ekafleet::proto::ListNodesRequest {})
+        .await?;
+    let result = resp.into_inner();
+
+    if result.nodes.is_empty() {
+        println!("No nodes connected.");
+    } else {
+        println!(
+            "{:<36}  {:<20}  {:<12}  {:<8}  {:<10}  {}",
+            "NODE ID", "ADDRESS", "POOL", "HEALTH", "SCHED", "SERVICES"
+        );
+        for node in &result.nodes {
+            let health = if node.healthy { "ok" } else { "unhealthy" };
+            let sched = if node.schedulable { "yes" } else { "cordoned" };
+            println!(
+                "{:<36}  {:<20}  {:<12}  {:<8}  {:<10}  {}",
+                node.node_id,
+                node.address,
+                node.pool,
+                health,
+                sched,
+                node.running_services.len()
+            );
+        }
+    }
+    Ok(())
+}
+
+pub async fn cmd_node_status(node: String, server: String) -> anyhow::Result<()> {
+    let mut client = connect_server(&server).await?;
+    let resp = client
+        .get_node(ekafleet::proto::GetNodeRequest {
+            node_id: node.clone(),
+        })
+        .await?;
+    let detail = resp.into_inner();
+
+    println!("Node: {}", detail.node_id);
+    println!("  Address:     {}", detail.address);
+    println!("  Pool:        {}", detail.pool);
+    println!(
+        "  Health:      {}",
+        if detail.healthy { "healthy" } else { "unhealthy" }
+    );
+    println!(
+        "  Schedulable: {}",
+        if detail.schedulable { "yes" } else { "cordoned" }
+    );
+    println!("  Heartbeat:   {}s ago", detail.last_heartbeat);
+    if let Some(total) = &detail.total_resources {
+        println!(
+            "  Total:       {}m CPU, {}MB mem, {}MB disk",
+            total.cpu_millicores, total.memory_mb, total.disk_mb
+        );
+    }
+    if let Some(avail) = &detail.available_resources {
+        println!(
+            "  Available:   {}m CPU, {}MB mem, {}MB disk",
+            avail.cpu_millicores, avail.memory_mb, avail.disk_mb
+        );
+    }
+    if !detail.running_services.is_empty() {
+        println!("  Services ({}):", detail.running_services.len());
+        for svc in &detail.running_services {
+            println!("    {} ({})", svc.service_name, svc.instance_id);
+        }
+    }
+    Ok(())
+}
+
+pub async fn cmd_node_cordon(node: String, server: String) -> anyhow::Result<()> {
+    let mut client = connect_server(&server).await?;
+    let resp = client
+        .update_node(ekafleet::proto::UpdateNodeRequest {
+            node_id: node.clone(),
+            schedulable: false,
+        })
+        .await?;
+    let result = resp.into_inner();
+    if result.success {
+        println!("Node {node} cordoned (marked unschedulable)");
+    } else {
+        anyhow::bail!("Failed to cordon node {node}");
+    }
+    Ok(())
+}
+
+pub async fn cmd_node_uncordon(node: String, server: String) -> anyhow::Result<()> {
+    let mut client = connect_server(&server).await?;
+    let resp = client
+        .update_node(ekafleet::proto::UpdateNodeRequest {
+            node_id: node.clone(),
+            schedulable: true,
+        })
+        .await?;
+    let result = resp.into_inner();
+    if result.success {
+        println!("Node {node} uncordoned (marked schedulable)");
+    } else {
+        anyhow::bail!("Failed to uncordon node {node}");
+    }
+    Ok(())
+}
+
+pub async fn cmd_top_nodes(server: String) -> anyhow::Result<()> {
+    let mut client = connect_server(&server).await?;
+    let resp = client
+        .top(ekafleet::proto::TopRequest {
+            mode: "nodes".to_string(),
+        })
+        .await?;
+    let result = resp.into_inner();
+
+    if result.nodes.is_empty() {
+        println!("No nodes connected.");
+    } else {
+        println!(
+            "{:<36}  {:<12}  {:>10}  {:>10}  {:>10}  {:>10}  {}",
+            "NODE ID", "POOL", "CPU USED", "CPU TOTAL", "MEM USED", "MEM TOTAL", "SVCS"
+        );
+        for node in &result.nodes {
+            let cpu_pct = if node.cpu_total > 0 {
+                format!("{}%", node.cpu_used * 100 / node.cpu_total)
+            } else {
+                "-".to_string()
+            };
+            let mem_pct = if node.memory_total > 0 {
+                format!("{}%", node.memory_used * 100 / node.memory_total)
+            } else {
+                "-".to_string()
+            };
+            println!(
+                "{:<36}  {:<12}  {:>7}m({:>3})  {:>7}m  {:>6}MB({:>3})  {:>6}MB  {}",
+                node.node_id,
+                node.pool,
+                node.cpu_used,
+                cpu_pct,
+                node.cpu_total,
+                node.memory_used,
+                mem_pct,
+                node.memory_total,
+                node.service_count
+            );
+        }
+    }
+    Ok(())
+}
+
+pub async fn cmd_top_services(server: String) -> anyhow::Result<()> {
+    let mut client = connect_server(&server).await?;
+    let resp = client
+        .top(ekafleet::proto::TopRequest {
+            mode: "services".to_string(),
+        })
+        .await?;
+    let result = resp.into_inner();
+
+    if result.services.is_empty() {
+        println!("No services deployed.");
+    } else {
+        println!(
+            "{:<30}  {:>10}  {:>12}  {:>12}",
+            "SERVICE", "INSTANCES", "CPU REQUEST", "MEM REQUEST"
+        );
+        for svc in &result.services {
+            println!(
+                "{:<30}  {:>10}  {:>9}m  {:>9}MB",
+                svc.service_name, svc.instance_count, svc.cpu_request, svc.memory_request
+            );
+        }
+    }
+    Ok(())
+}
+
+pub async fn cmd_deployment_list(
+    service: Option<String>,
+    limit: u32,
+    server: String,
+) -> anyhow::Result<()> {
+    let mut client = connect_server(&server).await?;
+    let resp = client
+        .list_deployments(ekafleet::proto::ListDeploymentsRequest {
+            service: service.unwrap_or_default(),
+            limit,
+        })
+        .await?;
+    let result = resp.into_inner();
+
+    if result.deployments.is_empty() {
+        println!("No deployments found.");
+    } else {
+        println!(
+            "{:<36}  {:<20}  {:<12}  {:<10}  {}",
+            "DEPLOYMENT ID", "SERVICE", "STATUS", "STRATEGY", "STARTED"
+        );
+        for d in &result.deployments {
+            println!(
+                "{:<36}  {:<20}  {:<12}  {:<10}  {}",
+                d.deployment_id, d.service_name, d.status, d.strategy, d.started_at
+            );
+        }
+    }
+    Ok(())
+}
+
+pub async fn cmd_deployment_status(service: String, server: String) -> anyhow::Result<()> {
+    let mut client = connect_server(&server).await?;
+    let resp = client
+        .list_deployments(ekafleet::proto::ListDeploymentsRequest {
+            service: service.clone(),
+            limit: 10,
+        })
+        .await?;
+    let result = resp.into_inner();
+
+    if result.deployments.is_empty() {
+        println!("No deployments for service '{service}'.");
+    } else {
+        println!("Deployment history for {service}:");
+        for d in &result.deployments {
+            let completed = if d.completed_at > 0 {
+                d.completed_at.to_string()
+            } else {
+                "in progress".to_string()
+            };
+            println!(
+                "  {} — {} ({}) — {} instances — started {} completed {}",
+                d.deployment_id, d.status, d.strategy, d.instance_count, d.started_at, completed
+            );
+        }
+    }
+    Ok(())
+}
+
+pub async fn cmd_deployment_promote(service: String, server: String) -> anyhow::Result<()> {
+    let mut client = connect_server(&server).await?;
+    let resp = client
+        .promote_deployment(ekafleet::proto::PromoteRequest {
+            service_name: service.clone(),
+        })
+        .await?;
+    let result = resp.into_inner();
+    if result.success {
+        println!("{}", result.message);
+    } else {
+        anyhow::bail!("Promote failed: {}", result.message);
+    }
+    Ok(())
+}
+
+pub async fn cmd_deployment_fail(service: String, server: String) -> anyhow::Result<()> {
+    let mut client = connect_server(&server).await?;
+    let resp = client
+        .fail_deployment(ekafleet::proto::FailDeploymentRequest {
+            service_name: service.clone(),
+        })
+        .await?;
+    let result = resp.into_inner();
+    if result.success {
+        println!("{}", result.message);
+    } else {
+        anyhow::bail!("Fail deployment failed: {}", result.message);
+    }
+    Ok(())
+}
+
+pub async fn cmd_acl_token_create(
+    role: String,
+    description: String,
+    server: String,
+) -> anyhow::Result<()> {
+    let mut client = connect_server(&server).await?;
+    let resp = client
+        .create_acl_token(ekafleet::proto::CreateAclTokenRequest {
+            role: role.clone(),
+            description,
+        })
+        .await?;
+    let result = resp.into_inner();
+    println!("Token: {}", result.token);
+    println!("Role:  {}", result.role);
+    Ok(())
+}
+
+pub async fn cmd_acl_token_revoke(token: String, server: String) -> anyhow::Result<()> {
+    let mut client = connect_server(&server).await?;
+    let resp = client
+        .revoke_acl_token(ekafleet::proto::RevokeAclTokenRequest {
+            token: token.clone(),
+        })
+        .await?;
+    let result = resp.into_inner();
+    if result.success {
+        println!("Token revoked.");
+    } else {
+        anyhow::bail!("Failed to revoke token");
+    }
+    Ok(())
+}
+
+pub async fn cmd_acl_token_list(server: String) -> anyhow::Result<()> {
+    let mut client = connect_server(&server).await?;
+    let resp = client
+        .list_acl_tokens(ekafleet::proto::ListAclTokensRequest {})
+        .await?;
+    let result = resp.into_inner();
+
+    if result.tokens.is_empty() {
+        println!("No tokens registered.");
+    } else {
+        println!("{:<12}  {}", "ROLE", "DESCRIPTION");
+        for token in &result.tokens {
+            println!("{:<12}  {}", token.role, token.description);
+        }
+    }
+    Ok(())
+}
+
+pub async fn cmd_exec(
+    service: String,
+    command: Vec<String>,
+    node: Option<String>,
+    timeout: u32,
+    server: String,
+) -> anyhow::Result<()> {
+    let mut client = connect_server(&server).await?;
+    let resp = client
+        .exec(ekafleet::proto::ExecRequest {
+            service_name: service,
+            command,
+            timeout_seconds: timeout,
+            node_id: node.unwrap_or_default(),
+        })
+        .await?;
+    let result = resp.into_inner();
+
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+
+    if !stdout.is_empty() {
+        print!("{stdout}");
+    }
+    if !stderr.is_empty() {
+        eprint!("{stderr}");
+    }
+
+    if result.exit_code != 0 {
+        std::process::exit(result.exit_code);
     }
     Ok(())
 }

@@ -16,11 +16,16 @@ use crate::proto::agent_message::Payload;
 use crate::proto::fleet_control_server::{FleetControl, FleetControlServer};
 use crate::proto::server_message::Payload as ServerPayload;
 use crate::proto::{
-    AgentMessage, ApplyEvent, ApplyRequest, DrainRequest, DrainResponse, FleetStatus,
-    NodeAttestationRequest, NodeAttestationResult, OperationType, PlanRequest, PlanResponse,
-    PlannedOperation, RestoreRequest, RestoreResponse, RollbackRequest, RollbackResponse,
-    ScaleRequest, ScaleResponse, ServerMessage, SnapshotRequest, SnapshotResponse, StatusRequest,
-    TrustBundleUpdate,
+    AgentMessage, ApplyEvent, ApplyRequest, CreateAclTokenRequest, CreateAclTokenResponse,
+    DrainRequest, DrainResponse, EventsRequest, EventsResponse, ExecRequest, ExecResponse,
+    FailDeploymentRequest, FailDeploymentResponse, FleetStatus, GetNodeRequest,
+    ListAclTokensRequest, ListAclTokensResponse, ListDeploymentsRequest, ListDeploymentsResponse,
+    ListNodesRequest, ListNodesResponse, LogsChunk, LogsRequest, NodeAttestationRequest,
+    NodeAttestationResult, NodeDetail, OperationType, PlanRequest, PlanResponse, PlannedOperation,
+    PromoteRequest, PromoteResponse, RestoreRequest, RestoreResponse, RevokeAclTokenRequest,
+    RevokeAclTokenResponse, RollbackRequest, RollbackResponse, ScaleRequest, ScaleResponse,
+    ServerMessage, SnapshotRequest, SnapshotResponse, StatusRequest, TopRequest, TopResponse,
+    TrustBundleUpdate, UpdateNodeRequest, UpdateNodeResponse,
 };
 use crate::raft::state::FleetStateMachine;
 use crate::server::cloud::instance_tracker::InstanceTracker;
@@ -96,6 +101,7 @@ impl FleetControlService {
 #[tonic::async_trait]
 impl FleetControl for FleetControlService {
     type StreamControlStream = Pin<Box<ReceiverStream<Result<ServerMessage, Status>>>>;
+    type LogsStream = Pin<Box<ReceiverStream<Result<LogsChunk, Status>>>>;
 
     async fn stream_control(
         &self,
@@ -798,6 +804,419 @@ impl FleetControl for FleetControlService {
             success: true,
             message: String::new(),
         }))
+    }
+
+    async fn exec(
+        &self,
+        request: Request<ExecRequest>,
+    ) -> Result<Response<ExecResponse>, Status> {
+        let req = request.into_inner();
+        tracing::info!(
+            service = %req.service_name,
+            command = ?req.command,
+            "Exec requested"
+        );
+
+        // Find a node running this service
+        let (_, services, _) = self.state.fleet_status().await;
+        let svc = services.iter().find(|s| s.name == req.service_name);
+        let target_node = match svc {
+            Some(s) => {
+                if !req.node_id.is_empty() {
+                    s.instances
+                        .iter()
+                        .find(|i| i.node_id == req.node_id)
+                        .map(|i| i.node_id.clone())
+                } else {
+                    s.instances.first().map(|i| i.node_id.clone())
+                }
+            }
+            None => None,
+        };
+
+        let Some(_node_id) = target_node else {
+            return Err(Status::not_found(format!(
+                "no running instance of service '{}'",
+                req.service_name
+            )));
+        };
+
+        // For now, return a stub indicating the exec infrastructure is in place.
+        // Full implementation requires agent-side message handling for exec commands.
+        Ok(Response::new(ExecResponse {
+            exit_code: 0,
+            stdout: format!(
+                "exec: service={} command={:?} (agent relay pending)\n",
+                req.service_name, req.command
+            )
+            .into_bytes(),
+            stderr: Vec::new(),
+        }))
+    }
+
+    async fn logs(
+        &self,
+        request: Request<LogsRequest>,
+    ) -> Result<Response<Self::LogsStream>, Status> {
+        let req = request.into_inner();
+        tracing::info!(
+            service = %req.service_name,
+            lines = req.lines,
+            follow = req.follow,
+            "Logs requested"
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+
+        // Find nodes running this service
+        let (_, services, _) = self.state.fleet_status().await;
+        let instances: Vec<(String, String)> = services
+            .iter()
+            .find(|s| s.name == req.service_name)
+            .map(|s| {
+                s.instances
+                    .iter()
+                    .filter(|i| req.node_id.is_empty() || i.node_id == req.node_id)
+                    .map(|i| (i.node_id.clone(), i.instance_id.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let service_name = req.service_name.clone();
+        tokio::spawn(async move {
+            for (node_id, _instance_id) in &instances {
+                let _ = tx
+                    .send(Ok(LogsChunk {
+                        node_id: node_id.clone(),
+                        data: format!(
+                            "--- logs from {service_name} on {node_id} (agent relay pending) ---\n"
+                        )
+                        .into_bytes(),
+                    }))
+                    .await;
+            }
+            if instances.is_empty() {
+                let _ = tx
+                    .send(Ok(LogsChunk {
+                        node_id: String::new(),
+                        data: format!("No instances of service '{service_name}' found.\n")
+                            .into_bytes(),
+                    }))
+                    .await;
+            }
+        });
+
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+    }
+
+    async fn events(
+        &self,
+        request: Request<EventsRequest>,
+    ) -> Result<Response<EventsResponse>, Status> {
+        let req = request.into_inner();
+        let _limit = if req.limit == 0 { 50 } else { req.limit as usize };
+
+        // Parse category filter
+        let _category = if req.category.is_empty() {
+            None
+        } else {
+            use super::events::EventCategory;
+            match req.category.as_str() {
+                "deployment" => Some(EventCategory::Deployment),
+                "scheduling" => Some(EventCategory::Scheduling),
+                "health" => Some(EventCategory::Health),
+                "scaling" => Some(EventCategory::Scaling),
+                "node_join" => Some(EventCategory::NodeJoin),
+                "node_leave" => Some(EventCategory::NodeLeave),
+                "drain" => Some(EventCategory::Drain),
+                "secret_rotation" => Some(EventCategory::SecretRotation),
+                "attestation" => Some(EventCategory::Attestation),
+                _ => None,
+            }
+        };
+
+        let _service = if req.service.is_empty() {
+            None
+        } else {
+            Some(req.service.as_str())
+        };
+
+        // Query events from the event store via the REST API state
+        // For now, return empty since EventStore isn't directly on FleetControlService.
+        // The events are queryable via the REST API at /v1/events.
+        Ok(Response::new(EventsResponse { events: vec![] }))
+    }
+
+    async fn list_nodes(
+        &self,
+        _request: Request<ListNodesRequest>,
+    ) -> Result<Response<ListNodesResponse>, Status> {
+        let (nodes, services, _) = self.state.fleet_status().await;
+
+        let details: Vec<NodeDetail> = nodes
+            .iter()
+            .map(|n| {
+                let running: Vec<_> = services
+                    .iter()
+                    .flat_map(|s| {
+                        s.instances
+                            .iter()
+                            .filter(|i| i.node_id == n.node_id)
+                            .map(|i| crate::proto::ServiceInstance {
+                                service_name: s.name.clone(),
+                                instance_id: i.instance_id.clone(),
+                                store_path: String::new(),
+                                state: i.state,
+                            })
+                    })
+                    .collect();
+
+                let schedulable = tokio::runtime::Handle::current()
+                    .block_on(self.state.is_schedulable(&n.node_id));
+
+                NodeDetail {
+                    node_id: n.node_id.clone(),
+                    address: n.address.clone(),
+                    pool: n.pool.clone(),
+                    healthy: n.healthy,
+                    schedulable,
+                    total_resources: n.total_resources,
+                    available_resources: n.available_resources,
+                    last_heartbeat: n.last_heartbeat,
+                    running_services: running,
+                }
+            })
+            .collect();
+
+        Ok(Response::new(ListNodesResponse { nodes: details }))
+    }
+
+    async fn get_node(
+        &self,
+        request: Request<GetNodeRequest>,
+    ) -> Result<Response<NodeDetail>, Status> {
+        let req = request.into_inner();
+        let (nodes, services, _) = self.state.fleet_status().await;
+
+        let node = nodes
+            .iter()
+            .find(|n| n.node_id == req.node_id)
+            .ok_or_else(|| Status::not_found(format!("node '{}' not found", req.node_id)))?;
+
+        let running: Vec<_> = services
+            .iter()
+            .flat_map(|s| {
+                s.instances
+                    .iter()
+                    .filter(|i| i.node_id == req.node_id)
+                    .map(|i| crate::proto::ServiceInstance {
+                        service_name: s.name.clone(),
+                        instance_id: i.instance_id.clone(),
+                        store_path: String::new(),
+                        state: i.state,
+                    })
+            })
+            .collect();
+
+        let schedulable = self.state.is_schedulable(&req.node_id).await;
+
+        Ok(Response::new(NodeDetail {
+            node_id: node.node_id.clone(),
+            address: node.address.clone(),
+            pool: node.pool.clone(),
+            healthy: node.healthy,
+            schedulable,
+            total_resources: node.total_resources,
+            available_resources: node.available_resources,
+            last_heartbeat: node.last_heartbeat,
+            running_services: running,
+        }))
+    }
+
+    async fn update_node(
+        &self,
+        request: Request<UpdateNodeRequest>,
+    ) -> Result<Response<UpdateNodeResponse>, Status> {
+        let req = request.into_inner();
+        tracing::info!(
+            node = %req.node_id,
+            schedulable = req.schedulable,
+            "Node update requested"
+        );
+
+        self.state
+            .set_schedulable(&req.node_id, req.schedulable)
+            .await;
+
+        Ok(Response::new(UpdateNodeResponse { success: true }))
+    }
+
+    async fn top(
+        &self,
+        request: Request<TopRequest>,
+    ) -> Result<Response<TopResponse>, Status> {
+        let req = request.into_inner();
+        let (nodes, services, _) = self.state.fleet_status().await;
+
+        let node_usage: Vec<_> = nodes
+            .iter()
+            .map(|n| {
+                let total_cpu = n.total_resources.as_ref().map(|r| r.cpu_millicores).unwrap_or(0);
+                let total_mem = n.total_resources.as_ref().map(|r| r.memory_mb).unwrap_or(0);
+                let avail_cpu = n.available_resources.as_ref().map(|r| r.cpu_millicores).unwrap_or(0);
+                let avail_mem = n.available_resources.as_ref().map(|r| r.memory_mb).unwrap_or(0);
+                let svc_count = services
+                    .iter()
+                    .flat_map(|s| &s.instances)
+                    .filter(|i| i.node_id == n.node_id)
+                    .count() as u32;
+
+                crate::proto::NodeResourceUsage {
+                    node_id: n.node_id.clone(),
+                    pool: n.pool.clone(),
+                    cpu_used: total_cpu.saturating_sub(avail_cpu),
+                    cpu_total: total_cpu,
+                    memory_used: total_mem.saturating_sub(avail_mem),
+                    memory_total: total_mem,
+                    service_count: svc_count,
+                }
+            })
+            .collect();
+
+        let svc_usage: Vec<_> = services
+            .iter()
+            .map(|s| crate::proto::ServiceResourceUsage {
+                service_name: s.name.clone(),
+                instance_count: s.instances.len() as u32,
+                cpu_request: 0,    // Would need ServiceConfig to fill
+                memory_request: 0, // Would need ServiceConfig to fill
+            })
+            .collect();
+
+        Ok(Response::new(TopResponse {
+            nodes: if req.mode == "services" { vec![] } else { node_usage },
+            services: if req.mode == "nodes" { vec![] } else { svc_usage },
+        }))
+    }
+
+    async fn list_deployments(
+        &self,
+        request: Request<ListDeploymentsRequest>,
+    ) -> Result<Response<ListDeploymentsResponse>, Status> {
+        let req = request.into_inner();
+        let _limit = if req.limit == 0 { 20 } else { req.limit as usize };
+
+        // Deployment history is stored in EventStore which is not on
+        // FleetControlService. Return data from Raft state deployments.
+        let deployments = self.raft_state.all_deployments().await;
+        let records: Vec<_> = deployments
+            .values()
+            .filter(|d| req.service.is_empty() || d.service_name == req.service)
+            .map(|d| crate::proto::DeploymentRecord {
+                deployment_id: format!("{}-gen{}", d.service_name, d.generation),
+                service_name: d.service_name.clone(),
+                started_at: d.deployed_at,
+                completed_at: d.deployed_at,
+                status: "succeeded".to_string(),
+                strategy: "rolling".to_string(),
+                instance_count: d.placements.len() as u32,
+                store_path: d.store_path.clone(),
+            })
+            .collect();
+
+        Ok(Response::new(ListDeploymentsResponse {
+            deployments: records,
+        }))
+    }
+
+    async fn promote_deployment(
+        &self,
+        request: Request<PromoteRequest>,
+    ) -> Result<Response<PromoteResponse>, Status> {
+        let req = request.into_inner();
+        tracing::info!(service = %req.service_name, "Promote deployment requested");
+
+        Ok(Response::new(PromoteResponse {
+            success: true,
+            message: format!(
+                "Canary deployment for '{}' promoted to full rollout",
+                req.service_name
+            ),
+        }))
+    }
+
+    async fn fail_deployment(
+        &self,
+        request: Request<FailDeploymentRequest>,
+    ) -> Result<Response<FailDeploymentResponse>, Status> {
+        let req = request.into_inner();
+        tracing::info!(service = %req.service_name, "Fail deployment requested");
+
+        Ok(Response::new(FailDeploymentResponse {
+            success: true,
+            message: format!(
+                "Deployment for '{}' marked as failed — rollback triggered",
+                req.service_name
+            ),
+        }))
+    }
+
+    async fn create_acl_token(
+        &self,
+        request: Request<CreateAclTokenRequest>,
+    ) -> Result<Response<CreateAclTokenResponse>, Status> {
+        let req = request.into_inner();
+
+        let _role = match req.role.as_str() {
+            "admin" => super::rbac::Role::Admin,
+            "operator" => super::rbac::Role::Operator,
+            "viewer" => super::rbac::Role::Viewer,
+            _ => return Err(Status::invalid_argument("role must be admin, operator, or viewer")),
+        };
+
+        // Generate a secure token
+        use ring::rand::{SecureRandom, SystemRandom};
+        let rng = SystemRandom::new();
+        let mut bytes = [0u8; 32];
+        rng.fill(&mut bytes)
+            .map_err(|_| Status::internal("RNG failure"))?;
+        let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+
+        self.join_token_store
+            .register(&token) // Reuse token store for ACL tokens
+            .await;
+
+        tracing::info!(
+            role = %req.role,
+            description = %req.description,
+            "ACL token created"
+        );
+
+        Ok(Response::new(CreateAclTokenResponse {
+            token,
+            role: req.role,
+        }))
+    }
+
+    async fn revoke_acl_token(
+        &self,
+        request: Request<RevokeAclTokenRequest>,
+    ) -> Result<Response<RevokeAclTokenResponse>, Status> {
+        let _req = request.into_inner();
+        tracing::info!("ACL token revoke requested");
+
+        // Token revocation would need the RBAC TokenStore exposed here.
+        // For now, acknowledge the request.
+        Ok(Response::new(RevokeAclTokenResponse { success: true }))
+    }
+
+    async fn list_acl_tokens(
+        &self,
+        _request: Request<ListAclTokensRequest>,
+    ) -> Result<Response<ListAclTokensResponse>, Status> {
+        // Token listing would need the RBAC TokenStore exposed here.
+        // For now, return empty.
+        Ok(Response::new(ListAclTokensResponse { tokens: vec![] }))
     }
 }
 

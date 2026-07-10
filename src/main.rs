@@ -196,10 +196,22 @@ enum Command {
         action: TokenAction,
     },
 
-    /// Aggregate logs from service replicas
+    /// Stream logs from service replicas
     Logs {
         /// Service name
         service: String,
+
+        /// Stream logs continuously
+        #[arg(long, short)]
+        follow: bool,
+
+        /// Number of lines to show
+        #[arg(long, default_value = "100")]
+        tail: u32,
+
+        /// Target a specific node
+        #[arg(long)]
+        node: Option<String>,
 
         /// Server address
         #[arg(long, default_value = "127.0.0.1:7400")]
@@ -224,6 +236,82 @@ enum Command {
         /// Parameters as KEY=VALUE pairs
         #[arg(trailing_var_arg = true)]
         params: Vec<String>,
+
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+
+    /// Validate fleet configuration without connecting to a server
+    Validate {
+        /// Path to fleet.nix configuration
+        #[arg(long, default_value = "fleet.nix")]
+        config: PathBuf,
+    },
+
+    /// Query fleet events
+    Events {
+        /// Filter by category (deployment, scaling, health, drain, etc.)
+        #[arg(long)]
+        category: Option<String>,
+
+        /// Filter by service name
+        #[arg(long)]
+        service: Option<String>,
+
+        /// Filter by node ID
+        #[arg(long)]
+        node: Option<String>,
+
+        /// Maximum number of events to show
+        #[arg(long, default_value = "50")]
+        limit: u32,
+
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+
+    /// Node management
+    Node {
+        #[command(subcommand)]
+        action: NodeAction,
+    },
+
+    /// Real-time resource usage
+    Top {
+        #[command(subcommand)]
+        mode: TopMode,
+    },
+
+    /// Deployment management
+    Deployment {
+        #[command(subcommand)]
+        action: DeploymentAction,
+    },
+
+    /// ACL token management
+    Acl {
+        #[command(subcommand)]
+        action: AclAction,
+    },
+
+    /// Execute a command in a service's context
+    Exec {
+        /// Service name
+        service: String,
+
+        /// Command to execute
+        #[arg(trailing_var_arg = true, required = true)]
+        command: Vec<String>,
+
+        /// Target a specific node
+        #[arg(long)]
+        node: Option<String>,
+
+        /// Execution timeout in seconds
+        #[arg(long, default_value = "30")]
+        timeout: u32,
 
         /// Server address
         #[arg(long, default_value = "127.0.0.1:7400")]
@@ -276,6 +364,135 @@ enum TokenAction {
         /// Token type (agent or server)
         #[arg(long, default_value = "agent")]
         r#type: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum NodeAction {
+    /// List all nodes
+    List {
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+    /// Show detailed node information
+    Status {
+        /// Node ID
+        node: String,
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+    /// Mark a node as unschedulable
+    Cordon {
+        /// Node ID
+        node: String,
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+    /// Mark a node as schedulable
+    Uncordon {
+        /// Node ID
+        node: String,
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum TopMode {
+    /// Resource usage per node
+    Nodes {
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+    /// Resource usage per service
+    Services {
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum DeploymentAction {
+    /// List recent deployments
+    List {
+        /// Filter by service name
+        #[arg(long)]
+        service: Option<String>,
+        /// Maximum number of deployments
+        #[arg(long, default_value = "20")]
+        limit: u32,
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+    /// Show deployment history for a service
+    Status {
+        /// Service name
+        service: String,
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+    /// Promote a canary deployment
+    Promote {
+        /// Service name
+        service: String,
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+    /// Fail a stuck deployment (triggers rollback)
+    Fail {
+        /// Service name
+        service: String,
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum AclAction {
+    /// Token management
+    Token {
+        #[command(subcommand)]
+        action: AclTokenAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum AclTokenAction {
+    /// Create a new ACL token
+    Create {
+        /// Role: admin, operator, or viewer
+        #[arg(long)]
+        role: String,
+        /// Description for this token
+        #[arg(long, default_value = "")]
+        description: String,
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+    /// Revoke an ACL token
+    Revoke {
+        /// Token to revoke
+        token: String,
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+    /// List all ACL tokens
+    List {
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
     },
 }
 
@@ -355,7 +572,13 @@ async fn main() -> anyhow::Result<()> {
             action: TokenAction::Create { r#type },
         } => commands::cmd_token_create(r#type).await?,
 
-        Command::Logs { service, server } => commands::cmd_logs(service, server).await?,
+        Command::Logs {
+            service,
+            follow,
+            tail,
+            node,
+            server,
+        } => commands::cmd_logs(service, follow, tail, node, server).await?,
 
         Command::Ssh { machine, server } => commands::cmd_ssh(machine, server).await?,
 
@@ -374,6 +597,75 @@ async fn main() -> anyhow::Result<()> {
         Command::Upgrade { store_path, server } => {
             commands::cmd_upgrade(store_path, server).await?
         }
+
+        Command::Validate { config } => commands::cmd_validate(config).await?,
+
+        Command::Events {
+            category,
+            service,
+            node,
+            limit,
+            server,
+        } => commands::cmd_events(category, service, node, limit, server).await?,
+
+        Command::Node { action } => match action {
+            NodeAction::List { server } => commands::cmd_node_list(server).await?,
+            NodeAction::Status { node, server } => {
+                commands::cmd_node_status(node, server).await?
+            }
+            NodeAction::Cordon { node, server } => {
+                commands::cmd_node_cordon(node, server).await?
+            }
+            NodeAction::Uncordon { node, server } => {
+                commands::cmd_node_uncordon(node, server).await?
+            }
+        },
+
+        Command::Top { mode } => match mode {
+            TopMode::Nodes { server } => commands::cmd_top_nodes(server).await?,
+            TopMode::Services { server } => commands::cmd_top_services(server).await?,
+        },
+
+        Command::Deployment { action } => match action {
+            DeploymentAction::List {
+                service,
+                limit,
+                server,
+            } => commands::cmd_deployment_list(service, limit, server).await?,
+            DeploymentAction::Status { service, server } => {
+                commands::cmd_deployment_status(service, server).await?
+            }
+            DeploymentAction::Promote { service, server } => {
+                commands::cmd_deployment_promote(service, server).await?
+            }
+            DeploymentAction::Fail { service, server } => {
+                commands::cmd_deployment_fail(service, server).await?
+            }
+        },
+
+        Command::Acl { action } => match action {
+            AclAction::Token { action } => match action {
+                AclTokenAction::Create {
+                    role,
+                    description,
+                    server,
+                } => commands::cmd_acl_token_create(role, description, server).await?,
+                AclTokenAction::Revoke { token, server } => {
+                    commands::cmd_acl_token_revoke(token, server).await?
+                }
+                AclTokenAction::List { server } => {
+                    commands::cmd_acl_token_list(server).await?
+                }
+            },
+        },
+
+        Command::Exec {
+            service,
+            command,
+            node,
+            timeout,
+            server,
+        } => commands::cmd_exec(service, command, node, timeout, server).await?,
     }
 
     Ok(())
