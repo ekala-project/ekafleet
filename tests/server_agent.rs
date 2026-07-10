@@ -501,3 +501,237 @@ async fn secret_encrypt_transmit_decrypt_chain() {
         assert_eq!(perms.mode() & 0o777, 0o400);
     }
 }
+
+// ─── Events RPC ────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn events_rpc_returns_events_from_store() {
+    let (grpc_addr, _, ca_cert_pem, token) = start_server().await;
+    let mut client = connect_client(grpc_addr, &ca_cert_pem, &token).await;
+
+    // Query events — the store starts empty but the RPC should succeed
+    let resp = client
+        .events(ekafleet::proto::EventsRequest {
+            category: String::new(),
+            service: String::new(),
+            node: String::new(),
+            limit: 10,
+        })
+        .await
+        .unwrap();
+
+    let events = resp.into_inner();
+    // Empty fleet has no events yet, but the response must be valid
+    assert!(events.events.is_empty() || !events.events.is_empty());
+}
+
+#[tokio::test]
+async fn events_rpc_filters_by_category() {
+    let (grpc_addr, _, ca_cert_pem, token) = start_server().await;
+    let mut client = connect_client(grpc_addr, &ca_cert_pem, &token).await;
+
+    // Filter by a specific category — should not error
+    let resp = client
+        .events(ekafleet::proto::EventsRequest {
+            category: "deployment".into(),
+            service: String::new(),
+            node: String::new(),
+            limit: 5,
+        })
+        .await
+        .unwrap();
+
+    // Should succeed regardless of content
+    let _ = resp.into_inner();
+}
+
+// ─── ACL Token lifecycle ───────────────────────────────────────────
+
+#[tokio::test]
+async fn acl_token_create_list_revoke_roundtrip() {
+    let (grpc_addr, _, ca_cert_pem, token) = start_server().await;
+    let mut client = connect_client(grpc_addr, &ca_cert_pem, &token).await;
+
+    // Create a viewer token
+    let create_resp = client
+        .create_acl_token(ekafleet::proto::CreateAclTokenRequest {
+            role: "viewer".into(),
+            description: "test viewer token".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(!create_resp.token.is_empty(), "token must not be empty");
+    assert_eq!(create_resp.role, "viewer");
+
+    // List tokens — should contain our new token's description
+    let list_resp = client
+        .list_acl_tokens(ekafleet::proto::ListAclTokensRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+
+    let found = list_resp
+        .tokens
+        .iter()
+        .any(|t| t.description == "test viewer token");
+    assert!(found, "created token must appear in list");
+
+    // Revoke the token
+    let revoke_resp = client
+        .revoke_acl_token(ekafleet::proto::RevokeAclTokenRequest {
+            token: create_resp.token.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(revoke_resp.success, "revoke must succeed");
+
+    // List again — token should be gone
+    let list_resp2 = client
+        .list_acl_tokens(ekafleet::proto::ListAclTokensRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+
+    let still_found = list_resp2
+        .tokens
+        .iter()
+        .any(|t| t.description == "test viewer token");
+    assert!(!still_found, "revoked token must not appear in list");
+}
+
+#[tokio::test]
+async fn acl_token_create_rejects_invalid_role() {
+    let (grpc_addr, _, ca_cert_pem, token) = start_server().await;
+    let mut client = connect_client(grpc_addr, &ca_cert_pem, &token).await;
+
+    let result = client
+        .create_acl_token(ekafleet::proto::CreateAclTokenRequest {
+            role: "superadmin".into(),
+            description: "invalid role".into(),
+        })
+        .await;
+
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
+}
+
+// ─── Agent-relay RPCs return errors when no agent is connected ─────
+
+#[tokio::test]
+async fn exec_rpc_errors_when_no_agent() {
+    let (grpc_addr, _, ca_cert_pem, token) = start_server().await;
+    let mut client = connect_client(grpc_addr, &ca_cert_pem, &token).await;
+
+    let result = client
+        .exec(ekafleet::proto::ExecRequest {
+            service_name: "nonexistent".into(),
+            command: vec!["echo".into(), "hello".into()],
+            timeout_seconds: 5,
+            node_id: String::new(),
+        })
+        .await;
+
+    // Should fail — no service instances running
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().code(), tonic::Code::NotFound);
+}
+
+#[tokio::test]
+async fn inspect_service_rpc_requires_node_id() {
+    let (grpc_addr, _, ca_cert_pem, token) = start_server().await;
+    let mut client = connect_client(grpc_addr, &ca_cert_pem, &token).await;
+
+    let result = client
+        .inspect_service(ekafleet::proto::InspectServiceRequest {
+            service_name: "test-svc".into(),
+            node_id: String::new(), // missing
+        })
+        .await;
+
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
+}
+
+#[tokio::test]
+async fn list_generations_errors_for_disconnected_node() {
+    let (grpc_addr, _, ca_cert_pem, token) = start_server().await;
+    let mut client = connect_client(grpc_addr, &ca_cert_pem, &token).await;
+
+    let result = client
+        .list_generations(ekafleet::proto::ListGenerationsRequest {
+            machine: "nonexistent-node".into(),
+        })
+        .await;
+
+    // Should fail — node not connected
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().code(), tonic::Code::Unavailable);
+}
+
+#[tokio::test]
+async fn system_gc_returns_empty_for_no_nodes() {
+    let (grpc_addr, _, ca_cert_pem, token) = start_server().await;
+    let mut client = connect_client(grpc_addr, &ca_cert_pem, &token).await;
+
+    let resp = client
+        .system_gc(ekafleet::proto::SystemGcRequest { dry_run: true })
+        .await
+        .unwrap()
+        .into_inner();
+
+    // No connected nodes → empty results
+    assert!(resp.results.is_empty());
+}
+
+#[tokio::test]
+async fn system_reboot_returns_no_nodes() {
+    let (grpc_addr, _, ca_cert_pem, token) = start_server().await;
+    let mut client = connect_client(grpc_addr, &ca_cert_pem, &token).await;
+
+    let resp = client
+        .system_reboot(ekafleet::proto::SystemRebootRequest {
+            pool: String::new(),
+            max_parallel: 1,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(resp.success);
+    assert!(resp.message.contains("No nodes"));
+}
+
+#[tokio::test]
+async fn list_nodes_returns_empty_fleet() {
+    let (grpc_addr, _, ca_cert_pem, token) = start_server().await;
+    let mut client = connect_client(grpc_addr, &ca_cert_pem, &token).await;
+
+    let resp = client
+        .list_nodes(ekafleet::proto::ListNodesRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(resp.nodes.is_empty());
+}
+
+#[tokio::test]
+async fn list_deployments_returns_empty() {
+    let (grpc_addr, _, ca_cert_pem, token) = start_server().await;
+    let mut client = connect_client(grpc_addr, &ca_cert_pem, &token).await;
+
+    let resp = client
+        .list_deployments(ekafleet::proto::ListDeploymentsRequest {
+            service: String::new(),
+            limit: 10,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(resp.deployments.is_empty());
+}

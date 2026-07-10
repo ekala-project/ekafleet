@@ -68,16 +68,41 @@ pkgs.testers.nixosTest {
     client.succeed("nc -z server 7400")
 
     # Verify the KV store works cross-machine
+    AUTH = "-H 'Authorization: Bearer cluster-token'"
+
     client.succeed(
-        "curl -sf -X PUT "
-        "-H 'Authorization: Bearer cluster-token' "
+        f"curl -sf -X PUT {AUTH} "
         "-d 'remote-value' "
         "http://server:7402/v1/kv/remote-key"
     )
     client.succeed(
-        "curl -sf "
-        "-H 'Authorization: Bearer cluster-token' "
+        f"curl -sf {AUTH} "
         "http://server:7402/v1/kv/remote-key | grep -q 'remote-value'"
+    )
+
+    # Verify events endpoint returns JSON from remote client
+    client.succeed(
+        f"curl -sf {AUTH} "
+        "http://server:7402/v1/events | jq -e 'type == \"array\"'"
+    )
+
+    # Verify deployments endpoint from remote client
+    client.succeed(
+        f"curl -sf {AUTH} "
+        "http://server:7402/v1/deployments | jq -e '.'"
+    )
+
+    # Verify alert silences from remote client
+    client.succeed(
+        f"curl -sf {AUTH} "
+        "http://server:7402/v1/alerts/silences | jq -e 'type == \"array\"'"
+    )
+
+    # Verify Prometheus metrics from remote client
+    client.succeed(
+        f"curl -sf {AUTH} "
+        "-o /dev/null -w '%{{http_code}}' "
+        "http://server:7402/metrics | grep -q '200'"
     )
   '';
 }
