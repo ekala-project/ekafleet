@@ -4,6 +4,7 @@ use tokio::sync::RwLock;
 
 /// Policy rule evaluated during plan/apply to enforce organizational constraints.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyRule {
     pub name: String,
     /// CEL-like expression that must evaluate to true.

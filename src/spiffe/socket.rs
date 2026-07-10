@@ -19,6 +19,7 @@ pub async fn serve_workload_api(
     workload_mgr: Arc<WorkloadManager>,
     socket_path: Option<&str>,
     jwt_key_material: &[u8],
+    shutdown: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<()> {
     let path = PathBuf::from(socket_path.unwrap_or(DEFAULT_SOCKET_PATH));
 
@@ -52,7 +53,7 @@ pub async fn serve_workload_api(
 
     tonic::transport::Server::builder()
         .add_service(SpiffeWorkloadApiServer::new(service))
-        .serve_with_incoming(uds_stream)
+        .serve_with_incoming_shutdown(uds_stream, shutdown.cancelled())
         .await?;
 
     // Cleanup socket on shutdown
@@ -84,10 +85,18 @@ mod tests {
         let sock_str = sock_path.to_str().unwrap().to_string();
 
         let mgr = Arc::new(WorkloadManager::new(dir.path(), "test.internal"));
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let test_shutdown = shutdown.clone();
 
         // Start the server in a background task
         let handle = tokio::spawn(async move {
-            serve_workload_api(mgr, Some(&sock_str), b"test-jwt-key-material-32bytes!!").await
+            serve_workload_api(
+                mgr,
+                Some(&sock_str),
+                b"test-jwt-key-material-32bytes!!",
+                test_shutdown,
+            )
+            .await
         });
 
         // Give it a moment to bind
@@ -96,7 +105,8 @@ mod tests {
         // Verify socket file exists
         assert!(sock_path.exists(), "socket file should exist");
 
-        // Abort the server
-        handle.abort();
+        // Gracefully stop the server
+        shutdown.cancel();
+        let _ = handle.await;
     }
 }

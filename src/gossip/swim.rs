@@ -92,8 +92,11 @@ impl SwimMembership {
     }
 
     /// Start the SWIM protocol. Listens for UDP messages and runs
-    /// the probe cycle.
-    pub async fn start(&self) -> Result<(), std::io::Error> {
+    /// the probe cycle. Stops when the cancellation token is triggered.
+    pub async fn start(
+        &self,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) -> Result<(), std::io::Error> {
         let state = self.inner.read().await;
         let socket = UdpSocket::bind(state.bind_addr).await?;
         let bind = state.bind_addr;
@@ -108,26 +111,32 @@ impl SwimMembership {
         let recv_inner = inner.clone();
         let recv_key = self.hmac_key.clone();
         let recv_socket = socket.clone();
+        let recv_shutdown = shutdown.child_token();
         tokio::spawn(async move {
             let mut buf = [0u8; 1500];
             loop {
-                match recv_socket.recv_from(&mut buf).await {
-                    Ok((len, src)) => {
-                        // Verify HMAC before processing
-                        let data = &buf[..len];
-                        if data.len() < HMAC_LEN {
-                            tracing::warn!(src = %src, "SWIM message too short, dropping");
-                            continue;
+                tokio::select! {
+                    _ = recv_shutdown.cancelled() => break,
+                    result = recv_socket.recv_from(&mut buf) => {
+                        match result {
+                            Ok((len, src)) => {
+                                // Verify HMAC before processing
+                                let data = &buf[..len];
+                                if data.len() < HMAC_LEN {
+                                    tracing::warn!(src = %src, "SWIM message too short, dropping");
+                                    continue;
+                                }
+                                let (payload, tag) = data.split_at(data.len() - HMAC_LEN);
+                                if hmac::verify(&recv_key, payload, tag).is_err() {
+                                    tracing::warn!(src = %src, "SWIM HMAC verification failed, dropping");
+                                    continue;
+                                }
+                                handle_message(&recv_inner, payload, src, &recv_socket, &recv_key).await;
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "SWIM recv error");
+                            }
                         }
-                        let (payload, tag) = data.split_at(data.len() - HMAC_LEN);
-                        if hmac::verify(&recv_key, payload, tag).is_err() {
-                            tracing::warn!(src = %src, "SWIM HMAC verification failed, dropping");
-                            continue;
-                        }
-                        handle_message(&recv_inner, payload, src, &recv_socket, &recv_key).await;
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "SWIM recv error");
                     }
                 }
             }
@@ -135,10 +144,14 @@ impl SwimMembership {
 
         // Spawn probe cycle
         let probe_inner = inner.clone();
+        let probe_shutdown = shutdown.child_token();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    _ = probe_shutdown.cancelled() => break,
+                    _ = interval.tick() => {}
+                }
                 probe_cycle(&probe_inner).await;
             }
         });
@@ -257,32 +270,50 @@ fn sign_with_key(key: &hmac::Key, payload: &[u8]) -> Vec<u8> {
 }
 
 /// Run one probe cycle: check for suspects and dead members.
+/// Snapshots member state under a read lock, then applies changes under a write lock
+/// to avoid holding the write lock during the entire iteration.
 async fn probe_cycle(state: &Arc<RwLock<MembershipState>>) {
-    let mut state = state.write().await;
-    let suspect_timeout = state.suspect_timeout;
-    let dead_timeout = state.dead_timeout;
+    // Snapshot under read lock
+    let transitions: Vec<(String, MemberStatus)> = {
+        let state = state.read().await;
+        let suspect_timeout = state.suspect_timeout;
+        let dead_timeout = state.dead_timeout;
 
-    for member in state.members.values_mut() {
-        let elapsed = member.last_seen.elapsed();
+        state
+            .members
+            .values()
+            .filter_map(|member| {
+                let elapsed = member.last_seen.elapsed();
+                match member.status {
+                    MemberStatus::Alive if elapsed > suspect_timeout => {
+                        tracing::warn!(
+                            node_id = %member.node_id,
+                            elapsed = ?elapsed,
+                            "Member suspected"
+                        );
+                        Some((member.node_id.clone(), MemberStatus::Suspect))
+                    }
+                    MemberStatus::Suspect if elapsed > dead_timeout => {
+                        tracing::error!(
+                            node_id = %member.node_id,
+                            elapsed = ?elapsed,
+                            "Member declared dead"
+                        );
+                        Some((member.node_id.clone(), MemberStatus::Dead))
+                    }
+                    _ => None,
+                }
+            })
+            .collect()
+    };
 
-        match member.status {
-            MemberStatus::Alive if elapsed > suspect_timeout => {
-                tracing::warn!(
-                    node_id = %member.node_id,
-                    elapsed = ?elapsed,
-                    "Member suspected"
-                );
-                member.status = MemberStatus::Suspect;
+    // Apply transitions under write lock only if there are changes
+    if !transitions.is_empty() {
+        let mut state = state.write().await;
+        for (node_id, new_status) in transitions {
+            if let Some(member) = state.members.get_mut(&node_id) {
+                member.status = new_status;
             }
-            MemberStatus::Suspect if elapsed > dead_timeout => {
-                tracing::error!(
-                    node_id = %member.node_id,
-                    elapsed = ?elapsed,
-                    "Member declared dead"
-                );
-                member.status = MemberStatus::Dead;
-            }
-            _ => {}
         }
     }
 }

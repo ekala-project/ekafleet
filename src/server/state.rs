@@ -158,40 +158,80 @@ impl FleetState {
     }
 
     /// Broadcast a message to all connected agents.
+    /// Clones senders under a read lock, then sends outside the lock to avoid
+    /// holding it across .await points.
     pub async fn broadcast(&self, msg: ServerMessage) {
-        let state = self.inner.read().await;
-        for (node_id, node) in &state.nodes {
-            if node.tx.send(msg.clone()).await.is_err() {
+        let senders: Vec<(String, mpsc::Sender<ServerMessage>)> = {
+            let state = self.inner.read().await;
+            state
+                .nodes
+                .iter()
+                .map(|(id, node)| (id.clone(), node.tx.clone()))
+                .collect()
+        };
+
+        for (node_id, tx) in senders {
+            if tx.send(msg.clone()).await.is_err() {
                 tracing::warn!(node_id, "Failed to send to agent");
             }
         }
     }
 
     /// Get a snapshot of fleet status for the Status RPC.
+    /// Takes a short read lock to snapshot node data, then aggregates outside the lock.
     pub async fn fleet_status(&self) -> (Vec<NodeStatus>, Vec<ServiceStatus>, Vec<PoolStatus>) {
-        let state = self.inner.read().await;
+        // Snapshot all data we need under a short read lock
+        struct NodeSnapshot {
+            node_id: String,
+            address: String,
+            pool: String,
+            total_resources: NodeResources,
+            available_resources: NodeResources,
+            heartbeat_elapsed_secs: u64,
+            services: Vec<(String, String, ServiceState, HealthStatus)>,
+        }
 
-        let nodes: Vec<NodeStatus> = state
-            .nodes
-            .iter()
-            .map(|(id, info)| {
-                let healthy = info.last_heartbeat.elapsed().as_secs() < 15;
-                NodeStatus {
+        let snapshots: Vec<NodeSnapshot> = {
+            let state = self.inner.read().await;
+            state
+                .nodes
+                .iter()
+                .map(|(id, info)| NodeSnapshot {
                     node_id: id.clone(),
                     address: info.address.clone(),
-                    healthy,
-                    total_resources: Some(info.total_resources),
-                    available_resources: Some(info.available_resources),
-                    last_heartbeat: info.last_heartbeat.elapsed().as_secs(),
                     pool: info.pool.clone(),
-                }
+                    total_resources: info.total_resources,
+                    available_resources: info.available_resources,
+                    heartbeat_elapsed_secs: info.last_heartbeat.elapsed().as_secs(),
+                    services: info
+                        .services
+                        .iter()
+                        .map(|(name, svc)| {
+                            (name.clone(), svc.instance_id.clone(), svc.state, svc.health)
+                        })
+                        .collect(),
+                })
+                .collect()
+        };
+        // Lock is now released — aggregate on the snapshot
+
+        let nodes: Vec<NodeStatus> = snapshots
+            .iter()
+            .map(|s| NodeStatus {
+                node_id: s.node_id.clone(),
+                address: s.address.clone(),
+                healthy: s.heartbeat_elapsed_secs < 15,
+                total_resources: Some(s.total_resources),
+                available_resources: Some(s.available_resources),
+                last_heartbeat: s.heartbeat_elapsed_secs,
+                pool: s.pool.clone(),
             })
             .collect();
 
         // Aggregate services across all nodes
         let mut svc_map: HashMap<String, ServiceStatus> = HashMap::new();
-        for (node_id, node) in &state.nodes {
-            for (svc_name, svc_info) in &node.services {
+        for snap in &snapshots {
+            for (svc_name, instance_id, state, health) in &snap.services {
                 let entry = svc_map
                     .entry(svc_name.clone())
                     .or_insert_with(|| ServiceStatus {
@@ -200,25 +240,25 @@ impl FleetState {
                         healthy_count: 0,
                         instances: vec![],
                     });
-                if svc_info.health == HealthStatus::Healthy {
+                if *health == HealthStatus::Healthy {
                     entry.healthy_count += 1;
                 }
                 entry.instances.push(crate::proto::InstanceStatus {
-                    instance_id: svc_info.instance_id.clone(),
-                    node_id: node_id.clone(),
-                    state: svc_info.state as i32,
-                    health: svc_info.health as i32,
+                    instance_id: instance_id.clone(),
+                    node_id: snap.node_id.clone(),
+                    state: *state as i32,
+                    health: *health as i32,
                 });
             }
         }
 
         // Aggregate pool status
         let mut pool_map: HashMap<String, PoolStatus> = HashMap::new();
-        for info in state.nodes.values() {
+        for snap in &snapshots {
             let entry = pool_map
-                .entry(info.pool.clone())
+                .entry(snap.pool.clone())
                 .or_insert_with(|| PoolStatus {
-                    name: info.pool.clone(),
+                    name: snap.pool.clone(),
                     machine_count: 0,
                     total_schedulable: Some(NodeResources {
                         cpu_millicores: 0,
@@ -234,18 +274,18 @@ impl FleetState {
                 });
             entry.machine_count += 1;
             if let Some(ref mut sched) = entry.total_schedulable {
-                sched.cpu_millicores += info.total_resources.cpu_millicores;
-                sched.memory_mb += info.total_resources.memory_mb;
+                sched.cpu_millicores += snap.total_resources.cpu_millicores;
+                sched.memory_mb += snap.total_resources.memory_mb;
             }
             if let Some(ref mut alloc) = entry.total_allocated {
-                let used_cpu = info
+                let used_cpu = snap
                     .total_resources
                     .cpu_millicores
-                    .saturating_sub(info.available_resources.cpu_millicores);
-                let used_mem = info
+                    .saturating_sub(snap.available_resources.cpu_millicores);
+                let used_mem = snap
                     .total_resources
                     .memory_mb
-                    .saturating_sub(info.available_resources.memory_mb);
+                    .saturating_sub(snap.available_resources.memory_mb);
                 alloc.cpu_millicores += used_cpu;
                 alloc.memory_mb += used_mem;
             }

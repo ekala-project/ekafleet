@@ -1830,6 +1830,7 @@ pub async fn serve_grpc(
     config: GrpcServerConfig,
     state: FleetState,
     token_store: TokenStore,
+    shutdown: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<()> {
     let GrpcServerConfig {
         addr,
@@ -1922,7 +1923,7 @@ pub async fn serve_grpc(
     tonic::transport::Server::builder()
         .tls_config(tls_config)?
         .add_service(FleetControlServer::with_interceptor(service, interceptor))
-        .serve(addr)
+        .serve_with_shutdown(addr, shutdown.cancelled())
         .await?;
 
     Ok(())

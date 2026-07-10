@@ -40,7 +40,14 @@ impl MetricsCollector {
     }
 
     /// Start scraping a service's metrics endpoint.
-    pub fn start_scraping(&self, service_name: String, port: u16, path: String) {
+    /// Stops when the cancellation token is triggered.
+    pub fn start_scraping(
+        &self,
+        service_name: String,
+        port: u16,
+        path: String,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) {
         let inner = self.inner.clone();
 
         tracing::info!(
@@ -54,7 +61,10 @@ impl MetricsCollector {
             let url = format!("http://127.0.0.1:{port}{path}");
 
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = interval.tick() => {}
+                }
                 match scrape_endpoint(&url).await {
                     Ok(samples) => {
                         let mut state = inner.write().await;

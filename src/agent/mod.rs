@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use tokio::sync::{RwLock, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
 
 use crate::agent::health::HealthChecker;
 use crate::ca::csr;
@@ -153,13 +154,18 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
     let response = client.stream_control(ReceiverStream::new(rx)).await?;
     let mut inbound = response.into_inner();
 
+    // Create a cancellation token for graceful shutdown
+    let shutdown = CancellationToken::new();
+
     // Spawn SPIFFE Workload API socket listener
     let wapi_mgr = workload_mgr.clone();
+    let wapi_shutdown = shutdown.child_token();
     tokio::spawn(async move {
         if let Err(e) = crate::spiffe::socket::serve_workload_api(
             wapi_mgr,
             None,
             b"ekafleet-default-jwt-signing-key",
+            wapi_shutdown,
         )
         .await
         {
@@ -170,10 +176,14 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
     // Spawn heartbeat sender
     let heartbeat_tx = tx.clone();
     let hb_node_id = node_id.clone();
+    let hb_shutdown = shutdown.child_token();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = hb_shutdown.cancelled() => break,
+                _ = interval.tick() => {}
+            }
             let msg = AgentMessage {
                 payload: Some(Payload::Heartbeat(Heartbeat {
                     node_id: hb_node_id.clone(),
@@ -193,10 +203,14 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
     let status_tx = tx.clone();
     let status_node_id = node_id.clone();
     let status_state = local_state.clone();
+    let status_shutdown = shutdown.child_token();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(10));
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = status_shutdown.cancelled() => break,
+                _ = interval.tick() => {}
+            }
             let state = status_state.read().await;
             let running = state
                 .desired_services
@@ -228,10 +242,14 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
     let renewal_node_id = node_id.clone();
     let renewal_mgr = workload_mgr.clone();
     let renewal_keys = pending_keys.clone();
+    let renewal_shutdown = shutdown.child_token();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = renewal_shutdown.cancelled() => break,
+                _ = interval.tick() => {}
+            }
             let renewals = renewal_mgr.needs_renewal().await;
             for service_name in renewals {
                 tracing::info!(service = %service_name, "Requesting SVID renewal");
@@ -273,10 +291,14 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
     let health_tx = tx.clone();
     let health_node_id = node_id.clone();
     let health_checker_clone = health_checker.clone();
+    let health_shutdown = shutdown.child_token();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(10));
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = health_shutdown.cancelled() => break,
+                _ = interval.tick() => {}
+            }
             let services = health_checker_clone.reports(&health_node_id).await;
             if services.is_empty() {
                 continue;
@@ -293,27 +315,43 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
         }
     });
 
-    // Process incoming server messages
-    while let Some(msg) = inbound.message().await? {
-        if let Some(payload) = msg.payload {
-            handlers::handle_server_message(
-                payload,
-                &supervisor,
-                &local_state,
-                &workload_mgr,
-                &pending_keys,
-                &secret_injector,
-                &dns_resolver,
-                &peer_manager,
-                &policy_enforcer,
-                &health_checker,
-                &tx,
-                &node_id,
-            )
-            .await;
+    // Process incoming server messages until stream ends or shutdown
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                tracing::info!("Agent shutting down");
+                break;
+            }
+            result = inbound.message() => {
+                match result? {
+                    Some(msg) => {
+                        if let Some(payload) = msg.payload {
+                            handlers::handle_server_message(
+                                payload,
+                                &supervisor,
+                                &local_state,
+                                &workload_mgr,
+                                &pending_keys,
+                                &secret_injector,
+                                &dns_resolver,
+                                &peer_manager,
+                                &policy_enforcer,
+                                &health_checker,
+                                &tx,
+                                &node_id,
+                            )
+                            .await;
+                        }
+                    }
+                    None => {
+                        tracing::warn!("Server stream ended");
+                        shutdown.cancel();
+                        break;
+                    }
+                }
+            }
         }
     }
 
-    tracing::warn!("Server stream ended");
     Ok(())
 }

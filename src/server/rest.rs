@@ -186,6 +186,7 @@ pub async fn serve_http(
     metrics: MetricsAggregator,
     alert_evaluator: AlertEvaluator,
     instance_tracker: Option<super::cloud::instance_tracker::InstanceTracker>,
+    shutdown: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<()> {
     use axum::extract::State;
     use axum::http::StatusCode;
@@ -256,7 +257,9 @@ pub async fn serve_http(
     tracing::info!(%addr, "HTTP server listening");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move { shutdown.cancelled().await })
+        .await?;
 
     Ok(())
 }

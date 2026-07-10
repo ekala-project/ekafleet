@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct SchedulingConfig {
     #[serde(default = "default_replicas")]
     pub replicas: u32,
@@ -38,11 +39,11 @@ pub struct SchedulingConfig {
     #[serde(default)]
     pub periodic: Option<PeriodicConfig>,
     /// Inter-service affinity: prefer or avoid co-location with other services.
-    #[serde(default, rename = "serviceAffinity")]
+    #[serde(default)]
     pub service_affinity: Vec<ServiceAffinityConfig>,
     /// Disruption budget: minimum availability guarantees during voluntary disruptions
     /// (node drain, rolling updates, scaling down).
-    #[serde(default, rename = "disruptionBudget")]
+    #[serde(default)]
     pub disruption_budget: Option<DisruptionBudget>,
     /// Parameterized job configuration. When set, this job can be dispatched
     /// with parameters that are injected as environment variables.
@@ -53,12 +54,13 @@ pub struct SchedulingConfig {
 
 /// Configuration for parameterized (dispatchable) batch jobs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ParameterizedConfig {
     /// Parameters that must be provided at dispatch time.
-    #[serde(default, rename = "requiredParams")]
+    #[serde(default)]
     pub required_params: Vec<String>,
     /// Parameters that have defaults and are optional at dispatch time.
-    #[serde(default, rename = "optionalParams")]
+    #[serde(default)]
     pub optional_params: Vec<String>,
 }
 
@@ -106,6 +108,7 @@ pub enum JobType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Constraint {
     pub attribute: String,
     pub op: String,
@@ -113,12 +116,14 @@ pub struct Constraint {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SpreadTarget {
     pub value: String,
     pub percent: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct SpreadConfig {
     pub attribute: String,
     #[serde(default)]
@@ -126,10 +131,10 @@ pub struct SpreadConfig {
     #[serde(default)]
     pub targets: Vec<SpreadTarget>,
     /// Maximum allowed skew between topology domains (K8s-style).
-    #[serde(default, rename = "maxSkew")]
+    #[serde(default)]
     pub max_skew: Option<u32>,
     /// Minimum number of topology domains required.
-    #[serde(default, rename = "minDomains")]
+    #[serde(default)]
     pub min_domains: Option<u32>,
     /// If true, spread becomes a hard constraint (filter phase).
     #[serde(default)]
@@ -137,6 +142,7 @@ pub struct SpreadConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AffinityConfig {
     pub attribute: String,
     pub op: String,
@@ -150,10 +156,11 @@ fn default_affinity_weight() -> i32 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct UpdateConfig {
-    #[serde(default = "default_strategy", rename = "strategy")]
+    #[serde(default = "default_strategy")]
     pub strategy: UpdateStrategy,
-    #[serde(default = "default_max_parallel", rename = "maxParallel")]
+    #[serde(default = "default_max_parallel")]
     pub max_parallel: u32,
     #[serde(default)]
     pub canary: u32,
@@ -161,13 +168,13 @@ pub struct UpdateConfig {
     pub min_healthy_time_secs: u64,
     #[serde(default = "default_healthy_deadline", rename = "healthyDeadline")]
     pub healthy_deadline_secs: u64,
-    #[serde(default, rename = "autoRevert")]
+    #[serde(default)]
     pub auto_revert: bool,
-    #[serde(default, rename = "autoPromote")]
+    #[serde(default)]
     pub auto_promote: bool,
     #[serde(default, rename = "progressDeadline")]
     pub progress_deadline_secs: Option<u64>,
-    #[serde(default, rename = "healthCheck")]
+    #[serde(default)]
     pub health_check: HealthCheckMode,
 }
 
@@ -210,6 +217,7 @@ pub enum UpdateStrategy {
 
 /// Toleration allows a service to be scheduled on a tainted machine.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Toleration {
     #[serde(default)]
     pub key: Option<String>,
@@ -219,7 +227,7 @@ pub struct Toleration {
     pub value: Option<String>,
     #[serde(default)]
     pub effect: Option<TaintEffect>,
-    #[serde(default, rename = "tolerationSeconds")]
+    #[serde(default)]
     pub toleration_seconds: Option<u64>,
 }
 
@@ -233,6 +241,7 @@ pub enum TolerationOp {
 
 /// Taint on a machine to repel non-tolerating services.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Taint {
     pub key: String,
     #[serde(default)]
@@ -250,12 +259,13 @@ pub enum TaintEffect {
 
 /// Local restart policy before rescheduling.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct RestartConfig {
     #[serde(default = "default_restart_attempts")]
     pub attempts: u32,
-    #[serde(default = "default_restart_interval", rename = "intervalSecs")]
+    #[serde(default = "default_restart_interval")]
     pub interval_secs: u64,
-    #[serde(default = "default_restart_delay", rename = "delaySecs")]
+    #[serde(default = "default_restart_delay")]
     pub delay_secs: u64,
     #[serde(default)]
     pub mode: RestartMode,
@@ -292,17 +302,18 @@ pub enum RestartMode {
 
 /// Cross-node reschedule policy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct RescheduleConfig {
-    #[serde(default = "default_reschedule_delay", rename = "delaySecs")]
+    #[serde(default = "default_reschedule_delay")]
     pub delay_secs: u64,
-    #[serde(default, rename = "delayFunction")]
+    #[serde(default)]
     pub delay_function: DelayFunction,
-    #[serde(default = "default_max_delay", rename = "maxDelaySecs")]
+    #[serde(default = "default_max_delay")]
     pub max_delay_secs: u64,
     /// None means unlimited attempts.
     #[serde(default)]
     pub attempts: Option<u32>,
-    #[serde(default = "default_reschedule_interval", rename = "intervalSecs")]
+    #[serde(default = "default_reschedule_interval")]
     pub interval_secs: u64,
 }
 
@@ -339,8 +350,9 @@ pub enum DelayFunction {
 
 /// Migration policy for node drain.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct MigrateConfig {
-    #[serde(default = "default_max_parallel", rename = "maxParallel")]
+    #[serde(default = "default_max_parallel")]
     pub max_parallel: u32,
     #[serde(default = "default_min_healthy_time", rename = "minHealthyTime")]
     pub min_healthy_time_secs: u64,
@@ -360,18 +372,16 @@ impl Default for MigrateConfig {
 
 /// Periodic/cron schedule for batch jobs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct PeriodicConfig {
     pub cron: String,
-    #[serde(default = "default_timezone", rename = "timeZone")]
+    #[serde(default = "default_timezone")]
     pub time_zone: String,
-    #[serde(default, rename = "concurrencyPolicy")]
+    #[serde(default)]
     pub concurrency_policy: ConcurrencyPolicy,
-    #[serde(
-        default = "default_successful_history",
-        rename = "successfulJobsHistoryLimit"
-    )]
+    #[serde(default = "default_successful_history")]
     pub successful_jobs_history_limit: u32,
-    #[serde(default = "default_failed_history", rename = "failedJobsHistoryLimit")]
+    #[serde(default = "default_failed_history")]
     pub failed_jobs_history_limit: u32,
 }
 
@@ -396,10 +406,9 @@ pub enum ConcurrencyPolicy {
 
 /// Inter-service affinity/anti-affinity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ServiceAffinityConfig {
-    #[serde(rename = "targetService")]
     pub target_service: String,
-    #[serde(rename = "topologyKey")]
     pub topology_key: String,
     #[serde(default = "default_affinity_weight")]
     pub weight: i32,
@@ -409,14 +418,15 @@ pub struct ServiceAffinityConfig {
 /// unavailable during voluntary disruptions (drain, rolling updates).
 /// Specify either `minAvailable` or `maxUnavailable`, not both.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct DisruptionBudget {
     /// Minimum number of instances that must remain available during disruptions.
     /// Can be an absolute count (e.g., 2) or a percentage string (e.g., "50%").
-    #[serde(default, rename = "minAvailable")]
+    #[serde(default)]
     pub min_available: Option<DisruptionValue>,
     /// Maximum number of instances that can be unavailable during disruptions.
     /// Can be an absolute count (e.g., 1) or a percentage string (e.g., "25%").
-    #[serde(default, rename = "maxUnavailable")]
+    #[serde(default)]
     pub max_unavailable: Option<DisruptionValue>,
 }
 

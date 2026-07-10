@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::sync::RwLock;
 
@@ -18,7 +19,7 @@ struct PoolState {
 
 struct ServicePool {
     endpoints: Vec<Endpoint>,
-    next_index: usize,
+    next_index: AtomicUsize,
 }
 
 #[derive(Debug, Clone)]
@@ -50,7 +51,7 @@ impl UpstreamPool {
             .entry(service_name.to_string())
             .or_insert_with(|| ServicePool {
                 endpoints: Vec::new(),
-                next_index: 0,
+                next_index: AtomicUsize::new(0),
             });
 
         pool.endpoints = addrs
@@ -67,17 +68,17 @@ impl UpstreamPool {
     }
 
     /// Get the next healthy endpoint for a service (round-robin).
+    /// Uses a read lock with atomic counter — concurrent callers are not serialized.
     pub async fn next_endpoint(&self, service_name: &str) -> Option<SocketAddr> {
-        let mut state = self.inner.write().await;
-        let pool = state.services.get_mut(service_name)?;
+        let state = self.inner.read().await;
+        let pool = state.services.get(service_name)?;
 
         let healthy: Vec<&Endpoint> = pool.endpoints.iter().filter(|e| e.healthy).collect();
         if healthy.is_empty() {
             return None;
         }
 
-        let idx = pool.next_index % healthy.len();
-        pool.next_index = pool.next_index.wrapping_add(1);
+        let idx = pool.next_index.fetch_add(1, Ordering::Relaxed) % healthy.len();
         Some(healthy[idx].addr)
     }
 

@@ -21,6 +21,7 @@ pub mod webhook;
 use std::path::{Path, PathBuf};
 
 use state::FleetState;
+use tokio_util::sync::CancellationToken;
 
 use crate::attestation::join_token::JoinTokenStore;
 use crate::ca::issuer::CertIssuer;
@@ -126,6 +127,9 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     let instance_tracker = cloud::instance_tracker::InstanceTracker::new(raft_state.clone());
     let join_token_store = JoinTokenStore::new();
 
+    // Create a cancellation token for graceful shutdown
+    let shutdown = CancellationToken::new();
+
     // Start gRPC and HTTP servers concurrently
     let grpc_config = api::GrpcServerConfig {
         addr: grpc_addr,
@@ -141,21 +145,30 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         event_store: event_store.clone(),
     };
 
-    let (grpc_result, http_result) = tokio::join!(
-        api::serve_grpc(grpc_config, fleet_state.clone(), token_store.clone()),
-        rest::serve_http(
+    let grpc_shutdown = shutdown.clone();
+    let http_shutdown = shutdown.clone();
+
+    tokio::select! {
+        result = api::serve_grpc(grpc_config, fleet_state.clone(), token_store.clone(), grpc_shutdown) => {
+            result?;
+        }
+        result = rest::serve_http(
             http_addr,
             fleet_state,
             event_store,
             token_store,
             metrics,
             alert_evaluator,
-            Some(instance_tracker)
-        ),
-    );
-
-    grpc_result?;
-    http_result?;
+            Some(instance_tracker),
+            http_shutdown,
+        ) => {
+            result?;
+        }
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("Received shutdown signal, stopping server");
+            shutdown.cancel();
+        }
+    }
 
     Ok(())
 }
