@@ -113,12 +113,15 @@ pkgs.testers.nixosTest {
         f"curl -sf {AUTH} http://localhost:7402/v1/alerts/silences | jq -e '. == []'"
     )
 
-    # Create a silence
+    # Create a silence — write JSON body to a file to avoid shell quoting issues
+    machine.succeed(
+        "echo '{\"matchers\":{\"severity\":\"warning\"},\"starts_at\":0,\"ends_at\":9999999999,\"comment\":\"maintenance\"}' > /tmp/silence.json"
+    )
     machine.succeed(
         f"curl -sf -X POST {AUTH} "
         "-H 'Content-Type: application/json' "
-        "-d '{{\"matchers\":{{\"severity\":\"warning\"}},\"starts_at\":0,\"ends_at\":9999999999,\"comment\":\"maintenance\"}}' "
-        "http://localhost:7402/v1/alerts/silences | jq -e '.id'"
+        "-d @/tmp/silence.json "
+        "http://localhost:7402/v1/alerts/silences | jq -e '.status == \"created\"'"
     )
 
     # List silences (now has one)

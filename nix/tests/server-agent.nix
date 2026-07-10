@@ -101,7 +101,7 @@ pkgs.testers.nixosTest {
     # Verify Prometheus metrics from remote client
     client.succeed(
         f"curl -sf {AUTH} "
-        "-o /dev/null -w '%{{http_code}}' "
+        "-o /dev/null -w '%{http_code}' "
         "http://server:7402/metrics | grep -q '200'"
     )
   '';

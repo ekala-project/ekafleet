@@ -39,8 +39,8 @@ pkgs.testers.nixosTest {
     token = machine.succeed("ekafleet token create").strip()
     assert len(token) == 64, f"Expected 64 hex chars, got {len(token)}: '{token}'"
 
-    # Shell completions
-    machine.succeed("ekafleet completions bash | grep -q 'ekafleet'")
+    # Shell completions (write to file first to avoid broken pipe panic in clap_complete)
+    machine.succeed("ekafleet completions bash > /tmp/completions.bash && grep -q 'ekafleet' /tmp/completions.bash")
 
     # --- REST API queries (equivalent to CLI status/capacity/services) ---
 
