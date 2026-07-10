@@ -211,6 +211,44 @@ pub async fn compute_plan(
         }
     }
 
+    // Evaluate organizational policies against service configurations.
+    if !desired.policies.is_empty() {
+        let engine = super::policy::PolicyEngine::new();
+        engine.set_rules(desired.policies.clone()).await;
+
+        // Check each service for policy violations; remove creates/updates
+        // that violate enforcing policies.
+        let mut blocked_services = Vec::new();
+        for (service_name, service_config) in &desired.services {
+            match engine.check(service_name, service_config).await {
+                Err(violations) => {
+                    for v in &violations {
+                        tracing::error!(
+                            rule = %v.rule_name,
+                            service = %v.service_name,
+                            "Policy violation: {}",
+                            v.message
+                        );
+                    }
+                    blocked_services.push(service_name.clone());
+                }
+                Ok(warnings) => {
+                    for w in &warnings {
+                        tracing::warn!(
+                            rule = %w.rule_name,
+                            service = %w.service_name,
+                            "Policy warning: {}",
+                            w.message
+                        );
+                    }
+                }
+            }
+        }
+
+        creates.retain(|op| !blocked_services.contains(&op.service_name));
+        updates.retain(|op| !blocked_services.contains(&op.service_name));
+    }
+
     let has_changes = !creates.is_empty()
         || !updates.is_empty()
         || !destroys.is_empty()
@@ -362,6 +400,7 @@ mod tests {
             node_pools: HashMap::new(),
             hooks: Default::default(),
             admission_webhooks: vec![],
+            policies: vec![],
         }
     }
 

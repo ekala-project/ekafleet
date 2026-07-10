@@ -21,6 +21,9 @@ pub struct FleetConfig {
     /// Admission webhooks for validating deployments.
     #[serde(default, rename = "admissionWebhooks")]
     pub admission_webhooks: Vec<AdmissionWebhook>,
+    /// Organizational policy rules evaluated during plan/apply.
+    #[serde(default)]
+    pub policies: Vec<crate::server::policy::PolicyRule>,
 }
 
 /// Script hooks executed at various deployment lifecycle points.

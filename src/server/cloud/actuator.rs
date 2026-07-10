@@ -448,6 +448,7 @@ mod tests {
             node_pools,
             hooks: Default::default(),
             admission_webhooks: vec![],
+            policies: vec![],
         }
     }
 
