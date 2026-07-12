@@ -1055,40 +1055,45 @@ impl FleetControl for FleetControlService {
     ) -> Result<Response<ListNodesResponse>, Status> {
         let (nodes, services, _) = self.state.fleet_status().await;
 
-        let details: Vec<NodeDetail> = nodes
-            .iter()
-            .map(|n| {
-                let running: Vec<_> = services
-                    .iter()
-                    .flat_map(|s| {
-                        s.instances
-                            .iter()
-                            .filter(|i| i.node_id == n.node_id)
-                            .map(|i| crate::proto::ServiceInstance {
+        let mut details: Vec<NodeDetail> = Vec::with_capacity(nodes.len());
+        for n in &nodes {
+            let store_paths = self.state.node_store_paths(&n.node_id).await;
+            let running: Vec<_> = services
+                .iter()
+                .flat_map(|s| {
+                    s.instances
+                        .iter()
+                        .filter(|i| i.node_id == n.node_id)
+                        .map(|i| {
+                            let store_path = store_paths
+                                .iter()
+                                .find(|(name, _)| name == &s.name)
+                                .map(|(_, p)| p.clone())
+                                .unwrap_or_default();
+                            crate::proto::ServiceInstance {
                                 service_name: s.name.clone(),
                                 instance_id: i.instance_id.clone(),
-                                store_path: String::new(),
+                                store_path,
                                 state: i.state,
-                            })
-                    })
-                    .collect();
+                            }
+                        })
+                })
+                .collect();
 
-                let schedulable = tokio::runtime::Handle::current()
-                    .block_on(self.state.is_schedulable(&n.node_id));
+            let schedulable = self.state.is_schedulable(&n.node_id).await;
 
-                NodeDetail {
-                    node_id: n.node_id.clone(),
-                    address: n.address.clone(),
-                    pool: n.pool.clone(),
-                    healthy: n.healthy,
-                    schedulable,
-                    total_resources: n.total_resources,
-                    available_resources: n.available_resources,
-                    last_heartbeat: n.last_heartbeat,
-                    running_services: running,
-                }
-            })
-            .collect();
+            details.push(NodeDetail {
+                node_id: n.node_id.clone(),
+                address: n.address.clone(),
+                pool: n.pool.clone(),
+                healthy: n.healthy,
+                schedulable,
+                total_resources: n.total_resources,
+                available_resources: n.available_resources,
+                last_heartbeat: n.last_heartbeat,
+                running_services: running,
+            });
+        }
 
         Ok(Response::new(ListNodesResponse { nodes: details }))
     }
@@ -1105,17 +1110,25 @@ impl FleetControl for FleetControlService {
             .find(|n| n.node_id == req.node_id)
             .ok_or_else(|| Status::not_found(format!("node '{}' not found", req.node_id)))?;
 
+        let store_paths = self.state.node_store_paths(&req.node_id).await;
         let running: Vec<_> = services
             .iter()
             .flat_map(|s| {
                 s.instances
                     .iter()
                     .filter(|i| i.node_id == req.node_id)
-                    .map(|i| crate::proto::ServiceInstance {
-                        service_name: s.name.clone(),
-                        instance_id: i.instance_id.clone(),
-                        store_path: String::new(),
-                        state: i.state,
+                    .map(|i| {
+                        let store_path = store_paths
+                            .iter()
+                            .find(|(name, _)| name == &s.name)
+                            .map(|(_, p)| p.clone())
+                            .unwrap_or_default();
+                        crate::proto::ServiceInstance {
+                            service_name: s.name.clone(),
+                            instance_id: i.instance_id.clone(),
+                            store_path,
+                            state: i.state,
+                        }
                     })
             })
             .collect();

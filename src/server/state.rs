@@ -39,7 +39,6 @@ struct NodeInfo {
 
 struct AgentServiceInfo {
     instance_id: String,
-    #[allow(dead_code)] // TODO: used for drift detection and generation tracking
     store_path: String,
     state: ServiceState,
     health: HealthStatus,
@@ -188,7 +187,7 @@ impl FleetState {
             total_resources: NodeResources,
             available_resources: NodeResources,
             heartbeat_elapsed_secs: u64,
-            services: Vec<(String, String, ServiceState, HealthStatus)>,
+            services: Vec<(String, String, String, ServiceState, HealthStatus)>,
         }
 
         let snapshots: Vec<NodeSnapshot> = {
@@ -207,7 +206,7 @@ impl FleetState {
                         .services
                         .iter()
                         .map(|(name, svc)| {
-                            (name.clone(), svc.instance_id.clone(), svc.state, svc.health)
+                            (name.clone(), svc.instance_id.clone(), svc.store_path.clone(), svc.state, svc.health)
                         })
                         .collect(),
                 })
@@ -231,7 +230,7 @@ impl FleetState {
         // Aggregate services across all nodes
         let mut svc_map: HashMap<String, ServiceStatus> = HashMap::new();
         for snap in &snapshots {
-            for (svc_name, instance_id, state, health) in &snap.services {
+            for (svc_name, instance_id, _store_path, state, health) in &snap.services {
                 let entry = svc_map
                     .entry(svc_name.clone())
                     .or_insert_with(|| ServiceStatus {
@@ -296,6 +295,32 @@ impl FleetState {
             svc_map.into_values().collect(),
             pool_map.into_values().collect(),
         )
+    }
+
+    /// Get the store path for a service running on a specific node.
+    /// Used for drift detection: compare reported store_path against desired state.
+    pub async fn service_store_path(&self, node_id: &str, service_name: &str) -> Option<String> {
+        let state = self.inner.read().await;
+        state
+            .nodes
+            .get(node_id)
+            .and_then(|node| node.services.get(service_name))
+            .map(|svc| svc.store_path.clone())
+    }
+
+    /// Get all service store paths for a node. Returns (service_name, store_path) pairs.
+    pub async fn node_store_paths(&self, node_id: &str) -> Vec<(String, String)> {
+        let state = self.inner.read().await;
+        state
+            .nodes
+            .get(node_id)
+            .map(|node| {
+                node.services
+                    .iter()
+                    .map(|(name, svc)| (name.clone(), svc.store_path.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Get list of connected node IDs.

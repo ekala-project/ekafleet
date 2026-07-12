@@ -16,7 +16,6 @@ pub struct DnsResolver {
 
 struct ResolverState {
     cache: HashMap<String, CacheEntry>,
-    #[allow(dead_code)] // TODO: used for forwarding non-fleet queries once DNS listener is wired
     upstream: Vec<String>,
 }
 
@@ -95,6 +94,12 @@ impl DnsResolver {
     pub async fn evict_expired(&self) {
         let mut state = self.inner.write().await;
         state.cache.retain(|_, entry| !entry.is_expired());
+    }
+
+    /// Get the configured upstream DNS servers for forwarding non-fleet queries.
+    pub async fn upstream_servers(&self) -> Vec<String> {
+        let state = self.inner.read().await;
+        state.upstream.clone()
     }
 }
 

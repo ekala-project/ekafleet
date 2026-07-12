@@ -21,7 +21,6 @@ pub struct SwimMembership {
 }
 
 struct MembershipState {
-    #[allow(dead_code)] // TODO: used to identify self in outbound SWIM messages
     node_id: String,
     bind_addr: SocketAddr,
     members: HashMap<String, MemberInfo>,
@@ -36,7 +35,6 @@ struct MemberInfo {
     addr: SocketAddr,
     status: MemberStatus,
     last_seen: Instant,
-    #[allow(dead_code)] // TODO: used for SWIM protocol conflict resolution
     incarnation: u64,
 }
 
@@ -61,6 +59,12 @@ impl SwimMembership {
             })),
             hmac_key: Arc::new(hmac_key),
         }
+    }
+
+    /// Get this node's identifier for use in protocol messages.
+    pub async fn node_id(&self) -> String {
+        let state = self.inner.read().await;
+        state.node_id.clone()
     }
 
     /// Attach a service catalog for gossip propagation.
@@ -209,18 +213,23 @@ async fn handle_message(
     hmac_key: &hmac::Key,
 ) {
     // Simple protocol: first byte is message type
-    // 0x01 = ping, 0x02 = ack, 0x03 = ping-req
+    // 0x01 = ping [node_id_bytes...], 0x02 = ack [node_id_bytes...], 0x03 = ping-req
     if data.is_empty() {
         return;
     }
 
     match data[0] {
         0x01 => {
-            // Ping — respond with ack (signed with HMAC)
+            // Ping — respond with ack including our node_id (signed with HMAC)
             tracing::trace!(src = %src, "SWIM ping received");
-            let ack_payload = [0x02u8]; // ack message type
+            let node_id = {
+                let s = state.read().await;
+                s.node_id.clone()
+            };
+            let mut ack_payload = vec![0x02u8];
+            ack_payload.extend_from_slice(node_id.as_bytes());
             let tag = hmac::sign(hmac_key, &ack_payload);
-            let mut signed = Vec::with_capacity(1 + HMAC_LEN);
+            let mut signed = Vec::with_capacity(ack_payload.len() + HMAC_LEN);
             signed.extend_from_slice(&ack_payload);
             signed.extend_from_slice(tag.as_ref());
             if let Err(e) = socket.send_to(&signed, src).await {
@@ -228,13 +237,42 @@ async fn handle_message(
             }
         }
         0x02 => {
-            // Ack — mark sender as alive
+            // Ack — mark sender as alive, using embedded node_id if present.
+            // A member that was suspected/dead must increment its incarnation
+            // to refute suspicion (SWIM conflict resolution).
+            let sender_id = if data.len() > 1 {
+                std::str::from_utf8(&data[1..]).ok().map(|s| s.to_string())
+            } else {
+                None
+            };
             let mut state = state.write().await;
-            for member in state.members.values_mut() {
-                if member.addr == src {
+            if let Some(ref id) = sender_id {
+                if let Some(member) = state.members.get_mut(id) {
+                    if member.status != MemberStatus::Alive {
+                        // Member was suspected/dead — increment incarnation to
+                        // record that it has come back (refutation).
+                        member.incarnation += 1;
+                        tracing::info!(
+                            node_id = %id,
+                            incarnation = member.incarnation,
+                            "Member refuted suspicion, incarnation incremented"
+                        );
+                    }
                     member.status = MemberStatus::Alive;
                     member.last_seen = Instant::now();
-                    break;
+                    member.addr = src;
+                }
+            } else {
+                // Fallback: match by address for backwards compatibility
+                for member in state.members.values_mut() {
+                    if member.addr == src {
+                        if member.status != MemberStatus::Alive {
+                            member.incarnation += 1;
+                        }
+                        member.status = MemberStatus::Alive;
+                        member.last_seen = Instant::now();
+                        break;
+                    }
                 }
             }
         }

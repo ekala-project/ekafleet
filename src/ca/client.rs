@@ -11,7 +11,6 @@ pub struct CertClient {
 }
 
 struct CertState {
-    #[allow(dead_code)] // TODO: used for certificate request identity once CertClient is wired
     node_id: String,
     certificates: Vec<ManagedCert>,
 }
@@ -70,6 +69,13 @@ impl CertClient {
             expires_at,
             "Certificate stored"
         );
+    }
+
+    /// Get the node ID associated with this certificate client.
+    /// Used as identity when requesting certificate renewals from the server.
+    pub async fn node_id(&self) -> String {
+        let state = self.inner.read().await;
+        state.node_id.clone()
     }
 
     /// Get services that need certificate renewal.

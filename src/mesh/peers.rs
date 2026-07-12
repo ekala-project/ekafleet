@@ -14,7 +14,6 @@ pub struct PeerManager {
 struct PeerInfo {
     public_key: String,
     endpoint: String,
-    #[allow(dead_code)] // TODO: needed for route table management once mesh routing is wired
     allowed_ip: Ipv4Addr,
 }
 
@@ -79,6 +78,15 @@ impl PeerManager {
         }
 
         Ok(())
+    }
+
+    /// Look up which peer node owns the given mesh IP address.
+    /// Used for route table management to determine next-hop peer.
+    pub fn route_to_peer(&self, ip: Ipv4Addr) -> Option<&str> {
+        self.peers
+            .iter()
+            .find(|(_, info)| info.allowed_ip == ip)
+            .map(|(node_id, _)| node_id.as_str())
     }
 
     /// Get the WireGuard manager reference.

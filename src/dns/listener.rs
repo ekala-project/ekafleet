@@ -83,10 +83,46 @@ async fn handle_query(query: &[u8], resolver: &DnsResolver) -> Vec<u8> {
             build_nxdomain_response(id, query, 12, offset + 4)
         }
         ResolveResult::Forward => {
-            // Not a fleet domain — return REFUSED
-            build_refused_response(id, query)
+            // Not a fleet domain — forward to upstream DNS servers
+            match forward_query(query, resolver).await {
+                Some(response) => response,
+                None => build_refused_response(id, query),
+            }
         }
     }
+}
+
+/// Forward a DNS query to upstream servers. Returns the first successful response,
+/// or None if all upstreams fail.
+async fn forward_query(query: &[u8], resolver: &DnsResolver) -> Option<Vec<u8>> {
+    let upstreams = resolver.upstream_servers().await;
+    if upstreams.is_empty() {
+        return None;
+    }
+
+    let socket = UdpSocket::bind("0.0.0.0:0").await.ok()?;
+    let mut buf = [0u8; 512];
+
+    for upstream in &upstreams {
+        let addr: SocketAddr = match upstream.parse() {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
+        if socket.send_to(query, addr).await.is_err() {
+            continue;
+        }
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            socket.recv_from(&mut buf),
+        )
+        .await
+        {
+            Ok(Ok((len, _))) => return Some(buf[..len].to_vec()),
+            _ => continue,
+        }
+    }
+
+    None
 }
 
 // DNS constants
