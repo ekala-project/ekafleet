@@ -5,7 +5,9 @@
 
 pub mod auth;
 pub mod digest;
+pub mod gc;
 pub mod manifest;
+pub mod pull;
 pub mod reference;
 pub mod registry;
 pub mod store;
