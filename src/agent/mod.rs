@@ -3,6 +3,7 @@ pub mod exec;
 pub mod health;
 pub mod logs;
 pub mod migrate;
+pub mod oci;
 pub mod snapshot;
 pub mod storage;
 pub mod supervisor;
