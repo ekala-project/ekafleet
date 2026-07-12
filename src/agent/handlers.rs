@@ -270,24 +270,19 @@ pub(super) async fn handle_server_message(
             let tx = tx.clone();
             tokio::spawn(async move {
                 let timeout = Duration::from_secs(cmd.timeout_seconds.max(5) as u64);
-                let result = crate::agent::exec::exec_in_service(
-                    &cmd.service_name,
-                    &cmd.command,
-                    timeout,
-                )
-                .await;
+                let result =
+                    crate::agent::exec::exec_in_service(&cmd.service_name, &cmd.command, timeout)
+                        .await;
                 let response = match result {
                     Ok(r) => AgentCommandResponse {
                         correlation_id,
                         success: true,
                         error_message: String::new(),
-                        result: Some(CmdResult::ExecResult(
-                            crate::proto::ExecCommandResult {
-                                exit_code: r.exit_code,
-                                stdout: r.stdout.into_bytes(),
-                                stderr: r.stderr.into_bytes(),
-                            },
-                        )),
+                        result: Some(CmdResult::ExecResult(crate::proto::ExecCommandResult {
+                            exit_code: r.exit_code,
+                            stdout: r.stdout.into_bytes(),
+                            stderr: r.stderr.into_bytes(),
+                        })),
                     },
                     Err(e) => AgentCommandResponse {
                         correlation_id,
@@ -310,13 +305,7 @@ pub(super) async fn handle_server_message(
                 let lines = if cmd.lines == 0 { 100 } else { cmd.lines };
                 if cmd.follow {
                     // For follow mode, stream chunks from journalctl
-                    match crate::agent::logs::stream_journal(
-                        &cmd.service_name,
-                        lines,
-                        true,
-                    )
-                    .await
-                    {
+                    match crate::agent::logs::stream_journal(&cmd.service_name, lines, true).await {
                         Ok(mut child) => {
                             let mut stdout = child.stdout.take().unwrap();
                             let mut buf = vec![0u8; 8192];
@@ -341,9 +330,7 @@ pub(super) async fn handle_server_message(
                                         };
                                         if tx
                                             .send(AgentMessage {
-                                                payload: Some(
-                                                    Payload::CommandResponse(resp),
-                                                ),
+                                                payload: Some(Payload::CommandResponse(resp)),
                                             })
                                             .await
                                             .is_err()
@@ -371,18 +358,15 @@ pub(super) async fn handle_server_message(
                         }
                     }
                 } else {
-                    let result =
-                        crate::agent::logs::read_logs(&cmd.service_name, lines).await;
+                    let result = crate::agent::logs::read_logs(&cmd.service_name, lines).await;
                     let response = match result {
                         Ok(data) => AgentCommandResponse {
                             correlation_id,
                             success: true,
                             error_message: String::new(),
-                            result: Some(CmdResult::LogsResult(
-                                crate::proto::LogsCommandResult {
-                                    data: data.into_bytes(),
-                                },
-                            )),
+                            result: Some(CmdResult::LogsResult(crate::proto::LogsCommandResult {
+                                data: data.into_bytes(),
+                            })),
                         },
                         Err(e) => AgentCommandResponse {
                             correlation_id,
@@ -493,12 +477,10 @@ pub(super) async fn handle_server_message(
                         correlation_id,
                         success: true,
                         error_message: String::new(),
-                        result: Some(CmdResult::GcResult(
-                            crate::proto::SystemGcCommandResult {
-                                freed_bytes,
-                                output,
-                            },
-                        )),
+                        result: Some(CmdResult::GcResult(crate::proto::SystemGcCommandResult {
+                            freed_bytes,
+                            output,
+                        })),
                     },
                     Err(e) => AgentCommandResponse {
                         correlation_id,
@@ -604,11 +586,7 @@ async fn list_nix_generations() -> Result<Vec<crate::proto::GenerationInfo>, std
     let mut generations = Vec::new();
 
     let output = tokio::process::Command::new("nix-env")
-        .args([
-            "-p",
-            "/nix/var/nix/profiles/system",
-            "--list-generations",
-        ])
+        .args(["-p", "/nix/var/nix/profiles/system", "--list-generations"])
         .output()
         .await?;
 
@@ -638,11 +616,10 @@ async fn list_nix_generations() -> Result<Vec<crate::proto::GenerationInfo>, std
         if let Ok(number) = parts[0].parse::<u64>() {
             // Try to get the store path by resolving the symlink
             let link_name = format!("system-{number}-link");
-            let store_path =
-                tokio::fs::read_link(profiles_dir.join(&link_name))
-                    .await
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_default();
+            let store_path = tokio::fs::read_link(profiles_dir.join(&link_name))
+                .await
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
 
             // Parse the date+time from the listing if available
             let created_at = if parts.len() >= 3 {
@@ -685,10 +662,7 @@ fn parse_generation_date(date_str: &str, time_str: &str) -> u64 {
 }
 
 /// Switch to a specific NixOS generation.
-async fn switch_nix_generation(
-    generation: u64,
-    action: &str,
-) -> Result<String, std::io::Error> {
+async fn switch_nix_generation(generation: u64, action: &str) -> Result<String, std::io::Error> {
     // First, switch the profile to the target generation
     let output = tokio::process::Command::new("nix-env")
         .args([

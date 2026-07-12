@@ -5,11 +5,7 @@
 /// The generated script:
 /// 1. Writes the CA certificate to `/etc/ekafleet/ca.pem`
 /// 2. Starts the ekafleet agent with the given join token and server address
-pub fn generate_user_data(
-    server_addr: &str,
-    join_token: &str,
-    ca_cert_pem: &str,
-) -> String {
+pub fn generate_user_data(server_addr: &str, join_token: &str, ca_cert_pem: &str) -> String {
     // Use a bash script wrapped in cloud-init compatible format.
     // NixOS cloud-init will execute this as a user-data script.
     format!(
@@ -36,8 +32,7 @@ exec ekafleet agent \
 pub fn encode_user_data(user_data: &str) -> String {
     // Simple base64 encoding without pulling in a crate.
     // Uses the standard base64 alphabet.
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
     let input = user_data.as_bytes();
     let mut output = Vec::with_capacity((input.len() + 2) / 3 * 4);

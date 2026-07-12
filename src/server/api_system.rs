@@ -8,8 +8,8 @@ use std::time::Duration;
 use tonic::{Response, Status};
 
 use super::api::FleetControlService;
-use crate::proto::server_message::Payload as ServerPayload;
 use crate::proto::ServerMessage;
+use crate::proto::server_message::Payload as ServerPayload;
 
 impl FleetControlService {
     pub(super) async fn handle_system_gc(
@@ -164,7 +164,10 @@ impl FleetControlService {
             }
 
             if !batch.is_empty() {
-                tracing::info!(batch_size = batch.len(), "Waiting for rebooted nodes to reconnect");
+                tracing::info!(
+                    batch_size = batch.len(),
+                    "Waiting for rebooted nodes to reconnect"
+                );
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
                 loop {

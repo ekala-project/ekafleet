@@ -180,10 +180,7 @@ impl TokenStore {
             created_at: now,
             expires_at: ttl_secs.map(|ttl| now + ttl),
         };
-        self.tokens
-            .write()
-            .await
-            .insert(token.to_string(), entry);
+        self.tokens.write().await.insert(token.to_string(), entry);
         tracing::info!(role = ?role, description = %description, "Token registered");
         self.persist().await;
     }
@@ -196,10 +193,7 @@ impl TokenStore {
 
     /// Synchronous token validation for use in interceptors.
     /// Returns the role if the token exists and is not expired.
-    pub fn authenticate_sync(
-        tokens: &HashMap<String, TokenEntry>,
-        token: &str,
-    ) -> Option<Role> {
+    pub fn authenticate_sync(tokens: &HashMap<String, TokenEntry>, token: &str) -> Option<Role> {
         let entry = tokens.get(token)?;
         if entry.is_expired() {
             None
@@ -324,10 +318,7 @@ mod tests {
             .register_with_ttl("ttl-tok", Role::Operator, "short-lived", Some(3600))
             .await;
 
-        assert_eq!(
-            store.authenticate("ttl-tok").await,
-            Some(Role::Operator)
-        );
+        assert_eq!(store.authenticate("ttl-tok").await, Some(Role::Operator));
     }
 
     #[tokio::test]
@@ -341,10 +332,7 @@ mod tests {
         // Create a new store pointing to the same directory and load
         let store2 = TokenStore::with_persistence(dir.path());
         store2.load().await.unwrap();
-        assert_eq!(
-            store2.authenticate("persist-tok").await,
-            Some(Role::Admin)
-        );
+        assert_eq!(store2.authenticate("persist-tok").await, Some(Role::Admin));
     }
 
     #[test]

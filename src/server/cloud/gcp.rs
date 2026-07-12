@@ -55,10 +55,7 @@ impl CloudProvider for GcpCloudProvider {
         request: &CreateMachineRequest,
     ) -> Result<MachineInstance, anyhow::Error> {
         let instance_name = Self::instance_name(&request.fleet_name, &request.pool);
-        let zone = request
-            .zone
-            .as_deref()
-            .unwrap_or(&self.zone);
+        let zone = request.zone.as_deref().unwrap_or(&self.zone);
 
         // Write user-data to a temp file
         let ud_path = format!("/tmp/ekafleet-ud-{instance_name}.sh");
@@ -70,7 +67,11 @@ impl CloudProvider for GcpCloudProvider {
             "create".to_string(),
             instance_name.clone(),
             "--project".to_string(),
-            request.project.as_deref().unwrap_or(&self.project).to_string(),
+            request
+                .project
+                .as_deref()
+                .unwrap_or(&self.project)
+                .to_string(),
             "--zone".to_string(),
             zone.to_string(),
             "--image".to_string(),
@@ -97,10 +98,7 @@ impl CloudProvider for GcpCloudProvider {
 
         // Disk size
         if let Some(disk_gb) = request.disk_size_gb {
-            args.extend([
-                "--boot-disk-size".to_string(),
-                format!("{disk_gb}GB"),
-            ]);
+            args.extend(["--boot-disk-size".to_string(), format!("{disk_gb}GB")]);
         }
 
         tracing::info!(
@@ -131,10 +129,7 @@ impl CloudProvider for GcpCloudProvider {
         let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
 
         // gcloud returns an array of created instances
-        let instance = json
-            .as_array()
-            .and_then(|a| a.first())
-            .unwrap_or(&json);
+        let instance = json.as_array().and_then(|a| a.first()).unwrap_or(&json);
 
         // Extract IPs from network interfaces
         let private_ip = instance["networkInterfaces"]
@@ -249,10 +244,7 @@ impl CloudProvider for GcpCloudProvider {
                 if key == "pool" {
                     pool = value.as_str().unwrap_or("").to_string();
                 } else {
-                    labels.insert(
-                        key.clone(),
-                        value.as_str().unwrap_or("").to_string(),
-                    );
+                    labels.insert(key.clone(), value.as_str().unwrap_or("").to_string());
                 }
             }
         }
@@ -272,10 +264,7 @@ impl CloudProvider for GcpCloudProvider {
             .map(|s| s.to_string());
 
         Ok(Some(MachineInstance {
-            instance_id: json["name"]
-                .as_str()
-                .unwrap_or(instance_id)
-                .to_string(),
+            instance_id: json["name"].as_str().unwrap_or(instance_id).to_string(),
             provider: "gcp".to_string(),
             state,
             public_ip,
@@ -339,10 +328,7 @@ impl CloudProvider for GcpCloudProvider {
                     .map(|s| s.to_string());
 
                 machines.push(MachineInstance {
-                    instance_id: instance["name"]
-                        .as_str()
-                        .unwrap_or("")
-                        .to_string(),
+                    instance_id: instance["name"].as_str().unwrap_or("").to_string(),
                     provider: "gcp".to_string(),
                     state: MachineState::Running,
                     public_ip,

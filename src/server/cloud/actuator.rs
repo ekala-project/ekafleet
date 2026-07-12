@@ -8,9 +8,9 @@ use crate::server::events::{EventCategory, EventLevel, EventStore};
 use crate::server::scaling::{CreateMachineRequest, PoolScalingDecision, PoolScalingEngine};
 use crate::server::state::FleetState;
 
+use super::CloudProviderRegistry;
 use super::bootstrap;
 use super::instance_tracker::InstanceTracker;
-use super::CloudProviderRegistry;
 
 /// Maximum number of instances to create per pool per evaluation cycle.
 const MAX_SCALE_UP_PER_CYCLE: u32 = 3;
@@ -97,8 +97,8 @@ impl ScalingActuator {
             return;
         };
 
-        let instances_to_create = (decision.desired_count - decision.current_count)
-            .min(MAX_SCALE_UP_PER_CYCLE);
+        let instances_to_create =
+            (decision.desired_count - decision.current_count).min(MAX_SCALE_UP_PER_CYCLE);
 
         for _ in 0..instances_to_create {
             match self
@@ -178,14 +178,9 @@ impl ScalingActuator {
                 tokio::time::sleep(DRAIN_WAIT).await;
             }
 
-            match provider
-                .destroy_machine(&candidate.cloud_instance_id)
-                .await
-            {
+            match provider.destroy_machine(&candidate.cloud_instance_id).await {
                 Ok(()) => {
-                    self.tracker
-                        .untrack(&candidate.cloud_instance_id)
-                        .await;
+                    self.tracker.untrack(&candidate.cloud_instance_id).await;
                     tracing::info!(
                         pool = %decision.pool_name,
                         instance_id = %candidate.cloud_instance_id,
@@ -233,8 +228,7 @@ impl ScalingActuator {
         self.join_tokens.register(&token).await;
 
         // Generate user-data bootstrap script
-        let user_data =
-            bootstrap::generate_user_data(&self.server_addr, &token, &self.ca_cert_pem);
+        let user_data = bootstrap::generate_user_data(&self.server_addr, &token, &self.ca_cert_pem);
 
         let request = CreateMachineRequest {
             pool: pool_name.to_string(),
@@ -295,8 +289,7 @@ impl ScalingActuator {
                                 instance_id = %cloud_inst.instance_id,
                                 "Orphaned cloud instance detected — terminating"
                             );
-                            if let Err(e) =
-                                provider.destroy_machine(&cloud_inst.instance_id).await
+                            if let Err(e) = provider.destroy_machine(&cloud_inst.instance_id).await
                             {
                                 tracing::error!(
                                     instance_id = %cloud_inst.instance_id,
@@ -331,7 +324,9 @@ fn generate_join_token() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::scaling::{CloudProvider, CreateMachineRequest, MachineInstance, MachineState};
+    use crate::server::scaling::{
+        CloudProvider, CreateMachineRequest, MachineInstance, MachineState,
+    };
     use std::sync::atomic::{AtomicU32, Ordering};
 
     /// Mock cloud provider that tracks create/destroy calls.

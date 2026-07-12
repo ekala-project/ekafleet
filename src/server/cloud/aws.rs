@@ -67,13 +67,9 @@ impl CloudProvider for AwsCloudProvider {
 
         // Root volume size
         if let Some(disk_gb) = request.disk_size_gb {
-            let block_mapping = format!(
-                "[{{\"DeviceName\":\"/dev/xvda\",\"Ebs\":{{\"VolumeSize\":{disk_gb}}}}}]"
-            );
-            args.extend([
-                "--block-device-mappings".to_string(),
-                block_mapping,
-            ]);
+            let block_mapping =
+                format!("[{{\"DeviceName\":\"/dev/xvda\",\"Ebs\":{{\"VolumeSize\":{disk_gb}}}}}]");
+            args.extend(["--block-device-mappings".to_string(), block_mapping]);
         }
 
         // Tags
@@ -82,10 +78,7 @@ impl CloudProvider for AwsCloudProvider {
             fleet = request.fleet_name,
             pool = request.pool,
         );
-        args.extend([
-            "--tag-specifications".to_string(),
-            tag_spec,
-        ]);
+        args.extend(["--tag-specifications".to_string(), tag_spec]);
 
         tracing::info!(
             region = %request.region,
@@ -112,12 +105,8 @@ impl CloudProvider for AwsCloudProvider {
             .as_str()
             .unwrap_or("unknown")
             .to_string();
-        let private_ip = instance["PrivateIpAddress"]
-            .as_str()
-            .map(|s| s.to_string());
-        let public_ip = instance["PublicIpAddress"]
-            .as_str()
-            .map(|s| s.to_string());
+        let private_ip = instance["PrivateIpAddress"].as_str().map(|s| s.to_string());
+        let public_ip = instance["PublicIpAddress"].as_str().map(|s| s.to_string());
 
         tracing::info!(
             instance_id = %instance_id,
@@ -230,16 +219,11 @@ impl CloudProvider for AwsCloudProvider {
         }
 
         Ok(Some(MachineInstance {
-            instance_id: instance["InstanceId"]
-                .as_str()
-                .unwrap_or("")
-                .to_string(),
+            instance_id: instance["InstanceId"].as_str().unwrap_or("").to_string(),
             provider: "aws".to_string(),
             state,
             public_ip: instance["PublicIpAddress"].as_str().map(|s| s.to_string()),
-            private_ip: instance["PrivateIpAddress"]
-                .as_str()
-                .map(|s| s.to_string()),
+            private_ip: instance["PrivateIpAddress"].as_str().map(|s| s.to_string()),
             labels,
             pool,
             created_at: 0, // Not easily available from describe
@@ -292,15 +276,10 @@ impl CloudProvider for AwsCloudProvider {
                         };
 
                         machines.push(MachineInstance {
-                            instance_id: instance["InstanceId"]
-                                .as_str()
-                                .unwrap_or("")
-                                .to_string(),
+                            instance_id: instance["InstanceId"].as_str().unwrap_or("").to_string(),
                             provider: "aws".to_string(),
                             state,
-                            public_ip: instance["PublicIpAddress"]
-                                .as_str()
-                                .map(|s| s.to_string()),
+                            public_ip: instance["PublicIpAddress"].as_str().map(|s| s.to_string()),
                             private_ip: instance["PrivateIpAddress"]
                                 .as_str()
                                 .map(|s| s.to_string()),

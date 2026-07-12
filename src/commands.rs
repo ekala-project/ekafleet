@@ -642,11 +642,19 @@ pub async fn cmd_node_status(node: String, server: String) -> anyhow::Result<()>
     println!("  Pool:        {}", detail.pool);
     println!(
         "  Health:      {}",
-        if detail.healthy { "healthy" } else { "unhealthy" }
+        if detail.healthy {
+            "healthy"
+        } else {
+            "unhealthy"
+        }
     );
     println!(
         "  Schedulable: {}",
-        if detail.schedulable { "yes" } else { "cordoned" }
+        if detail.schedulable {
+            "yes"
+        } else {
+            "cordoned"
+        }
     );
     println!("  Heartbeat:   {}s ago", detail.last_heartbeat);
     if let Some(total) = &detail.total_resources {
@@ -1175,13 +1183,20 @@ pub async fn cmd_service_inspect(
     let info = resp.into_inner();
 
     println!("Service: {service}");
-    println!("  State:         {} ({})", info.active_state, info.sub_state);
+    println!(
+        "  State:         {} ({})",
+        info.active_state, info.sub_state
+    );
     println!("  Main PID:      {}", info.main_pid);
     println!("  Control Group: {}", info.control_group);
     println!();
     println!("Resource Accounting:");
     println!("  CPU Usage:     {:.2}s", info.cpu_usage_nsec as f64 / 1e9);
-    println!("  Memory:        {}MB (peak {}MB)", info.memory_current / (1024 * 1024), info.memory_peak / (1024 * 1024));
+    println!(
+        "  Memory:        {}MB (peak {}MB)",
+        info.memory_current / (1024 * 1024),
+        info.memory_peak / (1024 * 1024)
+    );
     println!("  IO Read:       {}MB", info.io_read_bytes / (1024 * 1024));
     println!("  IO Write:      {}MB", info.io_write_bytes / (1024 * 1024));
     println!("  Tasks:         {}", info.tasks_current);

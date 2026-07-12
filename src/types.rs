@@ -5,8 +5,20 @@ use serde::{Deserialize, Serialize};
 
 /// Unique identifier for a node in the fleet.
 #[derive(
-    Debug, Clone, Hash, Eq, PartialEq, Ord, PartialOrd, Deref, Display, From, Into, AsRef,
-    Serialize, Deserialize,
+    Debug,
+    Clone,
+    Hash,
+    Eq,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Deref,
+    Display,
+    From,
+    Into,
+    AsRef,
+    Serialize,
+    Deserialize,
 )]
 pub struct NodeId(String);
 
@@ -24,8 +36,20 @@ impl Borrow<str> for NodeId {
 
 /// Name of a service in the fleet.
 #[derive(
-    Debug, Clone, Hash, Eq, PartialEq, Ord, PartialOrd, Deref, Display, From, Into, AsRef,
-    Serialize, Deserialize,
+    Debug,
+    Clone,
+    Hash,
+    Eq,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Deref,
+    Display,
+    From,
+    Into,
+    AsRef,
+    Serialize,
+    Deserialize,
 )]
 pub struct ServiceName(String);
 
@@ -37,8 +61,20 @@ impl ServiceName {
 
 /// Name of a node pool.
 #[derive(
-    Debug, Clone, Hash, Eq, PartialEq, Ord, PartialOrd, Deref, Display, From, Into, AsRef,
-    Serialize, Deserialize,
+    Debug,
+    Clone,
+    Hash,
+    Eq,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Deref,
+    Display,
+    From,
+    Into,
+    AsRef,
+    Serialize,
+    Deserialize,
 )]
 pub struct PoolName(String);
 

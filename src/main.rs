@@ -771,12 +771,8 @@ async fn main() -> anyhow::Result<()> {
 
         Command::Node { action } => match action {
             NodeAction::List { server } => commands::cmd_node_list(server).await?,
-            NodeAction::Status { node, server } => {
-                commands::cmd_node_status(node, server).await?
-            }
-            NodeAction::Cordon { node, server } => {
-                commands::cmd_node_cordon(node, server).await?
-            }
+            NodeAction::Status { node, server } => commands::cmd_node_status(node, server).await?,
+            NodeAction::Cordon { node, server } => commands::cmd_node_cordon(node, server).await?,
             NodeAction::Uncordon { node, server } => {
                 commands::cmd_node_uncordon(node, server).await?
             }
@@ -814,9 +810,7 @@ async fn main() -> anyhow::Result<()> {
                 AclTokenAction::Revoke { token, server } => {
                     commands::cmd_acl_token_revoke(token, server).await?
                 }
-                AclTokenAction::List { server } => {
-                    commands::cmd_acl_token_list(server).await?
-                }
+                AclTokenAction::List { server } => commands::cmd_acl_token_list(server).await?,
             },
         },
 
@@ -832,9 +826,7 @@ async fn main() -> anyhow::Result<()> {
             ClosureAction::Diff { path_a, path_b } => {
                 commands::cmd_closure_diff(path_a, path_b).await?
             }
-            ClosureAction::Deps { path, tree } => {
-                commands::cmd_closure_deps(path, tree).await?
-            }
+            ClosureAction::Deps { path, tree } => commands::cmd_closure_deps(path, tree).await?,
             ClosureAction::Size { path } => commands::cmd_closure_size(path).await?,
         },
 

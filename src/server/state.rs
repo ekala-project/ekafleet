@@ -20,8 +20,7 @@ pub struct FleetState {
 struct FleetStateInner {
     nodes: HashMap<NodeId, NodeInfo>,
     /// Pending request-response correlations for agent commands.
-    pending_requests:
-        HashMap<String, oneshot::Sender<crate::proto::AgentCommandResponse>>,
+    pending_requests: HashMap<String, oneshot::Sender<crate::proto::AgentCommandResponse>>,
 }
 
 struct NodeInfo {
@@ -206,7 +205,13 @@ impl FleetState {
                         .services
                         .iter()
                         .map(|(name, svc)| {
-                            (name.clone(), svc.instance_id.clone(), svc.store_path.clone(), svc.state, svc.health)
+                            (
+                                name.clone(),
+                                svc.instance_id.clone(),
+                                svc.store_path.clone(),
+                                svc.state,
+                                svc.health,
+                            )
                         })
                         .collect(),
                 })

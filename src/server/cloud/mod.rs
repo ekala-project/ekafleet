@@ -24,10 +24,7 @@ pub trait CloudProviderDyn: Send + Sync {
         request: &CreateMachineRequest,
     ) -> BoxFuture<'_, Result<MachineInstance, anyhow::Error>>;
 
-    fn destroy_machine(
-        &self,
-        instance_id: &str,
-    ) -> BoxFuture<'_, Result<(), anyhow::Error>>;
+    fn destroy_machine(&self, instance_id: &str) -> BoxFuture<'_, Result<(), anyhow::Error>>;
 
     fn describe_machine(
         &self,
@@ -51,10 +48,7 @@ impl<T: CloudProvider + 'static> CloudProviderDyn for T {
         Box::pin(async move { CloudProvider::create_machine(self, &req).await })
     }
 
-    fn destroy_machine(
-        &self,
-        instance_id: &str,
-    ) -> BoxFuture<'_, Result<(), anyhow::Error>> {
+    fn destroy_machine(&self, instance_id: &str) -> BoxFuture<'_, Result<(), anyhow::Error>> {
         let id = instance_id.to_string();
         Box::pin(async move { CloudProvider::destroy_machine(self, &id).await })
     }
@@ -86,9 +80,7 @@ pub struct CloudProviderRegistry {
 impl CloudProviderRegistry {
     /// Build a registry from the fleet's node pool configuration.
     /// Only pools with a `cloud` config get a provider entry.
-    pub fn from_pool_configs(
-        pools: &HashMap<String, crate::config::NodePoolConfig>,
-    ) -> Self {
+    pub fn from_pool_configs(pools: &HashMap<String, crate::config::NodePoolConfig>) -> Self {
         let mut providers: HashMap<String, Box<dyn CloudProviderDyn>> = HashMap::new();
 
         for (pool_name, pool_config) in pools {

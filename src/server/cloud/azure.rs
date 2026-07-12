@@ -81,10 +81,7 @@ impl CloudProvider for AzureCloudProvider {
 
         // Disk size
         if let Some(disk_gb) = request.disk_size_gb {
-            args.extend([
-                "--os-disk-size-gb".to_string(),
-                disk_gb.to_string(),
-            ]);
+            args.extend(["--os-disk-size-gb".to_string(), disk_gb.to_string()]);
         }
 
         // Subnet
@@ -122,16 +119,9 @@ impl CloudProvider for AzureCloudProvider {
 
         let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
 
-        let instance_id = json["id"]
-            .as_str()
-            .unwrap_or(&vm_name)
-            .to_string();
-        let private_ip = json["privateIpAddress"]
-            .as_str()
-            .map(|s| s.to_string());
-        let public_ip = json["publicIpAddress"]
-            .as_str()
-            .map(|s| s.to_string());
+        let instance_id = json["id"].as_str().unwrap_or(&vm_name).to_string();
+        let private_ip = json["privateIpAddress"].as_str().map(|s| s.to_string());
+        let public_ip = json["publicIpAddress"].as_str().map(|s| s.to_string());
 
         tracing::info!(
             vm_name = %vm_name,
@@ -154,10 +144,7 @@ impl CloudProvider for AzureCloudProvider {
     async fn destroy_machine(&self, instance_id: &str) -> Result<(), anyhow::Error> {
         // instance_id for Azure is either the full resource ID or the VM name.
         // Extract the VM name from a resource ID if needed.
-        let vm_name = instance_id
-            .rsplit('/')
-            .next()
-            .unwrap_or(instance_id);
+        let vm_name = instance_id.rsplit('/').next().unwrap_or(instance_id);
 
         tracing::info!(
             vm_name,
@@ -192,10 +179,7 @@ impl CloudProvider for AzureCloudProvider {
         &self,
         instance_id: &str,
     ) -> Result<Option<MachineInstance>, anyhow::Error> {
-        let vm_name = instance_id
-            .rsplit('/')
-            .next()
-            .unwrap_or(instance_id);
+        let vm_name = instance_id.rsplit('/').next().unwrap_or(instance_id);
 
         let output = tokio::process::Command::new("az")
             .args([
@@ -237,19 +221,13 @@ impl CloudProvider for AzureCloudProvider {
                 if key == "pool" {
                     pool = value.as_str().unwrap_or("").to_string();
                 } else {
-                    labels.insert(
-                        key.clone(),
-                        value.as_str().unwrap_or("").to_string(),
-                    );
+                    labels.insert(key.clone(), value.as_str().unwrap_or("").to_string());
                 }
             }
         }
 
         Ok(Some(MachineInstance {
-            instance_id: json["id"]
-                .as_str()
-                .unwrap_or(instance_id)
-                .to_string(),
+            instance_id: json["id"].as_str().unwrap_or(instance_id).to_string(),
             provider: "azure".to_string(),
             state,
             public_ip: json["publicIps"].as_str().map(|s| s.to_string()),
@@ -265,9 +243,7 @@ impl CloudProvider for AzureCloudProvider {
         fleet_name: &str,
         pool: &str,
     ) -> Result<Vec<MachineInstance>, anyhow::Error> {
-        let query = format!(
-            "[?tags.ekafleet=='{fleet_name}' && tags.pool=='{pool}']"
-        );
+        let query = format!("[?tags.ekafleet=='{fleet_name}' && tags.pool=='{pool}']");
 
         let output = tokio::process::Command::new("az")
             .args([

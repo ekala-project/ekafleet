@@ -57,12 +57,7 @@ impl InstanceTracker {
             )
             .await;
 
-        tracing::info!(
-            instance_id,
-            provider,
-            pool,
-            "Tracking cloud instance"
-        );
+        tracing::info!(instance_id, provider, pool, "Tracking cloud instance");
     }
 
     /// Associate a cloud instance with a fleet node ID (when the agent joins).
@@ -169,7 +164,9 @@ mod tests {
     #[tokio::test]
     async fn track_and_retrieve() {
         let tracker = make_tracker();
-        tracker.track("i-abc", "aws", "workers", Some("10.0.1.5")).await;
+        tracker
+            .track("i-abc", "aws", "workers", Some("10.0.1.5"))
+            .await;
 
         let all = tracker.all().await;
         assert_eq!(all.len(), 1);
@@ -183,22 +180,25 @@ mod tests {
     #[tokio::test]
     async fn associate_node_sets_fleet_id() {
         let tracker = make_tracker();
-        tracker.track("i-abc", "aws", "workers", Some("10.0.1.5")).await;
+        tracker
+            .track("i-abc", "aws", "workers", Some("10.0.1.5"))
+            .await;
         tracker.associate_node("i-abc", "node-uuid-1").await;
 
         let inst = tracker.all().await;
-        assert_eq!(
-            inst["i-abc"].fleet_node_id.as_deref(),
-            Some("node-uuid-1")
-        );
+        assert_eq!(inst["i-abc"].fleet_node_id.as_deref(), Some("node-uuid-1"));
         assert!(inst["i-abc"].joined_at.is_some());
     }
 
     #[tokio::test]
     async fn find_by_ip() {
         let tracker = make_tracker();
-        tracker.track("i-abc", "aws", "workers", Some("10.0.1.5")).await;
-        tracker.track("i-def", "aws", "workers", Some("10.0.1.6")).await;
+        tracker
+            .track("i-abc", "aws", "workers", Some("10.0.1.5"))
+            .await;
+        tracker
+            .track("i-def", "aws", "workers", Some("10.0.1.6"))
+            .await;
 
         let found = tracker.find_by_ip("10.0.1.5").await;
         assert_eq!(found.unwrap().cloud_instance_id, "i-abc");
@@ -254,6 +254,11 @@ mod tests {
     #[tokio::test]
     async fn scaledown_empty_pool_returns_none() {
         let tracker = make_tracker();
-        assert!(tracker.select_scaledown_candidate("workers").await.is_none());
+        assert!(
+            tracker
+                .select_scaledown_candidate("workers")
+                .await
+                .is_none()
+        );
     }
 }
