@@ -9,6 +9,7 @@ use super::digest::Digest;
 use super::manifest::{ImageManifest, ManifestKind, Platform};
 use super::reference::ImageReference;
 use super::registry::{RegistryClient, RegistryError};
+use super::signature::{self, SignaturePolicy};
 use super::store::{ImageStore, StoreError};
 use super::unpack;
 
@@ -43,6 +44,8 @@ pub enum PullError {
     Store(#[from] StoreError),
     #[error("unpack error: {0}")]
     Unpack(#[from] unpack::UnpackError),
+    #[error("signature error: {0}")]
+    Signature(#[from] signature::SignatureError),
     #[error("no matching platform in image index")]
     NoPlatformMatch,
     #[error("image not found locally and pull policy is Never")]
@@ -56,14 +59,16 @@ pub enum PullError {
 /// This is the main entry point for the image management pipeline:
 ///   1. Check local cache based on policy
 ///   2. Fetch manifest (resolving multi-platform indexes)
-///   3. Download missing layers
-///   4. Unpack into a rootfs bundle
+///   3. Verify cosign signature (if `signature_policy` is set)
+///   4. Download missing layers
+///   5. Unpack into a rootfs bundle
 pub async fn pull_image(
     client: &RegistryClient,
     store: &ImageStore,
     image: &ImageReference,
     service_name: &str,
     policy: &PullPolicy,
+    signature_policy: Option<&SignaturePolicy>,
 ) -> Result<PullResult, PullError> {
     let manifest_key = manifest_cache_key(image);
 
@@ -101,7 +106,15 @@ pub async fn pull_image(
             }
 
             // Not present — pull
-            do_pull(client, store, image, service_name, &manifest_key).await
+            do_pull(
+                client,
+                store,
+                image,
+                service_name,
+                &manifest_key,
+                signature_policy,
+            )
+            .await
         }
 
         PullPolicy::Always => {
@@ -124,18 +137,27 @@ pub async fn pull_image(
                 }
             }
 
-            do_pull(client, store, image, service_name, &manifest_key).await
+            do_pull(
+                client,
+                store,
+                image,
+                service_name,
+                &manifest_key,
+                signature_policy,
+            )
+            .await
         }
     }
 }
 
-/// Perform the actual pull: fetch manifest, download layers, unpack.
+/// Perform the actual pull: fetch manifest, verify signature, download layers, unpack.
 async fn do_pull(
     client: &RegistryClient,
     store: &ImageStore,
     image: &ImageReference,
     service_name: &str,
     manifest_key: &str,
+    signature_policy: Option<&SignaturePolicy>,
 ) -> Result<PullResult, PullError> {
     tracing::info!(image = %image, service = service_name, "Pulling image");
 
@@ -166,6 +188,16 @@ async fn do_pull(
             }
         }
     };
+
+    // Verify cosign signature before downloading layers
+    if let Some(sig_policy) = signature_policy {
+        tracing::info!(
+            image = %image,
+            digest = %manifest_digest,
+            "Verifying image signature"
+        );
+        signature::verify_image_signature(client, image, &manifest_digest, sig_policy).await?;
+    }
 
     // Cache the manifest
     store.put_manifest(manifest_key, &manifest_raw).await?;

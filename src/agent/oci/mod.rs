@@ -19,7 +19,7 @@
 //! use ekafleet::agent::oci::{ImageManager, pull::PullPolicy};
 //!
 //! let mgr = ImageManager::new("/var/lib/ekafleet/oci", credentials);
-//! let result = mgr.pull("ghcr.io/org/app:v1.0", "my-service", &PullPolicy::IfNotPresent).await?;
+//! let result = mgr.pull("ghcr.io/org/app:v1.0", "my-service", &PullPolicy::IfNotPresent, None).await?;
 //! // result.rootfs is the unpacked image ready for nspawn
 //! ```
 
@@ -31,6 +31,7 @@ pub mod manifest;
 pub mod pull;
 pub mod reference;
 pub mod registry;
+pub mod signature;
 pub mod store;
 pub mod unpack;
 
@@ -43,6 +44,7 @@ use manifest::ImageManifest;
 use pull::{PullError, PullPolicy, PullResult};
 use reference::ImageReference;
 use registry::RegistryClient;
+use signature::{SignatureError, SignaturePolicy};
 use store::ImageStore;
 
 /// High-level OCI image manager combining registry, store, and unpacking.
@@ -77,15 +79,26 @@ impl ImageManager {
     }
 
     /// Pull an image and return the rootfs path and image config.
+    ///
+    /// If `signature_policy` is `Some`, the image's cosign signature is
+    /// verified against the provided public key before downloading layers.
     pub async fn pull(
         &self,
         image: &str,
         service_name: &str,
         policy: &PullPolicy,
+        signature_policy: Option<&SignaturePolicy>,
     ) -> Result<ResolvedImage, ImageManagerError> {
         let image_ref: ImageReference = image.parse()?;
-        let result =
-            pull::pull_image(&self.client, &self.store, &image_ref, service_name, policy).await?;
+        let result = pull::pull_image(
+            &self.client,
+            &self.store,
+            &image_ref,
+            service_name,
+            policy,
+            signature_policy,
+        )
+        .await?;
 
         // Read the image config to get entrypoint/env/etc.
         let config = self.read_image_config(&image_ref, service_name).await?;
@@ -190,6 +203,8 @@ pub enum ImageManagerError {
     Pull(#[from] PullError),
     #[error("store error: {0}")]
     Store(#[from] store::StoreError),
+    #[error("signature verification failed: {0}")]
+    Signature(#[from] SignatureError),
     #[error("config blob not found for service {service} (digest {digest})")]
     ConfigNotFound { service: String, digest: Digest },
 }
