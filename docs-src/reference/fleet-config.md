@@ -18,9 +18,12 @@ Complete reference for the `fleet.nix` configuration schema.
 
 ## Service
 
+A service must have either `command` (native Nix process) or `container` (OCI container), but not both.
+
 ```nix
 services.<name> = {
-  command       = "string";              # Command to run (required)
+  command       = "string";              # Command to run (required unless container is set)
+  container     = ContainerConfig;       # OCI container config (required unless command is set)
   ports         = { <name> = PortConfig; };
   secrets       = { <name> = SecretConfig; };
   identity      = IdentityConfig;
@@ -32,6 +35,22 @@ services.<name> = {
   volumes       = [ VolumeConfig ];                # Persistent volumes (optional)
 };
 ```
+
+## ContainerConfig
+
+```nix
+container = {
+  image             = "string";           # OCI image reference (required)
+  pullPolicy        = "Always";           # Always | IfNotPresent | Never (default: Always)
+  entrypoint        = [ "string" ];       # Override image entrypoint (optional)
+  args              = [ "string" ];       # Override image CMD (optional)
+  workingDir        = "/app";             # Override working directory (optional)
+  bindMounts        = [ "host:container:ro" ];  # Additional bind mounts (optional)
+  registryAuthSecret = "secret-name";     # Registry credentials secret (optional)
+};
+```
+
+Container services run via `systemd-nspawn` with host networking, the same cgroup hierarchy, and SPIFFE identity as native services. See [OCI Containers](../operations/oci-containers.md) for details.
 
 ## PortConfig
 

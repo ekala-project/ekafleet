@@ -56,15 +56,17 @@ ekafleet treats security as foundational architecture:
 
 **Identity contracts enforce least-privilege networking.** Services declare `allowedCallers` and `allowedTargets`. The default posture is deny-all. ekafleet generates nftables rules that enforce these contracts at the kernel level. A compromised service cannot reach endpoints it wasn't explicitly authorized to contact.
 
-### System Orchestration, Not Container Orchestration
+### System Orchestration First, Containers When Needed
 
-Kubernetes orchestrates containers. ekafleet orchestrates systems.
+Kubernetes orchestrates containers. ekafleet orchestrates systems -- and can run containers too.
 
-Services run as systemd units, supervised by the init system that already manages everything else on a Linux machine. No container runtime sits between your workload and the kernel. No overlay filesystem adds latency to disk I/O. No virtual networking adds hops to packet paths.
+Native services run as systemd units, supervised by the init system that already manages everything else on a Linux machine. No container runtime sits between your workload and the kernel. No overlay filesystem adds latency to disk I/O. No virtual networking adds hops to packet paths.
 
-This isn't a limitation — it's a design choice. NixOS already provides the isolation and reproducibility that containers were invented to deliver. Store paths are immutable. Dependencies are explicit. Builds are reproducible. The container abstraction adds overhead without adding capability in this context.
+For workloads that are only available as OCI images, ekafleet runs containers via systemd-nspawn under the same `ekafleet-<name>.service` unit convention. The container inherits the unit's cgroup, so workload attestation, journald logging, and resource controls work identically. There is no second supervision tree -- systemd remains the sole process supervisor for both modes.
 
-ekafleet's supervisor manages service lifecycle with the same primitives Kubernetes offers — liveness, readiness, and startup probes; pre-stop and post-start hooks; configurable restart policies; graceful termination periods — but executes them through systemd rather than a container runtime.
+NixOS already provides the isolation and reproducibility that containers were invented to deliver. Store paths are immutable. Dependencies are explicit. Builds are reproducible. Containers are available when you need them, but they are not the default abstraction.
+
+ekafleet's supervisor manages service lifecycle with the same primitives Kubernetes offers -- liveness, readiness, and startup probes; pre-stop and post-start hooks; configurable restart policies; graceful termination periods -- but executes them through systemd rather than a container runtime.
 
 ### Continuous Reconciliation
 
@@ -88,7 +90,7 @@ This is fundamentally different from one-shot deployment tools like NixOps or de
 
 Honesty about scope builds trust, so here's what ekafleet explicitly does not attempt:
 
-**It is not a container orchestrator.** If your workloads are packaged as OCI images and you need the container ecosystem (registries, runtime classes, sidecar injection), Kubernetes is the right choice. ekafleet manages systemd services built from Nix store paths.
+**It is not a full container platform.** ekafleet can run OCI container images via systemd-nspawn with a built-in registry client, but it does not aim to replace Kubernetes. There is no bridge networking, no runtime class abstraction, no sidecar injection. Containers run with host networking under systemd, sharing the same cgroup hierarchy and identity model as native services. If you need the full container ecosystem, Kubernetes is the right choice.
 
 **It is not a general-purpose cloud platform.** ekafleet doesn't provision machines from cloud providers (though it provides advisory scaling signals via webhooks). Infrastructure provisioning remains the domain of Terraform, OpenTofu, or NixOps.
 

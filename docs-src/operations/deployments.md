@@ -1,6 +1,6 @@
 # Deployments
 
-ekafleet orchestrates deployments with dependency ordering, health gates, and automatic rollback.
+ekafleet orchestrates deployments with dependency ordering, health gates, and automatic rollback. All deployment strategies work identically for both native Nix services and OCI container services.
 
 ## Deployment Flow
 

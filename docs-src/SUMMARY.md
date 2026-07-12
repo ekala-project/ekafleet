@@ -19,6 +19,7 @@
 # Operations
 
 - [Deployments](./operations/deployments.md)
+- [OCI Containers](./operations/oci-containers.md)
 - [System Activation](./operations/system-activation.md)
 - [Scheduling](./operations/scheduling.md)
 - [Scaling](./operations/scaling.md)

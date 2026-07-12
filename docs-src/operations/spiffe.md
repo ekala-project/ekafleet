@@ -87,6 +87,8 @@ The Workload API identifies callers via Unix socket peer credentials:
 3. Fallback: check `EKAFLEET_SERVICE` env var in `/proc/<pid>/environ`
 4. Return the SVID for the identified service
 
+This works identically for OCI container services because containers run inside the `ekafleet-<name>.service` cgroup via `systemd-nspawn --keep-unit`. The SPIFFE socket is bind-mounted into the container, and `SO_PEERCRED` reports the host-namespace PID.
+
 ### Using the Workload API
 
 The `SPIFFE_ENDPOINT_SOCKET` environment variable is automatically set in all managed service unit files:

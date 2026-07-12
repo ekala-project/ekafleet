@@ -11,7 +11,7 @@ ekafleet is a single binary with two operational modes. Server mode includes all
 │  │                                                                │  │
 │  │  supervisor   health     dns_resolver   wireguard   nftables   │  │
 │  │  secrets_inj  metrics    proxy_l7/l4    gossip      certs      │  │
-│  │  workload_api template   storage                               │  │
+│  │  workload_api template   storage        oci_images             │  │
 │  └───────────────────────────────────────────────────────────────┘  │
 │                                                                     │
 │  ┌───────────────────────────────────────────────────────────────┐  │
@@ -31,7 +31,7 @@ ekafleet is a single binary with two operational modes. Server mode includes all
 
 | Subsystem | Purpose |
 |-----------|---------|
-| **supervisor** | Manages local services via systemd units |
+| **supervisor** | Manages local services via systemd units (native processes and OCI containers via systemd-nspawn) |
 | **health** | HTTP/TCP/exec health check probes |
 | **dns_resolver** | Local caching DNS resolver for fleet queries |
 | **wireguard** | Kernel WireGuard mesh interface management |
@@ -44,6 +44,7 @@ ekafleet is a single binary with two operational modes. Server mode includes all
 | **gossip** | SWIM-based membership and service catalog propagation |
 | **certs** | CSR generation, certificate request/renewal from built-in CA |
 | **workload_api** | SPIFFE Workload API over Unix domain socket |
+| **oci_images** | OCI registry client, content-addressable image store, layer unpacking, garbage collection |
 
 ### Server Mode Only
 

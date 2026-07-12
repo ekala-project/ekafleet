@@ -21,11 +21,13 @@ A fleet configuration has four top-level keys:
 
 ## Service Configuration
 
-Each service defines what to run and how to run it:
+Each service defines what to run and how to run it. A service runs as either a native Nix process (`command`) or an OCI container (`container`).
+
+### Native Process Service
 
 ```nix
 services.api-server = {
-  # Required: command to execute
+  # Required (unless container is set): command to execute
   command = "${pkgs.api-server}/bin/server";
 
   # Port declarations with optional health checks
@@ -141,6 +143,32 @@ services.api-server = {
   };
 };
 ```
+
+### Container Service
+
+Services can also run OCI container images via systemd-nspawn:
+
+```nix
+services.redis = {
+  container = {
+    image = "docker.io/library/redis:7.4@sha256:abc123...";
+    pullPolicy = "IfNotPresent";
+  };
+
+  ports.redis = {
+    port = 6379;
+    healthCheck.interval = 10;
+  };
+
+  resources = {
+    memory = { request = 512; limit = 1024; };
+  };
+
+  scheduling.replicas = 3;
+};
+```
+
+Container services receive the same SPIFFE identity, health checking, deployment strategies, and scheduling as native services. See [OCI Containers](../operations/oci-containers.md) for the full reference.
 
 ## Machine Configuration
 

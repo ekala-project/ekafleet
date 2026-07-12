@@ -14,10 +14,11 @@ Server mode embeds all agent capabilities, meaning a server node can also run wo
 Running a production fleet typically requires deploying and maintaining a dozen separate tools. ekafleet consolidates these into a single, statically-linked binary with no runtime dependencies:
 
 - **Small footprint** — single ~5MB musl-static binary
-- **No runtime dependencies** — no JVM, no interpreters, no container runtimes
+- **No runtime dependencies** — no JVM, no interpreters, no external daemons
 - **Predictable latency** — Rust's zero-cost abstractions and no GC
 - **Nix-native** — fleet configuration is pure Nix, consumed via `nix eval`
 - **OS deployment** — activates full EkaOS/NixOS system closures, not just services
+- **OCI container support** — run container images via systemd-nspawn alongside native services, with a built-in registry client and content-verified image store
 - **Secure by default** — mTLS everywhere, SPIFFE workload identity with standard Workload API, node attestation, encrypted secrets at rest, proper CSR flow (private keys never leave the workload)
 
 ## Design Principles
@@ -26,14 +27,14 @@ Running a production fleet typically requires deploying and maintaining a dozen 
 2. **Reconciliation model** — desired state is declared in Nix, ekafleet continuously converges actual state to match
 3. **Graceful degradation** — agents continue operating when the server is unreachable
 4. **Defense in depth** — mTLS (SPIFFE SVIDs) for identity, nftables for network policy, WireGuard for transport encryption, AES-256-GCM for secrets at rest
-5. **OS-level deployments** — manages full system closures, not just application containers
+5. **OS-level deployments** — manages full system closures and OCI containers, both as systemd units
 
 ## Key Features
 
 | Category | Capabilities |
 |----------|-------------|
 | Scheduling | Priority-based placement with preemption, constraints, affinities, spread, taints/tolerations, node pools, disruption budgets, resource quotas |
-| Deployment | Rolling, canary, blue-green; health-gated; auto-revert; auto-promote; deployment history; policy engine; OS activation |
+| Deployment | Rolling, canary, blue-green; health-gated; auto-revert; auto-promote; deployment history; policy engine; OS activation; OCI containers via systemd-nspawn |
 | Health | Separate liveness, readiness, and startup probes; configurable thresholds |
 | Security | RBAC (admin/operator/viewer), SPIFFE X.509-SVIDs with trust domain federation, Workload API, node attestation, mTLS, audit logging, namespaces |
 | Secrets | Static (encrypted), dynamic (PostgreSQL/MySQL credential rotation), transit encryption, versioned rollback, rotation notification |
