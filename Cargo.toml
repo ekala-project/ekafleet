@@ -73,6 +73,10 @@ regex = "1"
 # System
 libc = "0.2"
 
+# OCI image layer unpacking
+flate2 = "1"
+tar = "0.4"
+
 # Database drivers (for dynamic secrets)
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "mysql"], default-features = false }
 
