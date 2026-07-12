@@ -205,8 +205,6 @@ WantedBy=multi-user.target
             format!("--bind={spiffe_socket}"),
             // Bind-mount secrets directory (read-only inside container)
             format!("--bind-ro={secrets_dir}:/run/secrets"),
-            // Notify systemd when ready
-            "--notify-ready=yes".to_string(),
             // Register with machined for machinectl access
             "--register=yes".to_string(),
             // Keep unit running (don't daemonize)
@@ -237,7 +235,7 @@ After=network.target
 Wants=machines.target
 
 [Service]
-Type=notify
+Type=simple
 ExecStart={nspawn_cmd}
 ExecStop=machinectl terminate {machine}
 Restart=on-failure
@@ -581,7 +579,6 @@ WantedBy=multi-user.target
             "--network-namespace-path=/proc/1/ns/net".to_string(),
             format!("--bind={spiffe_socket}"),
             format!("--bind-ro={secrets_dir}:/run/secrets"),
-            "--notify-ready=yes".to_string(),
             "--register=yes".to_string(),
             "--keep-unit".to_string(),
         ];
@@ -597,7 +594,7 @@ After=network.target
 Wants=machines.target
 
 [Service]
-Type=notify
+Type=simple
 ExecStart={nspawn_cmd}
 ExecStop=machinectl terminate {machine}
 Restart=on-failure
@@ -639,8 +636,8 @@ WantedBy=multi-user.target
         assert!(content.contains("--register=yes"));
         assert!(content.contains("--keep-unit"));
 
-        // Verify Type=notify (nspawn reports readiness)
-        assert!(content.contains("Type=notify"));
+        // Verify Type=simple (container managed by systemd directly)
+        assert!(content.contains("Type=simple"));
 
         // Verify machinectl terminate for clean shutdown
         assert!(content.contains("ExecStop=machinectl terminate ekafleet-api"));
