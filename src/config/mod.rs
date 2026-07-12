@@ -79,7 +79,14 @@ fn default_webhook_timeout() -> u64 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceConfig {
-    pub command: String,
+    /// Command to execute for native (Nix) process services.
+    /// Required unless `container` is set.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// OCI container configuration. When set, the service runs as a
+    /// systemd-nspawn container instead of a native process.
+    #[serde(default)]
+    pub container: Option<ContainerConfig>,
     #[serde(default)]
     pub ports: HashMap<String, PortConfig>,
     #[serde(default)]
@@ -105,6 +112,44 @@ pub struct ServiceConfig {
     /// Sidecar processes to run alongside this service.
     #[serde(default)]
     pub sidecars: Vec<SidecarConfig>,
+}
+
+/// OCI container configuration for a service.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ContainerConfig {
+    /// OCI image reference (e.g. "ghcr.io/org/app:v1.0@sha256:...").
+    pub image: String,
+    /// Pull policy: "Always", "IfNotPresent", or "Never".
+    #[serde(default)]
+    pub pull_policy: ContainerPullPolicy,
+    /// Override the image's entrypoint.
+    #[serde(default)]
+    pub entrypoint: Option<Vec<String>>,
+    /// Override the image's CMD.
+    #[serde(default)]
+    pub args: Option<Vec<String>>,
+    /// Working directory inside the container.
+    #[serde(default)]
+    pub working_dir: Option<String>,
+    /// Additional bind mounts (host_path:container_path[:ro]).
+    #[serde(default)]
+    pub bind_mounts: Vec<String>,
+    /// Registry credentials secret name (references a secret in the service's secrets).
+    #[serde(default)]
+    pub registry_auth_secret: Option<String>,
+}
+
+/// Pull policy for OCI container images.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ContainerPullPolicy {
+    /// Always check the registry for a newer image.
+    #[default]
+    Always,
+    /// Only pull if the image is not present locally.
+    IfNotPresent,
+    /// Never pull from the registry; fail if not present locally.
+    Never,
 }
 
 /// A persistent volume to attach to a stateful service.
@@ -499,6 +544,23 @@ pub fn validate(config: &FleetConfig) -> Result<(), Vec<String>> {
                 "service '{}' prefers undefined pool '{}'",
                 name, pool
             ));
+        }
+
+        // Exactly one of command or container must be set
+        match (&service.command, &service.container) {
+            (None, None) => {
+                errors.push(format!(
+                    "service '{}' must have either 'command' or 'container'",
+                    name
+                ));
+            }
+            (Some(_), Some(_)) => {
+                errors.push(format!(
+                    "service '{}' cannot have both 'command' and 'container'",
+                    name
+                ));
+            }
+            _ => {}
         }
     }
 

@@ -67,7 +67,8 @@ fn make_service(name: &str, cpu: u64, memory: u64, replicas: u32) -> (String, Se
     (
         name.to_string(),
         ServiceConfig {
-            command: format!("/bin/{name}"),
+            command: Some(format!("/bin/{name}")),
+            container: None,
             ports: HashMap::new(),
             secrets: HashMap::new(),
             identity: Default::default(),
@@ -134,7 +135,8 @@ fn constraint_filtering() {
     let services: HashMap<String, ServiceConfig> = [(
         "api".to_string(),
         ServiceConfig {
-            command: "/bin/api".into(),
+            command: Some("/bin/api".into()),
+            container: None,
             ports: HashMap::new(),
             secrets: HashMap::new(),
             identity: Default::default(),
@@ -186,7 +188,8 @@ fn system_job_all_nodes() {
     let services: HashMap<String, ServiceConfig> = [(
         "monitoring".to_string(),
         ServiceConfig {
-            command: "/bin/monitor".into(),
+            command: Some("/bin/monitor".into()),
+            container: None,
             ports: HashMap::new(),
             secrets: HashMap::new(),
             identity: Default::default(),
@@ -266,7 +269,8 @@ fn pool_affinity_prefers_correct_pool() {
     let services: HashMap<String, ServiceConfig> = [(
         "ml".to_string(),
         ServiceConfig {
-            command: "/bin/ml".into(),
+            command: Some("/bin/ml".into()),
+            container: None,
             ports: HashMap::new(),
             secrets: HashMap::new(),
             identity: Default::default(),
@@ -338,7 +342,8 @@ fn pool_affinity_spills_when_full() {
     let services: HashMap<String, ServiceConfig> = [(
         "ml".to_string(),
         ServiceConfig {
-            command: "/bin/ml".into(),
+            command: Some("/bin/ml".into()),
+            container: None,
             ports: HashMap::new(),
             secrets: HashMap::new(),
             identity: Default::default(),
@@ -411,7 +416,8 @@ fn pool_hard_constraint_blocks_spillover() {
     let services: HashMap<String, ServiceConfig> = [(
         "ml".to_string(),
         ServiceConfig {
-            command: "/bin/ml".into(),
+            command: Some("/bin/ml".into()),
+            container: None,
             ports: HashMap::new(),
             secrets: HashMap::new(),
             identity: Default::default(),
@@ -526,7 +532,8 @@ fn pool_labels_merged() {
     let services: HashMap<String, ServiceConfig> = [(
         "svc".to_string(),
         ServiceConfig {
-            command: "/bin/svc".into(),
+            command: Some("/bin/svc".into()),
+            container: None,
             ports: HashMap::new(),
             secrets: HashMap::new(),
             identity: Default::default(),
@@ -618,7 +625,8 @@ fn system_job_on_pool() {
     let services: HashMap<String, ServiceConfig> = [(
         "monitor".to_string(),
         ServiceConfig {
-            command: "/bin/monitor".into(),
+            command: Some("/bin/monitor".into()),
+            container: None,
             ports: HashMap::new(),
             secrets: HashMap::new(),
             identity: Default::default(),
@@ -673,7 +681,8 @@ fn constraint_numeric_operators() {
     let services: HashMap<String, ServiceConfig> = [(
         "svc".to_string(),
         ServiceConfig {
-            command: "/bin/svc".into(),
+            command: Some("/bin/svc".into()),
+            container: None,
             ports: HashMap::new(),
             secrets: HashMap::new(),
             identity: Default::default(),
@@ -724,7 +733,8 @@ fn constraint_regexp() {
     let services: HashMap<String, ServiceConfig> = [(
         "svc".to_string(),
         ServiceConfig {
-            command: "/bin/svc".into(),
+            command: Some("/bin/svc".into()),
+            container: None,
             ports: HashMap::new(),
             secrets: HashMap::new(),
             identity: Default::default(),
@@ -775,7 +785,8 @@ fn constraint_is_set() {
     let services: HashMap<String, ServiceConfig> = [(
         "svc".to_string(),
         ServiceConfig {
-            command: "/bin/svc".into(),
+            command: Some("/bin/svc".into()),
+            container: None,
             ports: HashMap::new(),
             secrets: HashMap::new(),
             identity: Default::default(),
@@ -830,7 +841,8 @@ fn multiple_spread_blocks() {
     let services: HashMap<String, ServiceConfig> = [(
         "svc".to_string(),
         ServiceConfig {
-            command: "/bin/svc".into(),
+            command: Some("/bin/svc".into()),
+            container: None,
             ports: HashMap::new(),
             secrets: HashMap::new(),
             identity: Default::default(),
@@ -902,7 +914,8 @@ fn priority_ordering() {
         (
             "low".to_string(),
             ServiceConfig {
-                command: "/bin/low".into(),
+                command: Some("/bin/low".into()),
+                container: None,
                 ports: HashMap::new(),
                 secrets: HashMap::new(),
                 identity: Default::default(),
@@ -934,7 +947,8 @@ fn priority_ordering() {
         (
             "high".to_string(),
             ServiceConfig {
-                command: "/bin/high".into(),
+                command: Some("/bin/high".into()),
+                container: None,
                 ports: HashMap::new(),
                 secrets: HashMap::new(),
                 identity: Default::default(),
@@ -1010,7 +1024,8 @@ fn taint_blocks_non_tolerating_service() {
     let services: HashMap<String, ServiceConfig> = [(
         "ml".to_string(),
         ServiceConfig {
-            command: "/bin/ml".into(),
+            command: Some("/bin/ml".into()),
+            container: None,
             ports: HashMap::new(),
             secrets: HashMap::new(),
             identity: Default::default(),
@@ -1061,7 +1076,8 @@ fn sysbatch_runs_on_all_nodes() {
     let services: HashMap<String, ServiceConfig> = [(
         "migrate".to_string(),
         ServiceConfig {
-            command: "/bin/migrate".into(),
+            command: Some("/bin/migrate".into()),
+            container: None,
             ports: HashMap::new(),
             secrets: HashMap::new(),
             identity: Default::default(),

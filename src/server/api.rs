@@ -19,19 +19,19 @@ use crate::proto::fleet_control_server::{FleetControl, FleetControlServer};
 use crate::proto::server_message::Payload as ServerPayload;
 use crate::proto::{
     AgentMessage, ApplyEvent, ApplyRequest, CreateAclTokenRequest, CreateAclTokenResponse,
-    DrainRequest, DrainResponse, EventsRequest, EventsResponse, ExecRequest, ExecResponse,
-    FailDeploymentRequest, FailDeploymentResponse, FleetStatus, GetNodeRequest,
+    DiffGenerationsRequest, DiffGenerationsResponse, DrainRequest, DrainResponse, EventsRequest,
+    EventsResponse, ExecRequest, ExecResponse, FailDeploymentRequest, FailDeploymentResponse,
+    FleetStatus, GetNodeRequest, InspectServiceRequest, InspectServiceResponse,
     ListAclTokensRequest, ListAclTokensResponse, ListDeploymentsRequest, ListDeploymentsResponse,
-    ListNodesRequest, ListNodesResponse, LogsChunk, LogsRequest, NodeAttestationRequest,
-    NodeAttestationResult, NodeDetail, OperationType, PlanRequest, PlanResponse, PlannedOperation,
-    PromoteRequest, PromoteResponse, RestoreRequest, RestoreResponse, RevokeAclTokenRequest,
-    RevokeAclTokenResponse, RollbackRequest, RollbackResponse, ScaleRequest, ScaleResponse,
-    ServerMessage, SnapshotRequest, SnapshotResponse, StatusRequest, TopRequest, TopResponse,
-    DiffGenerationsRequest, DiffGenerationsResponse, InspectServiceRequest, InspectServiceResponse,
-    ListGenerationsRequest, ListGenerationsResponse, SwitchGenerationRequest,
-    SwitchGenerationResponse, SystemGcRequest, SystemGcResponse, SystemRebootRequest,
-    SystemRebootResponse, SystemRebuildRequest, SystemRebuildResponse,
-    TrustBundleUpdate, UpdateNodeRequest, UpdateNodeResponse,
+    ListGenerationsRequest, ListGenerationsResponse, ListNodesRequest, ListNodesResponse,
+    LogsChunk, LogsRequest, NodeAttestationRequest, NodeAttestationResult, NodeDetail,
+    OperationType, PlanRequest, PlanResponse, PlannedOperation, PromoteRequest, PromoteResponse,
+    RestoreRequest, RestoreResponse, RevokeAclTokenRequest, RevokeAclTokenResponse,
+    RollbackRequest, RollbackResponse, ScaleRequest, ScaleResponse, ServerMessage, SnapshotRequest,
+    SnapshotResponse, StatusRequest, SwitchGenerationRequest, SwitchGenerationResponse,
+    SystemGcRequest, SystemGcResponse, SystemRebootRequest, SystemRebootResponse,
+    SystemRebuildRequest, SystemRebuildResponse, TopRequest, TopResponse, TrustBundleUpdate,
+    UpdateNodeRequest, UpdateNodeResponse,
 };
 use crate::raft::state::FleetStateMachine;
 use crate::server::cloud::instance_tracker::InstanceTracker;
@@ -264,7 +264,13 @@ impl FleetControl for FleetControlService {
 
         // Compute plan
         let current_nodes = self.state.connected_nodes().await;
-        let plan = super::reconciler::compute_plan(&desired, &current_nodes, &self.state, Some(&self.instance_tracker)).await;
+        let plan = super::reconciler::compute_plan(
+            &desired,
+            &current_nodes,
+            &self.state,
+            Some(&self.instance_tracker),
+        )
+        .await;
 
         let mut operations = Vec::new();
         for op in &plan.creates {
@@ -340,20 +346,12 @@ impl FleetControl for FleetControlService {
         let config_path = std::path::PathBuf::from(&req.config_path);
         let watch = req.watch;
         let grpc_addr = self.grpc_addr.clone();
-        let ca_cert_pem = self
-            .trust_bundle_pem
-            .clone()
-            .unwrap_or_default();
+        let ca_cert_pem = self.trust_bundle_pem.clone().unwrap_or_default();
 
         tokio::spawn(async move {
             // Run a single reconciliation cycle
-            match super::reconciler::reconcile_once(
-                &config_path,
-                &state,
-                true,
-                Some(&tracker),
-            )
-            .await
+            match super::reconciler::reconcile_once(&config_path, &state, true, Some(&tracker))
+                .await
             {
                 Ok(plan) => {
                     let msg = if plan.has_changes {
@@ -379,10 +377,9 @@ impl FleetControl for FleetControlService {
                     if watch {
                         // Evaluate config to build the scaling actuator
                         if let Ok(fleet_config) = super::nix::eval_fleet(&config_path).await {
-                            let providers =
-                                super::cloud::CloudProviderRegistry::from_pool_configs(
-                                    &fleet_config.node_pools,
-                                );
+                            let providers = super::cloud::CloudProviderRegistry::from_pool_configs(
+                                &fleet_config.node_pools,
+                            );
                             let pool_engine =
                                 crate::server::scaling::PoolScalingEngine::new(state.clone());
 
@@ -397,17 +394,16 @@ impl FleetControl for FleetControlService {
                             let server_addr = grpc_addr.clone();
                             let ca_cert = ca_cert_pem.clone();
 
-                            let mut actuator =
-                                super::cloud::actuator::ScalingActuator::new(
-                                    pool_engine,
-                                    providers,
-                                    tracker.clone(),
-                                    join_tokens,
-                                    state.clone(),
-                                    fleet_config,
-                                    server_addr,
-                                    ca_cert,
-                                );
+                            let mut actuator = super::cloud::actuator::ScalingActuator::new(
+                                pool_engine,
+                                providers,
+                                tracker.clone(),
+                                join_tokens,
+                                state.clone(),
+                                fleet_config,
+                                server_addr,
+                                ca_cert,
+                            );
 
                             // Run scaling actuator alongside reconciliation
                             let tx_watch = tx.clone();
@@ -437,7 +433,9 @@ impl FleetControl for FleetControlService {
                                             let _ = tx_watch
                                                 .send(Ok(ApplyEvent {
                                                     operation_id: uuid::Uuid::new_v4().to_string(),
-                                                    status: crate::proto::ApplyStatus::ApplySucceeded as i32,
+                                                    status:
+                                                        crate::proto::ApplyStatus::ApplySucceeded
+                                                            as i32,
                                                     message: format!(
                                                         "Reconciled: {} changes applied",
                                                         plan.creates.len()
@@ -451,7 +449,8 @@ impl FleetControl for FleetControlService {
                                             let _ = tx_watch
                                                 .send(Ok(ApplyEvent {
                                                     operation_id: uuid::Uuid::new_v4().to_string(),
-                                                    status: crate::proto::ApplyStatus::ApplyFailed as i32,
+                                                    status: crate::proto::ApplyStatus::ApplyFailed
+                                                        as i32,
                                                     message: format!("Reconciliation failed: {e}"),
                                                 }))
                                                 .await;
@@ -651,6 +650,7 @@ impl FleetControl for FleetControlService {
                                 service_name: service_name.clone(),
                                 store_path: deployment.store_path.clone(),
                                 strategy: 0,
+                                container_image: String::new(),
                             },
                         )),
                     };
@@ -819,10 +819,7 @@ impl FleetControl for FleetControlService {
         }))
     }
 
-    async fn exec(
-        &self,
-        request: Request<ExecRequest>,
-    ) -> Result<Response<ExecResponse>, Status> {
+    async fn exec(&self, request: Request<ExecRequest>) -> Result<Response<ExecResponse>, Status> {
         let req = request.into_inner();
         tracing::info!(
             service = %req.service_name,
@@ -952,12 +949,7 @@ impl FleetControl for FleetControlService {
                 };
 
                 match state
-                    .send_command(
-                        node_id,
-                        msg,
-                        correlation_id,
-                        Duration::from_secs(30),
-                    )
+                    .send_command(node_id, msg, correlation_id, Duration::from_secs(30))
                     .await
                 {
                     Ok(resp) if resp.success => {
@@ -976,11 +968,8 @@ impl FleetControl for FleetControlService {
                         let _ = tx
                             .send(Ok(LogsChunk {
                                 node_id: node_id.clone(),
-                                data: format!(
-                                    "Error from {node_id}: {}\n",
-                                    resp.error_message
-                                )
-                                .into_bytes(),
+                                data: format!("Error from {node_id}: {}\n", resp.error_message)
+                                    .into_bytes(),
                             }))
                             .await;
                     }
@@ -1004,7 +993,11 @@ impl FleetControl for FleetControlService {
         request: Request<EventsRequest>,
     ) -> Result<Response<EventsResponse>, Status> {
         let req = request.into_inner();
-        let limit = if req.limit == 0 { 50 } else { req.limit as usize };
+        let limit = if req.limit == 0 {
+            50
+        } else {
+            req.limit as usize
+        };
 
         // Parse category filter
         let category = if req.category.is_empty() {
@@ -1166,20 +1159,29 @@ impl FleetControl for FleetControlService {
         Ok(Response::new(UpdateNodeResponse { success: true }))
     }
 
-    async fn top(
-        &self,
-        request: Request<TopRequest>,
-    ) -> Result<Response<TopResponse>, Status> {
+    async fn top(&self, request: Request<TopRequest>) -> Result<Response<TopResponse>, Status> {
         let req = request.into_inner();
         let (nodes, services, _) = self.state.fleet_status().await;
 
         let node_usage: Vec<_> = nodes
             .iter()
             .map(|n| {
-                let total_cpu = n.total_resources.as_ref().map(|r| r.cpu_millicores).unwrap_or(0);
+                let total_cpu = n
+                    .total_resources
+                    .as_ref()
+                    .map(|r| r.cpu_millicores)
+                    .unwrap_or(0);
                 let total_mem = n.total_resources.as_ref().map(|r| r.memory_mb).unwrap_or(0);
-                let avail_cpu = n.available_resources.as_ref().map(|r| r.cpu_millicores).unwrap_or(0);
-                let avail_mem = n.available_resources.as_ref().map(|r| r.memory_mb).unwrap_or(0);
+                let avail_cpu = n
+                    .available_resources
+                    .as_ref()
+                    .map(|r| r.cpu_millicores)
+                    .unwrap_or(0);
+                let avail_mem = n
+                    .available_resources
+                    .as_ref()
+                    .map(|r| r.memory_mb)
+                    .unwrap_or(0);
                 let svc_count = services
                     .iter()
                     .flat_map(|s| &s.instances)
@@ -1209,8 +1211,16 @@ impl FleetControl for FleetControlService {
             .collect();
 
         Ok(Response::new(TopResponse {
-            nodes: if req.mode == "services" { vec![] } else { node_usage },
-            services: if req.mode == "nodes" { vec![] } else { svc_usage },
+            nodes: if req.mode == "services" {
+                vec![]
+            } else {
+                node_usage
+            },
+            services: if req.mode == "nodes" {
+                vec![]
+            } else {
+                svc_usage
+            },
         }))
     }
 
@@ -1219,7 +1229,11 @@ impl FleetControl for FleetControlService {
         request: Request<ListDeploymentsRequest>,
     ) -> Result<Response<ListDeploymentsResponse>, Status> {
         let req = request.into_inner();
-        let _limit = if req.limit == 0 { 20 } else { req.limit as usize };
+        let _limit = if req.limit == 0 {
+            20
+        } else {
+            req.limit as usize
+        };
 
         // Deployment history is stored in EventStore which is not on
         // FleetControlService. Return data from Raft state deployments.
@@ -1286,7 +1300,11 @@ impl FleetControl for FleetControlService {
             "admin" => super::rbac::Role::Admin,
             "operator" => super::rbac::Role::Operator,
             "viewer" => super::rbac::Role::Viewer,
-            _ => return Err(Status::invalid_argument("role must be admin, operator, or viewer")),
+            _ => {
+                return Err(Status::invalid_argument(
+                    "role must be admin, operator, or viewer",
+                ));
+            }
         };
 
         // Generate a secure token

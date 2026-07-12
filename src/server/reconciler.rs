@@ -120,8 +120,7 @@ pub async fn compute_plan(
     let machines = merge_dynamic_machines(desired, instance_tracker).await;
 
     // Schedule services across all machines (static + cloud)
-    let placement_plan =
-        scheduler::schedule(&desired.services, &machines, &desired.node_pools);
+    let placement_plan = scheduler::schedule(&desired.services, &machines, &desired.node_pools);
 
     // Log blocked placements
     for b in &placement_plan.blocked {
@@ -293,7 +292,7 @@ async fn apply_plan(
                     strategy: service_cfg.scheduling.update.strategy.clone(),
                     max_parallel: service_cfg.scheduling.update.max_parallel,
                     placements: op.placements.clone(),
-                    store_path: service_cfg.command.clone(),
+                    store_path: service_cfg.command.clone().unwrap_or_default(),
                     auto_revert: service_cfg.scheduling.update.auto_revert,
                     auto_promote: service_cfg.scheduling.update.auto_promote,
                     min_healthy_time: Duration::from_secs(
@@ -387,8 +386,8 @@ pub(crate) async fn merge_dynamic_machines(
 mod tests {
     use super::*;
     use crate::config::{
-        CapacityConfig, CloudProviderConfig, CloudProviderType, NodePoolConfig,
-        SchedulingConfig, ServiceConfig,
+        CapacityConfig, CloudProviderConfig, CloudProviderType, NodePoolConfig, SchedulingConfig,
+        ServiceConfig,
     };
     use crate::raft::state::FleetStateMachine;
 
@@ -459,7 +458,9 @@ mod tests {
 
         let raft = FleetStateMachine::new();
         let tracker = InstanceTracker::new(raft);
-        tracker.track("i-abc", "aws", "workers", Some("10.0.1.5")).await;
+        tracker
+            .track("i-abc", "aws", "workers", Some("10.0.1.5"))
+            .await;
         tracker.associate_node("i-abc", "node-cloud-1").await;
 
         let result = merge_dynamic_machines(&config, Some(&tracker)).await;
@@ -479,7 +480,9 @@ mod tests {
         let raft = FleetStateMachine::new();
         let tracker = InstanceTracker::new(raft);
         // Tracked but not joined — no fleet_node_id
-        tracker.track("i-pending", "aws", "workers", Some("10.0.1.5")).await;
+        tracker
+            .track("i-pending", "aws", "workers", Some("10.0.1.5"))
+            .await;
 
         let result = merge_dynamic_machines(&config, Some(&tracker)).await;
         assert!(result.is_empty());
@@ -508,7 +511,9 @@ mod tests {
         let raft = FleetStateMachine::new();
         let tracker = InstanceTracker::new(raft);
         // Cloud instance joined with same node_id as a static machine
-        tracker.track("i-dup", "aws", "default", Some("10.0.0.99")).await;
+        tracker
+            .track("i-dup", "aws", "default", Some("10.0.0.99"))
+            .await;
         tracker.associate_node("i-dup", "node-1").await;
 
         let result = merge_dynamic_machines(&config, Some(&tracker)).await;
@@ -559,7 +564,8 @@ mod tests {
         config.services.insert(
             "blocked-svc".into(),
             ServiceConfig {
-                command: "/bin/svc".into(),
+                command: Some("/bin/svc".into()),
+                container: None,
                 ports: HashMap::new(),
                 secrets: HashMap::new(),
                 identity: Default::default(),

@@ -375,6 +375,11 @@ message ServiceSpec {
 
   // Cgroup v2 resource controls for systemd unit generation.
   CgroupControls cgroup_controls = 13;
+
+  // OCI container image reference (e.g. "ghcr.io/org/app:v1@sha256:...").
+  // When set, the service runs as a systemd-nspawn container instead of
+  // a native process. Mutually exclusive with command/store_path.
+  string container_image = 14;
 }
 
 message VolumeMount {
@@ -447,6 +452,8 @@ message DeployCommand {
   string service_name = 2;
   string store_path = 3;
   DeployStrategy strategy = 4;
+  // OCI container image reference for container-mode deployments.
+  string container_image = 5;
 }
 
 enum DeployStrategy {

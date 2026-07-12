@@ -150,6 +150,7 @@ async fn execute_rolling(
                     service_name: plan.service_name.clone(),
                     store_path: plan.store_path.clone(),
                     strategy: DeployStrategy::Rolling as i32,
+                    container_image: String::new(),
                 })),
             };
 
@@ -207,6 +208,7 @@ async fn execute_canary(
             service_name: plan.service_name.clone(),
             store_path: plan.store_path.clone(),
             strategy: DeployStrategy::Canary as i32,
+            container_image: String::new(),
         })),
     };
 
@@ -283,6 +285,7 @@ async fn execute_blue_green(
                 service_name: plan.service_name.clone(),
                 store_path: plan.store_path.clone(),
                 strategy: DeployStrategy::BlueGreen as i32,
+                container_image: String::new(),
             })),
         };
 

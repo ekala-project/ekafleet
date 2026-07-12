@@ -236,7 +236,8 @@ mod tests {
 
     fn minimal_service(replicas: u32) -> ServiceConfig {
         ServiceConfig {
-            command: "/bin/svc".into(),
+            command: Some("/bin/svc".into()),
+            container: None,
             ports: HashMap::new(),
             secrets: HashMap::new(),
             identity: Default::default(),
