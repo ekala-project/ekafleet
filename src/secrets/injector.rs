@@ -29,8 +29,8 @@ impl SecretInjector {
         }
     }
 
-    /// Decrypt a sealed value (nonce || ciphertext || tag).
-    fn decrypt(&self, sealed: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+    /// Decrypt a sealed value (nonce || ciphertext || tag) with additional authenticated data.
+    fn decrypt(&self, sealed: &[u8], aad: &[u8]) -> Result<Vec<u8>, std::io::Error> {
         if sealed.len() < NONCE_LEN {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -45,7 +45,7 @@ impl SecretInjector {
         let mut in_out = ciphertext_and_tag.to_vec();
         let plaintext = self
             .key
-            .open_in_place(nonce, Aad::empty(), &mut in_out)
+            .open_in_place(nonce, Aad::from(aad), &mut in_out)
             .map_err(|_| {
                 std::io::Error::new(std::io::ErrorKind::InvalidData, "decryption failed")
             })?;
@@ -74,8 +74,9 @@ impl SecretInjector {
 
         let path = dir.join(secret_name);
 
-        // Decrypt before writing to disk
-        let plaintext = self.decrypt(encrypted_value)?;
+        // Decrypt before writing to disk (AAD binds ciphertext to service/secret context)
+        let aad = super::store::secret_aad(service_name, secret_name);
+        let plaintext = self.decrypt(encrypted_value, &aad)?;
 
         // If the file already exists with read-only permissions, make it writable first
         #[cfg(unix)]
@@ -202,10 +203,17 @@ mod tests {
     }
 
     /// Encrypt a value the same way SecretStore does, for test input.
-    fn encrypt_value(key: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
+    /// AAD is built from service_name + secret_name to match inject().
+    fn encrypt_for(
+        key: &[u8; 32],
+        service_name: &str,
+        secret_name: &str,
+        plaintext: &[u8],
+    ) -> Vec<u8> {
         use ring::aead::{AES_256_GCM, Aad, Nonce, UnboundKey};
         use ring::rand::{SecureRandom, SystemRandom};
 
+        let aad = super::super::store::secret_aad(service_name, secret_name);
         let unbound = UnboundKey::new(&AES_256_GCM, key).unwrap();
         let sealing_key = LessSafeKey::new(unbound);
         let rng = SystemRandom::new();
@@ -216,7 +224,7 @@ mod tests {
 
         let mut in_out = plaintext.to_vec();
         sealing_key
-            .seal_in_place_append_tag(nonce, Aad::empty(), &mut in_out)
+            .seal_in_place_append_tag(nonce, Aad::from(aad.as_slice()), &mut in_out)
             .unwrap();
 
         let mut sealed = Vec::with_capacity(NONCE_LEN + in_out.len());
@@ -231,7 +239,7 @@ mod tests {
         let key = test_key();
         let mut injector = SecretInjector::new(dir.path(), &key);
 
-        let encrypted = encrypt_value(&key, b"database-password");
+        let encrypted = encrypt_for(&key, "my-service", "db_pass", b"database-password");
         let path = injector
             .inject("my-service", "db_pass", &encrypted, 1)
             .await
@@ -247,7 +255,7 @@ mod tests {
         let key = test_key();
         let mut injector = SecretInjector::new(dir.path(), &key);
 
-        let encrypted = encrypt_value(&key, b"secret");
+        let encrypted = encrypt_for(&key, "svc", "key", b"secret");
         let path = injector.inject("svc", "key", &encrypted, 1).await.unwrap();
 
         #[cfg(unix)]
@@ -268,7 +276,7 @@ mod tests {
         let key = test_key();
         let mut injector = SecretInjector::new(dir.path(), &key);
 
-        let encrypted = encrypt_value(&key, b"value");
+        let encrypted = encrypt_for(&key, "svc", "key", b"value");
         let path1 = injector.inject("svc", "key", &encrypted, 1).await.unwrap();
         let path2 = injector.inject("svc", "key", &encrypted, 1).await.unwrap();
 
@@ -281,8 +289,8 @@ mod tests {
         let key = test_key();
         let mut injector = SecretInjector::new(dir.path(), &key);
 
-        let enc1 = encrypt_value(&key, b"v1");
-        let enc2 = encrypt_value(&key, b"v2");
+        let enc1 = encrypt_for(&key, "svc", "key", b"v1");
+        let enc2 = encrypt_for(&key, "svc", "key", b"v2");
 
         injector.inject("svc", "key", &enc1, 1).await.unwrap();
         let path = injector.inject("svc", "key", &enc2, 2).await.unwrap();
@@ -294,7 +302,7 @@ mod tests {
     #[tokio::test]
     async fn wrong_key_fails_to_inject() {
         let dir = tempfile::tempdir().unwrap();
-        let encrypted = encrypt_value(&[0xAA; 32], b"secret");
+        let encrypted = encrypt_for(&[0xAA; 32], "svc", "key", b"secret");
 
         let mut injector = SecretInjector::new(dir.path(), &[0xBB; 32]);
         let result = injector.inject("svc", "key", &encrypted, 1).await;
@@ -311,7 +319,7 @@ mod tests {
         let key = test_key();
         let mut injector = SecretInjector::new(dir.path(), &key);
 
-        let encrypted = encrypt_value(&key, b"secret");
+        let encrypted = encrypt_for(&key, "svc", "key", b"secret");
         let path = injector.inject("svc", "key", &encrypted, 1).await.unwrap();
         assert!(path.exists());
 

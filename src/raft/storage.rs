@@ -35,8 +35,9 @@ impl RaftStorage {
         }
     }
 
-    /// Encrypt data using AES-256-GCM. Returns nonce || ciphertext || tag.
-    fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+    /// Encrypt data using AES-256-GCM with additional authenticated data.
+    /// Returns nonce || ciphertext || tag.
+    fn encrypt(&self, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, std::io::Error> {
         let mut nonce_bytes = [0u8; NONCE_LEN];
         self.rng
             .fill(&mut nonce_bytes)
@@ -45,7 +46,7 @@ impl RaftStorage {
         let nonce = Nonce::assume_unique_for_key(nonce_bytes);
         let mut in_out = plaintext.to_vec();
         self.key
-            .seal_in_place_append_tag(nonce, Aad::empty(), &mut in_out)
+            .seal_in_place_append_tag(nonce, Aad::from(aad), &mut in_out)
             .map_err(|_| std::io::Error::other("encryption failed"))?;
 
         let mut sealed = Vec::with_capacity(NONCE_LEN + in_out.len());
@@ -54,8 +55,8 @@ impl RaftStorage {
         Ok(sealed)
     }
 
-    /// Decrypt sealed data (nonce || ciphertext || tag).
-    fn decrypt(&self, sealed: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+    /// Decrypt sealed data (nonce || ciphertext || tag) with additional authenticated data.
+    fn decrypt(&self, sealed: &[u8], aad: &[u8]) -> Result<Vec<u8>, std::io::Error> {
         if sealed.len() < NONCE_LEN {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -70,7 +71,7 @@ impl RaftStorage {
         let mut in_out = ciphertext_and_tag.to_vec();
         let plaintext = self
             .key
-            .open_in_place(nonce, Aad::empty(), &mut in_out)
+            .open_in_place(nonce, Aad::from(aad), &mut in_out)
             .map_err(|_| {
                 std::io::Error::new(std::io::ErrorKind::InvalidData, "decryption failed")
             })?;
@@ -104,7 +105,7 @@ impl RaftStorage {
             .join(format!("{:020}.log", entry.index));
         let json = serde_json::to_vec(entry)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let sealed = self.encrypt(&json)?;
+        let sealed = self.encrypt(&json, b"raft-log")?;
         tokio::fs::write(path, sealed).await
     }
 
@@ -122,7 +123,7 @@ impl RaftStorage {
 
         for path in files {
             let sealed = tokio::fs::read(&path).await?;
-            let json = self.decrypt(&sealed)?;
+            let json = self.decrypt(&sealed, b"raft-log")?;
             let entry: LogEntry = serde_json::from_slice(&json)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
             if entry.index >= from_index {
@@ -139,7 +140,7 @@ impl RaftStorage {
             .data_dir
             .join("snapshots")
             .join(format!("{:020}.snap", index));
-        let sealed = self.encrypt(data)?;
+        let sealed = self.encrypt(data, b"raft-snapshot")?;
         let sealed_size = sealed.len();
         tokio::fs::write(path, sealed).await?;
 
@@ -166,7 +167,7 @@ impl RaftStorage {
         match latest {
             Some(path) => {
                 let sealed = tokio::fs::read(&path).await?;
-                let data = self.decrypt(&sealed)?;
+                let data = self.decrypt(&sealed, b"raft-snapshot")?;
                 let index = path
                     .file_stem()
                     .and_then(|s| s.to_str())

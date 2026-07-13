@@ -7,6 +7,18 @@ use tokio::sync::RwLock;
 
 const NONCE_LEN: usize = 12; // AES-256-GCM nonce size
 
+/// Build additional authenticated data (AAD) for a secret.
+///
+/// AAD binds the ciphertext to the service and secret name so that
+/// encrypted data cannot be swapped between different contexts.
+pub fn secret_aad(service_name: &str, secret_name: &str) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(service_name.len() + 1 + secret_name.len());
+    aad.extend_from_slice(service_name.as_bytes());
+    aad.push(0);
+    aad.extend_from_slice(secret_name.as_bytes());
+    aad
+}
+
 /// Server-side encrypted secret storage.
 /// Secrets are encrypted at rest with AES-256-GCM and scoped to specific services.
 #[derive(Clone)]
@@ -60,9 +72,9 @@ impl SecretStore {
         &self.raw_key
     }
 
-    /// Encrypt plaintext value using AES-256-GCM.
+    /// Encrypt plaintext value using AES-256-GCM with additional authenticated data.
     /// Returns nonce || ciphertext || tag.
-    fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, SecretStoreError> {
+    fn encrypt(&self, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, SecretStoreError> {
         let mut nonce_bytes = [0u8; NONCE_LEN];
         self.rng
             .fill(&mut nonce_bytes)
@@ -72,7 +84,7 @@ impl SecretStore {
 
         let mut in_out = plaintext.to_vec();
         self.key
-            .seal_in_place_append_tag(nonce, Aad::empty(), &mut in_out)
+            .seal_in_place_append_tag(nonce, Aad::from(aad), &mut in_out)
             .map_err(|_| SecretStoreError::Encrypt)?;
 
         // Prepend nonce to ciphertext+tag
@@ -82,8 +94,8 @@ impl SecretStore {
         Ok(sealed)
     }
 
-    /// Decrypt a sealed value (nonce || ciphertext || tag).
-    fn decrypt(&self, sealed: &[u8]) -> Result<Vec<u8>, SecretStoreError> {
+    /// Decrypt a sealed value (nonce || ciphertext || tag) with additional authenticated data.
+    fn decrypt(&self, sealed: &[u8], aad: &[u8]) -> Result<Vec<u8>, SecretStoreError> {
         if sealed.len() < NONCE_LEN {
             return Err(SecretStoreError::Decrypt);
         }
@@ -95,7 +107,7 @@ impl SecretStore {
         let mut in_out = ciphertext_and_tag.to_vec();
         let plaintext = self
             .key
-            .open_in_place(nonce, Aad::empty(), &mut in_out)
+            .open_in_place(nonce, Aad::from(aad), &mut in_out)
             .map_err(|_| SecretStoreError::Decrypt)?;
 
         Ok(plaintext.to_vec())
@@ -109,7 +121,8 @@ impl SecretStore {
         secret_name: &str,
         value: &[u8],
     ) -> Result<u64, SecretStoreError> {
-        let sealed = self.encrypt(value)?;
+        let aad = secret_aad(service_name, secret_name);
+        let sealed = self.encrypt(value, &aad)?;
 
         let mut state = self.inner.write().await;
         let service_secrets = state.secrets.entry(service_name.to_string()).or_default();
@@ -144,7 +157,8 @@ impl SecretStore {
             .and_then(|svc| svc.get(secret_name))
         {
             Some(entry) => {
-                let plaintext = self.decrypt(&entry.sealed)?;
+                let aad = secret_aad(service_name, secret_name);
+                let plaintext = self.decrypt(&entry.sealed, &aad)?;
                 Ok(Some((plaintext, entry.version)))
             }
             None => Ok(None),
@@ -216,7 +230,8 @@ impl SecretStore {
         let mut result = Vec::with_capacity(entries.len());
 
         for (svc, name, sealed, version) in entries {
-            match super::key_derivation::reencrypt(self.raw_key.as_ref(), &agent_key, &sealed) {
+            let aad = secret_aad(&svc, &name);
+            match super::key_derivation::reencrypt(self.raw_key.as_ref(), &agent_key, &sealed, &aad) {
                 Ok(reencrypted) => result.push((svc, name, reencrypted, version)),
                 Err(e) => {
                     tracing::error!(
@@ -274,10 +289,11 @@ mod tests {
     async fn different_encryptions_produce_different_ciphertext() {
         let store = SecretStore::new(&test_key());
         let plaintext = b"same-value";
+        let aad = secret_aad("svc", "key");
 
         // Encrypt twice — nonces should differ, producing different ciphertext
-        let sealed1 = store.encrypt(plaintext).unwrap();
-        let sealed2 = store.encrypt(plaintext).unwrap();
+        let sealed1 = store.encrypt(plaintext, &aad).unwrap();
+        let sealed2 = store.encrypt(plaintext, &aad).unwrap();
 
         assert_ne!(
             sealed1, sealed2,
@@ -289,9 +305,10 @@ mod tests {
     async fn wrong_key_cannot_decrypt() {
         let store1 = SecretStore::new(&[0xAA; 32]);
         let store2 = SecretStore::new(&[0xBB; 32]);
+        let aad = secret_aad("svc", "key");
 
-        let sealed = store1.encrypt(b"secret").unwrap();
-        let result = store2.decrypt(&sealed);
+        let sealed = store1.encrypt(b"secret", &aad).unwrap();
+        let result = store2.decrypt(&sealed, &aad);
 
         assert!(result.is_err(), "decryption with wrong key must fail");
     }
@@ -299,17 +316,26 @@ mod tests {
     #[tokio::test]
     async fn tampered_ciphertext_fails_decryption() {
         let store = SecretStore::new(&test_key());
-        let mut sealed = store.encrypt(b"secret").unwrap();
+        let aad = secret_aad("svc", "key");
+        let mut sealed = store.encrypt(b"secret", &aad).unwrap();
 
         // Flip a byte in the ciphertext (after the nonce)
         let idx = NONCE_LEN + 1;
         sealed[idx] ^= 0xFF;
 
-        let result = store.decrypt(&sealed);
+        let result = store.decrypt(&sealed, &aad);
         assert!(
             result.is_err(),
             "tampered ciphertext must fail authentication"
         );
+    }
+
+    #[tokio::test]
+    async fn wrong_aad_fails_decryption() {
+        let store = SecretStore::new(&test_key());
+        let sealed = store.encrypt(b"secret", &secret_aad("svc-a", "key")).unwrap();
+        let result = store.decrypt(&sealed, &secret_aad("svc-b", "key"));
+        assert!(result.is_err(), "decryption with wrong AAD must fail");
     }
 
     #[tokio::test]
@@ -397,9 +423,10 @@ mod tests {
     #[tokio::test]
     async fn truncated_ciphertext_fails() {
         let store = SecretStore::new(&test_key());
+        let aad = secret_aad("svc", "key");
         // Too short to contain a nonce
-        assert!(store.decrypt(&[0u8; 5]).is_err());
+        assert!(store.decrypt(&[0u8; 5], &aad).is_err());
         // Empty
-        assert!(store.decrypt(&[]).is_err());
+        assert!(store.decrypt(&[], &aad).is_err());
     }
 }

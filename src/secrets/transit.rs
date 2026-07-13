@@ -90,7 +90,7 @@ impl TransitEngine {
         let mut in_out = plaintext.to_vec();
         named_key
             .key
-            .seal_in_place_append_tag(nonce, Aad::empty(), &mut in_out)
+            .seal_in_place_append_tag(nonce, Aad::from(key_name.as_bytes()), &mut in_out)
             .map_err(|_| TransitError::EncryptionFailed)?;
 
         let mut sealed = Vec::with_capacity(NONCE_LEN + in_out.len());
@@ -122,7 +122,7 @@ impl TransitEngine {
         let mut in_out = ct_and_tag.to_vec();
         let plaintext = named_key
             .key
-            .open_in_place(nonce, Aad::empty(), &mut in_out)
+            .open_in_place(nonce, Aad::from(key_name.as_bytes()), &mut in_out)
             .map_err(|_| TransitError::DecryptionFailed)?;
 
         Ok(plaintext.to_vec())
