@@ -7,9 +7,10 @@ use std::time::Duration;
 use super::cloud::instance_tracker::InstanceTracker;
 use super::deployer::{self, DeploymentPlan};
 use super::nix;
-use super::scheduler::{self, Placement};
+use super::scheduler::{self, CurrentPlacements, Placement};
 use super::state::FleetState;
 use crate::config::{self, CapacityConfig, FleetConfig, MachineConfig};
+use crate::raft::state::FleetStateMachine;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReconcileError {
@@ -36,6 +37,16 @@ pub struct ServiceOp {
     pub service_name: String,
     pub placements: Vec<Placement>,
     pub description: String,
+    pub migrations: Vec<MigrationOp>,
+}
+
+/// Describes a volume data migration needed when a stateful service
+/// instance moves to a different node.
+#[derive(Debug)]
+pub struct MigrationOp {
+    pub instance_id: String,
+    pub source_machine: String,
+    pub dest_machine: String,
 }
 
 /// Run a single reconciliation cycle: eval → refresh → plan → apply.
@@ -44,6 +55,7 @@ pub async fn reconcile_once(
     state: &FleetState,
     auto_approve: bool,
     instance_tracker: Option<&InstanceTracker>,
+    raft_state: &FleetStateMachine,
 ) -> Result<ReconcilePlan, ReconcileError> {
     // 1. Evaluate: get desired state from Nix
     tracing::info!(config = %config_path.display(), "Evaluating fleet configuration");
@@ -59,7 +71,14 @@ pub async fn reconcile_once(
     tracing::info!(nodes = current_nodes.len(), "Current fleet state refreshed");
 
     // 3. Plan: diff desired vs actual
-    let plan = compute_plan(&desired, &current_nodes, state, instance_tracker).await;
+    let plan = compute_plan(
+        &desired,
+        &current_nodes,
+        state,
+        instance_tracker,
+        raft_state,
+    )
+    .await;
 
     if !plan.has_changes {
         tracing::info!("No changes detected");
@@ -91,6 +110,7 @@ pub async fn reconcile_loop(
     state: &FleetState,
     interval: Duration,
     instance_tracker: Option<&InstanceTracker>,
+    raft_state: &FleetStateMachine,
 ) -> Result<(), ReconcileError> {
     tracing::info!(
         interval = ?interval,
@@ -100,7 +120,7 @@ pub async fn reconcile_loop(
     let mut tick = tokio::time::interval(interval);
     loop {
         tick.tick().await;
-        match reconcile_once(config_path, state, true, instance_tracker).await {
+        match reconcile_once(config_path, state, true, instance_tracker, raft_state).await {
             Ok(_) => {}
             Err(e) => {
                 tracing::error!(error = %e, "Reconciliation cycle failed");
@@ -115,12 +135,29 @@ pub async fn compute_plan(
     _current_nodes: &[String],
     state: &FleetState,
     instance_tracker: Option<&InstanceTracker>,
+    raft_state: &FleetStateMachine,
 ) -> ReconcilePlan {
     // Merge static machines with cloud-provisioned dynamic machines
     let machines = merge_dynamic_machines(desired, instance_tracker).await;
 
+    // Build current placements from Raft state for data-locality scoring
+    let mut current_placements: CurrentPlacements = HashMap::new();
+    for (_, deployment) in raft_state.all_deployments().await {
+        for record in &deployment.placements {
+            current_placements.insert(
+                (deployment.service_name.clone(), record.instance_id.clone()),
+                record.machine_name.clone(),
+            );
+        }
+    }
+
     // Schedule services across all machines (static + cloud)
-    let placement_plan = scheduler::schedule(&desired.services, &machines, &desired.node_pools);
+    let placement_plan = scheduler::schedule(
+        &desired.services,
+        &machines,
+        &desired.node_pools,
+        &current_placements,
+    );
 
     // Log blocked placements
     for b in &placement_plan.blocked {
@@ -156,12 +193,14 @@ pub async fn compute_plan(
                 service_name: service_name.clone(),
                 placements: placements.clone(),
                 description: format!("Update {service_name} ({} instances)", placements.len()),
+                migrations: vec![],
             });
         } else {
             creates.push(ServiceOp {
                 service_name: service_name.clone(),
                 placements: placements.clone(),
                 description: format!("Create {service_name} ({} instances)", placements.len()),
+                migrations: vec![],
             });
         }
     }
@@ -173,6 +212,7 @@ pub async fn compute_plan(
                 service_name: svc.name.clone(),
                 placements: vec![],
                 description: format!("Destroy {} (no longer in desired state)", svc.name),
+                migrations: vec![],
             });
         }
     }
@@ -197,6 +237,43 @@ pub async fn compute_plan(
             desired_sorted.sort();
 
             if current_sorted != desired_sorted && !current_nodes.is_empty() {
+                // For stateful services with local volumes and migrate_on_reschedule
+                // enabled, detect per-instance node changes that require data migration.
+                let mut migrations = Vec::new();
+                if let Some(svc_cfg) = desired.services.get(service_name) {
+                    let is_stateful = svc_cfg.scheduling.job_type == config::JobType::Stateful;
+                    let has_local_volumes = svc_cfg.volumes.iter().any(|v| {
+                        v.storage_class == "local"
+                            && v.access_mode == config::VolumeAccessMode::ReadWriteOnce
+                    });
+                    let migrate_enabled = svc_cfg.scheduling.migrate.migrate_on_reschedule;
+
+                    if is_stateful && has_local_volumes && migrate_enabled {
+                        // Compare per-instance placements to find moves
+                        for dp in desired_placements {
+                            if let Some(old_machine) = current_placements
+                                .get(&(service_name.clone(), dp.instance_id.clone()))
+                            {
+                                if old_machine != &dp.machine_name {
+                                    migrations.push(MigrationOp {
+                                        instance_id: dp.instance_id.clone(),
+                                        source_machine: old_machine.clone(),
+                                        dest_machine: dp.machine_name.clone(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !migrations.is_empty() {
+                    tracing::info!(
+                        service = %service_name,
+                        count = migrations.len(),
+                        "Volume migrations required for reschedule"
+                    );
+                }
+
                 reschedules.push(ServiceOp {
                     service_name: service_name.clone(),
                     placements: desired_placements.clone(),
@@ -205,6 +282,7 @@ pub async fn compute_plan(
                         current_nodes.len(),
                         desired_nodes.len()
                     ),
+                    migrations,
                 });
             }
         }
@@ -268,16 +346,114 @@ async fn apply_plan(
     plan: &ReconcilePlan,
     state: &FleetState,
 ) -> Result<(), deployer::DeployError> {
+    // Execute volume migrations for reschedules before deploying.
+    // Migrations run first so data is available on the destination node
+    // before the service starts there.
+    for op in &plan.reschedules {
+        if op.migrations.is_empty() {
+            continue;
+        }
+
+        let service_cfg = match desired.services.get(&op.service_name) {
+            Some(cfg) => cfg,
+            None => continue,
+        };
+        let max_parallel = service_cfg.scheduling.migrate.max_parallel as usize;
+
+        for chunk in op.migrations.chunks(max_parallel) {
+            let mut handles = Vec::new();
+            for migration in chunk {
+                let source_host = desired
+                    .machines
+                    .get(&migration.source_machine)
+                    .map(|m| m.target_host.clone())
+                    .unwrap_or_default();
+                let dest_machine = migration.dest_machine.clone();
+                let service_name = op.service_name.clone();
+                let s = state.clone();
+
+                // Build volume paths for all local volumes in this service
+                let volume_names: Vec<String> = service_cfg
+                    .volumes
+                    .iter()
+                    .filter(|v| {
+                        v.storage_class == "local"
+                            && v.access_mode == config::VolumeAccessMode::ReadWriteOnce
+                    })
+                    .map(|v| v.name.clone())
+                    .collect();
+
+                handles.push(tokio::spawn(async move {
+                    for vol_name in &volume_names {
+                        let vol_path = format!(
+                            "/var/lib/ekafleet/data/volumes/{}/{}",
+                            service_name, vol_name
+                        );
+                        let correlation_id = uuid::Uuid::new_v4().to_string();
+                        let cmd = crate::proto::MigrateVolumeCommand {
+                            correlation_id: correlation_id.clone(),
+                            service_name: service_name.clone(),
+                            source_host: source_host.clone(),
+                            source_path: vol_path.clone(),
+                            dest_path: vol_path,
+                        };
+                        let msg = crate::proto::ServerMessage {
+                            payload: Some(
+                                crate::proto::server_message::Payload::MigrateVolumeCommand(cmd),
+                            ),
+                        };
+                        let timeout = Duration::from_secs(600);
+                        match s
+                            .send_command(&dest_machine, msg, correlation_id, timeout)
+                            .await
+                        {
+                            Ok(resp) if resp.success => {
+                                tracing::info!(
+                                    service = %service_name,
+                                    volume = %vol_name,
+                                    dest = %dest_machine,
+                                    "Volume migration completed"
+                                );
+                            }
+                            Ok(resp) => {
+                                tracing::error!(
+                                    service = %service_name,
+                                    volume = %vol_name,
+                                    dest = %dest_machine,
+                                    error = %resp.error_message,
+                                    "Volume migration failed"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    service = %service_name,
+                                    volume = %vol_name,
+                                    dest = %dest_machine,
+                                    error = %e,
+                                    "Volume migration command failed"
+                                );
+                            }
+                        }
+                    }
+                }));
+            }
+            for handle in handles {
+                let _ = handle.await;
+            }
+        }
+    }
+
     // Compute deployment order
     let tiers = deployer::compute_deploy_order(&desired.services);
 
     for tier in &tiers {
         for service_name in tier {
-            // Find ops for this service
+            // Find ops for this service (creates, updates, and reschedules)
             let ops: Vec<&ServiceOp> = plan
                 .creates
                 .iter()
                 .chain(plan.updates.iter())
+                .chain(plan.reschedules.iter())
                 .filter(|op| &op.service_name == service_name)
                 .collect();
 
@@ -589,7 +765,8 @@ mod tests {
             enforcement: PolicyEnforcement::Enforce,
         });
 
-        let plan = compute_plan(&config, &["node-1".to_string()], &state, None).await;
+        let raft = FleetStateMachine::new();
+        let plan = compute_plan(&config, &["node-1".to_string()], &state, None, &raft).await;
         // The service should be blocked by the policy.
         assert!(plan.creates.is_empty(), "blocked-svc should not be created");
     }

@@ -196,7 +196,7 @@ The highest-scoring candidate is selected. Resources are allocated, and the next
 | Type | Scheduling Behavior |
 |------|-------------------|
 | `service` | Placed on best N machines (N = `replicas`). Long-running. |
-| `stateful` | Same as service but with sticky placement preference |
+| `stateful` | Like service, with data-locality scoring (+200 bonus for previous node) and automatic volume migration on reschedule |
 | `system` | Runs on **every** machine matching constraints (ignores `replicas`) |
 | `batch` | Same as service but exits on completion |
 | `sysbatch` | Runs once on every matching machine, then completes |

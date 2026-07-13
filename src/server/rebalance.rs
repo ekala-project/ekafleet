@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+use std::collections::HashMap;
+
 use super::scheduler;
 use super::state::FleetState;
 use crate::config::FleetConfig;
@@ -16,8 +18,15 @@ pub async fn evaluate_rebalance(
     // Get current placements from fleet status
     let (_nodes, services, _) = state.fleet_status().await;
 
-    // Compute ideal placement from scratch
-    let ideal = scheduler::schedule(&config.services, &config.machines, &config.node_pools);
+    // Compute ideal placement from scratch (empty current placements
+    // intentionally — rebalancing evaluates the ideal state without
+    // stickiness bias).
+    let ideal = scheduler::schedule(
+        &config.services,
+        &config.machines,
+        &config.node_pools,
+        &HashMap::new(),
+    );
 
     // Compare actual vs ideal — find services that would be better placed elsewhere
     for svc_status in &services {

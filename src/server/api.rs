@@ -269,6 +269,7 @@ impl FleetControl for FleetControlService {
             &current_nodes,
             &self.state,
             Some(&self.instance_tracker),
+            &self.raft_state,
         )
         .await;
 
@@ -347,11 +348,18 @@ impl FleetControl for FleetControlService {
         let watch = req.watch;
         let grpc_addr = self.grpc_addr.clone();
         let ca_cert_pem = self.trust_bundle_pem.clone().unwrap_or_default();
+        let raft_state = self.raft_state.clone();
 
         tokio::spawn(async move {
             // Run a single reconciliation cycle
-            match super::reconciler::reconcile_once(&config_path, &state, true, Some(&tracker))
-                .await
+            match super::reconciler::reconcile_once(
+                &config_path,
+                &state,
+                true,
+                Some(&tracker),
+                &raft_state,
+            )
+            .await
             {
                 Ok(plan) => {
                     let msg = if plan.has_changes {
@@ -410,6 +418,7 @@ impl FleetControl for FleetControlService {
                             let reconcile_tracker = tracker.clone();
                             let reconcile_state = state.clone();
                             let reconcile_path = config_path.clone();
+                            let reconcile_raft = raft_state.clone();
 
                             tokio::spawn(async move {
                                 let mut interval =
@@ -426,6 +435,7 @@ impl FleetControl for FleetControlService {
                                         &reconcile_state,
                                         true,
                                         Some(&reconcile_tracker),
+                                        &reconcile_raft,
                                     )
                                     .await
                                     {

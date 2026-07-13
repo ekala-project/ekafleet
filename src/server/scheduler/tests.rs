@@ -1,5 +1,7 @@
 use super::*;
-use crate::config::{CapacityConfig, Constraint, ResourceConfig, ResourceValue, SchedulingConfig};
+use crate::config::{
+    CapacityConfig, Constraint, JobType, ResourceConfig, ResourceValue, SchedulingConfig,
+};
 use std::collections::HashMap;
 
 fn make_machine(
@@ -112,7 +114,7 @@ fn basic_placement() {
 
     let services: HashMap<String, ServiceConfig> = [make_service("web", 500, 1024, 2)].into();
 
-    let plan = schedule(&services, &machines, &no_pools());
+    let plan = schedule(&services, &machines, &no_pools(), &HashMap::new());
     assert_eq!(plan.placements.len(), 2);
 
     // Both replicas should be placed (on different nodes due to distinct-host penalty)
@@ -171,7 +173,7 @@ fn constraint_filtering() {
     )]
     .into();
 
-    let plan = schedule(&services, &machines, &no_pools());
+    let plan = schedule(&services, &machines, &no_pools(), &HashMap::new());
     assert_eq!(plan.placements.len(), 1);
     assert_eq!(plan.placements[0].machine_name, "app-1");
 }
@@ -220,7 +222,7 @@ fn system_job_all_nodes() {
     )]
     .into();
 
-    let plan = schedule(&services, &machines, &no_pools());
+    let plan = schedule(&services, &machines, &no_pools(), &HashMap::new());
     assert_eq!(plan.placements.len(), 3);
 }
 
@@ -230,7 +232,7 @@ fn insufficient_resources() {
 
     let services: HashMap<String, ServiceConfig> = [make_service("big", 8000, 16384, 1)].into();
 
-    let plan = schedule(&services, &machines, &no_pools());
+    let plan = schedule(&services, &machines, &no_pools(), &HashMap::new());
     assert_eq!(plan.placements.len(), 0);
 }
 
@@ -301,7 +303,7 @@ fn pool_affinity_prefers_correct_pool() {
     )]
     .into();
 
-    let plan = schedule(&services, &machines, &pools);
+    let plan = schedule(&services, &machines, &pools, &HashMap::new());
     assert_eq!(plan.placements.len(), 1);
     assert_eq!(plan.placements[0].machine_name, "compute-1");
 }
@@ -374,7 +376,7 @@ fn pool_affinity_spills_when_full() {
     )]
     .into();
 
-    let plan = schedule(&services, &machines, &pools);
+    let plan = schedule(&services, &machines, &pools, &HashMap::new());
     assert_eq!(plan.placements.len(), 2);
 
     // One on compute, one spilled to default
@@ -452,7 +454,7 @@ fn pool_hard_constraint_blocks_spillover() {
     )]
     .into();
 
-    let plan = schedule(&services, &machines, &pools);
+    let plan = schedule(&services, &machines, &pools, &HashMap::new());
     // Only 1 can fit on compute-1, second has no room and cannot spill
     assert_eq!(plan.placements.len(), 1);
     assert_eq!(plan.placements[0].machine_name, "compute-1");
@@ -474,7 +476,7 @@ fn reserved_capacity_reduces_schedulable() {
     // Request exactly the schedulable amount (3500 cpu, 7680 mem)
     let services: HashMap<String, ServiceConfig> = [make_service("svc", 3500, 7680, 1)].into();
 
-    let plan = schedule(&services, &machines, &no_pools());
+    let plan = schedule(&services, &machines, &no_pools(), &HashMap::new());
     assert_eq!(plan.placements.len(), 1);
 }
 
@@ -494,7 +496,7 @@ fn reserved_prevents_overcommit() {
     // Request more than schedulable (3600 > 3500 schedulable cpu)
     let services: HashMap<String, ServiceConfig> = [make_service("svc", 3600, 1024, 1)].into();
 
-    let plan = schedule(&services, &machines, &no_pools());
+    let plan = schedule(&services, &machines, &no_pools(), &HashMap::new());
     assert_eq!(plan.placements.len(), 0);
 }
 
@@ -568,7 +570,7 @@ fn pool_labels_merged() {
     )]
     .into();
 
-    let plan = schedule(&services, &machines, &pools);
+    let plan = schedule(&services, &machines, &pools, &HashMap::new());
     assert_eq!(plan.placements.len(), 1);
     assert_eq!(plan.placements[0].machine_name, "c-1");
 }
@@ -584,7 +586,7 @@ fn default_pool_backwards_compat() {
 
     let services: HashMap<String, ServiceConfig> = [make_service("web", 500, 1024, 2)].into();
 
-    let plan = schedule(&services, &machines, &no_pools());
+    let plan = schedule(&services, &machines, &no_pools(), &HashMap::new());
     assert_eq!(plan.placements.len(), 2);
 }
 
@@ -662,7 +664,7 @@ fn system_job_on_pool() {
     )]
     .into();
 
-    let plan = schedule(&services, &machines, &pools);
+    let plan = schedule(&services, &machines, &pools, &HashMap::new());
     // Should only run on the 2 compute pool machines
     assert_eq!(plan.placements.len(), 2);
     for p in &plan.placements {
@@ -717,7 +719,7 @@ fn constraint_numeric_operators() {
     )]
     .into();
 
-    let plan = schedule(&services, &machines, &no_pools());
+    let plan = schedule(&services, &machines, &no_pools(), &HashMap::new());
     assert_eq!(plan.placements.len(), 1);
     assert_eq!(plan.placements[0].machine_name, "big");
 }
@@ -769,7 +771,7 @@ fn constraint_regexp() {
     )]
     .into();
 
-    let plan = schedule(&services, &machines, &no_pools());
+    let plan = schedule(&services, &machines, &no_pools(), &HashMap::new());
     assert_eq!(plan.placements.len(), 1);
     assert_eq!(plan.placements[0].machine_name, "web-1");
 }
@@ -821,7 +823,7 @@ fn constraint_is_set() {
     )]
     .into();
 
-    let plan = schedule(&services, &machines, &no_pools());
+    let plan = schedule(&services, &machines, &no_pools(), &HashMap::new());
     assert_eq!(plan.placements.len(), 1);
     assert_eq!(plan.placements[0].machine_name, "gpu-1");
 }
@@ -890,7 +892,7 @@ fn multiple_spread_blocks() {
     )]
     .into();
 
-    let plan = schedule(&services, &machines, &no_pools());
+    let plan = schedule(&services, &machines, &no_pools(), &HashMap::new());
     assert_eq!(plan.placements.len(), 4);
     // All 4 machines should be used (spread across both zone and rack)
     let mut used: Vec<&str> = plan
@@ -980,7 +982,7 @@ fn priority_ordering() {
     ]
     .into();
 
-    let plan = schedule(&services, &machines, &no_pools());
+    let plan = schedule(&services, &machines, &no_pools(), &HashMap::new());
     // High priority should be placed, low should be blocked
     assert_eq!(plan.placements.len(), 1);
     assert_eq!(plan.placements[0].service_name, "high");
@@ -1016,7 +1018,7 @@ fn taint_blocks_non_tolerating_service() {
 
     // Service without toleration — should be blocked
     let services: HashMap<String, ServiceConfig> = [make_service("web", 100, 256, 1)].into();
-    let plan = schedule(&services, &machines, &no_pools());
+    let plan = schedule(&services, &machines, &no_pools(), &HashMap::new());
     assert_eq!(plan.placements.len(), 0);
     assert_eq!(plan.blocked.len(), 1);
 
@@ -1061,7 +1063,7 @@ fn taint_blocks_non_tolerating_service() {
         },
     )]
     .into();
-    let plan = schedule(&services, &machines, &no_pools());
+    let plan = schedule(&services, &machines, &no_pools(), &HashMap::new());
     assert_eq!(plan.placements.len(), 1);
 }
 
@@ -1108,6 +1110,174 @@ fn sysbatch_runs_on_all_nodes() {
     )]
     .into();
 
-    let plan = schedule(&services, &machines, &no_pools());
+    let plan = schedule(&services, &machines, &no_pools(), &HashMap::new());
     assert_eq!(plan.placements.len(), 2);
+}
+
+#[test]
+fn stateful_sticky_placement_prefers_current_node() {
+    let machines: HashMap<String, MachineConfig> = [
+        make_machine("node-1", 4000, 8192, vec![]),
+        make_machine("node-2", 4000, 8192, vec![]),
+    ]
+    .into();
+
+    let services: HashMap<String, ServiceConfig> = [(
+        "db".to_string(),
+        ServiceConfig {
+            command: Some("/bin/db".into()),
+            container: None,
+            ports: HashMap::new(),
+            secrets: HashMap::new(),
+            identity: Default::default(),
+            resources: ResourceConfig {
+                cpu: Some(ResourceValue {
+                    request: 500,
+                    limit: None,
+                }),
+                memory: Some(ResourceValue {
+                    request: 1024,
+                    limit: None,
+                }),
+                disk: None,
+                extended: HashMap::new(),
+                cgroup_controls: None,
+            },
+            scheduling: SchedulingConfig {
+                replicas: 1,
+                job_type: JobType::Stateful,
+                ..Default::default()
+            },
+            environment: HashMap::new(),
+            templates: HashMap::new(),
+            lifecycle: Default::default(),
+            volumes: Vec::new(),
+            sidecars: Vec::new(),
+        },
+    )]
+    .into();
+
+    // Simulate the service previously running on node-2
+    let current_placements: CurrentPlacements = [(
+        (String::from("db"), String::from("db-0")),
+        String::from("node-2"),
+    )]
+    .into();
+
+    let plan = schedule(&services, &machines, &no_pools(), &current_placements);
+    assert_eq!(plan.placements.len(), 1);
+    // Should prefer node-2 because of data locality bonus
+    assert_eq!(plan.placements[0].machine_name, "node-2");
+}
+
+#[test]
+fn non_stateful_ignores_current_placement() {
+    let machines: HashMap<String, MachineConfig> = [
+        make_machine("node-1", 8000, 16384, vec![]),
+        make_machine("node-2", 4000, 8192, vec![]),
+    ]
+    .into();
+
+    let services: HashMap<String, ServiceConfig> = [(
+        "web".to_string(),
+        ServiceConfig {
+            command: Some("/bin/web".into()),
+            container: None,
+            ports: HashMap::new(),
+            secrets: HashMap::new(),
+            identity: Default::default(),
+            resources: ResourceConfig {
+                cpu: Some(ResourceValue {
+                    request: 500,
+                    limit: None,
+                }),
+                memory: Some(ResourceValue {
+                    request: 1024,
+                    limit: None,
+                }),
+                disk: None,
+                extended: HashMap::new(),
+                cgroup_controls: None,
+            },
+            scheduling: SchedulingConfig {
+                replicas: 1,
+                job_type: JobType::Service,
+                ..Default::default()
+            },
+            environment: HashMap::new(),
+            templates: HashMap::new(),
+            lifecycle: Default::default(),
+            volumes: Vec::new(),
+            sidecars: Vec::new(),
+        },
+    )]
+    .into();
+
+    // Simulate the service previously running on node-2 (the smaller node)
+    let current_placements: CurrentPlacements = [(
+        (String::from("web"), String::from("web-0")),
+        String::from("node-2"),
+    )]
+    .into();
+
+    let plan = schedule(&services, &machines, &no_pools(), &current_placements);
+    assert_eq!(plan.placements.len(), 1);
+    // Service type should NOT get sticky bonus — scheduler picks on merit.
+    // We don't assert a specific node, just that placement succeeded without
+    // being forced to node-2 by stickiness.
+    assert!(!plan.placements[0].machine_name.is_empty());
+}
+
+#[test]
+fn stateful_sticky_falls_back_when_node_gone() {
+    // Only node-1 is available (node-2 is gone)
+    let machines: HashMap<String, MachineConfig> =
+        [make_machine("node-1", 4000, 8192, vec![])].into();
+
+    let services: HashMap<String, ServiceConfig> = [(
+        "db".to_string(),
+        ServiceConfig {
+            command: Some("/bin/db".into()),
+            container: None,
+            ports: HashMap::new(),
+            secrets: HashMap::new(),
+            identity: Default::default(),
+            resources: ResourceConfig {
+                cpu: Some(ResourceValue {
+                    request: 500,
+                    limit: None,
+                }),
+                memory: Some(ResourceValue {
+                    request: 1024,
+                    limit: None,
+                }),
+                disk: None,
+                extended: HashMap::new(),
+                cgroup_controls: None,
+            },
+            scheduling: SchedulingConfig {
+                replicas: 1,
+                job_type: JobType::Stateful,
+                ..Default::default()
+            },
+            environment: HashMap::new(),
+            templates: HashMap::new(),
+            lifecycle: Default::default(),
+            volumes: Vec::new(),
+            sidecars: Vec::new(),
+        },
+    )]
+    .into();
+
+    // Previous placement was on node-2, which no longer exists
+    let current_placements: CurrentPlacements = [(
+        (String::from("db"), String::from("db-0")),
+        String::from("node-2"),
+    )]
+    .into();
+
+    let plan = schedule(&services, &machines, &no_pools(), &current_placements);
+    assert_eq!(plan.placements.len(), 1);
+    // Falls back to node-1 since node-2 doesn't exist
+    assert_eq!(plan.placements[0].machine_name, "node-1");
 }

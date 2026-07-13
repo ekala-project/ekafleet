@@ -284,6 +284,7 @@ message ServerMessage {
     SystemRebootCommand system_reboot_command = 17;
     SystemRebuildCommand system_rebuild_command = 18;
     InspectServiceCommand inspect_service_command = 19;
+    MigrateVolumeCommand migrate_volume_command = 20;
   }
 }
 
@@ -335,6 +336,14 @@ message SystemRebuildCommand {
 message InspectServiceCommand {
   string correlation_id = 1;
   string service_name = 2;
+}
+
+message MigrateVolumeCommand {
+  string correlation_id = 1;
+  string service_name = 2;
+  string source_host = 3;
+  string source_path = 4;
+  string dest_path = 5;
 }
 
 // CA trust bundle pushed to agents for SPIFFE workload verification.

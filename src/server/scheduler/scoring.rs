@@ -19,6 +19,7 @@ pub(super) fn compute_score(
     spreads: &[SpreadConfig],
     service_affinities: &[ServiceAffinityConfig],
     pool_algorithm: Option<&SchedulerAlgorithm>,
+    current_machine: Option<&str>,
 ) -> f64 {
     let mut score = 0.0;
 
@@ -108,6 +109,14 @@ pub(super) fn compute_score(
             if has_target {
                 score += sa.weight as f64;
             }
+        }
+    }
+
+    // Data locality: strongly prefer the node where this instance's data
+    // already lives. Only applied for Stateful jobs via current_machine.
+    if let Some(current) = current_machine {
+        if candidate.name == current {
+            score += 200.0;
         }
     }
 

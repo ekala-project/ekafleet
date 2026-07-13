@@ -15,6 +15,10 @@ use crate::config::{
 use constraints::{passes_constraints, passes_required_spreads, passes_taints};
 use scoring::{compute_score, find_preemption_candidate};
 
+/// Maps (service_name, instance_id) → machine_name for currently-running instances.
+/// Used to provide data-locality scoring for Stateful jobs.
+pub type CurrentPlacements = HashMap<(String, String), String>;
+
 /// Result of scheduling: which services go to which machines.
 #[derive(Debug, Clone)]
 pub struct PlacementPlan {
@@ -156,6 +160,7 @@ pub fn schedule(
     services: &HashMap<String, ServiceConfig>,
     machines: &HashMap<String, MachineConfig>,
     node_pools: &HashMap<String, NodePoolConfig>,
+    current_placements: &CurrentPlacements,
 ) -> PlacementPlan {
     let mut candidates: Vec<Candidate> = machines
         .iter()
@@ -335,6 +340,16 @@ pub fn schedule(
                         continue;
                     }
 
+                    // Data locality: for Stateful jobs, look up the current
+                    // machine so the scorer can prefer it.
+                    let current_machine = if scheduling.job_type == JobType::Stateful {
+                        current_placements
+                            .get(&(service_name.to_string(), instance_id.clone()))
+                            .map(|m| m.as_str())
+                    } else {
+                        None
+                    };
+
                     // Phase 2: Score
                     let mut scored: Vec<(usize, f64)> = filtered
                         .into_iter()
@@ -347,6 +362,7 @@ pub fn schedule(
                                 &scheduling.spread,
                                 &scheduling.service_affinity,
                                 pool_algorithm,
+                                current_machine,
                             );
                             (i, score)
                         })

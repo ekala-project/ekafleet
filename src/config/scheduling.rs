@@ -348,7 +348,7 @@ pub enum DelayFunction {
     Fibonacci,
 }
 
-/// Migration policy for node drain.
+/// Migration policy for node drain and reschedule.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct MigrateConfig {
@@ -358,6 +358,15 @@ pub struct MigrateConfig {
     pub min_healthy_time_secs: u64,
     #[serde(default = "default_healthy_deadline", rename = "healthyDeadline")]
     pub healthy_deadline_secs: u64,
+    /// When true, volume data is migrated automatically when a stateful service
+    /// is rescheduled to a different node. Set to false for NFS-backed volumes
+    /// or services that rebuild state from replicas.
+    #[serde(default = "default_migrate_on_reschedule")]
+    pub migrate_on_reschedule: bool,
+}
+
+fn default_migrate_on_reschedule() -> bool {
+    true
 }
 
 impl Default for MigrateConfig {
@@ -366,6 +375,7 @@ impl Default for MigrateConfig {
             max_parallel: default_max_parallel(),
             min_healthy_time_secs: default_min_healthy_time(),
             healthy_deadline_secs: default_healthy_deadline(),
+            migrate_on_reschedule: default_migrate_on_reschedule(),
         }
     }
 }

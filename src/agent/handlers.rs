@@ -577,6 +577,43 @@ pub(super) async fn handle_server_message(
                     .await;
             });
         }
+        ServerPayload::MigrateVolumeCommand(cmd) => {
+            let correlation_id = cmd.correlation_id.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let source_path = std::path::PathBuf::from(&cmd.source_path);
+                let dest_path = std::path::PathBuf::from(&cmd.dest_path);
+                let result =
+                    super::migrate::migrate_volume(&cmd.source_host, &source_path, &dest_path)
+                        .await;
+                let response = match result {
+                    Ok(r) => {
+                        tracing::info!(
+                            service = %cmd.service_name,
+                            bytes = r.bytes_transferred,
+                            "Volume migration completed"
+                        );
+                        AgentCommandResponse {
+                            correlation_id,
+                            success: true,
+                            error_message: String::new(),
+                            result: None,
+                        }
+                    }
+                    Err(e) => AgentCommandResponse {
+                        correlation_id,
+                        success: false,
+                        error_message: e.to_string(),
+                        result: None,
+                    },
+                };
+                let _ = tx
+                    .send(AgentMessage {
+                        payload: Some(Payload::CommandResponse(response)),
+                    })
+                    .await;
+            });
+        }
     }
 }
 

@@ -97,13 +97,13 @@ struct Candidate {
 ```rust
 pub enum JobType {
     Service,    // Placed on best N machines (N = replicas)
-    Stateful,   // Same as Service (sticky placement NOT implemented)
+    Stateful,   // Sticky placement: prefers the node where data already lives
     System,     // Runs on every matching machine
     Batch,      // Same as Service
 }
 ```
 
-All non-system types currently use the identical filter-score-select algorithm. There is no behavioral difference between Service, Stateful, and Batch.
+All non-system types use the filter-score-select algorithm. `Stateful` adds a data-locality bonus (+200) during scoring to strongly prefer the node where the instance was previously placed, keeping volume data co-located. If the previous node is unavailable, the service is placed elsewhere and volumes are migrated automatically via rsync.
 
 ### What Nomad Does
 
@@ -136,10 +136,11 @@ All non-system types currently use the identical filter-score-select algorithm. 
 - Default reschedule: 1 attempt per 24h (vs unlimited for service)
 - Optional: fast placement path (evaluate fewer candidates for lower scheduling latency)
 
-**Stateful type**: Implement sticky placement:
-- On reschedule, prefer the machine a service instance was previously placed on
-- Persist last-known placement in Raft state (`PlacementRecord` already has `machine_name`)
-- Add affinity bonus for previous machine during scoring
+**Stateful type**: ~~Implement sticky placement~~ ✓ Implemented:
+- On reschedule, prefers the machine a service instance was previously placed on (+200 scoring bonus)
+- Uses `PlacementRecord` from Raft state for previous machine lookup
+- Automatic volume migration via rsync when service moves to a different node
+- Configurable via `migrate.migrateOnReschedule` (default: true)
 
 **System type**: Add auto-evaluation:
 - When a new agent registers (`register_agent`), trigger re-evaluation of all system jobs
