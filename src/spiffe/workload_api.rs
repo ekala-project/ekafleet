@@ -283,6 +283,91 @@ impl WorkloadManager {
             .map(|(name, svid)| (name.clone(), svid.spiffe_id.clone(), svid.expires_at))
             .collect()
     }
+
+    /// Load SVIDs from disk into memory.
+    ///
+    /// Scans `<data_dir>/spiffe/<service>/` directories for `svid.pem`,
+    /// `svid-key.pem`, and `bundle.pem` files. Used by the standalone
+    /// `workload-api` process to pick up SVIDs written by the data-plane.
+    pub async fn load_from_disk(&self) -> Result<usize, std::io::Error> {
+        let mut loaded = 0;
+
+        let mut entries = match tokio::fs::read_dir(&self.data_dir).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e),
+        };
+
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+
+            let service_name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(name) => name.to_string(),
+                None => continue,
+            };
+
+            let cert_path = path.join("svid.pem");
+            let key_path = path.join("svid-key.pem");
+            let bundle_path = path.join("bundle.pem");
+
+            let (cert_pem, key_pem) = match (
+                tokio::fs::read_to_string(&cert_path).await,
+                tokio::fs::read_to_string(&key_path).await,
+            ) {
+                (Ok(c), Ok(k)) => (c, k),
+                _ => continue,
+            };
+
+            let chain_pem = tokio::fs::read_to_string(&bundle_path)
+                .await
+                .unwrap_or_default();
+
+            // Parse expiry from the certificate (approximate: use file mtime + 1h default)
+            let expires_at = {
+                let meta = tokio::fs::metadata(&cert_path).await?;
+                let mtime = meta
+                    .modified()
+                    .unwrap_or(std::time::SystemTime::now())
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                mtime + 3600 // default 1h TTL estimate
+            };
+
+            let spiffe_id = {
+                let state = self.inner.read().await;
+                format!("spiffe://{}/service/{}", state.trust_domain, service_name)
+            };
+
+            let mut state = self.inner.write().await;
+            state.svids.insert(
+                service_name.clone(),
+                Svid {
+                    spiffe_id,
+                    cert_pem,
+                    key_pem,
+                    chain_pem: chain_pem.clone(),
+                    expires_at,
+                },
+            );
+
+            // Also load trust bundle if we don't have one
+            if state.trust_bundle_pem.is_none() && !chain_pem.is_empty() {
+                state.trust_bundle_pem = Some(chain_pem);
+            }
+
+            loaded += 1;
+        }
+
+        if loaded > 0 {
+            tracing::info!(count = loaded, "Loaded SVIDs from disk");
+        }
+
+        Ok(loaded)
+    }
 }
 
 /// Split a combined PEM (certificate + private key) into separate parts.

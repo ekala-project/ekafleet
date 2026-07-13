@@ -62,6 +62,72 @@ pub async fn serve_workload_api(
     Ok(())
 }
 
+/// Configuration for the standalone workload-api daemon.
+pub struct WorkloadApiConfig {
+    pub data_dir: PathBuf,
+    pub trust_domain: String,
+    pub socket_path: PathBuf,
+}
+
+/// Run the standalone SPIFFE Workload API daemon.
+///
+/// Loads existing SVIDs from `<data_dir>/spiffe/` on startup, then
+/// periodically re-scans to pick up new SVIDs written by the data-plane
+/// process. Serves the SPIFFE Workload API over a Unix socket.
+pub async fn run_standalone(config: WorkloadApiConfig) -> anyhow::Result<()> {
+    tracing::info!(
+        data_dir = %config.data_dir.display(),
+        socket = %config.socket_path.display(),
+        trust_domain = %config.trust_domain,
+        "Starting standalone Workload API daemon"
+    );
+
+    let mgr = Arc::new(WorkloadManager::new(&config.data_dir, &config.trust_domain));
+
+    // Load existing SVIDs from disk
+    let loaded = mgr.load_from_disk().await?;
+    tracing::info!(count = loaded, "Initial SVID load complete");
+
+    let shutdown = tokio_util::sync::CancellationToken::new();
+
+    // Spawn periodic disk scanner to pick up new SVIDs
+    let scan_mgr = mgr.clone();
+    let scan_shutdown = shutdown.child_token();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        loop {
+            tokio::select! {
+                _ = scan_shutdown.cancelled() => break,
+                _ = interval.tick() => {}
+            }
+            if let Err(e) = scan_mgr.load_from_disk().await {
+                tracing::warn!(error = %e, "Disk scan failed");
+            }
+        }
+    });
+
+    let socket_str = config.socket_path.to_string_lossy().to_string();
+    let api_shutdown = shutdown.clone();
+
+    // Run the Workload API server, cancel on Ctrl+C
+    tokio::select! {
+        result = serve_workload_api(
+            mgr,
+            Some(&socket_str),
+            b"ekafleet-default-jwt-signing-key",
+            api_shutdown,
+        ) => {
+            result?;
+        }
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("Workload API daemon shutting down");
+            shutdown.cancel();
+        }
+    }
+
+    Ok(())
+}
+
 /// Remove the socket file on shutdown.
 async fn cleanup_socket(path: &Path) {
     if let Err(e) = tokio::fs::remove_file(path).await {

@@ -56,6 +56,19 @@ pub async fn cmd_dev(data_dir: PathBuf, http_listen: String, listen: String) -> 
     Ok(())
 }
 
+pub async fn cmd_workload_api(
+    data_dir: PathBuf,
+    trust_domain: String,
+    socket: PathBuf,
+) -> anyhow::Result<()> {
+    ekafleet::spiffe::socket::run_standalone(ekafleet::spiffe::socket::WorkloadApiConfig {
+        data_dir,
+        trust_domain,
+        socket_path: socket,
+    })
+    .await
+}
+
 pub async fn cmd_ca_signer(
     data_dir: PathBuf,
     domain: String,

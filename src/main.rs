@@ -37,6 +37,21 @@ enum Command {
         listen: String,
     },
 
+    /// Standalone SPIFFE Workload API daemon (process-isolated, unprivileged)
+    WorkloadApi {
+        /// Data directory containing spiffe/ subdirectory with SVIDs
+        #[arg(long, default_value = "/var/lib/ekafleet")]
+        data_dir: PathBuf,
+
+        /// SPIFFE trust domain for workload identities
+        #[arg(long, default_value = "fleet.internal")]
+        trust_domain: String,
+
+        /// Unix socket path for the Workload API
+        #[arg(long, default_value = "/run/ekafleet/workload-api.sock")]
+        socket: PathBuf,
+    },
+
     /// Standalone CA signing daemon (process-isolated, no network)
     CaSigner {
         /// Data directory for CA key and certificate
@@ -681,6 +696,12 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Command::WorkloadApi {
+            data_dir,
+            trust_domain,
+            socket,
+        } => commands::cmd_workload_api(data_dir, trust_domain, socket).await?,
+
         Command::CaSigner {
             data_dir,
             domain,
