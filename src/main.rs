@@ -37,6 +37,21 @@ enum Command {
         listen: String,
     },
 
+    /// Standalone service mesh proxy daemon (process-isolated, unprivileged)
+    Proxy {
+        /// HTTP listen address for proxied traffic
+        #[arg(long, default_value = "0.0.0.0:8080")]
+        listen: String,
+
+        /// SPIFFE trust domain for mTLS authorization
+        #[arg(long, default_value = "fleet.internal")]
+        trust_domain: String,
+
+        /// Data directory (for SVID material)
+        #[arg(long, default_value = "/var/lib/ekafleet")]
+        data_dir: PathBuf,
+    },
+
     /// Standalone SPIFFE Workload API daemon (process-isolated, unprivileged)
     WorkloadApi {
         /// Data directory containing spiffe/ subdirectory with SVIDs
@@ -696,6 +711,12 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Command::Proxy {
+            listen,
+            trust_domain,
+            data_dir,
+        } => commands::cmd_proxy(listen, trust_domain, data_dir).await?,
+
         Command::WorkloadApi {
             data_dir,
             trust_domain,
