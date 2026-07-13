@@ -34,6 +34,7 @@ impl ImageStore {
         tokio::fs::create_dir_all(self.blobs_dir()).await?;
         tokio::fs::create_dir_all(self.bundles_dir()).await?;
         tokio::fs::create_dir_all(self.manifests_dir()).await?;
+        tokio::fs::create_dir_all(self.history_dir()).await?;
         Ok(())
     }
 
@@ -121,6 +122,103 @@ impl ImageStore {
         Ok(())
     }
 
+    // -- Manifest history operations --
+
+    /// Save a manifest to the history for a service.
+    ///
+    /// Each service maintains a rolling history of previous manifests,
+    /// enabling rollback without re-pulling from the registry.
+    /// History entries are named `<service>.<generation>` where generation
+    /// is an incrementing counter.
+    pub async fn put_history(&self, service_name: &str, data: &[u8]) -> Result<(), StoreError> {
+        let next = self.next_history_generation(service_name).await;
+        let key = format!("{service_name}.{next}");
+        let path = self.history_dir().join(&key);
+        tokio::fs::write(&path, data).await?;
+        tracing::debug!(
+            service = service_name,
+            generation = next,
+            "Saved manifest history"
+        );
+        Ok(())
+    }
+
+    /// List all history manifests for a service, sorted by generation (newest first).
+    pub async fn list_history(
+        &self,
+        service_name: &str,
+    ) -> Result<Vec<(u64, Vec<u8>)>, StoreError> {
+        let dir = self.history_dir();
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let prefix = format!("{service_name}.");
+        let mut entries = Vec::new();
+        let mut dir_entries = tokio::fs::read_dir(&dir).await?;
+        while let Some(entry) = dir_entries.next_entry().await? {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(gen_str) = name.strip_prefix(&prefix) {
+                if let Ok(generation) = gen_str.parse::<u64>() {
+                    let data = tokio::fs::read(entry.path()).await?;
+                    entries.push((generation, data));
+                }
+            }
+        }
+
+        // Sort newest first
+        entries.sort_by(|a, b| b.0.cmp(&a.0));
+        Ok(entries)
+    }
+
+    /// Prune history entries for a service, keeping only `retain` most recent.
+    pub async fn prune_history(
+        &self,
+        service_name: &str,
+        retain: usize,
+    ) -> Result<usize, StoreError> {
+        let entries = self.list_history(service_name).await?;
+        let mut pruned = 0;
+        for (generation, _) in entries.iter().skip(retain) {
+            let key = format!("{service_name}.{generation}");
+            let path = self.history_dir().join(&key);
+            if path.exists() {
+                tokio::fs::remove_file(&path).await?;
+                pruned += 1;
+            }
+        }
+        if pruned > 0 {
+            tracing::debug!(service = service_name, pruned, "Pruned manifest history");
+        }
+        Ok(pruned)
+    }
+
+    /// Remove all history entries for a service.
+    pub async fn remove_history(&self, service_name: &str) -> Result<(), StoreError> {
+        let dir = self.history_dir();
+        if !dir.exists() {
+            return Ok(());
+        }
+
+        let prefix = format!("{service_name}.");
+        let mut entries = tokio::fs::read_dir(&dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(&prefix) {
+                tokio::fs::remove_file(entry.path()).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Find the next generation number for a service's history.
+    async fn next_history_generation(&self, service_name: &str) -> u64 {
+        match self.list_history(service_name).await {
+            Ok(entries) => entries.first().map(|(g, _)| g + 1).unwrap_or(1),
+            Err(_) => 1,
+        }
+    }
+
     // -- Listing --
 
     /// List all blob digests in the store.
@@ -171,6 +269,10 @@ impl ImageStore {
 
     fn bundles_dir(&self) -> PathBuf {
         self.root.join("bundles")
+    }
+
+    fn history_dir(&self) -> PathBuf {
+        self.root.join("history")
     }
 }
 
@@ -276,5 +378,75 @@ mod tests {
 
         store.remove_bundle(svc).await.unwrap();
         assert!(!store.has_bundle(svc).await);
+    }
+
+    #[tokio::test]
+    async fn history_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(dir.path().join("oci"));
+        store.init().await.unwrap();
+
+        let svc = "my-svc";
+        store.put_history(svc, b"manifest-v1").await.unwrap();
+        store.put_history(svc, b"manifest-v2").await.unwrap();
+
+        let history = store.list_history(svc).await.unwrap();
+        assert_eq!(history.len(), 2);
+        // Newest first
+        assert_eq!(history[0].0, 2);
+        assert_eq!(history[0].1, b"manifest-v2");
+        assert_eq!(history[1].0, 1);
+        assert_eq!(history[1].1, b"manifest-v1");
+    }
+
+    #[tokio::test]
+    async fn history_prune() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(dir.path().join("oci"));
+        store.init().await.unwrap();
+
+        let svc = "prune-svc";
+        store.put_history(svc, b"v1").await.unwrap();
+        store.put_history(svc, b"v2").await.unwrap();
+        store.put_history(svc, b"v3").await.unwrap();
+
+        let pruned = store.prune_history(svc, 1).await.unwrap();
+        assert_eq!(pruned, 2);
+
+        let history = store.list_history(svc).await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].1, b"v3");
+    }
+
+    #[tokio::test]
+    async fn history_remove_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(dir.path().join("oci"));
+        store.init().await.unwrap();
+
+        let svc = "remove-svc";
+        store.put_history(svc, b"v1").await.unwrap();
+        store.put_history(svc, b"v2").await.unwrap();
+
+        store.remove_history(svc).await.unwrap();
+        let history = store.list_history(svc).await.unwrap();
+        assert!(history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn history_isolated_between_services() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(dir.path().join("oci"));
+        store.init().await.unwrap();
+
+        store.put_history("svc-a", b"a-data").await.unwrap();
+        store.put_history("svc-b", b"b-data").await.unwrap();
+
+        let history_a = store.list_history("svc-a").await.unwrap();
+        let history_b = store.list_history("svc-b").await.unwrap();
+        assert_eq!(history_a.len(), 1);
+        assert_eq!(history_b.len(), 1);
+        assert_eq!(history_a[0].1, b"a-data");
+        assert_eq!(history_b[0].1, b"b-data");
     }
 }

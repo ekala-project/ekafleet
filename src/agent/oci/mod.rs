@@ -115,12 +115,30 @@ impl ImageManager {
     }
 
     /// Run garbage collection, keeping only images for the given active services.
+    ///
+    /// `retain_generations` controls how many previous image versions per
+    /// service are kept for rollback (default 1). Set to 0 to disable
+    /// retention.
     pub async fn gc(
         &self,
         active_services: &HashSet<String>,
         active_manifests: &[(String, ImageManifest)],
+        retain_generations: usize,
     ) -> Result<gc::GcResult, store::StoreError> {
-        gc::collect(&self.store, active_services, active_manifests).await
+        // Collect retained manifests from history
+        let mut retained = Vec::new();
+        for svc in active_services {
+            let history = self.store.list_history(svc).await?;
+            for (_, raw) in history.iter().take(retain_generations) {
+                if let Ok(m) = serde_json::from_slice(raw) {
+                    retained.push(m);
+                }
+            }
+            // Prune excess history entries
+            self.store.prune_history(svc, retain_generations).await?;
+        }
+
+        gc::collect(&self.store, active_services, active_manifests, &retained).await
     }
 
     /// Generate an OCI bundle config.json for systemd-nspawn.

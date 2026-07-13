@@ -199,6 +199,14 @@ async fn do_pull(
         signature::verify_image_signature(client, image, &manifest_digest, sig_policy).await?;
     }
 
+    // Save previous manifest to history for rollback before overwriting
+    if let Ok(Some(previous_raw)) = store.get_manifest(manifest_key).await {
+        let previous_digest = super::digest::Digest::from_bytes(&previous_raw);
+        if previous_digest != manifest_digest {
+            store.put_history(service_name, &previous_raw).await?;
+        }
+    }
+
     // Cache the manifest
     store.put_manifest(manifest_key, &manifest_raw).await?;
 
