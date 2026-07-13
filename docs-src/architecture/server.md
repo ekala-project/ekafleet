@@ -75,6 +75,19 @@ The server handles SPIFFE-style node attestation via the `Attest` RPC:
 
 The server generates a 256-bit AES-256-GCM master key on first start (persisted at `<data-dir>/fleet-key`). The master key never leaves the server. Instead, each agent receives a unique key derived via HKDF-SHA256 using its SPIFFE ID (`spiffe://<domain>/agent/<node-id>`) as context. This ensures that compromising one agent's key does not expose secrets encrypted for other agents. Secrets stored in the Raft state are encrypted with the master key and re-encrypted under the agent's derived key before distribution.
 
+All ciphertext is bound to its context via AES-256-GCM additional authenticated data (AAD). For secrets, the AAD is `service_name\x00secret_name`, preventing encrypted values from being swapped between services. Raft log entries and snapshots use their own distinct AAD tags.
+
+### Key Rotation
+
+The fleet encryption key can be rotated at runtime via the `RotateFleetKey` gRPC RPC. Rotation is an atomic operation that:
+
+1. Generates a new 256-bit master key
+2. Re-encrypts every secret in the store under the new key
+3. Persists the new key to `<data-dir>/fleet-key`
+4. Pushes fresh HKDF-derived keys to all connected agents
+
+The key carries a monotonic version number so agents can detect rotations. Agents that connect after a rotation receive the current key version automatically. Rotation does not require downtime — agents update their decryption key in-place and continue injecting secrets normally.
+
 ## Agent Command Relay
 
 The server can relay operational commands to individual agents through the bidirectional gRPC stream and await correlated responses. This powers the `exec`, `logs`, `inspect`, `generation`, `system gc`, `system reboot`, and `system rebuild` commands. Each request carries a unique `correlation_id`; the server registers a oneshot channel and awaits the agent's response with a per-command timeout.

@@ -35,7 +35,7 @@ The primary communication channel is a bidirectional gRPC stream over TCP port 7
 | `PolicyUpdate` | Network policy rules to apply |
 | `TrustBundleUpdate` | CA certificate + trust domain |
 | `NodeAttestationChallenge` | Server challenge during attestation |
-| `FleetKeyUpdate` | Fleet encryption key for secret decryption |
+| `FleetKeyUpdate` | Per-agent derived encryption key + version for secret decryption |
 | `ExecCommand` | Execute a command in a service's cgroup context |
 | `LogsCommand` | Read or stream journal logs from a service |
 | `ListGenerationsCommand` | List NixOS system generations |
@@ -102,6 +102,9 @@ service FleetControl {
   rpc SystemGC(SystemGCRequest) returns (SystemGCResponse);
   rpc SystemReboot(SystemRebootRequest) returns (SystemRebootResponse);
   rpc SystemRebuild(SystemRebuildRequest) returns (SystemRebuildResponse);
+
+  // Key management
+  rpc RotateFleetKey(RotateFleetKeyRequest) returns (RotateFleetKeyResponse);
 }
 ```
 

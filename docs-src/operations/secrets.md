@@ -84,11 +84,33 @@ Useful for services that need to encrypt data at rest but shouldn't hold the enc
 All secrets are encrypted at rest using AES-256-GCM with:
 - 12-byte random nonces (unique per encryption)
 - Authenticated encryption (tampered ciphertext is rejected)
+- AAD binding (`service_name\x00secret_name`) prevents ciphertext from being swapped between services
 - Fleet master key (server-side only)
 
 The Raft log and snapshots are also encrypted — secrets never appear as plaintext on disk.
 
 Each agent receives a unique encryption key derived from the fleet master key via HKDF-SHA256, using the agent's SPIFFE ID as context. The server re-encrypts secrets under the agent's derived key before distribution, so compromising one agent's key does not expose secrets destined for other agents.
+
+### Key Rotation
+
+The fleet master key can be rotated at runtime without downtime:
+
+```bash
+# Via gRPC (using grpcurl or any gRPC client)
+grpcurl -H "Authorization: Bearer $TOKEN" \
+  server:7400 fleet.FleetControl/RotateFleetKey
+```
+
+When rotation is triggered, the server:
+
+1. Generates a new 256-bit master key
+2. Re-encrypts all stored secrets under the new key (atomic operation)
+3. Persists the new key to disk
+4. Pushes new HKDF-derived keys to every connected agent
+
+The response reports how many agents were notified. Agents that reconnect after rotation receive the current key automatically. Secret plaintext values are unchanged — only the encryption key protecting them is rotated.
+
+Rotate the fleet key periodically or after any suspected compromise of an agent node.
 
 ## Access Control
 
