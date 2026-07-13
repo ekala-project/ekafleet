@@ -90,10 +90,11 @@ Mutable tags like `:latest` work but sacrifice the content-addressing guarantees
 ### Image Pipeline
 
 1. **Pull** -- The agent's native OCI registry client fetches the manifest and layers
-2. **Verify** -- Each blob is SHA-256 verified against the manifest digest
-3. **Store** -- Layers are cached in a content-addressable store at `/var/lib/ekafleet/oci/`
-4. **Unpack** -- Layers are extracted in order into a rootfs, handling OCI whiteout files
-5. **Bundle** -- A `config.json` is generated from the image config and ekafleet parameters
+2. **Verify digest** -- Each blob is SHA-256 verified against the manifest digest
+3. **Verify signature** -- If a cosign public key is configured, the image's cosign signature is verified before downloading layers
+4. **Store** -- Layers are cached in a content-addressable store at `/var/lib/ekafleet/oci/`
+5. **Unpack** -- Layers are extracted in order into a rootfs, handling OCI whiteout files
+6. **Bundle** -- A `config.json` is generated from the image config and ekafleet parameters
 
 ### Execution
 
@@ -160,12 +161,38 @@ All deployment strategies (rolling, canary, blue-green) work identically for con
 
 Version changes are detected by comparing the image reference string. When the image reference changes (including digest), the supervisor restarts the unit with the new OCI bundle.
 
+## Image Signature Verification
+
+Container images can be verified against cosign signatures before layers are downloaded. When a public key is configured for a service, the agent fetches the cosign signature from the conventional tag (`sha256-<hex>.sig`) and verifies the cryptographic signature over the manifest payload.
+
+Supported key types:
+
+- **ECDSA P-256 with SHA-256** (cosign default)
+- **Ed25519**
+
+Signature verification is a gate in the pull pipeline -- if verification fails, no layers are downloaded and the service is not started.
+
+Keyless verification (Sigstore Fulcio/Rekor) is not yet supported.
+
+## Rollback Retention
+
+The image store maintains a configurable history of previous manifests per service. When an image reference changes, the previous manifest is saved to a history directory before being overwritten. Garbage collection preserves blobs referenced by retained historical manifests, ensuring rollback does not depend on registry availability.
+
+The `retain_generations` parameter (default: 1) controls how many previous image versions are kept per service. Set to 0 to disable retention and reclaim disk space immediately.
+
+## Container Hardening
+
+Containers run with a hardened security profile:
+
+- **Minimal capabilities** -- only essential capabilities are granted (e.g., `CAP_NET_BIND_SERVICE`, `CAP_SETUID`, `CAP_SETGID`). Dangerous capabilities like `CAP_SYS_ADMIN`, `CAP_NET_RAW`, and `CAP_SYS_PTRACE` are dropped.
+- **`no_new_privileges`** -- prevents processes from gaining additional privileges via setuid binaries or capability transitions.
+- **Seccomp filtering** -- a default-allow seccomp profile blocks dangerous syscalls including `kexec_load`, `mount`, `bpf`, `unshare`, `setns`, and kernel module operations.
+
 ## Limitations
 
 - **No bridge networking** -- containers use host networking only. Private container networks are not supported.
-- **No image signing verification** -- images are verified by digest but not by cryptographic signature (cosign/notation support is planned).
-- **Rollback depends on cache** -- unlike Nix generations which are always local, container rollback requires the previous image to be in the local cache or pullable from the registry.
-- **No rootless containers** -- systemd-nspawn runs as root. Workload isolation relies on cgroup v2 resource controls and namespace separation.
+- **No rootless containers** -- systemd-nspawn runs as root. Workload isolation relies on cgroup v2 resource controls, capability dropping, seccomp filtering, and namespace separation.
+- **No keyless signature verification** -- cosign static key verification is supported, but Sigstore keyless (Fulcio/Rekor) and Notation (CNCF Notary v2) are not yet implemented.
 
 ## Nix-Built Container Images
 

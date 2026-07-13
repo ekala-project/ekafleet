@@ -65,10 +65,13 @@ pub async fn write_bundle_config(
             env,
             cwd,
             terminal: false,
+            no_new_privileges: true,
+            capabilities: Some(default_capabilities()),
         },
         mounts,
         linux: Some(OciLinux {
             namespaces: default_namespaces(),
+            seccomp: Some(default_seccomp()),
         }),
     };
 
@@ -118,11 +121,15 @@ struct OciRoot {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct OciProcess {
     args: Vec<String>,
     env: Vec<String>,
     cwd: String,
     terminal: bool,
+    no_new_privileges: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capabilities: Option<OciCapabilities>,
 }
 
 #[derive(Serialize)]
@@ -139,12 +146,39 @@ struct OciMount {
 #[derive(Serialize)]
 struct OciLinux {
     namespaces: Vec<OciNamespace>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seccomp: Option<OciSeccomp>,
 }
 
 #[derive(Serialize)]
 struct OciNamespace {
     #[serde(rename = "type")]
     type_: String,
+}
+
+/// OCI capabilities configuration.
+#[derive(Serialize)]
+struct OciCapabilities {
+    bounding: Vec<String>,
+    effective: Vec<String>,
+    inheritable: Vec<String>,
+    permitted: Vec<String>,
+    ambient: Vec<String>,
+}
+
+/// OCI seccomp filter configuration.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OciSeccomp {
+    default_action: String,
+    architectures: Vec<String>,
+    syscalls: Vec<OciSyscallRule>,
+}
+
+#[derive(Serialize)]
+struct OciSyscallRule {
+    names: Vec<String>,
+    action: String,
 }
 
 fn default_mounts() -> Vec<OciMount> {
@@ -187,6 +221,78 @@ fn default_namespaces() -> Vec<OciNamespace> {
             type_: t.to_string(),
         })
         .collect()
+}
+
+/// Minimal capability set for hardened containers.
+///
+/// Drops all capabilities except the bare minimum needed for most services.
+/// This follows the Docker/OCI default set minus the more dangerous ones
+/// (e.g., NET_RAW, SYS_CHROOT).
+fn default_capabilities() -> OciCapabilities {
+    let caps: Vec<String> = [
+        "CAP_CHOWN",
+        "CAP_DAC_OVERRIDE",
+        "CAP_FSETID",
+        "CAP_FOWNER",
+        "CAP_SETGID",
+        "CAP_SETUID",
+        "CAP_SETFCAP",
+        "CAP_SETPCAP",
+        "CAP_NET_BIND_SERVICE",
+        "CAP_KILL",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+
+    OciCapabilities {
+        bounding: caps.clone(),
+        effective: caps.clone(),
+        inheritable: caps.clone(),
+        permitted: caps.clone(),
+        ambient: caps,
+    }
+}
+
+/// Default seccomp profile blocking dangerous syscalls.
+///
+/// Uses a default-allow policy with explicit blocks for syscalls that
+/// enable privilege escalation or container escape. This mirrors the
+/// Docker default seccomp profile's most critical restrictions.
+fn default_seccomp() -> OciSeccomp {
+    OciSeccomp {
+        default_action: "SCMP_ACT_ALLOW".to_string(),
+        architectures: vec![
+            "SCMP_ARCH_X86_64".to_string(),
+            "SCMP_ARCH_AARCH64".to_string(),
+        ],
+        syscalls: vec![OciSyscallRule {
+            names: vec![
+                "kexec_load".to_string(),
+                "kexec_file_load".to_string(),
+                "reboot".to_string(),
+                "mount".to_string(),
+                "umount2".to_string(),
+                "pivot_root".to_string(),
+                "swapon".to_string(),
+                "swapoff".to_string(),
+                "init_module".to_string(),
+                "finit_module".to_string(),
+                "delete_module".to_string(),
+                "acct".to_string(),
+                "settimeofday".to_string(),
+                "clock_settime".to_string(),
+                "add_key".to_string(),
+                "request_key".to_string(),
+                "keyctl".to_string(),
+                "bpf".to_string(),
+                "perf_event_open".to_string(),
+                "unshare".to_string(),
+                "setns".to_string(),
+            ],
+            action: "SCMP_ACT_ERRNO".to_string(),
+        }],
+    }
 }
 
 fn bind_options(read_only: bool) -> Vec<String> {
@@ -268,6 +374,30 @@ mod tests {
             .iter()
             .find(|m| m["destination"] == "/run/ekafleet/workload-api.sock");
         assert!(spiffe_mount.is_some());
+
+        // Check hardening: noNewPrivileges
+        assert_eq!(config["process"]["noNewPrivileges"], true);
+
+        // Check hardening: capabilities are restricted
+        let caps = &config["process"]["capabilities"];
+        let bounding = caps["bounding"].as_array().unwrap();
+        assert!(bounding.iter().any(|c| c == "CAP_NET_BIND_SERVICE"));
+        // Dangerous caps should NOT be present
+        let cap_strs: Vec<&str> = bounding.iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(!cap_strs.contains(&"CAP_SYS_ADMIN"));
+        assert!(!cap_strs.contains(&"CAP_NET_RAW"));
+        assert!(!cap_strs.contains(&"CAP_SYS_PTRACE"));
+
+        // Check hardening: seccomp profile present
+        let seccomp = &config["linux"]["seccomp"];
+        assert_eq!(seccomp["defaultAction"], "SCMP_ACT_ALLOW");
+        let blocked = &seccomp["syscalls"][0];
+        assert_eq!(blocked["action"], "SCMP_ACT_ERRNO");
+        let blocked_names = blocked["names"].as_array().unwrap();
+        let blocked_strs: Vec<&str> = blocked_names.iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(blocked_strs.contains(&"kexec_load"));
+        assert!(blocked_strs.contains(&"bpf"));
+        assert!(blocked_strs.contains(&"unshare"));
     }
 
     #[tokio::test]
