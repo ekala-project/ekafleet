@@ -13,6 +13,8 @@ const NONCE_LEN: usize = 12; // AES-256-GCM nonce size
 pub struct SecretStore {
     inner: Arc<RwLock<StoreState>>,
     key: Arc<LessSafeKey>,
+    /// Raw key bytes retained for HKDF derivation and re-encryption.
+    raw_key: Arc<[u8; 32]>,
     rng: Arc<SystemRandom>,
 }
 
@@ -48,8 +50,14 @@ impl SecretStore {
                 secrets: HashMap::new(),
             })),
             key: Arc::new(key),
+            raw_key: Arc::new(*encryption_key),
             rng: Arc::new(SystemRandom::new()),
         }
+    }
+
+    /// Returns the raw encryption key bytes (for HKDF derivation / re-encryption).
+    pub fn raw_key(&self) -> &[u8; 32] {
+        &self.raw_key
     }
 
     /// Encrypt plaintext value using AES-256-GCM.
@@ -185,6 +193,38 @@ impl SecretStore {
                         entry.sealed.clone(),
                         entry.version,
                     ));
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Get secrets for a specific agent, re-encrypted with a per-agent derived key.
+    ///
+    /// Secrets are stored encrypted with the fleet master key. This method
+    /// re-encrypts each secret under the agent's HKDF-derived key so the
+    /// fleet master key never reaches agents.
+    pub async fn secrets_for_agent(
+        &self,
+        service_names: &[String],
+        agent_spiffe_id: &str,
+    ) -> Vec<(String, String, Vec<u8>, u64)> {
+        let agent_key =
+            super::key_derivation::derive_agent_key(self.raw_key.as_ref(), agent_spiffe_id);
+        let entries = self.secrets_for_services(service_names).await;
+        let mut result = Vec::with_capacity(entries.len());
+
+        for (svc, name, sealed, version) in entries {
+            match super::key_derivation::reencrypt(self.raw_key.as_ref(), &agent_key, &sealed) {
+                Ok(reencrypted) => result.push((svc, name, reencrypted, version)),
+                Err(e) => {
+                    tracing::error!(
+                        service = %svc,
+                        secret = %name,
+                        error = %e,
+                        "Failed to re-encrypt secret for agent"
+                    );
                 }
             }
         }

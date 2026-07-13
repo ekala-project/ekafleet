@@ -182,11 +182,18 @@ impl FleetControl for FleetControlService {
             let _ = self.state.send_to_agent(&node_id, bundle_msg).await;
         }
 
-        // Push fleet encryption key to agent (for secret decryption)
-        if let Some(key) = &self.fleet_key {
+        // Push per-agent derived encryption key (for secret decryption).
+        // The fleet master key stays on the server; each agent receives a unique
+        // key derived via HKDF so that compromising one agent does not expose
+        // secrets encrypted for other agents.
+        if let Some(master_key) = &self.fleet_key {
+            let agent_spiffe_id =
+                format!("spiffe://{}/agent/{}", self.domain, node_id);
+            let derived =
+                crate::secrets::key_derivation::derive_agent_key(master_key, &agent_spiffe_id);
             let key_msg = ServerMessage {
                 payload: Some(ServerPayload::FleetKey(crate::proto::FleetKeyUpdate {
-                    encrypted_key: key.clone(),
+                    encrypted_key: derived.to_vec(),
                     version: 1,
                 })),
             };

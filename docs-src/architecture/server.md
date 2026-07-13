@@ -73,7 +73,7 @@ The server handles SPIFFE-style node attestation via the `Attest` RPC:
 
 ## Fleet Encryption Key
 
-The server generates a 256-bit AES-256-GCM encryption key on first start (persisted at `<data-dir>/fleet-key`). This key is distributed to agents over the mTLS channel for secret decryption.
+The server generates a 256-bit AES-256-GCM master key on first start (persisted at `<data-dir>/fleet-key`). The master key never leaves the server. Instead, each agent receives a unique key derived via HKDF-SHA256 using its SPIFFE ID (`spiffe://<domain>/agent/<node-id>`) as context. This ensures that compromising one agent's key does not expose secrets encrypted for other agents. Secrets stored in the Raft state are encrypted with the master key and re-encrypted under the agent's derived key before distribution.
 
 ## Agent Command Relay
 

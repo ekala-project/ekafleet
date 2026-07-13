@@ -84,9 +84,11 @@ Useful for services that need to encrypt data at rest but shouldn't hold the enc
 All secrets are encrypted at rest using AES-256-GCM with:
 - 12-byte random nonces (unique per encryption)
 - Authenticated encryption (tampered ciphertext is rejected)
-- Fleet-wide encryption key
+- Fleet master key (server-side only)
 
 The Raft log and snapshots are also encrypted — secrets never appear as plaintext on disk.
+
+Each agent receives a unique encryption key derived from the fleet master key via HKDF-SHA256, using the agent's SPIFFE ID as context. The server re-encrypts secrets under the agent's derived key before distribution, so compromising one agent's key does not expose secrets destined for other agents.
 
 ## Access Control
 
