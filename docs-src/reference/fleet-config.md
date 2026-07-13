@@ -315,15 +315,18 @@ reschedule = {
 
 ## MigrateConfig
 
-Migration policy for node drain operations.
+Migration policy for node drain and reschedule operations.
 
 ```nix
 migrate = {
-  maxParallel     = 1;    # Concurrent migrations (default: 1)
-  minHealthyTime  = 10;   # Seconds (default: 10)
-  healthyDeadline = 300;  # Seconds (default: 300)
+  maxParallel         = 1;    # Concurrent migrations (default: 1)
+  minHealthyTime      = 10;   # Seconds before next migration (default: 10)
+  healthyDeadline     = 300;  # Seconds to wait for health gate (default: 300)
+  migrateOnReschedule = true; # Auto-migrate volumes when stateful services move nodes (default: true)
 };
 ```
+
+When `migrateOnReschedule` is `true` (default), volume data is automatically copied via rsync to the destination node before the service starts there. Set to `false` for NFS-backed or `ReadWriteMany` volumes where data is already accessible from any node.
 
 ## PeriodicConfig
 

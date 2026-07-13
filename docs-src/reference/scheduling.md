@@ -1024,19 +1024,21 @@ migrate {
 
 ### What to Build
 
-Add `MigrateConfig` to `SchedulingConfig`:
+`MigrateConfig` in `SchedulingConfig`:
 ```rust
 pub struct MigrateConfig {
     #[serde(default = "default_migrate_parallel", rename = "maxParallel")]
-    pub max_parallel: u32,           // default 1
-    #[serde(default, rename = "healthCheck")]
-    pub health_check: HealthCheckMode,
+    pub max_parallel: u32,              // default 1
     #[serde(default = "default_min_healthy_time", rename = "minHealthyTime")]
-    pub min_healthy_time_secs: u64,  // default 10s
+    pub min_healthy_time_secs: u64,     // default 10s
     #[serde(default = "default_healthy_deadline", rename = "healthyDeadline")]
-    pub healthy_deadline_secs: u64,  // default 300s
+    pub healthy_deadline_secs: u64,     // default 300s
+    #[serde(default = "default_migrate_on_reschedule")]
+    pub migrate_on_reschedule: bool,    // default true
 }
 ```
+
+When `migrate_on_reschedule` is true (default), volume data for `stateful` services is automatically migrated via rsync when the service moves to a different node. Migration is skipped for NFS/`ReadWriteMany` volumes. Set to false for services that rebuild state from replicas or use shared storage.
 
 Update the `drain` CLI command:
 - Accept `--deadline <duration>` flag for forced drain timeout
@@ -1189,7 +1191,7 @@ Summary of all features with implementation status and priority.
 | Service (long-running) | `service` | Deployment | Implemented |
 | Batch (run-to-completion) | `batch` | Job | Implemented |
 | System (all nodes) | `system` | DaemonSet | Implemented |
-| Stateful (sticky) | — | StatefulSet | Implemented (config; sticky placement via affinity) |
+| Stateful (sticky) | — | StatefulSet | Implemented (data-locality scoring + automatic volume migration) |
 | Sysbatch (system+batch) | `sysbatch` | — | Implemented |
 | Periodic / Cron | `periodic` | CronJob | Implemented (config type; server-side loop TBD) |
 | Parameterized / Dispatch | `parameterized` | — | Not planned |

@@ -223,14 +223,18 @@ An ineligible node continues running its existing services but does not receive 
 
 ## Data Migration on Reschedule
 
-When a stateful service is rescheduled to a different machine, its volume data can be migrated automatically using rsync over SSH:
+When a `stateful` service is rescheduled to a different machine, its volume data is migrated automatically:
 
-1. The agent on the source machine snapshots the volume
-2. The agent on the destination machine provisions the volume directory
-3. Data is transferred via `rsync -avz --delete` from source to destination
+1. The reconciler detects that a stateful instance has moved nodes
+2. A `MigrateVolumeCommand` is sent to the destination agent
+3. The destination agent pulls data via `rsync -avz --delete` from the source node
 4. The service is started on the destination machine after migration completes
 
-Migration respects the service's `migrate` config for pacing and health gates.
+Migration respects the service's `migrate` config for pacing and health gates (`maxParallel`, `minHealthyTime`, `healthyDeadline`). Disable automatic migration by setting `migrateOnReschedule = false` in the service's `migrate` block.
+
+Migration is skipped automatically for volumes with `storageClass = "nfs"` and `accessMode = "ReadWriteMany"`, since the data is already accessible from any node.
+
+> **Note:** Only services with `type = "stateful"` trigger automatic migration. Services with `type = "service"` are treated as stateless and do not migrate volume data on reschedule.
 
 ## Rebalancing
 
