@@ -16,6 +16,7 @@
 
 | Path | Protocol | Used By | Purpose |
 |------|----------|---------|---------|
+| `/run/ekafleet/ca.sock` | Length-prefixed JSON (UDS) | Server | CA signer ↔ control plane (SignCSR, GetBundle, IssueServerSVID) |
 | `/run/ekafleet/workload-api.sock` | gRPC (UDS) | Agent | SPIFFE Workload API (FetchX509SVID, FetchX509Bundles) |
 
 ## Firewall Requirements

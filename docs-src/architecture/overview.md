@@ -1,59 +1,54 @@
 # Architecture Overview
 
-ekafleet is a single binary with two operational modes. Server mode includes all agent capabilities, allowing server nodes to also run workloads.
+ekafleet is a single binary with multiple subcommands. For development and quick bootstrapping, convenience modes (`server`, `agent`, `dev`) embed all subsystems in a single process. In production, the NixOS module deploys a **process-isolated topology** where security-sensitive components run as separate daemons.
+
+## Runtime Topology
+
+### Production (NixOS Module)
 
 ```text
-┌─────────────────────────────────────────────────────────────────────┐
-│                    ekafleet (single binary)                         │
-│                                                                     │
-│  ┌───────────────────────────────────────────────────────────────┐  │
-│  │                    ALWAYS ACTIVE                               │  │
-│  │                                                                │  │
-│  │  supervisor   health     dns_resolver   wireguard   nftables   │  │
-│  │  secrets_inj  metrics    proxy_l7/l4    gossip      certs      │  │
-│  │  workload_api template   storage        oci_images             │  │
-│  └───────────────────────────────────────────────────────────────┘  │
-│                                                                     │
-│  ┌───────────────────────────────────────────────────────────────┐  │
-│  │              SERVER MODE ONLY (ekafleet server)                │  │
-│  │                                                                │  │
-│  │  scheduler    nix_eval    raft      ca_root     dns_authority  │  │
-│  │  deployer     secrets_store         scaling     api            │  │
-│  │  attestation  rbac        audit     events      policy         │  │
-│  │  federation   webhooks    alerting  rebalancer  quotas         │  │
-│  └───────────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────────┘
+SERVER NODE:
+  ekafleet-ca-signer.service     <- PrivateNetwork, no caps, owns CA key
+       | Unix socket (/run/ekafleet/ca.sock)
+  ekafleet-server.service        <- Control plane (Raft, scheduler, API)
+
+AGENT NODE:
+  ekafleet-agent.service         <- Root, manages systemd/WG/nft/secrets
+       | writes SVID files to disk
+  ekafleet-workload-api.service  <- Unprivileged, serves SVIDs via Unix socket
+  ekafleet-proxy.service         <- CAP_NET_BIND_SERVICE only, mesh traffic
 ```
+
+### Development / Quick Bootstrap
+
+```text
+  ekafleet server                <- All server components in one process
+  ekafleet agent                 <- All agent components in one process
+  ekafleet dev                   <- Server + agent, no TLS, no WireGuard
+```
+
+## Process Isolation Rationale
+
+Three subsystems are split into separate processes for security:
+
+| Component | Why Isolated | Hardening |
+|-----------|-------------|-----------|
+| **CA Signer** | CA private key must not share address space with HTTP parsers, webhook handlers, cloud API clients | `PrivateNetwork`, no capabilities, `MemoryDenyWriteExecute` |
+| **Workload API** | Workload private keys must not share address space with the remote exec handler or container supervisor | `PrivateNetwork`, `DynamicUser`, no capabilities |
+| **Proxy** | Untrusted network traffic parsing must not have root access or fleet key access | `DynamicUser`, only `CAP_NET_BIND_SERVICE` |
+
+Everything else stays in-process: Raft/scheduler/reconciler need tight coupling for consistency, the REST/gRPC APIs share state, and the heartbeat/health/renewal tasks are lightweight with no secrets.
 
 ## Subsystems
 
-### Always Active (Agent + Server)
-
-| Subsystem | Purpose |
-|-----------|---------|
-| **supervisor** | Manages local services via systemd units (native processes and OCI containers via systemd-nspawn) |
-| **health** | HTTP/TCP/exec health check probes |
-| **dns_resolver** | Local caching DNS resolver for fleet queries |
-| **wireguard** | Kernel WireGuard mesh interface management |
-| **nftables** | Network policy enforcement |
-| **secrets_inj** | Local secret file injection |
-| **metrics** | Scrapes local service metrics, collects node metrics |
-| **proxy_l7/l4** | HTTP reverse proxy with circuit breaking, retries, rate limiting, session affinity + L4 TCP proxy |
-| **template** | Config file template rendering with fleet context |
-| **storage** | Persistent volume provisioning, snapshots, migration |
-| **gossip** | SWIM-based membership and service catalog propagation |
-| **certs** | CSR generation, certificate request/renewal from built-in CA |
-| **workload_api** | SPIFFE Workload API over Unix domain socket |
-| **oci_images** | OCI registry client, content-addressable image store, layer unpacking, garbage collection |
-
-### Server Mode Only
+### Server-Side (Control Plane)
 
 | Subsystem | Purpose |
 |-----------|---------|
 | **scheduler** | Priority-based placement with constraints, affinities, taints, spread, preemption |
 | **nix_eval** | Evaluates fleet.nix via `nix eval` |
 | **raft** | Consensus for server HA (3-node) |
-| **ca_root** | Root Certificate Authority, signs CSRs, issues SPIFFE SVIDs |
+| **ca_root** | Root Certificate Authority, signs CSRs, issues SPIFFE SVIDs (isolated via `ca-signer` process) |
 | **attestation** | Node attestation (join token, future: TPM, Nix store path) |
 | **dns_authority** | Authoritative DNS for the fleet domain |
 | **deployer** | Rolling/canary/blue-green deployment orchestration |
@@ -70,13 +65,32 @@ ekafleet is a single binary with two operational modes. Server mode includes all
 | **rebalancer** | Descheduler for workload rebalancing after drift |
 | **quotas** | Per-pool/namespace resource quota enforcement |
 
+### Agent-Side (Data Plane)
+
+| Subsystem | Purpose |
+|-----------|---------|
+| **supervisor** | Manages local services via systemd units (native processes and OCI containers via systemd-nspawn) |
+| **health** | HTTP/TCP/exec health check probes |
+| **dns_resolver** | Local caching DNS resolver for fleet queries |
+| **wireguard** | Kernel WireGuard mesh interface management |
+| **nftables** | Network policy enforcement |
+| **secrets_inj** | Local secret file injection |
+| **metrics** | Scrapes local service metrics, collects node metrics |
+| **template** | Config file template rendering with fleet context |
+| **storage** | Persistent volume provisioning, snapshots, migration |
+| **gossip** | SWIM-based membership and service catalog propagation |
+| **certs** | CSR generation, certificate request/renewal from built-in CA |
+| **oci_images** | OCI registry client, content-addressable image store, layer unpacking, garbage collection |
+| **workload_api** | SPIFFE Workload API over Unix domain socket (isolated via `workload-api` process) |
+| **proxy_l7/l4** | HTTP reverse proxy with circuit breaking, retries, rate limiting + L4 TCP proxy (isolated via `proxy` process) |
+
 ## Reconciliation Model
 
 ekafleet follows a Terraform-inspired reconciliation loop:
 
 ```text
 ┌─────────────┐     ┌──────────┐     ┌──────────┐     ┌──────────┐
-│  Evaluate   │────▶│  Refresh │────▶│   Plan   │────▶│  Apply   │
+│  Evaluate   │────>│  Refresh │────>│   Plan   │────>│  Apply   │
 │  (nix eval) │     │  (query) │     │  (diff)  │     │(converge)│
 └─────────────┘     └──────────┘     └──────────┘     └──────────┘
 ```

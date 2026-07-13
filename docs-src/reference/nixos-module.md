@@ -2,90 +2,137 @@
 
 ekafleet provides a NixOS module at `nix/module.nix` for declarative deployment on EkaOS and NixOS machines.
 
-## Usage
+The module always deploys the **process-isolated topology**: security-sensitive subsystems (CA signer, Workload API, proxy) run as separate systemd services with maximum hardening. There is no toggle for monolithic mode — the NixOS module is the production deployment path.
+
+## Server Node
+
+Enable `services.ekafleet.server` to deploy the control plane. This creates two systemd services:
+
+- **ekafleet-ca-signer** — holds the CA private key in an isolated process with `PrivateNetwork=true`, no capabilities, and restricted syscalls
+- **ekafleet-server** — the control plane (Raft, scheduler, API), connecting to the CA signer via Unix socket
 
 ```nix
 { inputs, ... }:
 {
   imports = [ inputs.ekaos-fleet.nixosModules.default ];
 
-  services.ekafleet = {
+  services.ekafleet.server = {
     enable = true;
-    mode = "agent";
-    token = "your-join-token";
-    serverAddr = "10.0.0.1:7400";
+    token = "fleet-admin-token";
+    domain = "fleet.internal";
+    peers = [ "10.0.0.2:7400" "10.0.0.3:7400" ];
   };
 }
 ```
 
-## Options
+### Server Options
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `enable` | bool | `false` | Enable the ekafleet service |
-| `mode` | enum | `"agent"` | Operating mode: `"server"` or `"agent"` |
+| `enable` | bool | `false` | Enable the control plane |
 | `token` | string | *(required)* | Authentication token |
-| `serverAddr` | string | `""` | Server address (required for agent mode) |
 | `dataDir` | path | `/var/lib/ekafleet` | Data directory for persistent state |
-| `peers` | list of string | `[]` | Peer server addresses (server mode HA) |
+| `peers` | list of string | `[]` | Peer server addresses for HA |
+| `grpcListen` | string | `0.0.0.0:7400` | gRPC listen address |
+| `httpListen` | string | `0.0.0.0:7402` | HTTP API listen address |
+| `domain` | string | `fleet.internal` | SPIFFE trust domain |
+| `caSocketPath` | string | `/run/ekafleet/ca.sock` | Unix socket for CA signer |
 
-## Server Mode
+## Agent Node
+
+Enable `services.ekafleet.agent` to deploy the data plane. This creates three systemd services:
+
+- **ekafleet-agent** — the data plane (systemd unit management, WireGuard, nftables, secrets), runs as root
+- **ekafleet-workload-api** — serves SPIFFE SVIDs to workloads, unprivileged with `PrivateNetwork=true`
+- **ekafleet-proxy** — service mesh proxy, unprivileged with only `CAP_NET_BIND_SERVICE`
 
 ```nix
-services.ekafleet = {
+{ inputs, ... }:
+{
+  imports = [ inputs.ekaos-fleet.nixosModules.default ];
+
+  services.ekafleet.agent = {
+    enable = true;
+    serverAddr = "10.0.0.1:7400";
+    token = "agent-token";
+  };
+}
+```
+
+### Agent Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `enable` | bool | `false` | Enable the data plane |
+| `serverAddr` | string | *(required)* | Server address to join |
+| `token` | string | `""` | Authentication token (legacy) |
+| `dataDir` | path | `/var/lib/ekafleet` | Data directory for persistent state |
+| `domain` | string | `fleet.internal` | SPIFFE trust domain |
+| `caCert` | path or null | `null` | CA certificate PEM for TLS verification |
+| `workloadApiSocketPath` | string | `/run/ekafleet/workload-api.sock` | Workload API socket path |
+| `proxyListen` | string | `0.0.0.0:8080` | Proxy listen address |
+
+## Combined Node (Server + Agent)
+
+A server that also runs workloads enables both:
+
+```nix
+services.ekafleet.server = {
   enable = true;
-  mode = "server";
   token = "fleet-admin-token";
-  peers = [ "10.0.0.2:7400" "10.0.0.3:7400" ];
 };
-```
-
-Starts ekafleet in server mode with:
-- gRPC on `0.0.0.0:7400`
-- HTTP API on `0.0.0.0:7402`
-- Data stored in `/var/lib/ekafleet`
-
-## Agent Mode
-
-```nix
-services.ekafleet = {
+services.ekafleet.agent = {
   enable = true;
-  mode = "agent";
-  token = "agent-join-token";
-  serverAddr = "10.0.0.1:7400";
+  serverAddr = "127.0.0.1:7400";
 };
 ```
 
-Starts ekafleet in agent mode, connecting to the specified server.
+This creates all five systemd services on the same machine.
 
-## Systemd Service
+## Systemd Services
 
-The module generates a systemd service `ekafleet.service` with:
-- `Type=simple`
-- `Restart=always`
-- `RestartSec=5`
-- State directory at the configured `dataDir`
+### Server-Side
 
-## Integration with clan.lol / deploy-rs
+| Service | User | Hardening |
+|---------|------|-----------|
+| `ekafleet-ca-signer` | DynamicUser | `PrivateNetwork`, no capabilities, `MemoryDenyWriteExecute`, `IPAddressDeny=any` |
+| `ekafleet-server` | DynamicUser | `ProtectSystem=strict`, `MemoryDenyWriteExecute`, `NoNewPrivileges` |
 
-Use your preferred machine provisioning tool to deploy the NixOS configuration containing the ekafleet module. Once the machine boots with ekafleet enabled, it joins the fleet automatically.
+### Agent-Side
 
-Example with flakes:
+| Service | User | Hardening |
+|---------|------|-----------|
+| `ekafleet-agent` | root | `ProtectHome`, `PrivateTmp` (needs root for systemd, WireGuard, nftables) |
+| `ekafleet-workload-api` | DynamicUser | `PrivateNetwork`, no capabilities, `ProtectSystem=strict` |
+| `ekafleet-proxy` | DynamicUser | `CAP_NET_BIND_SERVICE` only, `ProtectSystem=strict`, `NoNewPrivileges` |
+
+## Integration with Flakes
 
 ```nix
 {
   inputs.ekaos-fleet.url = "github:your-org/ekaos-fleet";
 
   outputs = { self, nixpkgs, ekaos-fleet, ... }: {
+    nixosConfigurations.server-1 = nixpkgs.lib.nixosSystem {
+      modules = [
+        ekaos-fleet.nixosModules.default
+        {
+          services.ekafleet.server = {
+            enable = true;
+            token = "token-from-vault-or-sops";
+          };
+        }
+      ];
+    };
+
     nixosConfigurations.app-1 = nixpkgs.lib.nixosSystem {
       modules = [
         ekaos-fleet.nixosModules.default
         {
-          services.ekafleet = {
+          services.ekafleet.agent = {
             enable = true;
-            mode = "agent";
+            serverAddr = "server-1.fleet.internal:7400";
             token = "token-from-vault-or-sops";
-            serverAddr = "server.fleet.internal:7400";
           };
         }
       ];

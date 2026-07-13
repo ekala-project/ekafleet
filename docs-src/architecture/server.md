@@ -1,13 +1,13 @@
 # Server Mode
 
-Start with `ekafleet server`. The server runs the control plane and can optionally run workloads too.
+Start with `ekafleet server`. The server runs the control plane and can optionally run workloads too. In production, the NixOS module deploys the server as two processes: `ekafleet-ca-signer` (holds the CA key in isolation) and `ekafleet-server --ca-socket` (the control plane connecting to the CA via Unix socket).
 
 ## Responsibilities
 
 - **Scheduling** — Priority-based placement with constraints, affinities, taints/tolerations, node pools, spread, and disruption budgets
 - **Deployment orchestration** — Manages rollouts with health gates and disruption budget enforcement
 - **RBAC** — Role-based access control with admin, operator, and viewer roles
-- **Certificate Authority** — Issues SPIFFE X.509-SVIDs, signs CSRs (private keys stay with workloads)
+- **Certificate Authority** — Issues SPIFFE X.509-SVIDs, signs CSRs (private keys stay with workloads). In production, the CA key is held in a separate `ca-signer` process with `PrivateNetwork=true` and no capabilities
 - **Node attestation** — Validates join tokens, issues node SVIDs for mTLS bootstrap
 - **Secret management** — Stores and distributes encrypted secrets; distributes fleet encryption key
 - **DNS authority** — Authoritative DNS for the fleet domain
@@ -63,6 +63,19 @@ The server operates a root CA that:
 - Performs workload attestation by verifying node-to-service assignment
 - Distributes trust bundles to all connected agents
 - The server itself has a SPIFFE SVID: `spiffe://<domain>/server/<server-id>`
+
+### CA Process Isolation
+
+In production (via the NixOS module), the CA runs as a separate `ekafleet-ca-signer` process that communicates with the control plane via a Unix socket. The CA process is maximally hardened:
+
+- `PrivateNetwork=true` — no network access at all
+- `CapabilityBoundingSet=` — no Linux capabilities
+- `MemoryDenyWriteExecute=true` — no JIT or writable+executable memory
+- `IPAddressDeny=any` — belt-and-suspenders network denial
+
+This ensures that a vulnerability in the REST API, webhook dispatcher, or any other control plane subsystem cannot access the CA private key — it lives in a different address space.
+
+For development and quick bootstrapping, `ekafleet server` (without `--ca-socket`) embeds the CA in-process.
 
 ## Node Attestation
 

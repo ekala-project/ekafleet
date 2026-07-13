@@ -8,7 +8,9 @@
 
 Use `--output json` with any command for structured JSON output suitable for scripting and CI/CD pipelines.
 
-## Server & Agent
+## Daemon Modes
+
+ekafleet is a single binary with multiple subcommands. In production, the NixOS module deploys the process-isolated topology (separate `ca-signer`, `server`, `agent`, `workload-api`, and `proxy` processes). For development and quick bootstrapping, convenience modes (`dev`, `server`, `agent`) embed everything in a single process.
 
 ### `ekafleet dev`
 
@@ -28,7 +30,7 @@ A dev token (`dev-token`) is automatically generated and printed at startup.
 
 ### `ekafleet server`
 
-Start in server mode (control plane + agent capabilities).
+Start in server mode (control plane). By default embeds the CA in-process; use `--ca-socket` to connect to an external `ca-signer` daemon for process isolation.
 
 ```
 ekafleet server [OPTIONS]
@@ -42,10 +44,11 @@ ekafleet server [OPTIONS]
 | `--http-listen` | `0.0.0.0:7402` | HTTP API listen address |
 | `--token` | *(required)* | Bearer token for agent authentication (also reads `EKAFLEET_TOKEN` env) |
 | `--domain` | `fleet.internal` | SPIFFE trust domain for fleet identities |
+| `--ca-socket` | | Path to CA signer Unix socket (uses external ca-signer daemon) |
 
 ### `ekafleet agent`
 
-Start in agent mode (data plane).
+Start in agent mode (data plane). Embeds the Workload API and proxy in-process by default.
 
 ```
 ekafleet agent [OPTIONS]
@@ -58,6 +61,48 @@ ekafleet agent [OPTIONS]
 | `--join-token` | | One-time join token for SPIFFE node attestation (preferred) |
 | `--data-dir` | `/var/lib/ekafleet` | Data directory for local state |
 | `--ca-cert` | | Path to CA certificate PEM for TLS verification |
+
+### `ekafleet ca-signer`
+
+Standalone CA signing daemon. Holds the CA private key in an isolated process with no network access, communicating only via a Unix socket. Used by the NixOS module for production deployments.
+
+```
+ekafleet ca-signer [OPTIONS]
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--data-dir` | `/var/lib/ekafleet` | Data directory for CA key and certificate |
+| `--domain` | `fleet.internal` | SPIFFE trust domain |
+| `--socket` | `/run/ekafleet/ca.sock` | Unix socket path for signing requests |
+
+### `ekafleet workload-api`
+
+Standalone SPIFFE Workload API daemon. Reads SVIDs from disk (written by the agent) and serves them to workloads over a Unix socket. Runs unprivileged with no network access.
+
+```
+ekafleet workload-api [OPTIONS]
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--data-dir` | `/var/lib/ekafleet` | Data directory containing `spiffe/` subdirectory |
+| `--trust-domain` | `fleet.internal` | SPIFFE trust domain |
+| `--socket` | `/run/ekafleet/workload-api.sock` | Unix socket path for the Workload API |
+
+### `ekafleet proxy`
+
+Standalone service mesh proxy daemon. Runs the L7 reverse proxy with routing, circuit breaking, mTLS authorization, and upstream management. Runs unprivileged with only `CAP_NET_BIND_SERVICE`.
+
+```
+ekafleet proxy [OPTIONS]
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--listen` | `0.0.0.0:8080` | HTTP listen address for proxied traffic |
+| `--trust-domain` | `fleet.internal` | SPIFFE trust domain for mTLS authorization |
+| `--data-dir` | `/var/lib/ekafleet` | Data directory (for SVID material) |
 
 ## Deployment
 

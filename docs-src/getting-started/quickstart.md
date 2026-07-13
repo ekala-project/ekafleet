@@ -22,6 +22,8 @@ ekafleet status --server 127.0.0.1:7400 --output json
 
 ## Production Setup
 
+For production, use the NixOS module (see [NixOS Module Reference](../reference/nixos-module.md)) which deploys the process-isolated topology automatically. The steps below show the manual CLI approach for understanding or non-NixOS environments.
+
 ### 1. Start the Server
 
 On your first machine, start ekafleet in server mode:
@@ -35,6 +37,16 @@ By default, the server listens on:
 - `0.0.0.0:7402` — HTTP API (health, metrics)
 
 The `--domain` flag sets the SPIFFE trust domain (default: `fleet.internal`). The server generates a persistent identity and SPIFFE SVID (`spiffe://<domain>/server/<server-id>`).
+
+For process isolation, run the CA signer separately:
+
+```bash
+# Terminal 1: CA signer (holds private key, no network)
+ekafleet ca-signer --data-dir /var/lib/ekafleet --domain fleet.internal
+
+# Terminal 2: Control plane (connects to CA via socket)
+ekafleet server --data-dir /var/lib/ekafleet --ca-socket /run/ekafleet/ca.sock
+```
 
 ## 2. Create a Join Token
 
