@@ -37,6 +37,21 @@ enum Command {
         listen: String,
     },
 
+    /// Standalone CA signing daemon (process-isolated, no network)
+    CaSigner {
+        /// Data directory for CA key and certificate
+        #[arg(long, default_value = "/var/lib/ekafleet")]
+        data_dir: PathBuf,
+
+        /// SPIFFE trust domain for fleet identities
+        #[arg(long, default_value = "fleet.internal")]
+        domain: String,
+
+        /// Unix socket path for signing requests
+        #[arg(long, default_value = "/run/ekafleet/ca.sock")]
+        socket: PathBuf,
+    },
+
     /// Start in server mode (control plane + agent capabilities)
     Server {
         /// Data directory for persistent state
@@ -62,6 +77,10 @@ enum Command {
         /// SPIFFE trust domain for fleet identities
         #[arg(long, default_value = "fleet.internal")]
         domain: String,
+
+        /// Path to CA signer Unix socket (uses external ca-signer daemon instead of embedding CA)
+        #[arg(long)]
+        ca_socket: Option<PathBuf>,
     },
 
     /// Start in agent mode (data plane)
@@ -662,6 +681,12 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Command::CaSigner {
+            data_dir,
+            domain,
+            socket,
+        } => commands::cmd_ca_signer(data_dir, domain, socket).await?,
+
         Command::Dev {
             data_dir,
             http_listen,
@@ -675,7 +700,11 @@ async fn main() -> anyhow::Result<()> {
             http_listen,
             token,
             domain,
-        } => commands::cmd_server(data_dir, peers, listen, http_listen, token, domain).await?,
+            ca_socket,
+        } => {
+            commands::cmd_server(data_dir, peers, listen, http_listen, token, domain, ca_socket)
+                .await?
+        }
 
         Command::Agent {
             join,

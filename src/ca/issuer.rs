@@ -3,20 +3,21 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
-use super::root::{CaError, RootCa};
+use super::root::CaError;
+use super::CaSigner;
 
 /// Certificate issuance service.
 /// Validates CSRs, performs attestation, checks service assignment,
-/// and delegates to RootCa for signing.
+/// and delegates to a `CaSigner` implementation for signing.
 #[derive(Clone)]
 pub struct CertIssuer {
-    ca: RootCa,
+    ca: Arc<dyn CaSigner>,
     /// node_id → list of service names assigned to that node
     assignments: Arc<RwLock<HashMap<String, Vec<String>>>>,
 }
 
 impl CertIssuer {
-    pub fn new(ca: RootCa) -> Self {
+    pub fn new(ca: Arc<dyn CaSigner>) -> Self {
         Self {
             ca,
             assignments: Arc::new(RwLock::new(HashMap::new())),
@@ -98,11 +99,13 @@ impl CertIssuer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ca::root::RootCa;
+    use crate::ca::signer::DirectCaSigner;
 
     async fn test_issuer() -> CertIssuer {
         let ca = RootCa::new("test.internal");
         ca.initialize(None, None).await.unwrap();
-        CertIssuer::new(ca)
+        CertIssuer::new(Arc::new(DirectCaSigner::new(ca)))
     }
 
     #[tokio::test]

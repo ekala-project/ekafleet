@@ -14,7 +14,7 @@ use super::state::FleetState;
 use crate::attestation::join_token::JoinTokenStore;
 use crate::ca::csr;
 use crate::ca::issuer::CertIssuer;
-use crate::ca::root::RootCa;
+use crate::ca::CaSigner;
 use crate::metrics::aggregator::MetricsAggregator;
 use crate::proto::agent_message::Payload;
 use crate::proto::fleet_control_server::{FleetControl, FleetControlServer};
@@ -48,7 +48,7 @@ pub struct FleetKeyState {
 pub struct FleetControlService {
     pub(super) state: FleetState,
     pub(super) cert_issuer: Option<CertIssuer>,
-    pub(super) ca: Option<RootCa>,
+    pub(super) ca: Option<Arc<dyn CaSigner>>,
     pub(super) trust_bundle_pem: Option<String>,
     /// Trust domain for SPIFFE identities (e.g., "fleet.internal").
     pub(super) domain: String,
@@ -112,8 +112,8 @@ impl FleetControlService {
         self
     }
 
-    /// Configure the service with a root CA for node SVID issuance during attestation.
-    pub fn with_ca(mut self, ca: RootCa) -> Self {
+    /// Configure the service with a CA signer for node SVID issuance during attestation.
+    pub fn with_ca(mut self, ca: Arc<dyn CaSigner>) -> Self {
         self.ca = Some(ca);
         self
     }
@@ -1563,7 +1563,7 @@ pub struct GrpcServerConfig {
     pub addr: SocketAddr,
     pub tls: TlsConfig,
     pub cert_issuer: CertIssuer,
-    pub ca: RootCa,
+    pub ca: Arc<dyn CaSigner>,
     pub trust_bundle_pem: String,
     pub domain: String,
     pub fleet_key: Vec<u8>,

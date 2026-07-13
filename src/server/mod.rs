@@ -20,6 +20,7 @@ pub mod state;
 pub mod webhook;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use state::FleetState;
 use tokio_util::sync::CancellationToken;
@@ -27,6 +28,8 @@ use tokio_util::sync::CancellationToken;
 use crate::attestation::join_token::JoinTokenStore;
 use crate::ca::issuer::CertIssuer;
 use crate::ca::root::RootCa;
+use crate::ca::signer::{DirectCaSigner, RemoteCaSigner};
+use crate::ca::CaSigner;
 use crate::raft::state::FleetStateMachine;
 
 pub struct ServerConfig {
@@ -37,6 +40,9 @@ pub struct ServerConfig {
     pub token: String,
     /// Trust domain for SPIFFE identities (e.g., "fleet.internal").
     pub domain: String,
+    /// Path to a CA signer Unix socket. When set, the server connects to
+    /// an external `ca-signer` daemon instead of loading the CA key in-process.
+    pub ca_socket: Option<PathBuf>,
 }
 
 pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
@@ -45,49 +51,59 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         peers = ?config.peers,
         grpc = %config.grpc_listen,
         http = %config.http_listen,
+        ca_socket = ?config.ca_socket,
         "Starting ekafleet server"
     );
 
     let grpc_addr = config.grpc_listen.parse()?;
     let http_addr = config.http_listen.parse()?;
 
-    // Initialize the fleet CA with configurable trust domain
-    let ca = RootCa::new(&config.domain);
+    // Build the CA signer — either in-process or remote
+    let ca: Arc<dyn CaSigner> = if let Some(socket_path) = &config.ca_socket {
+        tracing::info!(socket = %socket_path.display(), "Using remote CA signer");
+        Arc::new(RemoteCaSigner::new(socket_path))
+    } else {
+        tracing::info!("Using in-process CA (embedded mode)");
+        let root_ca = RootCa::new(&config.domain);
 
-    // Try to load persisted CA key/cert, or generate new ones
-    let ca_key_path = config.data_dir.join("ca-key.pem");
-    let ca_cert_path = config.data_dir.join("ca-cert.pem");
+        let ca_key_path = config.data_dir.join("ca-key.pem");
+        let ca_cert_path = config.data_dir.join("ca-cert.pem");
 
-    let (stored_key, stored_cert) = match (
-        tokio::fs::read_to_string(&ca_key_path).await,
-        tokio::fs::read_to_string(&ca_cert_path).await,
-    ) {
-        (Ok(key), Ok(cert)) => (Some(key), Some(cert)),
-        _ => (None, None),
-    };
+        let (stored_key, stored_cert) = match (
+            tokio::fs::read_to_string(&ca_key_path).await,
+            tokio::fs::read_to_string(&ca_cert_path).await,
+        ) {
+            (Ok(key), Ok(cert)) => (Some(key), Some(cert)),
+            _ => (None, None),
+        };
 
-    ca.initialize(stored_key.as_deref(), stored_cert.as_deref())
-        .await?;
+        root_ca
+            .initialize(stored_key.as_deref(), stored_cert.as_deref())
+            .await?;
 
-    // Persist CA key and cert if newly generated
-    if stored_key.is_none()
-        && let (Some(key_pem), Some(cert_pem)) =
-            (ca.root_key_pem().await, ca.root_certificate_pem().await)
-    {
-        tokio::fs::create_dir_all(&config.data_dir).await?;
-        tokio::fs::write(&ca_key_path, &key_pem).await?;
-        tokio::fs::write(&ca_cert_path, &cert_pem).await?;
-
-        // Restrict CA key file permissions
-        #[cfg(unix)]
+        // Persist CA key and cert if newly generated
+        if stored_key.is_none()
+            && let (Some(key_pem), Some(cert_pem)) = (
+                root_ca.root_key_pem().await,
+                root_ca.root_certificate_pem().await,
+            )
         {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            tokio::fs::set_permissions(&ca_key_path, perms).await?;
+            tokio::fs::create_dir_all(&config.data_dir).await?;
+            tokio::fs::write(&ca_key_path, &key_pem).await?;
+            tokio::fs::write(&ca_cert_path, &cert_pem).await?;
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let perms = std::fs::Permissions::from_mode(0o600);
+                tokio::fs::set_permissions(&ca_key_path, perms).await?;
+            }
+
+            tracing::info!("CA key and certificate persisted to disk");
         }
 
-        tracing::info!("CA key and certificate persisted to disk");
-    }
+        Arc::new(DirectCaSigner::new(root_ca))
+    };
 
     // Generate or load server identity
     let server_id = get_server_id(&config.data_dir)?;
@@ -104,7 +120,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     // Initialize certificate issuer for SPIFFE SVID issuance
     let cert_issuer = CertIssuer::new(ca.clone());
 
-    let trust_bundle_pem = ca.root_certificate_pem().await.unwrap_or_default();
+    let trust_bundle_pem = ca.trust_bundle_pem().await?;
 
     // Generate or load fleet encryption key for secret distribution
     let fleet_key = get_or_create_fleet_key(&config.data_dir)?;

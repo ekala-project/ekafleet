@@ -49,10 +49,24 @@ pub async fn cmd_dev(data_dir: PathBuf, http_listen: String, listen: String) -> 
         http_listen,
         token: dev_token.to_string(),
         domain: "dev.local".to_string(),
+        ca_socket: None,
     };
 
     server::run(config).await?;
     Ok(())
+}
+
+pub async fn cmd_ca_signer(
+    data_dir: PathBuf,
+    domain: String,
+    socket: PathBuf,
+) -> anyhow::Result<()> {
+    ekafleet::ca::signer::serve(ekafleet::ca::signer::CaSignerConfig {
+        data_dir,
+        domain,
+        socket_path: socket,
+    })
+    .await
 }
 
 pub async fn cmd_server(
@@ -62,6 +76,7 @@ pub async fn cmd_server(
     http_listen: String,
     token: String,
     domain: String,
+    ca_socket: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let peer_list: Vec<String> = peers
         .map(|p| p.split(',').map(String::from).collect())
@@ -74,6 +89,7 @@ pub async fn cmd_server(
         http_listen,
         token,
         domain,
+        ca_socket,
     };
 
     server::run(config).await?;
