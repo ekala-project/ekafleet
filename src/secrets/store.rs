@@ -246,6 +246,62 @@ impl SecretStore {
 
         result
     }
+
+    /// Re-encrypt all secrets with a new master key.
+    ///
+    /// Decrypts every secret using the current key and re-encrypts it under
+    /// `new_key`. Updates the internal key so subsequent operations use the
+    /// new key. Returns the number of secrets re-encrypted.
+    pub async fn rekey(&mut self, new_key: &[u8; 32]) -> Result<usize, SecretStoreError> {
+        let mut state = self.inner.write().await;
+        let mut count = 0;
+
+        for (svc_name, svc_secrets) in state.secrets.iter_mut() {
+            for (secret_name, entry) in svc_secrets.iter_mut() {
+                let aad = secret_aad(svc_name, secret_name);
+                // Decrypt with current key
+                let plaintext = self.decrypt(&entry.sealed, &aad)?;
+                // Re-encrypt with new key
+                let new_sealed = Self::encrypt_with_key(new_key, &plaintext, &aad)?;
+                entry.sealed = new_sealed;
+                count += 1;
+            }
+        }
+
+        // Swap to the new key
+        let unbound =
+            UnboundKey::new(&AES_256_GCM, new_key).map_err(|_| SecretStoreError::Encrypt)?;
+        self.key = Arc::new(LessSafeKey::new(unbound));
+        self.raw_key = Arc::new(*new_key);
+
+        tracing::info!(count, "All secrets re-encrypted with new fleet key");
+        Ok(count)
+    }
+
+    /// Encrypt with an explicit key (used during rekeying before the key is swapped).
+    fn encrypt_with_key(
+        key: &[u8; 32],
+        plaintext: &[u8],
+        aad: &[u8],
+    ) -> Result<Vec<u8>, SecretStoreError> {
+        let rng = SystemRandom::new();
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        rng.fill(&mut nonce_bytes)
+            .map_err(|_| SecretStoreError::Encrypt)?;
+        let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+
+        let unbound =
+            UnboundKey::new(&AES_256_GCM, key).map_err(|_| SecretStoreError::Encrypt)?;
+        let aead = LessSafeKey::new(unbound);
+        let mut in_out = plaintext.to_vec();
+        aead.seal_in_place_append_tag(nonce, Aad::from(aad), &mut in_out)
+            .map_err(|_| SecretStoreError::Encrypt)?;
+
+        let mut sealed = Vec::with_capacity(NONCE_LEN + in_out.len());
+        sealed.extend_from_slice(&nonce_bytes);
+        sealed.extend_from_slice(&in_out);
+        Ok(sealed)
+    }
 }
 
 #[cfg(test)]
@@ -428,5 +484,75 @@ mod tests {
         assert!(store.decrypt(&[0u8; 5], &aad).is_err());
         // Empty
         assert!(store.decrypt(&[], &aad).is_err());
+    }
+
+    #[tokio::test]
+    async fn rekey_preserves_all_secrets() {
+        let old_key = test_key();
+        let new_key = [0xCD; 32];
+        let mut store = SecretStore::new(&old_key);
+
+        store.put("svc-a", "pass", b"alpha").await.unwrap();
+        store.put("svc-b", "key", b"beta").await.unwrap();
+        store.put("svc-a", "token", b"gamma").await.unwrap();
+
+        let count = store.rekey(&new_key).await.unwrap();
+        assert_eq!(count, 3);
+
+        // All secrets should be readable with the new key
+        let (val, _) = store.get("svc-a", "pass").await.unwrap().unwrap();
+        assert_eq!(val, b"alpha");
+        let (val, _) = store.get("svc-b", "key").await.unwrap().unwrap();
+        assert_eq!(val, b"beta");
+        let (val, _) = store.get("svc-a", "token").await.unwrap().unwrap();
+        assert_eq!(val, b"gamma");
+    }
+
+    #[tokio::test]
+    async fn rekey_old_key_cannot_decrypt() {
+        let old_key = test_key();
+        let new_key = [0xCD; 32];
+        let mut store = SecretStore::new(&old_key);
+        store.put("svc", "secret", b"value").await.unwrap();
+
+        // Grab the sealed data before rekey
+        let before = {
+            let state = store.inner.read().await;
+            state.secrets.get("svc").unwrap().get("secret").unwrap().sealed.clone()
+        };
+
+        store.rekey(&new_key).await.unwrap();
+
+        // The sealed data must change after rekeying
+        let after = {
+            let state = store.inner.read().await;
+            state.secrets.get("svc").unwrap().get("secret").unwrap().sealed.clone()
+        };
+        assert_ne!(before, after, "sealed data must change after rekey");
+
+        // Decryption still works (using the new key internally)
+        let (val, _) = store.get("svc", "secret").await.unwrap().unwrap();
+        assert_eq!(val, b"value");
+    }
+
+    #[tokio::test]
+    async fn rekey_preserves_versions() {
+        let mut store = SecretStore::new(&test_key());
+        store.put("svc", "key", b"v1").await.unwrap();
+        store.put("svc", "key", b"v2").await.unwrap();
+        store.put("svc", "key", b"v3").await.unwrap();
+
+        store.rekey(&[0xCC; 32]).await.unwrap();
+
+        let (val, version) = store.get("svc", "key").await.unwrap().unwrap();
+        assert_eq!(val, b"v3");
+        assert_eq!(version, 3, "version must be preserved across rekey");
+    }
+
+    #[tokio::test]
+    async fn rekey_empty_store_succeeds() {
+        let mut store = SecretStore::new(&test_key());
+        let count = store.rekey(&[0xCC; 32]).await.unwrap();
+        assert_eq!(count, 0);
     }
 }

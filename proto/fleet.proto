@@ -97,6 +97,10 @@ service FleetControl {
 
   // Inspect a service's systemd unit and cgroup accounting.
   rpc InspectService(InspectServiceRequest) returns (InspectServiceResponse);
+
+  // Rotate the fleet encryption key. Generates a new master key, re-encrypts
+  // all secrets in the store, and pushes derived keys to all connected agents.
+  rpc RotateFleetKey(RotateFleetKeyRequest) returns (RotateFleetKeyResponse);
 }
 
 // --- Agent → Server messages ---
@@ -1005,4 +1009,16 @@ message CgroupControls {
   uint32 io_weight = 4;
   uint32 tasks_max = 5;
   string oom_policy = 6;
+}
+
+// --- Fleet Key Rotation ---
+
+message RotateFleetKeyRequest {}
+
+message RotateFleetKeyResponse {
+  bool success = 1;
+  uint64 previous_version = 2;
+  uint64 new_version = 3;
+  uint32 agents_notified = 4;    // Number of connected agents that received the new key
+  string message = 5;
 }

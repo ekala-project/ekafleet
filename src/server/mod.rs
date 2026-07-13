@@ -147,6 +147,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         raft_state,
         instance_tracker: instance_tracker.clone(),
         event_store: event_store.clone(),
+        data_dir: config.data_dir.clone(),
     };
 
     let grpc_shutdown = shutdown.clone();

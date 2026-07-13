@@ -1,7 +1,9 @@
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::RwLock;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 use tonic::{Request, Response, Status, Streaming};
@@ -27,14 +29,21 @@ use crate::proto::{
     LogsChunk, LogsRequest, NodeAttestationRequest, NodeAttestationResult, NodeDetail,
     OperationType, PlanRequest, PlanResponse, PlannedOperation, PromoteRequest, PromoteResponse,
     RestoreRequest, RestoreResponse, RevokeAclTokenRequest, RevokeAclTokenResponse,
-    RollbackRequest, RollbackResponse, ScaleRequest, ScaleResponse, ServerMessage, SnapshotRequest,
-    SnapshotResponse, StatusRequest, SwitchGenerationRequest, SwitchGenerationResponse,
-    SystemGcRequest, SystemGcResponse, SystemRebootRequest, SystemRebootResponse,
-    SystemRebuildRequest, SystemRebuildResponse, TopRequest, TopResponse, TrustBundleUpdate,
-    UpdateNodeRequest, UpdateNodeResponse,
+    RollbackRequest, RollbackResponse, RotateFleetKeyRequest, RotateFleetKeyResponse,
+    ScaleRequest, ScaleResponse, ServerMessage, SnapshotRequest, SnapshotResponse, StatusRequest,
+    SwitchGenerationRequest, SwitchGenerationResponse, SystemGcRequest, SystemGcResponse,
+    SystemRebootRequest, SystemRebootResponse, SystemRebuildRequest, SystemRebuildResponse,
+    TopRequest, TopResponse, TrustBundleUpdate, UpdateNodeRequest, UpdateNodeResponse,
 };
 use crate::raft::state::FleetStateMachine;
+use crate::secrets::store::SecretStore;
 use crate::server::cloud::instance_tracker::InstanceTracker;
+
+/// Fleet encryption key with version tracking for rotation.
+pub struct FleetKeyState {
+    pub key: Vec<u8>,
+    pub version: u64,
+}
 
 pub struct FleetControlService {
     pub(super) state: FleetState,
@@ -43,8 +52,12 @@ pub struct FleetControlService {
     pub(super) trust_bundle_pem: Option<String>,
     /// Trust domain for SPIFFE identities (e.g., "fleet.internal").
     pub(super) domain: String,
-    /// Fleet encryption key for secret distribution (32 bytes, AES-256-GCM).
-    pub(super) fleet_key: Option<Vec<u8>>,
+    /// Fleet encryption key state — supports runtime rotation.
+    pub(super) fleet_key: Arc<RwLock<FleetKeyState>>,
+    /// Server-side encrypted secret storage (shared for rotation).
+    pub(super) secret_store: Arc<RwLock<SecretStore>>,
+    /// Path to persist the fleet key on disk.
+    pub(super) data_dir: std::path::PathBuf,
     pub(super) join_token_store: JoinTokenStore,
     pub(super) metrics: MetricsAggregator,
     pub(super) raft_state: FleetStateMachine,
@@ -68,6 +81,7 @@ impl FleetControlService {
         grpc_addr: &str,
         event_store: EventStore,
         token_store: TokenStore,
+        data_dir: std::path::PathBuf,
     ) -> Self {
         Self {
             state,
@@ -75,7 +89,12 @@ impl FleetControlService {
             ca: None,
             trust_bundle_pem: None,
             domain: domain.to_string(),
-            fleet_key: None,
+            fleet_key: Arc::new(RwLock::new(FleetKeyState {
+                key: Vec::new(),
+                version: 0,
+            })),
+            secret_store: Arc::new(RwLock::new(SecretStore::new(&[0u8; 32]))),
+            data_dir,
             join_token_store,
             metrics: MetricsAggregator::new(),
             raft_state,
@@ -99,9 +118,17 @@ impl FleetControlService {
         self
     }
 
-    /// Configure the fleet encryption key for distribution to agents.
-    pub fn with_fleet_key(mut self, key: Vec<u8>) -> Self {
-        self.fleet_key = Some(key);
+    /// Configure the fleet encryption key and secret store.
+    pub fn with_fleet_key(self, key: Vec<u8>) -> Self {
+        // Initialize the secret store with this key and set version 1
+        let store = SecretStore::new(
+            <&[u8; 32]>::try_from(key.as_slice()).expect("fleet key must be 32 bytes"),
+        );
+        *self.fleet_key.blocking_write() = FleetKeyState {
+            key: key.clone(),
+            version: 1,
+        };
+        *self.secret_store.blocking_write() = store;
         self
     }
 
@@ -186,18 +213,21 @@ impl FleetControl for FleetControlService {
         // The fleet master key stays on the server; each agent receives a unique
         // key derived via HKDF so that compromising one agent does not expose
         // secrets encrypted for other agents.
-        if let Some(master_key) = &self.fleet_key {
-            let agent_spiffe_id =
-                format!("spiffe://{}/agent/{}", self.domain, node_id);
-            let derived =
-                crate::secrets::key_derivation::derive_agent_key(master_key, &agent_spiffe_id);
-            let key_msg = ServerMessage {
-                payload: Some(ServerPayload::FleetKey(crate::proto::FleetKeyUpdate {
-                    encrypted_key: derived.to_vec(),
-                    version: 1,
-                })),
-            };
-            let _ = self.state.send_to_agent(&node_id, key_msg).await;
+        {
+            let fk = self.fleet_key.read().await;
+            if fk.version > 0 {
+                let agent_spiffe_id =
+                    format!("spiffe://{}/agent/{}", self.domain, node_id);
+                let derived =
+                    crate::secrets::key_derivation::derive_agent_key(&fk.key, &agent_spiffe_id);
+                let key_msg = ServerMessage {
+                    payload: Some(ServerPayload::FleetKey(crate::proto::FleetKeyUpdate {
+                        encrypted_key: derived.to_vec(),
+                        version: fk.version,
+                    })),
+                };
+                let _ = self.state.send_to_agent(&node_id, key_msg).await;
+            }
         }
 
         // Process the first message
@@ -1422,6 +1452,88 @@ impl FleetControl for FleetControlService {
     ) -> Result<Response<InspectServiceResponse>, Status> {
         self.handle_inspect_service(request.into_inner()).await
     }
+
+    async fn rotate_fleet_key(
+        &self,
+        _request: Request<RotateFleetKeyRequest>,
+    ) -> Result<Response<RotateFleetKeyResponse>, Status> {
+        tracing::info!("Fleet key rotation requested");
+
+        // Generate a new 256-bit key
+        use ring::rand::{SecureRandom, SystemRandom};
+        let rng = SystemRandom::new();
+        let mut new_key = [0u8; 32];
+        rng.fill(&mut new_key)
+            .map_err(|_| Status::internal("RNG failure during key generation"))?;
+
+        // Re-encrypt all secrets in the store with the new key
+        {
+            let mut store = self.secret_store.write().await;
+            store.rekey(&new_key).await.map_err(|e| {
+                Status::internal(format!("failed to re-encrypt secrets: {e}"))
+            })?;
+        }
+
+        // Update the fleet key state and bump the version
+        let (prev_version, new_version) = {
+            let mut fk = self.fleet_key.write().await;
+            let prev = fk.version;
+            fk.version += 1;
+            fk.key = new_key.to_vec();
+            (prev, fk.version)
+        };
+
+        // Persist the new key to disk
+        let key_path = self.data_dir.join("fleet-key");
+        let hex: String = new_key.iter().map(|b| format!("{b:02x}")).collect();
+        tokio::fs::write(&key_path, &hex).await.map_err(|e| {
+            Status::internal(format!("failed to persist rotated key: {e}"))
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            let _ = tokio::fs::set_permissions(&key_path, perms).await;
+        }
+
+        // Push the new per-agent derived key to all connected agents
+        let node_ids = self.state.connected_nodes().await;
+        let mut notified: u32 = 0;
+        for nid in &node_ids {
+            let agent_spiffe_id =
+                format!("spiffe://{}/agent/{}", self.domain, nid);
+            let derived =
+                crate::secrets::key_derivation::derive_agent_key(&new_key, &agent_spiffe_id);
+            let key_msg = ServerMessage {
+                payload: Some(ServerPayload::FleetKey(crate::proto::FleetKeyUpdate {
+                    encrypted_key: derived.to_vec(),
+                    version: new_version,
+                })),
+            };
+            if self.state.send_to_agent(nid, key_msg).await {
+                notified += 1;
+            }
+        }
+
+        tracing::info!(
+            prev_version,
+            new_version,
+            notified,
+            total_agents = node_ids.len(),
+            "Fleet key rotated successfully"
+        );
+
+        Ok(Response::new(RotateFleetKeyResponse {
+            success: true,
+            previous_version: prev_version,
+            new_version,
+            agents_notified: notified,
+            message: format!(
+                "Fleet key rotated from v{prev_version} to v{new_version}, {notified}/{} agents notified",
+                node_ids.len()
+            ),
+        }))
+    }
 }
 
 impl FleetControlService {
@@ -1459,6 +1571,7 @@ pub struct GrpcServerConfig {
     pub raft_state: FleetStateMachine,
     pub instance_tracker: InstanceTracker,
     pub event_store: EventStore,
+    pub data_dir: std::path::PathBuf,
 }
 
 /// Start the gRPC server with TLS and RBAC-based authentication.
@@ -1480,6 +1593,7 @@ pub async fn serve_grpc(
         raft_state,
         instance_tracker,
         event_store,
+        data_dir,
     } = config;
 
     tracing::info!(%addr, domain = %domain, "gRPC server listening (TLS + RBAC + SPIFFE)");
@@ -1549,6 +1663,7 @@ pub async fn serve_grpc(
         &addr_str,
         event_store,
         service_token_store,
+        data_dir,
     )
     .with_cert_issuer(cert_issuer, trust_bundle_pem)
     .with_ca(ca)

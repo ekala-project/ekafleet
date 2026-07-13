@@ -58,6 +58,7 @@ async fn start_server() -> (SocketAddr, SocketAddr, String, String) {
         "127.0.0.1:7400",
         event_store,
         token_store,
+        std::path::PathBuf::from("/tmp/ekafleet-test"),
     );
 
     let expected_token = format!("Bearer {token}");
