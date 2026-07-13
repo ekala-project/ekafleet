@@ -291,4 +291,106 @@ mod tests {
         assert!(store.has_blob(&current_digest).await);
         assert!(!store.has_blob(&orphan_digest).await);
     }
+
+    #[tokio::test]
+    async fn gc_shared_layers_between_active_and_retained() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(dir.path().join("oci"));
+        store.init().await.unwrap();
+
+        // A shared layer used by both active and retained manifests
+        let shared_layer = b"shared base layer";
+        let active_only_layer = b"active-only layer";
+        let retained_only_layer = b"retained-only layer";
+        let config_data = b"config";
+
+        let shared_digest = Digest::from_bytes(shared_layer);
+        let active_digest = Digest::from_bytes(active_only_layer);
+        let retained_digest = Digest::from_bytes(retained_only_layer);
+        let config_digest = Digest::from_bytes(config_data);
+
+        store.put_blob(&shared_digest, shared_layer).await.unwrap();
+        store
+            .put_blob(&active_digest, active_only_layer)
+            .await
+            .unwrap();
+        store
+            .put_blob(&retained_digest, retained_only_layer)
+            .await
+            .unwrap();
+        store.put_blob(&config_digest, config_data).await.unwrap();
+
+        let active_manifest = ImageManifest {
+            schema_version: 2,
+            media_type: None,
+            config: make_descriptor(config_data),
+            layers: vec![
+                make_descriptor(shared_layer),
+                make_descriptor(active_only_layer),
+            ],
+        };
+
+        let retained_manifest = ImageManifest {
+            schema_version: 2,
+            media_type: None,
+            config: make_descriptor(config_data),
+            layers: vec![
+                make_descriptor(shared_layer),
+                make_descriptor(retained_only_layer),
+            ],
+        };
+
+        let active_services: HashSet<String> = ["test-svc".to_string()].into();
+        let result = collect(
+            &store,
+            &active_services,
+            &[("test-svc".to_string(), active_manifest)],
+            &[retained_manifest],
+        )
+        .await
+        .unwrap();
+
+        // All blobs should be preserved
+        assert_eq!(result.blobs_removed, 0);
+        assert!(store.has_blob(&shared_digest).await);
+        assert!(store.has_blob(&active_digest).await);
+        assert!(store.has_blob(&retained_digest).await);
+    }
+
+    #[tokio::test]
+    async fn gc_cleans_history_for_inactive_services() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(dir.path().join("oci"));
+        store.init().await.unwrap();
+
+        // Create bundles and history for two services
+        let active_rootfs = store.rootfs_path("active-svc");
+        let inactive_rootfs = store.rootfs_path("inactive-svc");
+        tokio::fs::create_dir_all(&active_rootfs).await.unwrap();
+        tokio::fs::create_dir_all(&inactive_rootfs).await.unwrap();
+
+        store
+            .put_history("active-svc", b"manifest-v1")
+            .await
+            .unwrap();
+        store
+            .put_history("inactive-svc", b"manifest-v1")
+            .await
+            .unwrap();
+
+        let active_services: HashSet<String> = ["active-svc".to_string()].into();
+        let result = collect(&store, &active_services, &[], &[]).await.unwrap();
+
+        assert_eq!(result.bundles_removed, 1);
+        assert!(store.has_bundle("active-svc").await);
+        assert!(!store.has_bundle("inactive-svc").await);
+
+        // History for inactive service should be removed
+        let inactive_history = store.list_history("inactive-svc").await.unwrap();
+        assert!(inactive_history.is_empty());
+
+        // History for active service should be preserved
+        let active_history = store.list_history("active-svc").await.unwrap();
+        assert_eq!(active_history.len(), 1);
+    }
 }

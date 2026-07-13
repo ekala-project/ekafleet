@@ -412,4 +412,120 @@ mod tests {
         let result = write_bundle_config(bundle, &image_config, &HashMap::new(), &[]).await;
         assert!(result.is_err());
     }
+
+    #[test]
+    fn capabilities_sets_are_identical() {
+        let caps = default_capabilities();
+        assert_eq!(caps.bounding, caps.effective);
+        assert_eq!(caps.bounding, caps.inheritable);
+        assert_eq!(caps.bounding, caps.permitted);
+        assert_eq!(caps.bounding, caps.ambient);
+    }
+
+    #[test]
+    fn capabilities_minimal_set() {
+        let caps = default_capabilities();
+        let set = &caps.bounding;
+
+        // Expected capabilities present
+        assert!(set.contains(&"CAP_CHOWN".to_string()));
+        assert!(set.contains(&"CAP_DAC_OVERRIDE".to_string()));
+        assert!(set.contains(&"CAP_FSETID".to_string()));
+        assert!(set.contains(&"CAP_FOWNER".to_string()));
+        assert!(set.contains(&"CAP_SETGID".to_string()));
+        assert!(set.contains(&"CAP_SETUID".to_string()));
+        assert!(set.contains(&"CAP_SETFCAP".to_string()));
+        assert!(set.contains(&"CAP_SETPCAP".to_string()));
+        assert!(set.contains(&"CAP_NET_BIND_SERVICE".to_string()));
+        assert!(set.contains(&"CAP_KILL".to_string()));
+        assert_eq!(set.len(), 10);
+
+        // Dangerous capabilities must NOT be present
+        let dangerous = [
+            "CAP_SYS_ADMIN",
+            "CAP_NET_RAW",
+            "CAP_SYS_PTRACE",
+            "CAP_SYS_MODULE",
+            "CAP_SYS_RAWIO",
+            "CAP_SYS_BOOT",
+            "CAP_SYS_TIME",
+            "CAP_MKNOD",
+            "CAP_AUDIT_WRITE",
+            "CAP_AUDIT_CONTROL",
+        ];
+        for cap in dangerous {
+            assert!(
+                !set.contains(&cap.to_string()),
+                "{cap} should not be in the capability set"
+            );
+        }
+    }
+
+    #[test]
+    fn seccomp_blocks_dangerous_syscalls() {
+        let seccomp = default_seccomp();
+        assert_eq!(seccomp.default_action, "SCMP_ACT_ALLOW");
+        assert!(
+            seccomp
+                .architectures
+                .contains(&"SCMP_ARCH_X86_64".to_string())
+        );
+        assert!(
+            seccomp
+                .architectures
+                .contains(&"SCMP_ARCH_AARCH64".to_string())
+        );
+
+        assert_eq!(seccomp.syscalls.len(), 1);
+        let rule = &seccomp.syscalls[0];
+        assert_eq!(rule.action, "SCMP_ACT_ERRNO");
+
+        let blocked = &rule.names;
+        let expected_blocked = [
+            "kexec_load",
+            "kexec_file_load",
+            "reboot",
+            "mount",
+            "umount2",
+            "pivot_root",
+            "swapon",
+            "swapoff",
+            "init_module",
+            "finit_module",
+            "delete_module",
+            "acct",
+            "settimeofday",
+            "clock_settime",
+            "add_key",
+            "request_key",
+            "keyctl",
+            "bpf",
+            "perf_event_open",
+            "unshare",
+            "setns",
+        ];
+        for syscall in expected_blocked {
+            assert!(
+                blocked.contains(&syscall.to_string()),
+                "{syscall} should be blocked by seccomp"
+            );
+        }
+        assert_eq!(blocked.len(), expected_blocked.len());
+    }
+
+    #[test]
+    fn default_namespaces_excludes_net_and_user() {
+        let ns = default_namespaces();
+        let types: Vec<&str> = ns.iter().map(|n| n.type_.as_str()).collect();
+
+        // Must include
+        assert!(types.contains(&"pid"));
+        assert!(types.contains(&"ipc"));
+        assert!(types.contains(&"uts"));
+        assert!(types.contains(&"mount"));
+
+        // Must NOT include (host networking, no rootless)
+        assert!(!types.contains(&"net"));
+        assert!(!types.contains(&"user"));
+    }
 }

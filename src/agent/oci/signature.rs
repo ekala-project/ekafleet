@@ -430,6 +430,119 @@ mod tests {
     }
 
     #[test]
+    fn verify_ed25519_wrong_key() {
+        let rng = ring::rand::SystemRandom::new();
+
+        // Generate two key pairs
+        let pkcs8_a = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let key_pair_a = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8_a.as_ref()).unwrap();
+
+        let pkcs8_b = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let key_pair_b = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8_b.as_ref()).unwrap();
+
+        // Sign with key A, verify with key B's public key
+        let message = b"signed by A";
+        let sig = key_pair_a.sign(message);
+        let wrong_public_key = key_pair_b.public_key().as_ref().to_vec();
+
+        let key = SigningKey::Ed25519(wrong_public_key);
+        assert!(verify_signature(&key, message, sig.as_ref()).is_err());
+    }
+
+    #[test]
+    fn verify_ed25519_wrong_message() {
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let key_pair = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+
+        let sig = key_pair.sign(b"original");
+        let public_key_bytes = key_pair.public_key().as_ref().to_vec();
+
+        let key = SigningKey::Ed25519(public_key_bytes);
+        assert!(verify_signature(&key, b"tampered", sig.as_ref()).is_err());
+    }
+
+    #[test]
+    fn verify_ecdsa_wrong_key() {
+        let rng = ring::rand::SystemRandom::new();
+
+        let pkcs8_a = ring::signature::EcdsaKeyPair::generate_pkcs8(
+            &signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+            &rng,
+        )
+        .unwrap();
+        let key_pair_a = ring::signature::EcdsaKeyPair::from_pkcs8(
+            &signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+            pkcs8_a.as_ref(),
+            &rng,
+        )
+        .unwrap();
+
+        let pkcs8_b = ring::signature::EcdsaKeyPair::generate_pkcs8(
+            &signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+            &rng,
+        )
+        .unwrap();
+        let key_pair_b = ring::signature::EcdsaKeyPair::from_pkcs8(
+            &signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+            pkcs8_b.as_ref(),
+            &rng,
+        )
+        .unwrap();
+
+        let sig = key_pair_a.sign(&rng, b"message").unwrap();
+        let wrong_public_key = key_pair_b.public_key().as_ref().to_vec();
+
+        let key = SigningKey::EcdsaP256(wrong_public_key);
+        assert!(verify_signature(&key, b"message", sig.as_ref()).is_err());
+    }
+
+    #[test]
+    fn verify_empty_signature_fails() {
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let key_pair = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let public_key_bytes = key_pair.public_key().as_ref().to_vec();
+
+        let key = SigningKey::Ed25519(public_key_bytes);
+        assert!(verify_signature(&key, b"message", &[]).is_err());
+    }
+
+    #[test]
+    fn verify_truncated_signature_fails() {
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let key_pair = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+
+        let message = b"test";
+        let sig = key_pair.sign(message);
+        let public_key_bytes = key_pair.public_key().as_ref().to_vec();
+
+        // Truncate signature to half its length
+        let truncated = &sig.as_ref()[..sig.as_ref().len() / 2];
+
+        let key = SigningKey::Ed25519(public_key_bytes);
+        assert!(verify_signature(&key, message, truncated).is_err());
+    }
+
+    #[test]
+    fn base64_decode_invalid_char() {
+        assert!(base64_decode("abc!").is_err());
+    }
+
+    #[test]
+    fn base64_decode_with_whitespace() {
+        // base64 decoder should handle whitespace within input
+        assert_eq!(base64_decode("aGVs\nbG8=").unwrap(), b"hello");
+    }
+
+    #[test]
+    fn base64_decode_no_padding() {
+        // "ab" in base64 without padding
+        assert_eq!(base64_decode("YWI").unwrap(), b"ab");
+    }
+
+    #[test]
     fn cosign_payload_parse() {
         let json = r#"{
             "critical": {
@@ -450,5 +563,63 @@ mod tests {
             "ghcr.io/org/app"
         );
         assert_eq!(payload.critical.type_, "cosign container image signature");
+    }
+
+    #[test]
+    fn cosign_payload_without_optional() {
+        // optional field is absent entirely
+        let json = r#"{
+            "critical": {
+                "identity": {
+                    "docker-reference": "ghcr.io/org/app"
+                },
+                "image": {
+                    "docker-manifest-digest": "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+                },
+                "type": "cosign container image signature"
+            }
+        }"#;
+
+        let payload: CosignPayload = serde_json::from_str(json).unwrap();
+        assert!(payload.optional.is_none());
+    }
+
+    #[test]
+    fn cosign_payload_with_optional_annotations() {
+        let json = r#"{
+            "critical": {
+                "identity": {
+                    "docker-reference": "ghcr.io/org/app"
+                },
+                "image": {
+                    "docker-manifest-digest": "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+                },
+                "type": "cosign container image signature"
+            },
+            "optional": {"creator": "test", "timestamp": 1234567890}
+        }"#;
+
+        let payload: CosignPayload = serde_json::from_str(json).unwrap();
+        assert!(payload.optional.is_some());
+    }
+
+    #[test]
+    fn cosign_payload_invalid_json_rejected() {
+        let bad = r#"{"not": "a cosign payload"}"#;
+        assert!(serde_json::from_str::<CosignPayload>(bad).is_err());
+    }
+
+    #[test]
+    fn contains_subsequence_found() {
+        assert!(contains_subsequence(b"hello world", b"world"));
+        assert!(contains_subsequence(b"hello world", b"hello"));
+        assert!(contains_subsequence(b"abc", b"abc"));
+    }
+
+    #[test]
+    fn contains_subsequence_not_found() {
+        assert!(!contains_subsequence(b"hello", b"world"));
+        assert!(!contains_subsequence(b"ab", b"abc"));
+        assert!(!contains_subsequence(b"", b"a"));
     }
 }

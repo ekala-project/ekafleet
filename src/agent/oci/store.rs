@@ -449,4 +449,73 @@ mod tests {
         assert_eq!(history_a[0].1, b"a-data");
         assert_eq!(history_b[0].1, b"b-data");
     }
+
+    #[tokio::test]
+    async fn list_history_nonexistent_service() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(dir.path().join("oci"));
+        store.init().await.unwrap();
+
+        let history = store.list_history("no-such-svc").await.unwrap();
+        assert!(history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn prune_history_to_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(dir.path().join("oci"));
+        store.init().await.unwrap();
+
+        store.put_history("svc", b"v1").await.unwrap();
+        store.put_history("svc", b"v2").await.unwrap();
+        store.put_history("svc", b"v3").await.unwrap();
+
+        let pruned = store.prune_history("svc", 0).await.unwrap();
+        assert_eq!(pruned, 3);
+
+        let history = store.list_history("svc").await.unwrap();
+        assert!(history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn prune_history_retain_more_than_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(dir.path().join("oci"));
+        store.init().await.unwrap();
+
+        store.put_history("svc", b"v1").await.unwrap();
+
+        let pruned = store.prune_history("svc", 10).await.unwrap();
+        assert_eq!(pruned, 0);
+
+        let history = store.list_history("svc").await.unwrap();
+        assert_eq!(history.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn history_generations_increment() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(dir.path().join("oci"));
+        store.init().await.unwrap();
+
+        store.put_history("svc", b"v1").await.unwrap();
+        store.put_history("svc", b"v2").await.unwrap();
+        store.put_history("svc", b"v3").await.unwrap();
+
+        let history = store.list_history("svc").await.unwrap();
+        // Generations should be 3, 2, 1 (newest first)
+        assert_eq!(history[0].0, 3);
+        assert_eq!(history[1].0, 2);
+        assert_eq!(history[2].0, 1);
+    }
+
+    #[tokio::test]
+    async fn remove_history_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(dir.path().join("oci"));
+        store.init().await.unwrap();
+
+        // Should not error even if no history exists
+        store.remove_history("no-such-svc").await.unwrap();
+    }
 }
