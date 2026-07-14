@@ -102,6 +102,37 @@ impl FleetState {
         tracing::info!(node_id, "Agent deregistered");
     }
 
+    /// Evict nodes whose last heartbeat exceeds the timeout.
+    /// Returns the IDs of evicted nodes so the caller can trigger
+    /// reconciliation to reschedule their services.
+    pub async fn evict_dead_nodes(&self, timeout_secs: u64) -> Vec<String> {
+        let mut state = self.inner.write().await;
+        let timeout = std::time::Duration::from_secs(timeout_secs);
+        let evicted: Vec<String> = state
+            .nodes
+            .iter()
+            .filter(|(_, info)| info.last_heartbeat.elapsed() > timeout)
+            .map(|(id, _)| id.to_string())
+            .collect();
+
+        for id in &evicted {
+            state.nodes.remove(id.as_str());
+            tracing::warn!(
+                node_id = %id,
+                timeout_secs,
+                "Evicted dead node (heartbeat timeout)"
+            );
+        }
+
+        evicted
+    }
+
+    /// Get the set of currently connected node IDs.
+    pub async fn connected_node_ids(&self) -> std::collections::HashSet<String> {
+        let state = self.inner.read().await;
+        state.nodes.keys().map(|k| k.to_string()).collect()
+    }
+
     /// Update heartbeat timestamp and available resources for a node.
     pub async fn update_heartbeat(&self, node_id: &str, resources: Option<NodeResources>) {
         let mut state = self.inner.write().await;
