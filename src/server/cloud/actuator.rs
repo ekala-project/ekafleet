@@ -230,11 +230,17 @@ impl ScalingActuator {
         // Generate user-data bootstrap script
         let user_data = bootstrap::generate_user_data(&self.server_addr, &token, &self.ca_cert_pem);
 
+        // image_id must be resolved by the time we create instances
+        let image_id = cloud_config
+            .image_id
+            .clone()
+            .expect("image_id must be resolved before creating instances");
+
         let request = CreateMachineRequest {
             pool: pool_name.to_string(),
             labels: HashMap::new(),
             instance_type: cloud_config.instance_type.clone(),
-            image_id: cloud_config.image_id.clone(),
+            image_id,
             user_data,
             region: cloud_config.region.clone(),
             zone: cloud_config.zone.clone(),
@@ -245,6 +251,8 @@ impl ScalingActuator {
             disk_size_gb: cloud_config.disk_size_gb,
             resource_group: cloud_config.resource_group.clone(),
             project: cloud_config.project.clone(),
+            iam_instance_profile: cloud_config.iam_instance_profile.clone(),
+            spot: cloud_config.spot.clone(),
         };
 
         let instance = provider.create_machine(&request).await?;
@@ -418,7 +426,8 @@ mod tests {
                     provider: CloudProviderType::Aws,
                     region: "us-east-1".into(),
                     instance_type: "t3.large".into(),
-                    image_id: "ami-test".into(),
+                    image_id: Some("ami-test".into()),
+                    image: None,
                     subnet_id: None,
                     security_group_ids: vec![],
                     ssh_key_name: None,
@@ -431,6 +440,10 @@ mod tests {
                         memory: 4096,
                         disk: 50000,
                     },
+                    iam_instance_profile: None,
+                    spot: None,
+                    launch_timeout_seconds: 300,
+                    join_timeout_seconds: 600,
                 }),
             },
         );

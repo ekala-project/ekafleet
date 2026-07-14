@@ -412,8 +412,15 @@ pub struct CloudProviderConfig {
     pub region: String,
     /// Instance type / VM size (e.g., "c6i.xlarge", "Standard_D4s_v3", "n2-standard-4").
     pub instance_type: String,
-    /// Machine image ID (e.g., AMI ID, managed image name, GCE image name).
-    pub image_id: String,
+    /// Static machine image ID (e.g., AMI ID, managed image name, GCE image name).
+    /// Mutually exclusive with `image`. One of `image_id` or `image` must be set.
+    #[serde(default)]
+    pub image_id: Option<String>,
+    /// Managed image configuration. When set, ekafleet builds NixOS disk images
+    /// from the referenced Nix configuration and registers them with the cloud
+    /// provider automatically. Mutually exclusive with `image_id`.
+    #[serde(default)]
+    pub image: Option<CloudImageConfig>,
     /// Subnet ID for network placement (AWS/GCP).
     #[serde(default)]
     pub subnet_id: Option<String>,
@@ -438,6 +445,95 @@ pub struct CloudProviderConfig {
     /// Expected machine capacity for scheduling before the agent reports
     /// real resources. CPU in millicores, memory/disk in MB.
     pub machine_capacity: CapacityConfig,
+    /// IAM instance profile ARN (AWS), managed identity resource ID (Azure),
+    /// or service account email (GCP).
+    #[serde(default)]
+    pub iam_instance_profile: Option<String>,
+    /// Spot/preemptible instance configuration.
+    #[serde(default)]
+    pub spot: Option<SpotConfig>,
+    /// Maximum time (seconds) to wait for an instance to reach running state.
+    /// Default: 300 (5 minutes).
+    #[serde(default = "default_launch_timeout")]
+    pub launch_timeout_seconds: u64,
+    /// Maximum time (seconds) to wait for an agent to join after instance
+    /// creation. Instances that fail to join within this window are terminated.
+    /// Default: 600 (10 minutes).
+    #[serde(default = "default_join_timeout")]
+    pub join_timeout_seconds: u64,
+}
+
+/// Configuration for ekafleet-managed cloud images. When present in a pool's
+/// cloud config, ekafleet builds NixOS disk images from the referenced Nix
+/// configuration, uploads them to cloud storage, and registers them as
+/// AMIs / managed images / GCE images.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct CloudImageConfig {
+    /// Nix flake reference for the NixOS system configuration.
+    /// Must expose `config.system.build.toplevel` and a disk image attribute.
+    /// e.g., ".#nixosConfigurations.cloud-worker"
+    pub nixos_config: String,
+    /// Nix attribute path for the disk image build under the NixOS config.
+    /// Defaults per provider: aws → "amazonImage", azure → "azureImage", gcp → "gceImage".
+    #[serde(default)]
+    pub disk_image_attr: Option<String>,
+    /// Image name prefix for cloud registration. Default: "<fleet-name>-<pool-name>".
+    #[serde(default)]
+    pub name_prefix: Option<String>,
+    /// S3 bucket for AWS image import (required for AWS provider).
+    #[serde(default)]
+    pub s3_bucket: Option<String>,
+    /// GCS bucket for GCP image upload (required for GCP provider).
+    #[serde(default)]
+    pub gcs_bucket: Option<String>,
+    /// Azure storage account name for VHD upload (required for Azure provider).
+    #[serde(default)]
+    pub storage_account: Option<String>,
+    /// Azure storage container name. Default: "ekafleet-images".
+    #[serde(default)]
+    pub storage_container: Option<String>,
+    /// Number of previous images to retain per pool for rollback. Default: 2.
+    /// The current active image is always kept; this controls how many older
+    /// generations are preserved before cleanup.
+    #[serde(default = "default_image_retain_count")]
+    pub retain_count: u32,
+    /// Maximum age (in seconds) for unused images before automatic cleanup.
+    /// Default: 604800 (7 days). Images older than this that are not the
+    /// current active image and not within retain_count are deleted.
+    #[serde(default = "default_image_max_age")]
+    pub max_age_seconds: u64,
+}
+
+/// Spot/preemptible instance configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SpotConfig {
+    /// Whether to use spot/preemptible instances.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Maximum price per hour (AWS spot). If omitted, uses on-demand price cap.
+    #[serde(default)]
+    pub max_price: Option<String>,
+    /// Fallback to on-demand if spot capacity is unavailable. Default: true.
+    #[serde(default = "default_true")]
+    pub fallback_to_on_demand: bool,
+}
+
+fn default_launch_timeout() -> u64 {
+    300
+}
+
+fn default_join_timeout() -> u64 {
+    600
+}
+
+fn default_image_retain_count() -> u32 {
+    2
+}
+
+fn default_image_max_age() -> u64 {
+    604800 // 7 days
 }
 
 /// Supported cloud provider types.
@@ -584,6 +680,46 @@ pub fn validate(config: &FleetConfig) -> Result<(), Vec<String>> {
                     "pool '{}' has cloud provider config but no scaling config",
                     name
                 ));
+            }
+
+            // Exactly one of image_id or image must be set
+            match (&cloud.image_id, &cloud.image) {
+                (None, None) => {
+                    errors.push(format!(
+                        "pool '{}' cloud config must have either 'imageId' or 'image'",
+                        name
+                    ));
+                }
+                (Some(_), Some(_)) => {
+                    errors.push(format!(
+                        "pool '{}' cloud config cannot have both 'imageId' and 'image'",
+                        name
+                    ));
+                }
+                (None, Some(img)) => {
+                    // Validate provider-specific storage requirements for managed images
+                    if cloud.provider == CloudProviderType::Aws && img.s3_bucket.is_none() {
+                        errors.push(format!(
+                            "pool '{}' managed image config requires 's3Bucket' for AWS",
+                            name
+                        ));
+                    }
+                    if cloud.provider == CloudProviderType::Gcp && img.gcs_bucket.is_none() {
+                        errors.push(format!(
+                            "pool '{}' managed image config requires 'gcsBucket' for GCP",
+                            name
+                        ));
+                    }
+                    if cloud.provider == CloudProviderType::Azure
+                        && img.storage_account.is_none()
+                    {
+                        errors.push(format!(
+                            "pool '{}' managed image config requires 'storageAccount' for Azure",
+                            name
+                        ));
+                    }
+                }
+                _ => {}
             }
         }
     }

@@ -274,6 +274,11 @@ pub struct CreateMachineRequest {
     pub resource_group: Option<String>,
     /// GCP-specific: project ID.
     pub project: Option<String>,
+    /// IAM instance profile ARN (AWS), managed identity (Azure), or
+    /// service account email (GCP).
+    pub iam_instance_profile: Option<String>,
+    /// Spot/preemptible instance configuration.
+    pub spot: Option<crate::config::SpotConfig>,
 }
 
 /// A cloud machine instance returned by provider operations.
