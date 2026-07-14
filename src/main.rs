@@ -428,6 +428,12 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:7400")]
         server: String,
     },
+
+    /// Managed cloud image operations
+    Images {
+        #[command(subcommand)]
+        action: ImagesAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -698,6 +704,42 @@ enum SystemAction {
     },
 }
 
+#[derive(Subcommand)]
+enum ImagesAction {
+    /// List all managed cloud images
+    List {
+        /// Filter by pool name
+        #[arg(long)]
+        pool: Option<String>,
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+    /// Build and register a cloud image for a pool
+    Build {
+        /// Pool name to build image for
+        pool: String,
+        /// Path to fleet.nix configuration
+        #[arg(long, default_value = "fleet.nix")]
+        config: PathBuf,
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+    /// Garbage collect stale cloud images
+    Gc {
+        /// Show what would be deleted without actually deleting
+        #[arg(long)]
+        dry_run: bool,
+        /// Path to fleet.nix configuration
+        #[arg(long, default_value = "fleet.nix")]
+        config: PathBuf,
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -942,6 +984,22 @@ async fn main() -> anyhow::Result<()> {
                 all,
                 server,
             } => commands::cmd_system_rebuild(machine, all, server).await?,
+        },
+
+        Command::Images { action } => match action {
+            ImagesAction::List { pool, server } => {
+                commands::cmd_images_list(pool, server).await?
+            }
+            ImagesAction::Build {
+                pool,
+                config,
+                server,
+            } => commands::cmd_images_build(pool, config, server).await?,
+            ImagesAction::Gc {
+                dry_run,
+                config,
+                server,
+            } => commands::cmd_images_gc(dry_run, config, server).await?,
         },
     }
 

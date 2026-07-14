@@ -1307,3 +1307,221 @@ pub async fn cmd_upgrade(store_path: String, server: String) -> anyhow::Result<(
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// ekafleet images
+// ---------------------------------------------------------------------------
+
+pub async fn cmd_images_list(pool: Option<String>, server: String) -> anyhow::Result<()> {
+    let mut client = connect_server(&server).await?;
+
+    // Use the snapshot RPC to get Raft state, then query KV for images
+    let resp = client
+        .snapshot(SnapshotRequest {})
+        .await?
+        .into_inner();
+
+    let raft = ekafleet::raft::state::FleetStateMachine::new();
+    raft.restore(&resp.data).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let image_tracker = ekafleet::server::cloud::image_tracker::ImageTracker::new(raft);
+    let images = image_tracker.list_all().await;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let filtered: Vec<_> = if let Some(ref p) = pool {
+        images.into_iter().filter(|i| &i.pool == p).collect()
+    } else {
+        images
+    };
+
+    if filtered.is_empty() {
+        println!("No managed cloud images found.");
+        return Ok(());
+    }
+
+    println!(
+        "{:<30} {:<15} {:<12} {:<15} {:<10} {:<10}",
+        "IMAGE_ID", "POOL", "PROVIDER", "STORE_HASH", "AGE", "LAST_USED"
+    );
+    for img in &filtered {
+        let age = format_duration(now.saturating_sub(img.created_at));
+        let last_used = format_duration(now.saturating_sub(img.last_used_at));
+        println!(
+            "{:<30} {:<15} {:<12} {:<15} {:<10} {:<10}",
+            img.image_id,
+            img.pool,
+            img.provider,
+            &img.store_path_hash[..12.min(img.store_path_hash.len())],
+            age,
+            last_used,
+        );
+    }
+
+    Ok(())
+}
+
+pub async fn cmd_images_build(
+    pool: String,
+    config: std::path::PathBuf,
+    server: String,
+) -> anyhow::Result<()> {
+    // Evaluate fleet config to get pool's cloud image settings
+    let fleet_config = ekafleet::server::nix::eval_fleet(&config).await
+        .map_err(|e| anyhow::anyhow!("failed to evaluate fleet config: {e}"))?;
+
+    let pool_config = fleet_config
+        .node_pools
+        .get(&pool)
+        .ok_or_else(|| anyhow::anyhow!("pool '{}' not found in fleet config", pool))?;
+
+    let cloud_config = pool_config
+        .cloud
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("pool '{}' has no cloud provider config", pool))?;
+
+    let image_config = cloud_config
+        .image
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("pool '{}' has no managed image config (uses static imageId)", pool))?;
+
+    // Connect to server to access Raft state for tracking
+    let mut client = connect_server(&server).await?;
+
+    let resp = client
+        .snapshot(SnapshotRequest {})
+        .await?
+        .into_inner();
+
+    let raft = ekafleet::raft::state::FleetStateMachine::new();
+    raft.restore(&resp.data).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let image_tracker = ekafleet::server::cloud::image_tracker::ImageTracker::new(raft);
+    let manager = ekafleet::server::cloud::image::build_image_manager(cloud_config, image_config);
+
+    println!("Building and registering image for pool '{pool}'...");
+
+    let image_id = ekafleet::server::cloud::image::ensure_image(
+        &pool,
+        cloud_config,
+        image_config,
+        &fleet_config.name,
+        &image_tracker,
+        manager.as_ref(),
+    )
+    .await?;
+
+    println!("Image ready: {image_id}");
+
+    Ok(())
+}
+
+pub async fn cmd_images_gc(
+    dry_run: bool,
+    config: std::path::PathBuf,
+    server: String,
+) -> anyhow::Result<()> {
+    let fleet_config = ekafleet::server::nix::eval_fleet(&config).await
+        .map_err(|e| anyhow::anyhow!("failed to evaluate fleet config: {e}"))?;
+
+    let mut client = connect_server(&server).await?;
+
+    let resp = client
+        .snapshot(SnapshotRequest {})
+        .await?
+        .into_inner();
+
+    let raft = ekafleet::raft::state::FleetStateMachine::new();
+    raft.restore(&resp.data).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let image_tracker = ekafleet::server::cloud::image_tracker::ImageTracker::new(raft);
+
+    // Build active hashes and image managers
+    let mut image_managers: std::collections::HashMap<
+        String,
+        Box<dyn ekafleet::server::cloud::image::CloudImageManagerDyn>,
+    > = std::collections::HashMap::new();
+    let mut active_hashes: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+
+    for (pool_name, pool_config) in &fleet_config.node_pools {
+        let Some(cloud) = &pool_config.cloud else {
+            continue;
+        };
+        let Some(image_config) = &cloud.image else {
+            continue;
+        };
+
+        // Determine current active hash
+        let toplevel_attr = format!(
+            "{}.config.system.build.toplevel",
+            image_config.nixos_config
+        );
+        if let Ok(store_path) = ekafleet::server::nix::build(&toplevel_attr).await {
+            if let Some(hash) = ekafleet::server::cloud::image::extract_store_path_hash(&store_path) {
+                active_hashes.insert(pool_name.clone(), hash.to_string());
+            }
+        }
+
+        let manager_key = match cloud.provider {
+            ekafleet::config::CloudProviderType::Aws => "aws",
+            ekafleet::config::CloudProviderType::Azure => "azure",
+            ekafleet::config::CloudProviderType::Gcp => "gcp",
+        };
+        let manager = ekafleet::server::cloud::image::build_image_manager(cloud, image_config);
+        image_managers
+            .entry(manager_key.to_string())
+            .or_insert(manager);
+    }
+
+    if dry_run {
+        println!("Dry run — would clean up the following expired images:");
+        let all_images = image_tracker.list_all().await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        for img in &all_images {
+            let is_active = active_hashes
+                .get(&img.pool)
+                .map_or(false, |h| h == &img.store_path_hash);
+            if !is_active {
+                let age = now.saturating_sub(img.created_at);
+                println!(
+                    "  {} (pool={}, age={}d, hash={})",
+                    img.image_id,
+                    img.pool,
+                    age / 86400,
+                    &img.store_path_hash[..12.min(img.store_path_hash.len())],
+                );
+            }
+        }
+    } else {
+        ekafleet::server::cloud::image::cleanup_expired_images(
+            &fleet_config,
+            &image_tracker,
+            &image_managers,
+            &active_hashes,
+        )
+        .await;
+        println!("Image garbage collection complete.");
+    }
+
+    Ok(())
+}
+
+fn format_duration(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86400)
+    }
+}
