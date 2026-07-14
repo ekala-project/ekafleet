@@ -25,6 +25,12 @@ const MAX_SCALE_UP_PER_CYCLE: u32 = 3;
 /// Gives the reconciler time to reschedule services off the node.
 const DRAIN_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Maximum backoff duration for repeated failures (10 minutes).
+const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Base cooldown for the first failure (60 seconds).
+const BASE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub struct ScalingActuator {
     pool_engine: PoolScalingEngine,
     providers: CloudProviderRegistry,
@@ -35,6 +41,9 @@ pub struct ScalingActuator {
     server_addr: String,
     ca_cert_pem: String,
     events: Option<EventStore>,
+    /// Per-pool failure tracking for exponential backoff.
+    /// Maps pool name to (consecutive failure count, last failure time).
+    failure_counts: HashMap<String, (u32, std::time::Instant)>,
 }
 
 impl ScalingActuator {
@@ -58,7 +67,45 @@ impl ScalingActuator {
             server_addr,
             ca_cert_pem,
             events: None,
+            failure_counts: HashMap::new(),
         }
+    }
+
+    /// Check if a pool is in backoff due to previous failures.
+    fn is_in_backoff(&self, pool_name: &str) -> bool {
+        if let Some((count, last_failure)) = self.failure_counts.get(pool_name) {
+            let backoff = BASE_BACKOFF
+                .mul_f64(2.0_f64.powi((*count).saturating_sub(1) as i32))
+                .min(MAX_BACKOFF);
+            last_failure.elapsed() < backoff
+        } else {
+            false
+        }
+    }
+
+    /// Record a failure for a pool (increments backoff).
+    fn record_failure(&mut self, pool_name: &str) {
+        let entry = self
+            .failure_counts
+            .entry(pool_name.to_string())
+            .or_insert((0, std::time::Instant::now()));
+        entry.0 += 1;
+        entry.1 = std::time::Instant::now();
+
+        let backoff = BASE_BACKOFF
+            .mul_f64(2.0_f64.powi(entry.0.saturating_sub(1) as i32))
+            .min(MAX_BACKOFF);
+        tracing::warn!(
+            pool = %pool_name,
+            failures = entry.0,
+            next_retry_secs = backoff.as_secs(),
+            "Pool in backoff after provider failure"
+        );
+    }
+
+    /// Clear backoff for a pool after a successful operation.
+    fn clear_failure(&mut self, pool_name: &str) {
+        self.failure_counts.remove(pool_name);
     }
 
     /// Attach an event store for emitting scaling events.
@@ -147,6 +194,15 @@ impl ScalingActuator {
 
     /// Provision new cloud VMs for a scale-up decision.
     async fn handle_scale_up(&mut self, decision: &PoolScalingDecision) {
+        // Skip if pool is in backoff from previous failures
+        if self.is_in_backoff(&decision.pool_name) {
+            tracing::debug!(
+                pool = %decision.pool_name,
+                "Pool in failure backoff — skipping scale-up"
+            );
+            return;
+        }
+
         let Some(provider) = self.providers.get(&decision.pool_name) else {
             tracing::debug!(
                 pool = %decision.pool_name,
@@ -165,12 +221,14 @@ impl ScalingActuator {
         let instances_to_create =
             (decision.desired_count - decision.current_count).min(MAX_SCALE_UP_PER_CYCLE);
 
+        let mut any_success = false;
         for _ in 0..instances_to_create {
             match self
                 .create_instance(&decision.pool_name, cloud_config, provider)
                 .await
             {
                 Ok(instance_id) => {
+                    any_success = true;
                     tracing::info!(
                         pool = %decision.pool_name,
                         instance_id = %instance_id,
@@ -212,6 +270,7 @@ impl ScalingActuator {
                             .await
                         {
                             Ok(instance_id) => {
+                                any_success = true;
                                 tracing::info!(
                                     pool = %decision.pool_name,
                                     instance_id = %instance_id,
@@ -224,6 +283,7 @@ impl ScalingActuator {
                                     error = %e2,
                                     "On-demand fallback also failed"
                                 );
+                                self.record_failure(&decision.pool_name);
                                 break;
                             }
                         }
@@ -233,10 +293,15 @@ impl ScalingActuator {
                             error = %e,
                             "Failed to create cloud instance"
                         );
+                        self.record_failure(&decision.pool_name);
                         break;
                     }
                 }
             }
+        }
+
+        if any_success {
+            self.clear_failure(&decision.pool_name);
         }
 
         self.pool_engine.record_scale(&decision.pool_name);
