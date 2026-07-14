@@ -165,6 +165,29 @@ impl MetricsAggregator {
             .unwrap_or_default()
     }
 
+    /// Remove metrics for nodes that are no longer connected.
+    pub async fn prune_stale_nodes(&self, active_nodes: &std::collections::HashSet<String>) {
+        let mut state = self.inner.write().await;
+
+        // Prune node-level metrics
+        state.node_metrics.retain(|nid, _| active_nodes.contains(nid));
+
+        // Prune per-node entries from service-level metrics
+        for metrics in state.service_metrics.values_mut() {
+            for values in metrics.values_mut() {
+                values.retain(|(nid, _)| active_nodes.contains(nid));
+            }
+        }
+    }
+
+    /// Remove metrics for services that no longer exist.
+    pub async fn prune_stale_services(&self, active_services: &std::collections::HashSet<String>) {
+        let mut state = self.inner.write().await;
+        state
+            .service_metrics
+            .retain(|svc, _| active_services.contains(svc));
+    }
+
     /// Get fleet-wide average for a node metric.
     pub async fn fleet_metric_avg(&self, metric_name: &str) -> Option<f64> {
         let state = self.inner.read().await;
