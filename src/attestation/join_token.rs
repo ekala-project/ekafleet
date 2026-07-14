@@ -19,6 +19,8 @@ struct TokenEntry {
     /// Optional node ID to bind the token to a specific node.
     /// If None, the attestor will use the node_id from the CSR CN.
     _bound_node_id: Option<String>,
+    /// When this token was registered (epoch seconds).
+    created_at: u64,
 }
 
 impl Default for JoinTokenStore {
@@ -41,9 +43,23 @@ impl JoinTokenStore {
             token.to_string(),
             TokenEntry {
                 _bound_node_id: None,
+                created_at: now_epoch(),
             },
         );
         tracing::info!("Join token registered");
+    }
+
+    /// Remove tokens older than `max_age_secs`. Returns the number removed.
+    pub async fn expire_old(&self, max_age_secs: u64) -> usize {
+        let cutoff = now_epoch().saturating_sub(max_age_secs);
+        let mut tokens = self.inner.write().await;
+        let before = tokens.len();
+        tokens.retain(|_, entry| entry.created_at >= cutoff);
+        let removed = before - tokens.len();
+        if removed > 0 {
+            tracing::info!(removed, "Expired stale join tokens");
+        }
+        removed
     }
 
     /// Attempt to consume a join token. Returns Ok if valid, Err if unknown or already used.
@@ -63,6 +79,13 @@ impl JoinTokenStore {
     pub async fn count(&self) -> usize {
         self.inner.read().await.len()
     }
+}
+
+fn now_epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 /// Validate a join token attestation request.
@@ -156,5 +179,49 @@ mod tests {
                 .selectors
                 .contains(&("attestation_type".to_string(), "join_token".to_string()))
         );
+    }
+
+    #[tokio::test]
+    async fn expire_old_removes_stale_tokens() {
+        let store = JoinTokenStore::new();
+        store.register("fresh-token").await;
+
+        // With a large max_age, nothing should expire
+        let removed = store.expire_old(3600).await;
+        assert_eq!(removed, 0);
+        assert_eq!(store.count().await, 1);
+
+        // Manually insert a token with an old created_at to simulate aging
+        {
+            let mut tokens = store.inner.write().await;
+            tokens.insert(
+                "old-token".to_string(),
+                TokenEntry {
+                    _bound_node_id: None,
+                    created_at: 1000, // epoch second 1000 — very old
+                },
+            );
+        }
+        assert_eq!(store.count().await, 2);
+
+        // Expire tokens older than 1 hour — only old-token should be removed
+        let removed = store.expire_old(3600).await;
+        assert_eq!(removed, 1);
+        assert_eq!(store.count().await, 1);
+
+        // The fresh token should still be there
+        store.consume("fresh-token").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn expire_old_preserves_fresh_tokens() {
+        let store = JoinTokenStore::new();
+        store.register("token-a").await;
+        store.register("token-b").await;
+
+        // Both tokens just created — nothing should expire with 1h TTL
+        let removed = store.expire_old(3600).await;
+        assert_eq!(removed, 0);
+        assert_eq!(store.count().await, 2);
     }
 }
