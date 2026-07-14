@@ -104,25 +104,96 @@ Instances are labeled with `ekafleet`, `pool`, and `managed-by` (GCE labels are 
 
 ## Building NixOS Images
 
-Cloud VMs need a NixOS image with the ekafleet binary. Use [nixos-generators](https://github.com/nix-community/nixos-generators) to build cloud-specific images:
+Cloud VMs need a NixOS image with the ekafleet binary. There are two approaches:
+
+### Managed Images (Recommended)
+
+ekafleet can automatically build, register, and cache cloud images from your NixOS configuration. When the NixOS configuration changes (producing a different Nix store path), a new image is built and registered. Unchanged configurations reuse the cached image.
 
 ```nix
-# Example NixOS configuration for a cloud image
-{ pkgs, ... }: {
-  imports = [ ekafleet.nixosModules.ekafleet ];
+nodePools.workers.cloud = {
+  provider = "aws";
+  region = "us-east-1";
+  instanceType = "c6i.xlarge";
 
-  services.ekafleet = {
-    enable = true;
-    mode = "agent";
-    # Server address and token are injected via cloud-init user-data
+  # Managed image: ekafleet builds and registers the AMI automatically
+  image = {
+    nixosConfig = ".#nixosConfigurations.cloud-worker";
+    s3Bucket = "my-fleet-images";     # Required for AWS
+    retainCount = 2;                  # Keep 2 previous images for rollback
+    maxAgeSeconds = 604800;           # Clean up after 7 days
   };
 
-  # Enable cloud-init for user-data processing
-  services.cloud-init.enable = true;
-}
+  machineCapacity = { cpu = 4000; memory = 8192; disk = 100000; };
+};
 ```
 
-Build commands:
+The NixOS configuration must expose `config.system.build.toplevel` and a disk image attribute. Example flake output:
+
+```nix
+nixosConfigurations.cloud-worker = nixpkgs.lib.nixosSystem {
+  system = "x86_64-linux";
+  modules = [
+    ekafleet.nixosModules.ekafleet
+    ({ pkgs, ... }: {
+      services.ekafleet = {
+        enable = true;
+        mode = "agent";
+      };
+      services.cloud-init.enable = true;
+    })
+  ];
+};
+```
+
+Provider-specific storage requirements for managed images:
+
+| Provider | Required Field | Purpose |
+|----------|---------------|---------|
+| AWS | `s3Bucket` | S3 bucket for raw disk image upload before AMI import |
+| GCP | `gcsBucket` | GCS bucket for disk image upload |
+| Azure | `storageAccount` | Azure Storage account for VHD upload |
+
+#### Image Lifecycle
+
+- **Active image**: The image matching the current NixOS store path hash. Never deleted.
+- **Retained images**: The `retainCount` (default 2) most recent non-active images, kept for rollback.
+- **Expired images**: Non-active images beyond `retainCount` older than `maxAgeSeconds` (default 7 days). Automatically deleted.
+
+Cleanup runs automatically during `ekafleet apply --watch`. Use `ekafleet images gc` for manual cleanup.
+
+```bash
+# List all managed images
+ekafleet images list
+
+# List images for a specific pool
+ekafleet images list --pool workers
+
+# Manually build and register an image
+ekafleet images build workers
+
+# Garbage collect expired images (dry run)
+ekafleet images gc --dry-run
+
+# Garbage collect expired images
+ekafleet images gc
+```
+
+### Static Images
+
+Alternatively, provide a pre-built image ID directly:
+
+```nix
+nodePools.workers.cloud = {
+  provider = "aws";
+  region = "us-east-1";
+  instanceType = "c6i.xlarge";
+  imageId = "ami-0123456789abcdef0";  # Pre-built NixOS AMI
+  machineCapacity = { cpu = 4000; memory = 8192; disk = 100000; };
+};
+```
+
+Use [nixos-generators](https://github.com/nix-community/nixos-generators) to build cloud-specific images:
 
 ```bash
 # AWS AMI
@@ -136,6 +207,58 @@ nixos-generators -f gce -c ./cloud-image.nix
 ```
 
 On AWS, community NixOS AMIs can be used as a base — the ekafleet binary is installed and started via user-data (slower boot but no custom image required).
+
+## IAM / Identity Configuration
+
+Cloud instances can be assigned IAM roles, managed identities, or service accounts:
+
+```nix
+nodePools.workers.cloud = {
+  # ... provider config ...
+
+  # AWS: IAM instance profile ARN
+  iamInstanceProfile = "arn:aws:iam::123456789:instance-profile/ekafleet-worker";
+
+  # Azure: managed identity resource ID
+  # iamInstanceProfile = "/subscriptions/.../resourceGroups/.../providers/Microsoft.ManagedIdentity/...";
+
+  # GCP: service account email
+  # iamInstanceProfile = "ekafleet-worker@my-project.iam.gserviceaccount.com";
+};
+```
+
+## Spot / Preemptible Instances
+
+Use spot (AWS), spot priority (Azure), or preemptible (GCP) instances for cost savings:
+
+```nix
+nodePools.workers.cloud = {
+  # ... provider config ...
+
+  spot = {
+    enabled = true;
+    maxPrice = "0.10";          # Optional: max hourly price (AWS/Azure)
+    fallbackToOnDemand = true;  # Retry with on-demand if spot fails
+  };
+};
+```
+
+When `fallbackToOnDemand` is enabled, the actuator automatically retries with on-demand pricing if spot capacity is unavailable.
+
+## Launch Timeouts
+
+Configure how long to wait for instances to become operational:
+
+```nix
+nodePools.workers.cloud = {
+  # ... provider config ...
+
+  launchTimeoutSeconds = 300;  # Max time for instance to reach running (default: 300)
+  joinTimeoutSeconds = 600;    # Max time for agent to join fleet (default: 600)
+};
+```
+
+Instances that fail to have their agent join within `joinTimeoutSeconds` are automatically terminated and untracked.
 
 ## Agent Bootstrap
 
