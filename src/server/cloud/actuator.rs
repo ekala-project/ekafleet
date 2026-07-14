@@ -67,8 +67,11 @@ impl ScalingActuator {
         self
     }
 
-    /// Run a single scaling evaluation cycle.
+    /// Run a single scaling evaluation cycle, including launch health checks.
     pub async fn run_cycle(&mut self) {
+        // Check for instances that failed to boot or join
+        self.check_launch_health().await;
+
         let decisions = self.pool_engine.evaluate().await;
 
         for decision in decisions {
@@ -76,6 +79,68 @@ impl ScalingActuator {
                 self.handle_scale_up(&decision).await;
             } else if decision.desired_count < decision.current_count {
                 self.handle_scale_down(&decision).await;
+            }
+        }
+    }
+
+    /// Detect and clean up instances that failed to boot or whose agent
+    /// never joined the fleet within the configured timeout.
+    async fn check_launch_health(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        for (pool_name, pool_config) in &self.fleet_config.node_pools {
+            let Some(cloud_config) = &pool_config.cloud else {
+                continue;
+            };
+            let Some(provider) = self.providers.get(pool_name) else {
+                continue;
+            };
+
+            let join_timeout = cloud_config.join_timeout_seconds;
+            let instances = self.tracker.for_pool(pool_name).await;
+
+            for instance in &instances {
+                let age = now.saturating_sub(instance.created_at);
+
+                // Instance agent never joined and exceeded join timeout
+                if instance.fleet_node_id.is_none() && age > join_timeout {
+                    tracing::warn!(
+                        pool = %pool_name,
+                        instance_id = %instance.cloud_instance_id,
+                        age_seconds = age,
+                        timeout = join_timeout,
+                        "Instance failed to join within timeout, terminating"
+                    );
+
+                    if let Err(e) = provider.destroy_machine(&instance.cloud_instance_id).await {
+                        tracing::error!(
+                            instance_id = %instance.cloud_instance_id,
+                            error = %e,
+                            "Failed to terminate timed-out instance"
+                        );
+                        continue;
+                    }
+
+                    self.tracker.untrack(&instance.cloud_instance_id).await;
+
+                    if let Some(events) = &self.events {
+                        events
+                            .emit_detail(
+                                EventLevel::Info,
+                                EventCategory::Scaling,
+                                None,
+                                None,
+                                &format!(
+                                    "Terminated instance {} in pool {} (join timeout after {}s)",
+                                    instance.cloud_instance_id, pool_name, age
+                                ),
+                            )
+                            .await;
+                    }
+                }
             }
         }
     }
