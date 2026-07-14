@@ -30,6 +30,16 @@ pub struct ReconcilePlan {
     pub destroys: Vec<ServiceOp>,
     pub reschedules: Vec<ServiceOp>,
     pub has_changes: bool,
+    /// Services blocked from deployment due to policy violations.
+    pub policy_blocked: Vec<PolicyBlock>,
+}
+
+/// A service that was blocked from deployment by a policy rule.
+#[derive(Debug)]
+pub struct PolicyBlock {
+    pub service_name: String,
+    pub rule_name: String,
+    pub message: String,
 }
 
 #[derive(Debug)]
@@ -99,7 +109,7 @@ pub async fn reconcile_once(
     }
 
     // 4. Apply: execute deployment operations
-    apply_plan(&desired, &plan, state).await?;
+    apply_plan(&desired, &plan, state, raft_state, None).await?;
 
     Ok(plan)
 }
@@ -151,9 +161,23 @@ pub async fn compute_plan(
         }
     }
 
+    // Apply runtime replica overrides from Scale RPC before scheduling.
+    let mut services = desired.services.clone();
+    for (name, cfg) in services.iter_mut() {
+        if let Some(count) = raft_state.get_replica_override(name).await {
+            tracing::info!(
+                service = %name,
+                config_replicas = cfg.scheduling.replicas,
+                override_replicas = count,
+                "Applying runtime replica override"
+            );
+            cfg.scheduling.replicas = count;
+        }
+    }
+
     // Schedule services across all machines (static + cloud)
     let placement_plan = scheduler::schedule(
-        &desired.services,
+        &services,
         &machines,
         &desired.node_pools,
         &current_placements,
@@ -289,6 +313,7 @@ pub async fn compute_plan(
     }
 
     // Evaluate organizational policies against service configurations.
+    let mut policy_blocked = Vec::new();
     if !desired.policies.is_empty() {
         let engine = super::policy::PolicyEngine::new();
         engine.set_rules(desired.policies.clone()).await;
@@ -306,6 +331,11 @@ pub async fn compute_plan(
                             "Policy violation: {}",
                             v.message
                         );
+                        policy_blocked.push(PolicyBlock {
+                            service_name: v.service_name.clone(),
+                            rule_name: v.rule_name.clone(),
+                            message: v.message.clone(),
+                        });
                     }
                     blocked_services.push(service_name.clone());
                 }
@@ -337,6 +367,7 @@ pub async fn compute_plan(
         destroys,
         reschedules,
         has_changes,
+        policy_blocked,
     }
 }
 
@@ -345,10 +376,15 @@ async fn apply_plan(
     desired: &FleetConfig,
     plan: &ReconcilePlan,
     state: &FleetState,
+    raft_state: &FleetStateMachine,
+    events: Option<&super::events::EventStore>,
 ) -> Result<(), deployer::DeployError> {
     // Execute volume migrations for reschedules before deploying.
     // Migrations run first so data is available on the destination node
-    // before the service starts there.
+    // before the service starts there. Services whose migrations fail are
+    // skipped to prevent data loss.
+    let mut migration_failed_services: Vec<String> = Vec::new();
+
     for op in &plan.reschedules {
         if op.migrations.is_empty() {
             continue;
@@ -360,7 +396,12 @@ async fn apply_plan(
         };
         let max_parallel = service_cfg.scheduling.migrate.max_parallel as usize;
 
+        let mut service_failed = false;
         for chunk in op.migrations.chunks(max_parallel) {
+            if service_failed {
+                break;
+            }
+
             let mut handles = Vec::new();
             for migration in chunk {
                 let source_host = desired
@@ -383,6 +424,7 @@ async fn apply_plan(
                     .map(|v| v.name.clone())
                     .collect();
 
+                // Each migration task returns Ok(()) on success, Err(msg) on failure.
                 handles.push(tokio::spawn(async move {
                     for vol_name in &volume_names {
                         let vol_path = format!(
@@ -423,6 +465,10 @@ async fn apply_plan(
                                     error = %resp.error_message,
                                     "Volume migration failed"
                                 );
+                                return Err(format!(
+                                    "migration of volume {vol_name} to {dest_machine} failed: {}",
+                                    resp.error_message
+                                ));
                             }
                             Err(e) => {
                                 tracing::error!(
@@ -432,14 +478,40 @@ async fn apply_plan(
                                     error = %e,
                                     "Volume migration command failed"
                                 );
+                                return Err(format!(
+                                    "migration of volume {vol_name} to {dest_machine} failed: {e}"
+                                ));
                             }
                         }
                     }
+                    Ok(())
                 }));
             }
             for handle in handles {
-                let _ = handle.await;
+                match handle.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(msg)) => {
+                        tracing::error!(
+                            service = %op.service_name,
+                            error = %msg,
+                            "Volume migration failed — skipping reschedule for this service to prevent data loss"
+                        );
+                        service_failed = true;
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            service = %op.service_name,
+                            error = %e,
+                            "Volume migration task panicked — skipping reschedule"
+                        );
+                        service_failed = true;
+                    }
+                }
             }
+        }
+
+        if service_failed {
+            migration_failed_services.push(op.service_name.clone());
         }
     }
 
@@ -448,12 +520,17 @@ async fn apply_plan(
 
     for tier in &tiers {
         for service_name in tier {
-            // Find ops for this service (creates, updates, and reschedules)
+            // Find ops for this service (creates, updates, and reschedules).
+            // Skip reschedules for services whose volume migrations failed.
             let ops: Vec<&ServiceOp> = plan
                 .creates
                 .iter()
                 .chain(plan.updates.iter())
-                .chain(plan.reschedules.iter())
+                .chain(
+                    plan.reschedules
+                        .iter()
+                        .filter(|op| !migration_failed_services.contains(&op.service_name)),
+                )
                 .filter(|op| &op.service_name == service_name)
                 .collect();
 
@@ -462,6 +539,12 @@ async fn apply_plan(
                     Some(cfg) => cfg,
                     None => continue,
                 };
+
+                // Look up previous store_path from Raft state for auto-revert
+                let previous_store_path = raft_state
+                    .get_deployment(service_name)
+                    .await
+                    .map(|d| d.store_path);
 
                 let deploy_plan = DeploymentPlan {
                     service_name: service_name.clone(),
@@ -484,9 +567,20 @@ async fn apply_plan(
                         .map(Duration::from_secs),
                     disruption_budget: service_cfg.scheduling.disruption_budget.clone(),
                     total_replicas: service_cfg.scheduling.replicas,
+                    previous_store_path,
                 };
 
-                deployer::execute(state, deploy_plan).await?;
+                match deployer::execute(state, deploy_plan, events).await {
+                    Ok(()) => {}
+                    Err(deployer::DeployError::AwaitingPromotion(id)) => {
+                        tracing::info!(
+                            service = %service_name,
+                            deployment_id = %id,
+                            "Canary awaiting promotion — skipping remaining services in this tier"
+                        );
+                    }
+                    Err(e) => return Err(e),
+                }
             }
         }
     }

@@ -297,6 +297,18 @@ WantedBy=multi-user.target
             false
         }
     }
+
+    /// Query the actual systemd state of a managed service.
+    /// Returns `ServiceState::Unknown` if the service is not managed.
+    pub async fn service_state(
+        &self,
+        service_name: &str,
+    ) -> crate::proto::ServiceState {
+        let Some(unit) = self.managed_units.get(service_name) else {
+            return crate::proto::ServiceState::Unknown;
+        };
+        query_unit_state(&unit.unit_name).await
+    }
 }
 
 /// Whether a ServiceSpec describes an OCI container service.
@@ -419,6 +431,28 @@ async fn systemctl(args: &[&str]) -> Result<(), SupervisorError> {
     }
 
     Ok(())
+}
+
+/// Query `systemctl is-active` for a unit and map the result to a
+/// [`ServiceState`](crate::proto::ServiceState).
+async fn query_unit_state(unit_name: &str) -> crate::proto::ServiceState {
+    let output = tokio::process::Command::new("systemctl")
+        .args(["is-active", unit_name])
+        .output()
+        .await;
+
+    let stdout = match output {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        Err(_) => return crate::proto::ServiceState::Unknown,
+    };
+
+    match stdout.as_str() {
+        "active" => crate::proto::ServiceState::ServiceRunning,
+        "activating" => crate::proto::ServiceState::ServiceStarting,
+        "failed" => crate::proto::ServiceState::ServiceFailed,
+        // inactive, deactivating, etc.
+        _ => crate::proto::ServiceState::ServiceStopped,
+    }
 }
 
 #[cfg(test)]

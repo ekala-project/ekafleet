@@ -176,8 +176,9 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     let hk_raft = grpc_config.raft_state.clone();
     let hk_metrics = metrics.clone();
     let hk_alerts = alert_evaluator.clone();
+    let hk_events = event_store.clone();
     tokio::spawn(async move {
-        housekeeping_loop(hk_state, hk_join_tokens, hk_raft, hk_metrics, hk_alerts, hk_shutdown)
+        housekeeping_loop(hk_state, hk_join_tokens, hk_raft, hk_metrics, hk_alerts, hk_events, hk_shutdown)
             .await;
     });
 
@@ -251,6 +252,7 @@ async fn housekeeping_loop(
     raft_state: FleetStateMachine,
     metrics: crate::metrics::aggregator::MetricsAggregator,
     alerts: crate::metrics::alerting::AlertEvaluator,
+    event_store: events::EventStore,
     shutdown: CancellationToken,
 ) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -280,6 +282,20 @@ async fn housekeeping_loop(
                 nodes = ?evicted,
                 "Evicted dead nodes during housekeeping"
             );
+            for node_id in &evicted {
+                event_store
+                    .emit_detail(
+                        events::EventLevel::Warning,
+                        events::EventCategory::NodeLeave,
+                        None,
+                        Some(node_id),
+                        &format!(
+                            "Node {node_id} evicted (heartbeat timeout) — \
+                             services on this node need rescheduling"
+                        ),
+                    )
+                    .await;
+            }
         }
 
         // 3. Prune metrics for disconnected nodes

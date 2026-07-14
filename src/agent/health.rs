@@ -373,7 +373,8 @@ async fn check_http(port: u16, path: &str, timeout: Duration) -> Result<String, 
 
         let response_str = String::from_utf8_lossy(&response);
         if let Some(status_line) = response_str.lines().next() {
-            if status_line.contains("200") || status_line.contains("204") {
+            // Accept any 2xx status code as healthy
+            if status_line.contains(" 2") {
                 Ok(format!("{url} → {status_line}"))
             } else {
                 Err(format!("{url} → {status_line}"))
@@ -399,16 +400,24 @@ async fn check_tcp(port: u16, timeout: Duration) -> Result<String, String> {
     }
 }
 
-/// Check gRPC health by connecting to the port via HTTP/2 and sending a
-/// grpc.health.v1.Health/Check request. The response is parsed to check
-/// for a SERVING status.
+/// Check gRPC health by establishing an HTTP/2 connection via tonic.
+/// This verifies that the service is accepting HTTP/2 connections (required
+/// for gRPC), which is a stronger signal than a raw TCP connect.
 async fn check_grpc(port: u16, _service: &str, timeout: Duration) -> Result<String, String> {
-    // Use TCP connect as the health signal — if the gRPC port accepts
-    // connections, the service is considered alive.
-    let addr = format!("127.0.0.1:{port}");
-    match tokio::time::timeout(timeout, TcpStream::connect(&addr)).await {
-        Ok(Ok(_)) => Ok(format!("grpc:{port} → connected")),
-        Ok(Err(e)) => Err(format!("grpc:{port} → {e}")),
+    let endpoint = format!("http://127.0.0.1:{port}");
+    let result = tokio::time::timeout(timeout, async {
+        tonic::transport::Endpoint::from_shared(endpoint)
+            .map_err(|e| format!("grpc:{port} → bad endpoint: {e}"))?
+            .connect()
+            .await
+            .map_err(|e| format!("grpc:{port} → connect failed: {e}"))?;
+        Ok::<_, String>(())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => Ok(format!("grpc:{port} → h2 connected")),
+        Ok(Err(e)) => Err(e),
         Err(_) => Err(format!("grpc:{port} → timeout")),
     }
 }

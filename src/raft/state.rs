@@ -319,4 +319,33 @@ impl FleetStateMachine {
             .find(|i| i.private_ip.as_deref() == Some(ip))
             .cloned()
     }
+
+    /// Set a runtime replica count override for a service.
+    /// Stored in the KV store so it survives snapshots.
+    /// The reconciler reads this to override the config-defined replica count.
+    pub async fn set_replica_override(&self, service_name: &str, count: u32) {
+        let key = format!("replica-override/{service_name}");
+        let value = count.to_le_bytes().to_vec();
+        let mut state = self.inner.write().await;
+        state.kv.insert(key, value);
+    }
+
+    /// Get the runtime replica count override for a service, if any.
+    pub async fn get_replica_override(&self, service_name: &str) -> Option<u32> {
+        let key = format!("replica-override/{service_name}");
+        let state = self.inner.read().await;
+        state.kv.get(&key).and_then(|v| {
+            v.as_slice()
+                .try_into()
+                .ok()
+                .map(u32::from_le_bytes)
+        })
+    }
+
+    /// Clear a runtime replica count override for a service.
+    pub async fn clear_replica_override(&self, service_name: &str) {
+        let key = format!("replica-override/{service_name}");
+        let mut state = self.inner.write().await;
+        state.kv.remove(&key);
+    }
 }

@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use super::events::{DeployOutcome, EventStore};
 use super::scheduler::Placement;
 use super::state::FleetState;
 use crate::config::{DisruptionBudget, UpdateStrategy};
@@ -19,6 +20,8 @@ pub enum DeployError {
     Reverted(String),
     #[error("disruption budget violated: {0}")]
     DisruptionBudgetViolation(String),
+    #[error("canary healthy — awaiting manual promotion (deployment_id: {0})")]
+    AwaitingPromotion(String),
 }
 
 /// A deployment operation for a single service.
@@ -38,10 +41,18 @@ pub struct DeploymentPlan {
     pub disruption_budget: Option<DisruptionBudget>,
     /// Total desired replica count (used with disruption budget).
     pub total_replicas: u32,
+    /// Previous store path for auto-revert. When set and auto_revert is true,
+    /// nodes that received the new version will be rolled back to this path
+    /// on deployment failure.
+    pub previous_store_path: Option<String>,
 }
 
 /// Execute a deployment plan against the fleet.
-pub async fn execute(state: &FleetState, plan: DeploymentPlan) -> Result<(), DeployError> {
+pub async fn execute(
+    state: &FleetState,
+    plan: DeploymentPlan,
+    events: Option<&EventStore>,
+) -> Result<(), DeployError> {
     let deployment_id = uuid::Uuid::new_v4().to_string();
 
     tracing::info!(
@@ -51,6 +62,17 @@ pub async fn execute(state: &FleetState, plan: DeploymentPlan) -> Result<(), Dep
         instances = plan.placements.len(),
         "Starting deployment"
     );
+
+    if let Some(es) = events {
+        es.record_deploy_start(
+            &deployment_id,
+            &plan.service_name,
+            &format!("{:?}", plan.strategy),
+            plan.placements.len() as u32,
+            &plan.store_path,
+        )
+        .await;
+    }
 
     // If a progress deadline is set, wrap the deployment in a timeout
     let result = if let Some(progress_deadline) = plan.progress_deadline {
@@ -94,6 +116,23 @@ pub async fn execute(state: &FleetState, plan: DeploymentPlan) -> Result<(), Dep
                 service = %plan.service_name,
                 "Deployment completed successfully"
             );
+            if let Some(es) = events {
+                es.record_deploy_complete(
+                    &deployment_id,
+                    DeployOutcome::Succeeded,
+                    "all instances healthy",
+                )
+                .await;
+            }
+        }
+        Err(DeployError::AwaitingPromotion(_)) => {
+            // Canary is healthy but waiting for manual promotion — not a failure.
+            tracing::info!(
+                deployment_id = %deployment_id,
+                service = %plan.service_name,
+                "Canary deployed and healthy — awaiting manual promotion"
+            );
+            // Don't record as completed; it stays InProgress until promoted.
         }
         Err(e) => {
             tracing::error!(
@@ -102,10 +141,94 @@ pub async fn execute(state: &FleetState, plan: DeploymentPlan) -> Result<(), Dep
                 error = %e,
                 "Deployment failed"
             );
+
+            // On failure with auto_revert, roll back nodes that already
+            // received the new version to the previous store path.
+            let reverted = if plan.auto_revert {
+                if let Some(ref prev_path) = plan.previous_store_path {
+                    revert_deployed_nodes(
+                        state,
+                        &deployment_id,
+                        &plan.service_name,
+                        prev_path,
+                        &plan.placements,
+                    )
+                    .await;
+                    true
+                } else {
+                    tracing::warn!(
+                        deployment_id = %deployment_id,
+                        service = %plan.service_name,
+                        "auto_revert requested but no previous store path available — \
+                         cannot roll back (first deployment?)"
+                    );
+                    false
+                }
+            } else {
+                false
+            };
+
+            if let Some(es) = events {
+                let outcome = if reverted {
+                    DeployOutcome::RolledBack
+                } else {
+                    DeployOutcome::Failed
+                };
+                es.record_deploy_complete(
+                    &deployment_id,
+                    outcome,
+                    &e.to_string(),
+                )
+                .await;
+            }
         }
     }
 
     result
+}
+
+/// Send the previous store path to all nodes that may have received the
+/// new deployment, reverting them to the last known-good version.
+async fn revert_deployed_nodes(
+    state: &FleetState,
+    deployment_id: &str,
+    service_name: &str,
+    previous_store_path: &str,
+    placements: &[Placement],
+) {
+    tracing::info!(
+        deployment_id = %deployment_id,
+        service = %service_name,
+        nodes = placements.len(),
+        previous_store_path = %previous_store_path,
+        "Reverting nodes to previous version"
+    );
+
+    for placement in placements {
+        let msg = ServerMessage {
+            payload: Some(Payload::Deploy(DeployCommand {
+                deployment_id: deployment_id.to_string(),
+                service_name: service_name.to_string(),
+                store_path: previous_store_path.to_string(),
+                strategy: DeployStrategy::Rolling as i32,
+                container_image: String::new(),
+            })),
+        };
+
+        if !state.send_to_agent(&placement.machine_name, msg).await {
+            tracing::error!(
+                deployment_id = %deployment_id,
+                node = %placement.machine_name,
+                "Failed to send revert command to node"
+            );
+        }
+    }
+
+    tracing::info!(
+        deployment_id = %deployment_id,
+        service = %service_name,
+        "Revert commands sent to all placement nodes"
+    );
 }
 
 /// Rolling deployment: update instances in batches of max_parallel.
@@ -237,12 +360,12 @@ async fn execute_canary(
     } else {
         tracing::info!(
             deployment_id,
-            "Canary healthy, promoting to remaining instances"
+            "Canary healthy — awaiting manual promotion via Promote RPC"
         );
+        return Err(DeployError::AwaitingPromotion(deployment_id.to_string()));
     }
 
-    // Deploy remaining (auto_promote proceeds automatically; without it,
-    // a real implementation would wait for manual promotion via API)
+    // Deploy remaining instances via rolling strategy
     if plan.placements.len() > 1 {
         let remaining = &plan.placements[1..];
         let remaining_plan = DeploymentPlan {
@@ -258,6 +381,7 @@ async fn execute_canary(
             progress_deadline: plan.progress_deadline,
             disruption_budget: plan.disruption_budget.clone(),
             total_replicas: plan.total_replicas,
+            previous_store_path: plan.previous_store_path.clone(),
         };
         execute_rolling(state, deployment_id, &remaining_plan).await?;
     }
@@ -455,20 +579,14 @@ pub fn compute_deploy_order(
     let mut deployed: Vec<&str> = Vec::new();
 
     while !remaining.is_empty() {
-        // Find services whose dependencies are all deployed
+        // Find services whose dependencies are all deployed.
+        // A service's deps are the things it calls (allowed_targets).
         let tier: Vec<&str> = remaining
             .iter()
             .filter(|&&svc| {
-                let deps = services[svc]
-                    .identity
-                    .allowed_callers
-                    .iter()
-                    .filter(|caller| services.contains_key(caller.as_str()))
-                    .all(|_| true); // callers are things that call us, not our deps
-                // Our deps are things we call (allowedTargets)
                 services[svc].identity.allowed_targets.iter().all(|target| {
                     deployed.contains(&target.as_str()) || !services.contains_key(target.as_str())
-                }) && deps
+                })
             })
             .copied()
             .collect();

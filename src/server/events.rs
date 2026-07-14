@@ -7,8 +7,8 @@ use tokio::sync::RwLock;
 /// Maximum number of events retained in memory.
 const MAX_EVENTS: usize = 10_000;
 
-/// Maximum number of deployment history entries per service.
-const MAX_DEPLOY_HISTORY: usize = 100;
+/// Maximum number of deployment history entries (global across all services).
+const MAX_DEPLOY_HISTORY: usize = 1000;
 
 /// Severity level for fleet events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]

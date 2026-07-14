@@ -386,6 +386,7 @@ impl FleetControl for FleetControlService {
         let grpc_addr = self.grpc_addr.clone();
         let ca_cert_pem = self.trust_bundle_pem.clone().unwrap_or_default();
         let raft_state = self.raft_state.clone();
+        let event_store = self.event_store.clone();
 
         tokio::spawn(async move {
             // Run a single reconciliation cycle
@@ -399,6 +400,22 @@ impl FleetControl for FleetControlService {
             .await
             {
                 Ok(plan) => {
+                    // Emit events for policy-blocked services
+                    for block in &plan.policy_blocked {
+                        event_store
+                            .emit_detail(
+                                super::events::EventLevel::Error,
+                                super::events::EventCategory::Scheduling,
+                                Some(&block.service_name),
+                                None,
+                                &format!(
+                                    "Deployment blocked by policy '{}': {}",
+                                    block.rule_name, block.message
+                                ),
+                            )
+                            .await;
+                    }
+
                     let msg = if plan.has_changes {
                         format!(
                             "Applied: {} creates, {} updates, {} destroys, {} reschedules",
@@ -539,6 +556,7 @@ impl FleetControl for FleetControlService {
                             let reconcile_state = state.clone();
                             let reconcile_path = config_path.clone();
                             let reconcile_raft = raft_state.clone();
+                            let reconcile_events = event_store.clone();
 
                             tokio::spawn(async move {
                                 let mut interval =
@@ -560,6 +578,20 @@ impl FleetControl for FleetControlService {
                                     .await
                                     {
                                         Ok(plan) if plan.has_changes => {
+                                            for block in &plan.policy_blocked {
+                                                reconcile_events
+                                                    .emit_detail(
+                                                        super::events::EventLevel::Error,
+                                                        super::events::EventCategory::Scheduling,
+                                                        Some(&block.service_name),
+                                                        None,
+                                                        &format!(
+                                                            "Deployment blocked by policy '{}': {}",
+                                                            block.rule_name, block.message
+                                                        ),
+                                                    )
+                                                    .await;
+                                            }
                                             let _ = tx_watch
                                                 .send(Ok(ApplyEvent {
                                                     operation_id: uuid::Uuid::new_v4().to_string(),
@@ -812,7 +844,7 @@ impl FleetControl for FleetControlService {
         let req = request.into_inner();
         tracing::info!(machine = %req.machine, deadline = req.deadline_seconds, "Drain requested");
 
-        // Mark node as unschedulable
+        // Mark node as unschedulable so no new services are placed here
         self.state.set_schedulable(&req.machine, false).await;
 
         // Find services running on this node
@@ -835,6 +867,26 @@ impl FleetControl for FleetControlService {
             services = ?services_on_node,
             "Draining services from node"
         );
+
+        // Send an empty DesiredState to the agent so it stops all services
+        // on the drained node. The next reconciliation cycle will reschedule
+        // them onto healthy, schedulable nodes.
+        let drain_msg = ServerMessage {
+            payload: Some(ServerPayload::DesiredState(
+                crate::proto::DesiredState {
+                    correlation_id: uuid::Uuid::new_v4().to_string(),
+                    services: vec![],
+                    system_path: String::new(),
+                },
+            )),
+        };
+
+        if !self.state.send_to_agent(&req.machine, drain_msg).await {
+            tracing::warn!(
+                machine = %req.machine,
+                "Could not send drain command to agent (node may already be disconnected)"
+            );
+        }
 
         Ok(Response::new(DrainResponse {
             success: true,
@@ -869,11 +921,17 @@ impl FleetControl for FleetControlService {
             }));
         }
 
+        // Update the desired replica count in Raft state so the next
+        // reconciliation cycle picks up the change.
+        self.raft_state
+            .set_replica_override(&req.service_name, req.desired_count)
+            .await;
+
         tracing::info!(
             service = %req.service_name,
             from = current_count,
             to = req.desired_count,
-            "Scaling service"
+            "Service replica override recorded"
         );
 
         Ok(Response::new(ScaleResponse {
@@ -924,6 +982,18 @@ impl FleetControl for FleetControlService {
             params = ?req.params,
             "Dispatch requested"
         );
+
+        if req.service_name.is_empty() {
+            return Err(Status::invalid_argument("service_name is required"));
+        }
+
+        // Verify the service is deployed (exists in Raft state)
+        if self.raft_state.get_deployment(&req.service_name).await.is_none() {
+            return Err(Status::not_found(format!(
+                "service '{}' is not deployed",
+                req.service_name
+            )));
+        }
 
         let instance_id = format!("{}-{}", req.service_name, uuid::Uuid::new_v4());
 

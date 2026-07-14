@@ -214,6 +214,7 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
     let status_tx = tx.clone();
     let status_node_id: Arc<str> = Arc::from(node_id.as_str());
     let status_state = local_state.clone();
+    let status_supervisor = supervisor.clone();
     let status_shutdown = shutdown.child_token();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(10));
@@ -223,17 +224,26 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
                 _ = interval.tick() => {}
             }
             let state = status_state.read().await;
-            let running = state
+            let service_list: Vec<(String, String)> = state
                 .desired_services
                 .iter()
-                .map(|(name, spec)| crate::proto::ServiceInstance {
-                    service_name: name.clone(),
-                    instance_id: format!("{}-{}", name, status_node_id),
-                    store_path: spec.store_path.clone(),
-                    state: crate::proto::ServiceState::ServiceRunning as i32,
-                })
+                .map(|(name, spec)| (name.clone(), spec.store_path.clone()))
                 .collect();
             drop(state);
+
+            // Query actual systemd state for each service
+            let sv = status_supervisor.read().await;
+            let mut running = Vec::with_capacity(service_list.len());
+            for (name, store_path) in &service_list {
+                let actual_state = sv.service_state(name).await;
+                running.push(crate::proto::ServiceInstance {
+                    service_name: name.clone(),
+                    instance_id: format!("{}-{}", name, status_node_id),
+                    store_path: store_path.clone(),
+                    state: actual_state as i32,
+                });
+            }
+            drop(sv);
 
             let msg = AgentMessage {
                 payload: Some(Payload::Status(StatusReport {
