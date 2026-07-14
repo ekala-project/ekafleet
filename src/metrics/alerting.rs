@@ -257,6 +257,31 @@ impl AlertEvaluator {
     pub async fn list_silences(&self) -> Vec<AlertSilence> {
         self.silences.read().await.clone()
     }
+
+    /// Cap the fired alert history to the most recent `max_entries`.
+    pub async fn prune_history(&self, max_entries: usize) {
+        let mut fired = self.fired.write().await;
+        if fired.len() > max_entries {
+            let excess = fired.len() - max_entries;
+            fired.drain(0..excess);
+        }
+    }
+
+    /// Remove silences that have expired (past their `ends_at` time).
+    pub async fn expire_silences(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let mut silences = self.silences.write().await;
+        let before = silences.len();
+        silences.retain(|s| s.ends_at > now);
+        let removed = before - silences.len();
+        if removed > 0 {
+            tracing::debug!(removed, "Expired alert silences");
+        }
+    }
 }
 
 #[cfg(test)]
