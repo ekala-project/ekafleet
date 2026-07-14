@@ -127,12 +127,49 @@ impl ScalingActuator {
                     }
                 }
                 Err(e) => {
-                    tracing::error!(
-                        pool = %decision.pool_name,
-                        error = %e,
-                        "Failed to create cloud instance"
-                    );
-                    break; // Stop trying if one fails
+                    // If spot instance failed and fallback is enabled, retry on-demand
+                    let should_fallback = cloud_config
+                        .spot
+                        .as_ref()
+                        .map(|s| s.enabled && s.fallback_to_on_demand)
+                        .unwrap_or(false);
+
+                    if should_fallback {
+                        tracing::warn!(
+                            pool = %decision.pool_name,
+                            error = %e,
+                            "Spot instance creation failed, falling back to on-demand"
+                        );
+                        let mut fallback_config = cloud_config.clone();
+                        fallback_config.spot = None;
+                        match self
+                            .create_instance(&decision.pool_name, &fallback_config, provider)
+                            .await
+                        {
+                            Ok(instance_id) => {
+                                tracing::info!(
+                                    pool = %decision.pool_name,
+                                    instance_id = %instance_id,
+                                    "On-demand fallback instance created"
+                                );
+                            }
+                            Err(e2) => {
+                                tracing::error!(
+                                    pool = %decision.pool_name,
+                                    error = %e2,
+                                    "On-demand fallback also failed"
+                                );
+                                break;
+                            }
+                        }
+                    } else {
+                        tracing::error!(
+                            pool = %decision.pool_name,
+                            error = %e,
+                            "Failed to create cloud instance"
+                        );
+                        break;
+                    }
                 }
             }
         }

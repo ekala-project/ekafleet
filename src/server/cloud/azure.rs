@@ -89,6 +89,26 @@ impl CloudProvider for AzureCloudProvider {
             args.extend(["--subnet".to_string(), subnet.clone()]);
         }
 
+        // Managed identity
+        if let Some(identity) = &request.iam_instance_profile {
+            args.extend(["--assign-identity".to_string(), identity.clone()]);
+        }
+
+        // Spot instances
+        if let Some(spot) = &request.spot {
+            if spot.enabled {
+                args.extend([
+                    "--priority".to_string(),
+                    "Spot".to_string(),
+                    "--eviction-policy".to_string(),
+                    "Delete".to_string(),
+                ]);
+                if let Some(max_price) = &spot.max_price {
+                    args.extend(["--max-price".to_string(), max_price.clone()]);
+                }
+            }
+        }
+
         // Tags
         args.push("--tags".to_string());
         args.push(format!("ekafleet={}", request.fleet_name));

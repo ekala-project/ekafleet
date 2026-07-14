@@ -101,6 +101,18 @@ impl CloudProvider for GcpCloudProvider {
             args.extend(["--boot-disk-size".to_string(), format!("{disk_gb}GB")]);
         }
 
+        // Service account
+        if let Some(sa) = &request.iam_instance_profile {
+            args.extend(["--service-account".to_string(), sa.clone()]);
+        }
+
+        // Spot/preemptible instances
+        if let Some(spot) = &request.spot {
+            if spot.enabled {
+                args.extend(["--provisioning-model".to_string(), "SPOT".to_string()]);
+            }
+        }
+
         tracing::info!(
             project = %self.project,
             zone = %zone,

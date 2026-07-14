@@ -72,6 +72,32 @@ impl CloudProvider for AwsCloudProvider {
             args.extend(["--block-device-mappings".to_string(), block_mapping]);
         }
 
+        // IAM instance profile
+        if let Some(profile) = &request.iam_instance_profile {
+            args.extend([
+                "--iam-instance-profile".to_string(),
+                format!("Arn={profile}"),
+            ]);
+        }
+
+        // Spot instances
+        if let Some(spot) = &request.spot {
+            if spot.enabled {
+                let mut spot_opts = serde_json::json!({
+                    "MarketType": "spot",
+                });
+                if let Some(max_price) = &spot.max_price {
+                    spot_opts["SpotOptions"] = serde_json::json!({
+                        "MaxPrice": max_price,
+                    });
+                }
+                args.extend([
+                    "--instance-market-options".to_string(),
+                    spot_opts.to_string(),
+                ]);
+            }
+        }
+
         // Tags
         let tag_spec = format!(
             "ResourceType=instance,Tags=[{{Key=ekafleet,Value={fleet}}},{{Key=pool,Value={pool}}},{{Key=managed-by,Value=ekafleet}}]",
