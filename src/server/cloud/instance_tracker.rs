@@ -128,11 +128,16 @@ impl InstanceTracker {
     }
 
     /// Select the best candidate for scale-down in a pool.
-    /// Prefers instances without a fleet node ID (never joined), then
-    /// the most recently created (newest first) to preserve older, more
-    /// established nodes.
-    pub async fn select_scaledown_candidate(&self, pool: &str) -> Option<TrackedCloudInstance> {
-        let mut instances = self.for_pool(pool).await;
+    /// Priority:
+    /// 1. Un-joined instances (they're not serving anything)
+    /// 2. Among joined instances, prefer those with fewest running services
+    /// 3. Among equal service counts, prefer newest (most recently created)
+    pub async fn select_scaledown_candidate(
+        &self,
+        pool: &str,
+        fleet_state: &crate::server::state::FleetState,
+    ) -> Option<TrackedCloudInstance> {
+        let instances = self.for_pool(pool).await;
         if instances.is_empty() {
             return None;
         }
@@ -146,9 +151,25 @@ impl InstanceTracker {
             return Some((*inst).clone());
         }
 
-        // Otherwise pick the newest (most recently created)
-        instances.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-        instances.into_iter().next()
+        // Score joined instances: (service_count, -created_at) — prefer
+        // fewest services, then newest among ties
+        let mut scored: Vec<(TrackedCloudInstance, usize)> = Vec::new();
+        for inst in &instances {
+            let count = if let Some(node_id) = &inst.fleet_node_id {
+                fleet_state.service_count_for_node(node_id).await
+            } else {
+                0
+            };
+            scored.push((inst.clone(), count));
+        }
+
+        // Sort: fewest services first, then newest first (highest created_at)
+        scored.sort_by(|a, b| {
+            a.1.cmp(&b.1)
+                .then_with(|| b.0.created_at.cmp(&a.0.created_at))
+        });
+
+        scored.into_iter().next().map(|(inst, _)| inst)
     }
 }
 
@@ -243,20 +264,25 @@ mod tests {
     #[tokio::test]
     async fn scaledown_prefers_unjoined() {
         let tracker = make_tracker();
+        let fleet_state = crate::server::state::FleetState::new();
         tracker.track("i-joined", "aws", "workers", None).await;
         tracker.associate_node("i-joined", "node-A").await;
         tracker.track("i-unjoined", "aws", "workers", None).await;
 
-        let candidate = tracker.select_scaledown_candidate("workers").await.unwrap();
+        let candidate = tracker
+            .select_scaledown_candidate("workers", &fleet_state)
+            .await
+            .unwrap();
         assert_eq!(candidate.cloud_instance_id, "i-unjoined");
     }
 
     #[tokio::test]
     async fn scaledown_empty_pool_returns_none() {
         let tracker = make_tracker();
+        let fleet_state = crate::server::state::FleetState::new();
         assert!(
             tracker
-                .select_scaledown_candidate("workers")
+                .select_scaledown_candidate("workers", &fleet_state)
                 .await
                 .is_none()
         );

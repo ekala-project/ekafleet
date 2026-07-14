@@ -313,6 +313,16 @@ impl FleetState {
             .map(|svc| svc.store_path.clone())
     }
 
+    /// Count the number of services currently running on a node.
+    pub async fn service_count_for_node(&self, node_id: &str) -> usize {
+        let state = self.inner.read().await;
+        state
+            .nodes
+            .get(node_id)
+            .map(|node| node.services.len())
+            .unwrap_or(0)
+    }
+
     /// Get all service store paths for a node. Returns (service_name, store_path) pairs.
     pub async fn node_store_paths(&self, node_id: &str) -> Vec<(String, String)> {
         let state = self.inner.read().await;

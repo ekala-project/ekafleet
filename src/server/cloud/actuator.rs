@@ -257,7 +257,7 @@ impl ScalingActuator {
         for _ in 0..instances_to_remove {
             let Some(candidate) = self
                 .tracker
-                .select_scaledown_candidate(&decision.pool_name)
+                .select_scaledown_candidate(&decision.pool_name, &self.fleet_state)
                 .await
             else {
                 tracing::debug!(
