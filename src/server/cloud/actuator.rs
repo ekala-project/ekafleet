@@ -21,9 +21,10 @@ const MAX_SCALE_UP_PER_CYCLE: u32 = 3;
 /// 1. Evaluates pool scaling policies via [`PoolScalingEngine`]
 /// 2. For scale-up: provisions new cloud VMs and registers join tokens
 /// 3. For scale-down: selects a victim, drains it, and terminates
-/// Duration to wait after marking a node unschedulable before terminating.
-/// Gives the reconciler time to reschedule services off the node.
-const DRAIN_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Default duration to wait after marking a node unschedulable before
+/// terminating. Gives the reconciler time to reschedule services off the node.
+/// Overridden by `drain_wait_seconds` in CloudProviderConfig.
+const DEFAULT_DRAIN_WAIT_SECS: u64 = 30;
 
 /// Maximum backoff duration for repeated failures (10 minutes).
 const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(600);
@@ -342,7 +343,14 @@ impl ScalingActuator {
                 self.fleet_state.set_schedulable(node_id, false).await;
                 // Allow time for the reconciler to reschedule services
                 // off this node before we terminate it.
-                tokio::time::sleep(DRAIN_WAIT).await;
+                let drain_secs = self
+                    .fleet_config
+                    .node_pools
+                    .get(&decision.pool_name)
+                    .and_then(|p| p.cloud.as_ref())
+                    .map(|c| c.drain_wait_seconds)
+                    .unwrap_or(DEFAULT_DRAIN_WAIT_SECS);
+                tokio::time::sleep(std::time::Duration::from_secs(drain_secs)).await;
             }
 
             match provider.destroy_machine(&candidate.cloud_instance_id).await {
@@ -611,6 +619,7 @@ mod tests {
                     spot: None,
                     launch_timeout_seconds: 300,
                     join_timeout_seconds: 600,
+                    drain_wait_seconds: 30,
                 }),
             },
         );

@@ -633,6 +633,7 @@ mod tests {
                     spot: None,
                     launch_timeout_seconds: 300,
                     join_timeout_seconds: 600,
+                    drain_wait_seconds: 30,
                 }),
             },
         );

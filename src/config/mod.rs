@@ -461,6 +461,11 @@ pub struct CloudProviderConfig {
     /// Default: 600 (10 minutes).
     #[serde(default = "default_join_timeout")]
     pub join_timeout_seconds: u64,
+    /// Seconds to wait after marking a node unschedulable before terminating
+    /// it during scale-down. Gives the reconciler time to reschedule services.
+    /// Default: 30.
+    #[serde(default = "default_drain_wait")]
+    pub drain_wait_seconds: u64,
 }
 
 /// Configuration for ekafleet-managed cloud images. When present in a pool's
@@ -526,6 +531,10 @@ fn default_launch_timeout() -> u64 {
 
 fn default_join_timeout() -> u64 {
     600
+}
+
+fn default_drain_wait() -> u64 {
+    30
 }
 
 fn default_image_retain_count() -> u32 {
