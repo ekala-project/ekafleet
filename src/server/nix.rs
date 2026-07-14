@@ -2,8 +2,18 @@
 
 use std::path::Path;
 use std::process::Stdio;
+use std::time::Duration;
 
 use crate::config::FleetConfig;
+
+/// Default timeout for `nix eval` commands.
+const EVAL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Default timeout for `nix build` commands.
+const BUILD_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Default timeout for `nix-copy-closure` commands.
+const COPY_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, thiserror::Error)]
 pub enum NixError {
@@ -15,6 +25,8 @@ pub enum NixError {
     CopyFailed(String),
     #[error("failed to parse nix output: {0}")]
     ParseError(String),
+    #[error("nix command timed out: {0}")]
+    Timeout(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -32,12 +44,20 @@ pub async fn eval_fleet(config_path: &Path) -> Result<FleetConfig, NixError> {
         format!("{config_str}#fleet")
     };
 
-    let output = tokio::process::Command::new("nix")
+    let fut = tokio::process::Command::new("nix")
         .args(["eval", "--json", &attr])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
-        .await?;
+        .output();
+
+    let output = tokio::time::timeout(EVAL_TIMEOUT, fut)
+        .await
+        .map_err(|_| {
+            NixError::Timeout(format!(
+                "nix eval timed out after {}s",
+                EVAL_TIMEOUT.as_secs()
+            ))
+        })??;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -60,12 +80,20 @@ pub async fn eval_fleet(config_path: &Path) -> Result<FleetConfig, NixError> {
 
 /// Build a Nix derivation and return the store path.
 pub async fn build(flake_ref: &str) -> Result<String, NixError> {
-    let output = tokio::process::Command::new("nix")
+    let fut = tokio::process::Command::new("nix")
         .args(["build", "--no-link", "--print-out-paths", flake_ref])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
-        .await?;
+        .output();
+
+    let output = tokio::time::timeout(BUILD_TIMEOUT, fut)
+        .await
+        .map_err(|_| {
+            NixError::Timeout(format!(
+                "nix build timed out after {}s",
+                BUILD_TIMEOUT.as_secs()
+            ))
+        })??;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -80,12 +108,20 @@ pub async fn build(flake_ref: &str) -> Result<String, NixError> {
 
 /// Copy a store path to a remote machine via nix-copy-closure.
 pub async fn copy_closure(store_path: &str, target_host: &str) -> Result<(), NixError> {
-    let output = tokio::process::Command::new("nix-copy-closure")
+    let fut = tokio::process::Command::new("nix-copy-closure")
         .args(["--to", target_host, store_path])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
-        .await?;
+        .output();
+
+    let output = tokio::time::timeout(COPY_TIMEOUT, fut)
+        .await
+        .map_err(|_| {
+            NixError::Timeout(format!(
+                "nix-copy-closure timed out after {}s",
+                COPY_TIMEOUT.as_secs()
+            ))
+        })??;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
