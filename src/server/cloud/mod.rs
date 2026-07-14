@@ -5,6 +5,7 @@ pub mod aws;
 pub mod azure;
 pub mod bootstrap;
 pub mod gcp;
+pub mod image;
 pub mod image_tracker;
 pub mod instance_tracker;
 
