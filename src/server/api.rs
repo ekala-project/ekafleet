@@ -421,7 +421,90 @@ impl FleetControl for FleetControlService {
                     // If watch mode, start continuous reconciliation and scaling actuator
                     if watch {
                         // Evaluate config to build the scaling actuator
-                        if let Ok(fleet_config) = super::nix::eval_fleet(&config_path).await {
+                        if let Ok(mut fleet_config) = super::nix::eval_fleet(&config_path).await {
+                            // Resolve managed cloud images: build and register
+                            // any NixOS images whose store path has changed.
+                            let image_tracker = super::cloud::image_tracker::ImageTracker::new(
+                                raft_state.clone(),
+                            );
+                            let mut image_managers: std::collections::HashMap<
+                                String,
+                                Box<dyn super::cloud::image::CloudImageManagerDyn>,
+                            > = std::collections::HashMap::new();
+                            let mut active_hashes: std::collections::HashMap<String, String> =
+                                std::collections::HashMap::new();
+
+                            for (pool_name, pool_config) in &mut fleet_config.node_pools {
+                                let Some(cloud) = &mut pool_config.cloud else {
+                                    continue;
+                                };
+                                let Some(image_config) = &cloud.image else {
+                                    continue;
+                                };
+
+                                let manager = super::cloud::image::build_image_manager(
+                                    cloud, image_config,
+                                );
+                                let manager_key = match cloud.provider {
+                                    crate::config::CloudProviderType::Aws => "aws",
+                                    crate::config::CloudProviderType::Azure => "azure",
+                                    crate::config::CloudProviderType::Gcp => "gcp",
+                                };
+
+                                match super::cloud::image::ensure_image(
+                                    pool_name,
+                                    cloud,
+                                    image_config,
+                                    &fleet_config.name,
+                                    &image_tracker,
+                                    manager.as_ref(),
+                                )
+                                .await
+                                {
+                                    Ok(resolved_id) => {
+                                        // Track the active hash for cleanup
+                                        if let Ok(toplevel) = super::nix::build(&format!(
+                                            "{}.config.system.build.toplevel",
+                                            image_config.nixos_config
+                                        ))
+                                        .await
+                                        {
+                                            if let Some(h) =
+                                                super::cloud::image::extract_store_path_hash(
+                                                    &toplevel,
+                                                )
+                                            {
+                                                active_hashes.insert(
+                                                    pool_name.clone(),
+                                                    h.to_string(),
+                                                );
+                                            }
+                                        }
+
+                                        cloud.image_id = Some(resolved_id);
+                                        image_managers
+                                            .entry(manager_key.to_string())
+                                            .or_insert(manager);
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            pool = %pool_name,
+                                            error = %e,
+                                            "Failed to resolve managed cloud image"
+                                        );
+                                    }
+                                }
+                            }
+
+                            // Clean up expired images
+                            super::cloud::image::cleanup_expired_images(
+                                &fleet_config,
+                                &image_tracker,
+                                &image_managers,
+                                &active_hashes,
+                            )
+                            .await;
+
                             let providers = super::cloud::CloudProviderRegistry::from_pool_configs(
                                 &fleet_config.node_pools,
                             );
