@@ -59,6 +59,10 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     let grpc_addr = config.grpc_listen.parse()?;
     let http_addr = config.http_listen.parse()?;
 
+    // Apply configurable Nix timeouts and --option passthrough from the
+    // environment before any Nix invocation runs.
+    nix::init_options(nix::NixOptions::from_env());
+
     // Build the CA signer — either in-process or remote
     let ca: Arc<dyn CaSigner> = if let Some(socket_path) = &config.ca_socket {
         tracing::info!(socket = %socket_path.display(), "Using remote CA signer");

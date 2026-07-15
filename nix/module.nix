@@ -59,6 +59,48 @@ in
         default = "/run/ekafleet/ca.sock";
         description = "Unix socket path for the CA signer.";
       };
+
+      nixEvalTimeout = lib.mkOption {
+        type = lib.types.ints.unsigned;
+        default = 120;
+        description = ''
+          Timeout in seconds for `nix eval` of the fleet configuration.
+          Set to 0 to use the built-in default.
+        '';
+      };
+
+      nixBuildTimeout = lib.mkOption {
+        type = lib.types.ints.unsigned;
+        default = 600;
+        description = ''
+          Timeout in seconds for `nix build`. Increase for large or
+          cache-cold closures. Set to 0 to use the built-in default.
+        '';
+      };
+
+      nixCopyTimeout = lib.mkOption {
+        type = lib.types.ints.unsigned;
+        default = 300;
+        description = ''
+          Timeout in seconds for `nix-copy-closure`. Set to 0 to use the
+          built-in default.
+        '';
+      };
+
+      nixOptions = lib.mkOption {
+        type = lib.types.attrsOf lib.types.str;
+        default = { };
+        example = {
+          substituters = "https://cache.example.org";
+          "trusted-public-keys" = "cache.example.org:AAAA...";
+        };
+        description = ''
+          Extra `nix.conf`-style options passed through to every server-side
+          Nix invocation as `--option <name> <value>` (e.g. extra
+          substituters, trusted public keys, or
+          `allow-import-from-derivation`).
+        '';
+      };
     };
 
     agent = {
@@ -209,7 +251,17 @@ in
             RuntimeDirectory = "ekafleet";
           };
 
-        environment.RUST_LOG = "info";
+        environment = {
+          RUST_LOG = "info";
+          EKAFLEET_NIX_EVAL_TIMEOUT = toString cfg.server.nixEvalTimeout;
+          EKAFLEET_NIX_BUILD_TIMEOUT = toString cfg.server.nixBuildTimeout;
+          EKAFLEET_NIX_COPY_TIMEOUT = toString cfg.server.nixCopyTimeout;
+        }
+        // lib.optionalAttrs (cfg.server.nixOptions != { }) {
+          EKAFLEET_NIX_OPTIONS = lib.concatStringsSep ";" (
+            lib.mapAttrsToList (name: value: "${name}=${value}") cfg.server.nixOptions
+          );
+        };
       };
     })
 
