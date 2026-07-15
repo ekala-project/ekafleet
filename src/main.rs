@@ -786,8 +786,16 @@ async fn main() -> anyhow::Result<()> {
             domain,
             ca_socket,
         } => {
-            commands::cmd_server(data_dir, peers, listen, http_listen, token, domain, ca_socket)
-                .await?
+            commands::cmd_server(
+                data_dir,
+                peers,
+                listen,
+                http_listen,
+                token,
+                domain,
+                ca_socket,
+            )
+            .await?
         }
 
         Command::Agent {
@@ -987,9 +995,7 @@ async fn main() -> anyhow::Result<()> {
         },
 
         Command::Images { action } => match action {
-            ImagesAction::List { pool, server } => {
-                commands::cmd_images_list(pool, server).await?
-            }
+            ImagesAction::List { pool, server } => commands::cmd_images_list(pool, server).await?,
             ImagesAction::Build {
                 pool,
                 config,

@@ -15,9 +15,8 @@ pkgs.testers.nixosTest {
       imports = [ ../module.nix ];
       nixpkgs.overlays = [ (import ../overlay.nix) ];
 
-      services.ekafleet = {
+      services.ekafleet.server = {
         enable = true;
-        mode = "server";
         token = "oci-test-token";
       };
 
@@ -66,7 +65,7 @@ pkgs.testers.nixosTest {
       import time
       import json as json_mod
 
-      machine.wait_for_unit("ekafleet.service")
+      machine.wait_for_unit("ekafleet-server.service")
       machine.wait_for_open_port(7402)
 
       # ── Step 1: Verify ekafleet is running ──

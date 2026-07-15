@@ -39,8 +39,7 @@ pub fn reencrypt(
         return Err(ReencryptError);
     }
     let (nonce_bytes, ciphertext_and_tag) = sealed.split_at(NONCE_LEN);
-    let nonce =
-        Nonce::try_assume_unique_for_key(nonce_bytes).map_err(|_| ReencryptError)?;
+    let nonce = Nonce::try_assume_unique_for_key(nonce_bytes).map_err(|_| ReencryptError)?;
     let src_unbound = UnboundKey::new(&AES_256_GCM, src_key).map_err(|_| ReencryptError)?;
     let src_aead = LessSafeKey::new(src_unbound);
     let mut in_out = ciphertext_and_tag.to_vec();
@@ -112,7 +111,9 @@ mod tests {
         let unbound = UnboundKey::new(&AES_256_GCM, key).unwrap();
         let aead = LessSafeKey::new(unbound);
         let mut in_out = ct.to_vec();
-        let pt = aead.open_in_place(nonce, Aad::from(aad), &mut in_out).unwrap();
+        let pt = aead
+            .open_in_place(nonce, Aad::from(aad), &mut in_out)
+            .unwrap();
         pt.to_vec()
     }
 
@@ -171,7 +172,10 @@ mod tests {
         let nonce = Nonce::try_assume_unique_for_key(nonce_bytes).unwrap();
         let mut in_out = ct.to_vec();
         let result = aead.open_in_place(nonce, Aad::from(TEST_AAD), &mut in_out);
-        assert!(result.is_err(), "re-encrypted data must not be decryptable with the original fleet key");
+        assert!(
+            result.is_err(),
+            "re-encrypted data must not be decryptable with the original fleet key"
+        );
     }
 
     #[test]

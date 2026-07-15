@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
-use super::root::CaError;
 use super::CaSigner;
+use super::root::CaError;
 
 /// Certificate issuance service.
 /// Validates CSRs, performs attestation, checks service assignment,

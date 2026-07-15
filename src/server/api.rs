@@ -12,9 +12,9 @@ use super::events::EventStore;
 use super::rbac::{TokenStore, extract_bearer_token};
 use super::state::FleetState;
 use crate::attestation::join_token::JoinTokenStore;
+use crate::ca::CaSigner;
 use crate::ca::csr;
 use crate::ca::issuer::CertIssuer;
-use crate::ca::CaSigner;
 use crate::metrics::aggregator::MetricsAggregator;
 use crate::proto::agent_message::Payload;
 use crate::proto::fleet_control_server::{FleetControl, FleetControlServer};
@@ -29,8 +29,8 @@ use crate::proto::{
     LogsChunk, LogsRequest, NodeAttestationRequest, NodeAttestationResult, NodeDetail,
     OperationType, PlanRequest, PlanResponse, PlannedOperation, PromoteRequest, PromoteResponse,
     RestoreRequest, RestoreResponse, RevokeAclTokenRequest, RevokeAclTokenResponse,
-    RollbackRequest, RollbackResponse, RotateFleetKeyRequest, RotateFleetKeyResponse,
-    ScaleRequest, ScaleResponse, ServerMessage, SnapshotRequest, SnapshotResponse, StatusRequest,
+    RollbackRequest, RollbackResponse, RotateFleetKeyRequest, RotateFleetKeyResponse, ScaleRequest,
+    ScaleResponse, ServerMessage, SnapshotRequest, SnapshotResponse, StatusRequest,
     SwitchGenerationRequest, SwitchGenerationResponse, SystemGcRequest, SystemGcResponse,
     SystemRebootRequest, SystemRebootResponse, SystemRebuildRequest, SystemRebuildResponse,
     TopRequest, TopResponse, TrustBundleUpdate, UpdateNodeRequest, UpdateNodeResponse,
@@ -216,8 +216,7 @@ impl FleetControl for FleetControlService {
         {
             let fk = self.fleet_key.read().await;
             if fk.version > 0 {
-                let agent_spiffe_id =
-                    format!("spiffe://{}/agent/{}", self.domain, node_id);
+                let agent_spiffe_id = format!("spiffe://{}/agent/{}", self.domain, node_id);
                 let derived =
                     crate::secrets::key_derivation::derive_agent_key(&fk.key, &agent_spiffe_id);
                 let key_msg = ServerMessage {
@@ -441,9 +440,8 @@ impl FleetControl for FleetControlService {
                         if let Ok(mut fleet_config) = super::nix::eval_fleet(&config_path).await {
                             // Resolve managed cloud images: build and register
                             // any NixOS images whose store path has changed.
-                            let image_tracker = super::cloud::image_tracker::ImageTracker::new(
-                                raft_state.clone(),
-                            );
+                            let image_tracker =
+                                super::cloud::image_tracker::ImageTracker::new(raft_state.clone());
                             let mut image_managers: std::collections::HashMap<
                                 String,
                                 Box<dyn super::cloud::image::CloudImageManagerDyn>,
@@ -459,9 +457,8 @@ impl FleetControl for FleetControlService {
                                     continue;
                                 };
 
-                                let manager = super::cloud::image::build_image_manager(
-                                    cloud, image_config,
-                                );
+                                let manager =
+                                    super::cloud::image::build_image_manager(cloud, image_config);
                                 let manager_key = match cloud.provider {
                                     crate::config::CloudProviderType::Aws => "aws",
                                     crate::config::CloudProviderType::Azure => "azure",
@@ -491,10 +488,8 @@ impl FleetControl for FleetControlService {
                                                     &toplevel,
                                                 )
                                             {
-                                                active_hashes.insert(
-                                                    pool_name.clone(),
-                                                    h.to_string(),
-                                                );
+                                                active_hashes
+                                                    .insert(pool_name.clone(), h.to_string());
                                             }
                                         }
 
@@ -872,13 +867,11 @@ impl FleetControl for FleetControlService {
         // on the drained node. The next reconciliation cycle will reschedule
         // them onto healthy, schedulable nodes.
         let drain_msg = ServerMessage {
-            payload: Some(ServerPayload::DesiredState(
-                crate::proto::DesiredState {
-                    correlation_id: uuid::Uuid::new_v4().to_string(),
-                    services: vec![],
-                    system_path: String::new(),
-                },
-            )),
+            payload: Some(ServerPayload::DesiredState(crate::proto::DesiredState {
+                correlation_id: uuid::Uuid::new_v4().to_string(),
+                services: vec![],
+                system_path: String::new(),
+            })),
         };
 
         if !self.state.send_to_agent(&req.machine, drain_msg).await {
@@ -988,7 +981,12 @@ impl FleetControl for FleetControlService {
         }
 
         // Verify the service is deployed (exists in Raft state)
-        if self.raft_state.get_deployment(&req.service_name).await.is_none() {
+        if self
+            .raft_state
+            .get_deployment(&req.service_name)
+            .await
+            .is_none()
+        {
             return Err(Status::not_found(format!(
                 "service '{}' is not deployed",
                 req.service_name
@@ -1622,9 +1620,10 @@ impl FleetControl for FleetControlService {
         // Re-encrypt all secrets in the store with the new key
         {
             let mut store = self.secret_store.write().await;
-            store.rekey(&new_key).await.map_err(|e| {
-                Status::internal(format!("failed to re-encrypt secrets: {e}"))
-            })?;
+            store
+                .rekey(&new_key)
+                .await
+                .map_err(|e| Status::internal(format!("failed to re-encrypt secrets: {e}")))?;
         }
 
         // Update the fleet key state and bump the version
@@ -1639,9 +1638,9 @@ impl FleetControl for FleetControlService {
         // Persist the new key to disk
         let key_path = self.data_dir.join("fleet-key");
         let hex: String = new_key.iter().map(|b| format!("{b:02x}")).collect();
-        tokio::fs::write(&key_path, &hex).await.map_err(|e| {
-            Status::internal(format!("failed to persist rotated key: {e}"))
-        })?;
+        tokio::fs::write(&key_path, &hex)
+            .await
+            .map_err(|e| Status::internal(format!("failed to persist rotated key: {e}")))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1653,8 +1652,7 @@ impl FleetControl for FleetControlService {
         let node_ids = self.state.connected_nodes().await;
         let mut notified: u32 = 0;
         for nid in &node_ids {
-            let agent_spiffe_id =
-                format!("spiffe://{}/agent/{}", self.domain, nid);
+            let agent_spiffe_id = format!("spiffe://{}/agent/{}", self.domain, nid);
             let derived =
                 crate::secrets::key_derivation::derive_agent_key(&new_key, &agent_spiffe_id);
             let key_msg = ServerMessage {

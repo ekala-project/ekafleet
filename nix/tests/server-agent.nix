@@ -17,9 +17,8 @@ pkgs.testers.nixosTest {
       imports = [ ../module.nix ];
       nixpkgs.overlays = [ (import ../overlay.nix) ];
 
-      services.ekafleet = {
+      services.ekafleet.server = {
         enable = true;
-        mode = "server";
         token = "cluster-token";
       };
 
@@ -43,7 +42,7 @@ pkgs.testers.nixosTest {
 
   testScript = ''
     # Start the server and wait for it to be ready
-    server.wait_for_unit("ekafleet.service")
+    server.wait_for_unit("ekafleet-server.service")
     server.wait_for_open_port(7402)
     server.succeed("curl -sf http://localhost:7402/health | grep -q 'ok'")
 

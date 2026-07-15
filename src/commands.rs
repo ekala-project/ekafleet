@@ -1316,13 +1316,12 @@ pub async fn cmd_images_list(pool: Option<String>, server: String) -> anyhow::Re
     let mut client = connect_server(&server).await?;
 
     // Use the snapshot RPC to get Raft state, then query KV for images
-    let resp = client
-        .snapshot(SnapshotRequest {})
-        .await?
-        .into_inner();
+    let resp = client.snapshot(SnapshotRequest {}).await?.into_inner();
 
     let raft = ekafleet::raft::state::FleetStateMachine::new();
-    raft.restore(&resp.data).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    raft.restore(&resp.data)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let image_tracker = ekafleet::server::cloud::image_tracker::ImageTracker::new(raft);
     let images = image_tracker.list_all().await;
@@ -1370,7 +1369,8 @@ pub async fn cmd_images_build(
     server: String,
 ) -> anyhow::Result<()> {
     // Evaluate fleet config to get pool's cloud image settings
-    let fleet_config = ekafleet::server::nix::eval_fleet(&config).await
+    let fleet_config = ekafleet::server::nix::eval_fleet(&config)
+        .await
         .map_err(|e| anyhow::anyhow!("failed to evaluate fleet config: {e}"))?;
 
     let pool_config = fleet_config
@@ -1383,21 +1383,22 @@ pub async fn cmd_images_build(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("pool '{}' has no cloud provider config", pool))?;
 
-    let image_config = cloud_config
-        .image
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("pool '{}' has no managed image config (uses static imageId)", pool))?;
+    let image_config = cloud_config.image.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "pool '{}' has no managed image config (uses static imageId)",
+            pool
+        )
+    })?;
 
     // Connect to server to access Raft state for tracking
     let mut client = connect_server(&server).await?;
 
-    let resp = client
-        .snapshot(SnapshotRequest {})
-        .await?
-        .into_inner();
+    let resp = client.snapshot(SnapshotRequest {}).await?.into_inner();
 
     let raft = ekafleet::raft::state::FleetStateMachine::new();
-    raft.restore(&resp.data).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    raft.restore(&resp.data)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let image_tracker = ekafleet::server::cloud::image_tracker::ImageTracker::new(raft);
     let manager = ekafleet::server::cloud::image::build_image_manager(cloud_config, image_config);
@@ -1424,18 +1425,18 @@ pub async fn cmd_images_gc(
     config: std::path::PathBuf,
     server: String,
 ) -> anyhow::Result<()> {
-    let fleet_config = ekafleet::server::nix::eval_fleet(&config).await
+    let fleet_config = ekafleet::server::nix::eval_fleet(&config)
+        .await
         .map_err(|e| anyhow::anyhow!("failed to evaluate fleet config: {e}"))?;
 
     let mut client = connect_server(&server).await?;
 
-    let resp = client
-        .snapshot(SnapshotRequest {})
-        .await?
-        .into_inner();
+    let resp = client.snapshot(SnapshotRequest {}).await?.into_inner();
 
     let raft = ekafleet::raft::state::FleetStateMachine::new();
-    raft.restore(&resp.data).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    raft.restore(&resp.data)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let image_tracker = ekafleet::server::cloud::image_tracker::ImageTracker::new(raft);
 
@@ -1456,12 +1457,10 @@ pub async fn cmd_images_gc(
         };
 
         // Determine current active hash
-        let toplevel_attr = format!(
-            "{}.config.system.build.toplevel",
-            image_config.nixos_config
-        );
+        let toplevel_attr = format!("{}.config.system.build.toplevel", image_config.nixos_config);
         if let Ok(store_path) = ekafleet::server::nix::build(&toplevel_attr).await {
-            if let Some(hash) = ekafleet::server::cloud::image::extract_store_path_hash(&store_path) {
+            if let Some(hash) = ekafleet::server::cloud::image::extract_store_path_hash(&store_path)
+            {
                 active_hashes.insert(pool_name.clone(), hash.to_string());
             }
         }

@@ -174,12 +174,8 @@ pub async fn execute(
                 } else {
                     DeployOutcome::Failed
                 };
-                es.record_deploy_complete(
-                    &deployment_id,
-                    outcome,
-                    &e.to_string(),
-                )
-                .await;
+                es.record_deploy_complete(&deployment_id, outcome, &e.to_string())
+                    .await;
             }
         }
     }

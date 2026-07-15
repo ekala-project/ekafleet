@@ -231,7 +231,8 @@ impl SecretStore {
 
         for (svc, name, sealed, version) in entries {
             let aad = secret_aad(&svc, &name);
-            match super::key_derivation::reencrypt(self.raw_key.as_ref(), &agent_key, &sealed, &aad) {
+            match super::key_derivation::reencrypt(self.raw_key.as_ref(), &agent_key, &sealed, &aad)
+            {
                 Ok(reencrypted) => result.push((svc, name, reencrypted, version)),
                 Err(e) => {
                     tracing::error!(
@@ -290,8 +291,7 @@ impl SecretStore {
             .map_err(|_| SecretStoreError::Encrypt)?;
         let nonce = Nonce::assume_unique_for_key(nonce_bytes);
 
-        let unbound =
-            UnboundKey::new(&AES_256_GCM, key).map_err(|_| SecretStoreError::Encrypt)?;
+        let unbound = UnboundKey::new(&AES_256_GCM, key).map_err(|_| SecretStoreError::Encrypt)?;
         let aead = LessSafeKey::new(unbound);
         let mut in_out = plaintext.to_vec();
         aead.seal_in_place_append_tag(nonce, Aad::from(aad), &mut in_out)
@@ -389,7 +389,9 @@ mod tests {
     #[tokio::test]
     async fn wrong_aad_fails_decryption() {
         let store = SecretStore::new(&test_key());
-        let sealed = store.encrypt(b"secret", &secret_aad("svc-a", "key")).unwrap();
+        let sealed = store
+            .encrypt(b"secret", &secret_aad("svc-a", "key"))
+            .unwrap();
         let result = store.decrypt(&sealed, &secret_aad("svc-b", "key"));
         assert!(result.is_err(), "decryption with wrong AAD must fail");
     }
@@ -518,7 +520,14 @@ mod tests {
         // Grab the sealed data before rekey
         let before = {
             let state = store.inner.read().await;
-            state.secrets.get("svc").unwrap().get("secret").unwrap().sealed.clone()
+            state
+                .secrets
+                .get("svc")
+                .unwrap()
+                .get("secret")
+                .unwrap()
+                .sealed
+                .clone()
         };
 
         store.rekey(&new_key).await.unwrap();
@@ -526,7 +535,14 @@ mod tests {
         // The sealed data must change after rekeying
         let after = {
             let state = store.inner.read().await;
-            state.secrets.get("svc").unwrap().get("secret").unwrap().sealed.clone()
+            state
+                .secrets
+                .get("svc")
+                .unwrap()
+                .get("secret")
+                .unwrap()
+                .sealed
+                .clone()
         };
         assert_ne!(before, after, "sealed data must change after rekey");
 

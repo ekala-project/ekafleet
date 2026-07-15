@@ -719,9 +719,7 @@ pub fn validate(config: &FleetConfig) -> Result<(), Vec<String>> {
                             name
                         ));
                     }
-                    if cloud.provider == CloudProviderType::Azure
-                        && img.storage_account.is_none()
-                    {
+                    if cloud.provider == CloudProviderType::Azure && img.storage_account.is_none() {
                         errors.push(format!(
                             "pool '{}' managed image config requires 'storageAccount' for Azure",
                             name

@@ -34,10 +34,7 @@ pub trait CaSigner: Send + Sync + 'static {
 
     /// Issue a server SVID for gRPC TLS.
     /// Returns (cert_pem + key_pem combined, chain_pem, expires_at).
-    async fn issue_server_svid(
-        &self,
-        server_id: &str,
-    ) -> Result<(Vec<u8>, Vec<u8>, u64), CaError>;
+    async fn issue_server_svid(&self, server_id: &str) -> Result<(Vec<u8>, Vec<u8>, u64), CaError>;
 
     /// Get the root CA certificate PEM (trust bundle).
     async fn trust_bundle_pem(&self) -> Result<String, CaError>;

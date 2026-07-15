@@ -10,8 +10,8 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
-use super::root::{CaError, RootCa};
 use super::CaSigner;
+use super::root::{CaError, RootCa};
 
 // --- Wire protocol ---
 //
@@ -116,10 +116,7 @@ impl CaSigner for DirectCaSigner {
             .await
     }
 
-    async fn issue_server_svid(
-        &self,
-        server_id: &str,
-    ) -> Result<(Vec<u8>, Vec<u8>, u64), CaError> {
+    async fn issue_server_svid(&self, server_id: &str) -> Result<(Vec<u8>, Vec<u8>, u64), CaError> {
         self.ca.issue_server_svid(server_id).await
     }
 
@@ -211,10 +208,7 @@ impl CaSigner for RemoteCaSigner {
         Self::into_cert_result(resp)
     }
 
-    async fn issue_server_svid(
-        &self,
-        server_id: &str,
-    ) -> Result<(Vec<u8>, Vec<u8>, u64), CaError> {
+    async fn issue_server_svid(&self, server_id: &str) -> Result<(Vec<u8>, Vec<u8>, u64), CaError> {
         let resp = self
             .call(&Request::IssueServerSvid {
                 server_id: server_id.to_string(),
@@ -347,10 +341,7 @@ pub async fn serve(config: CaSignerConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn handle_connection(
-    mut stream: tokio::net::UnixStream,
-    ca: &RootCa,
-) -> anyhow::Result<()> {
+async fn handle_connection(mut stream: tokio::net::UnixStream, ca: &RootCa) -> anyhow::Result<()> {
     let req_bytes = recv_msg(&mut stream).await?;
     let req: Request = serde_json::from_slice(&req_bytes)?;
 

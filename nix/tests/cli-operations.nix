@@ -9,9 +9,8 @@ pkgs.testers.nixosTest {
       imports = [ ../module.nix ];
       nixpkgs.overlays = [ (import ../overlay.nix) ];
 
-      services.ekafleet = {
+      services.ekafleet.server = {
         enable = true;
-        mode = "server";
         token = "cli-test-token";
       };
 
@@ -27,7 +26,7 @@ pkgs.testers.nixosTest {
     };
 
   testScript = ''
-    machine.wait_for_unit("ekafleet.service")
+    machine.wait_for_unit("ekafleet-server.service")
     machine.wait_for_open_port(7402)
 
     # --- CLI binary tests (no server connection needed) ---

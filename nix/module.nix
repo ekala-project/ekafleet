@@ -162,7 +162,9 @@ in
 
         serviceConfig =
           let
-            peersArg = lib.optionalString (cfg.server.peers != [ ]) "--peers ${lib.concatStringsSep "," cfg.server.peers}";
+            peersArg = lib.optionalString (
+              cfg.server.peers != [ ]
+            ) "--peers ${lib.concatStringsSep "," cfg.server.peers}";
           in
           {
             Type = "simple";

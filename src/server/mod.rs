@@ -26,10 +26,10 @@ use state::FleetState;
 use tokio_util::sync::CancellationToken;
 
 use crate::attestation::join_token::JoinTokenStore;
+use crate::ca::CaSigner;
 use crate::ca::issuer::CertIssuer;
 use crate::ca::root::RootCa;
 use crate::ca::signer::{DirectCaSigner, RemoteCaSigner};
-use crate::ca::CaSigner;
 use crate::raft::state::FleetStateMachine;
 
 pub struct ServerConfig {
@@ -178,8 +178,16 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     let hk_alerts = alert_evaluator.clone();
     let hk_events = event_store.clone();
     tokio::spawn(async move {
-        housekeeping_loop(hk_state, hk_join_tokens, hk_raft, hk_metrics, hk_alerts, hk_events, hk_shutdown)
-            .await;
+        housekeeping_loop(
+            hk_state,
+            hk_join_tokens,
+            hk_raft,
+            hk_metrics,
+            hk_alerts,
+            hk_events,
+            hk_shutdown,
+        )
+        .await;
     });
 
     tokio::select! {

@@ -9,9 +9,8 @@ pkgs.testers.nixosTest {
       imports = [ ../module.nix ];
       nixpkgs.overlays = [ (import ../overlay.nix) ];
 
-      services.ekafleet = {
+      services.ekafleet.server = {
         enable = true;
-        mode = "server";
         token = "test-token-12345";
       };
 
@@ -22,11 +21,11 @@ pkgs.testers.nixosTest {
     };
 
   testScript = ''
-    machine.wait_for_unit("ekafleet.service")
+    machine.wait_for_unit("ekafleet-server.service")
     machine.wait_for_open_port(7402)
 
     # Verify the systemd unit is active
-    machine.succeed("systemctl is-active ekafleet.service")
+    machine.succeed("systemctl is-active ekafleet-server.service")
 
     # Verify the ekafleet process is running
     machine.succeed("pgrep -x ekafleet")
@@ -74,7 +73,7 @@ pkgs.testers.nixosTest {
     )
 
     # Verify the service restarts cleanly
-    machine.succeed("systemctl restart ekafleet.service")
+    machine.succeed("systemctl restart ekafleet-server.service")
     machine.wait_for_open_port(7402)
     result = machine.succeed("curl -sf http://localhost:7402/health")
     assert result.strip() == "ok", f"Expected 'ok' after restart, got '{result.strip()}'"

@@ -170,7 +170,9 @@ impl MetricsAggregator {
         let mut state = self.inner.write().await;
 
         // Prune node-level metrics
-        state.node_metrics.retain(|nid, _| active_nodes.contains(nid));
+        state
+            .node_metrics
+            .retain(|nid, _| active_nodes.contains(nid));
 
         // Prune per-node entries from service-level metrics
         for metrics in state.service_metrics.values_mut() {

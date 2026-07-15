@@ -300,10 +300,7 @@ WantedBy=multi-user.target
 
     /// Query the actual systemd state of a managed service.
     /// Returns `ServiceState::Unknown` if the service is not managed.
-    pub async fn service_state(
-        &self,
-        service_name: &str,
-    ) -> crate::proto::ServiceState {
+    pub async fn service_state(&self, service_name: &str) -> crate::proto::ServiceState {
         let Some(unit) = self.managed_units.get(service_name) else {
             return crate::proto::ServiceState::Unknown;
         };

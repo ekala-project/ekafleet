@@ -334,12 +334,10 @@ impl FleetStateMachine {
     pub async fn get_replica_override(&self, service_name: &str) -> Option<u32> {
         let key = format!("replica-override/{service_name}");
         let state = self.inner.read().await;
-        state.kv.get(&key).and_then(|v| {
-            v.as_slice()
-                .try_into()
-                .ok()
-                .map(u32::from_le_bytes)
-        })
+        state
+            .kv
+            .get(&key)
+            .and_then(|v| v.as_slice().try_into().ok().map(u32::from_le_bytes))
     }
 
     /// Clear a runtime replica count override for a service.

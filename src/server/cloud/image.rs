@@ -61,15 +61,9 @@ pub trait CloudImageManagerDyn: Send + Sync {
         store_path_hash: &str,
     ) -> BoxFuture<'_, Result<Option<String>, anyhow::Error>>;
 
-    fn delete_image(
-        &self,
-        image_id: &str,
-    ) -> BoxFuture<'_, Result<(), anyhow::Error>>;
+    fn delete_image(&self, image_id: &str) -> BoxFuture<'_, Result<(), anyhow::Error>>;
 
-    fn delete_storage_object(
-        &self,
-        storage_uri: &str,
-    ) -> BoxFuture<'_, Result<(), anyhow::Error>>;
+    fn delete_storage_object(&self, storage_uri: &str) -> BoxFuture<'_, Result<(), anyhow::Error>>;
 }
 
 impl<T: CloudImageManager + 'static> CloudImageManagerDyn for T {
@@ -93,18 +87,12 @@ impl<T: CloudImageManager + 'static> CloudImageManagerDyn for T {
         Box::pin(async move { CloudImageManager::find_image_by_hash(self, &h).await })
     }
 
-    fn delete_image(
-        &self,
-        image_id: &str,
-    ) -> BoxFuture<'_, Result<(), anyhow::Error>> {
+    fn delete_image(&self, image_id: &str) -> BoxFuture<'_, Result<(), anyhow::Error>> {
         let id = image_id.to_string();
         Box::pin(async move { CloudImageManager::delete_image(self, &id).await })
     }
 
-    fn delete_storage_object(
-        &self,
-        storage_uri: &str,
-    ) -> BoxFuture<'_, Result<(), anyhow::Error>> {
+    fn delete_storage_object(&self, storage_uri: &str) -> BoxFuture<'_, Result<(), anyhow::Error>> {
         let uri = storage_uri.to_string();
         Box::pin(async move { CloudImageManager::delete_storage_object(self, &uri).await })
     }
@@ -141,10 +129,7 @@ impl CloudImageManager for AwsImageManager {
         // 1. Upload to S3
         tracing::info!(s3_uri = %s3_uri, "Uploading disk image to S3");
         let output = tokio::process::Command::new("aws")
-            .args([
-                "s3", "cp", image_path, &s3_uri,
-                "--region", &self.region,
-            ])
+            .args(["s3", "cp", image_path, &s3_uri, "--region", &self.region])
             .output()
             .await?;
         if !output.status.success() {
@@ -164,10 +149,14 @@ impl CloudImageManager for AwsImageManager {
         tracing::info!(name = %name, "Importing EBS snapshot from S3");
         let output = tokio::process::Command::new("aws")
             .args([
-                "ec2", "import-snapshot",
-                "--region", &self.region,
-                "--disk-container", &container.to_string(),
-                "--output", "json",
+                "ec2",
+                "import-snapshot",
+                "--region",
+                &self.region,
+                "--disk-container",
+                &container.to_string(),
+                "--output",
+                "json",
             ])
             .output()
             .await?;
@@ -197,15 +186,23 @@ impl CloudImageManager for AwsImageManager {
         tracing::info!(name = %name, snapshot_id = %snapshot_id, "Registering AMI");
         let output = tokio::process::Command::new("aws")
             .args([
-                "ec2", "register-image",
-                "--region", &self.region,
-                "--name", name,
-                "--root-device-name", "/dev/xvda",
-                "--block-device-mappings", &block_mappings.to_string(),
-                "--architecture", "x86_64",
-                "--virtualization-type", "hvm",
+                "ec2",
+                "register-image",
+                "--region",
+                &self.region,
+                "--name",
+                name,
+                "--root-device-name",
+                "/dev/xvda",
+                "--block-device-mappings",
+                &block_mappings.to_string(),
+                "--architecture",
+                "x86_64",
+                "--virtualization-type",
+                "hvm",
                 "--ena-support",
-                "--output", "json",
+                "--output",
+                "json",
             ])
             .output()
             .await?;
@@ -221,15 +218,19 @@ impl CloudImageManager for AwsImageManager {
             .to_string();
 
         // 5. Tag the AMI
-        let tags = format!(
-            "Key=nix-store-hash,Value={store_path_hash} Key=managed-by,Value=ekafleet"
-        );
+        let tags =
+            format!("Key=nix-store-hash,Value={store_path_hash} Key=managed-by,Value=ekafleet");
         let _ = tokio::process::Command::new("aws")
             .args([
-                "ec2", "create-tags",
-                "--region", &self.region,
-                "--resources", &image_id, &snapshot_id,
-                "--tags", &tags,
+                "ec2",
+                "create-tags",
+                "--region",
+                &self.region,
+                "--resources",
+                &image_id,
+                &snapshot_id,
+                "--tags",
+                &tags,
             ])
             .output()
             .await;
@@ -249,11 +250,16 @@ impl CloudImageManager for AwsImageManager {
         let filter = format!("Name=tag:nix-store-hash,Values={store_path_hash}");
         let output = tokio::process::Command::new("aws")
             .args([
-                "ec2", "describe-images",
-                "--region", &self.region,
-                "--owners", "self",
-                "--filters", &filter,
-                "--output", "json",
+                "ec2",
+                "describe-images",
+                "--region",
+                &self.region,
+                "--owners",
+                "self",
+                "--filters",
+                &filter,
+                "--output",
+                "json",
             ])
             .output()
             .await?;
@@ -276,10 +282,14 @@ impl CloudImageManager for AwsImageManager {
         // Get snapshot ID before deregistering
         let output = tokio::process::Command::new("aws")
             .args([
-                "ec2", "describe-images",
-                "--region", &self.region,
-                "--image-ids", image_id,
-                "--output", "json",
+                "ec2",
+                "describe-images",
+                "--region",
+                &self.region,
+                "--image-ids",
+                image_id,
+                "--output",
+                "json",
             ])
             .output()
             .await?;
@@ -300,9 +310,12 @@ impl CloudImageManager for AwsImageManager {
         // Deregister AMI
         let output = tokio::process::Command::new("aws")
             .args([
-                "ec2", "deregister-image",
-                "--region", &self.region,
-                "--image-id", image_id,
+                "ec2",
+                "deregister-image",
+                "--region",
+                &self.region,
+                "--image-id",
+                image_id,
             ])
             .output()
             .await?;
@@ -315,9 +328,12 @@ impl CloudImageManager for AwsImageManager {
         if let Some(snap_id) = snapshot_id {
             let _ = tokio::process::Command::new("aws")
                 .args([
-                    "ec2", "delete-snapshot",
-                    "--region", &self.region,
-                    "--snapshot-id", &snap_id,
+                    "ec2",
+                    "delete-snapshot",
+                    "--region",
+                    &self.region,
+                    "--snapshot-id",
+                    &snap_id,
                 ])
                 .output()
                 .await;
@@ -329,10 +345,7 @@ impl CloudImageManager for AwsImageManager {
     async fn delete_storage_object(&self, storage_uri: &str) -> Result<(), anyhow::Error> {
         tracing::info!(uri = %storage_uri, "Deleting S3 object");
         let output = tokio::process::Command::new("aws")
-            .args([
-                "s3", "rm", storage_uri,
-                "--region", &self.region,
-            ])
+            .args(["s3", "rm", storage_uri, "--region", &self.region])
             .output()
             .await?;
         if !output.status.success() {
@@ -348,10 +361,14 @@ impl AwsImageManager {
         loop {
             let output = tokio::process::Command::new("aws")
                 .args([
-                    "ec2", "describe-import-snapshot-tasks",
-                    "--region", &self.region,
-                    "--import-task-ids", task_id,
-                    "--output", "json",
+                    "ec2",
+                    "describe-import-snapshot-tasks",
+                    "--region",
+                    &self.region,
+                    "--import-task-ids",
+                    task_id,
+                    "--output",
+                    "json",
                 ])
                 .output()
                 .await?;
@@ -434,13 +451,20 @@ impl CloudImageManager for AzureImageManager {
         tracing::info!(blob_url = %blob_url, "Uploading VHD to Azure blob storage");
         let output = tokio::process::Command::new("az")
             .args([
-                "storage", "blob", "upload",
-                "--account-name", &self.storage_account,
-                "--container-name", &self.storage_container,
-                "--file", image_path,
-                "--name", &blob_name,
+                "storage",
+                "blob",
+                "upload",
+                "--account-name",
+                &self.storage_account,
+                "--container-name",
+                &self.storage_container,
+                "--file",
+                image_path,
+                "--name",
+                &blob_name,
                 "--overwrite",
-                "--output", "json",
+                "--output",
+                "json",
             ])
             .output()
             .await?;
@@ -453,16 +477,23 @@ impl CloudImageManager for AzureImageManager {
         tracing::info!(name = %name, "Creating Azure managed image");
         let output = tokio::process::Command::new("az")
             .args([
-                "image", "create",
-                "--resource-group", &self.resource_group,
-                "--name", name,
-                "--os-type", "Linux",
-                "--source", &blob_url,
-                "--location", &self.location,
+                "image",
+                "create",
+                "--resource-group",
+                &self.resource_group,
+                "--name",
+                name,
+                "--os-type",
+                "Linux",
+                "--source",
+                &blob_url,
+                "--location",
+                &self.location,
                 "--tags",
                 &format!("nix-store-hash={store_path_hash}"),
                 "managed-by=ekafleet",
-                "--output", "json",
+                "--output",
+                "json",
             ])
             .output()
             .await?;
@@ -483,15 +514,17 @@ impl CloudImageManager for AzureImageManager {
         &self,
         store_path_hash: &str,
     ) -> Result<Option<String>, anyhow::Error> {
-        let query = format!(
-            "[?tags.\"nix-store-hash\"=='{store_path_hash}'].name | [0]"
-        );
+        let query = format!("[?tags.\"nix-store-hash\"=='{store_path_hash}'].name | [0]");
         let output = tokio::process::Command::new("az")
             .args([
-                "image", "list",
-                "--resource-group", &self.resource_group,
-                "--query", &query,
-                "--output", "tsv",
+                "image",
+                "list",
+                "--resource-group",
+                &self.resource_group,
+                "--query",
+                &query,
+                "--output",
+                "tsv",
             ])
             .output()
             .await?;
@@ -512,10 +545,14 @@ impl CloudImageManager for AzureImageManager {
         tracing::info!(image = %image_id, "Deleting Azure managed image");
         let output = tokio::process::Command::new("az")
             .args([
-                "image", "delete",
-                "--resource-group", &self.resource_group,
-                "--name", image_id,
-                "--output", "json",
+                "image",
+                "delete",
+                "--resource-group",
+                &self.resource_group,
+                "--name",
+                image_id,
+                "--output",
+                "json",
             ])
             .output()
             .await?;
@@ -528,19 +565,22 @@ impl CloudImageManager for AzureImageManager {
 
     async fn delete_storage_object(&self, storage_uri: &str) -> Result<(), anyhow::Error> {
         // Extract blob name from URL
-        let blob_name = storage_uri
-            .rsplit('/')
-            .next()
-            .unwrap_or(storage_uri);
+        let blob_name = storage_uri.rsplit('/').next().unwrap_or(storage_uri);
 
         tracing::info!(blob = %blob_name, "Deleting Azure blob");
         let output = tokio::process::Command::new("az")
             .args([
-                "storage", "blob", "delete",
-                "--account-name", &self.storage_account,
-                "--container-name", &self.storage_container,
-                "--name", blob_name,
-                "--output", "json",
+                "storage",
+                "blob",
+                "delete",
+                "--account-name",
+                &self.storage_account,
+                "--container-name",
+                &self.storage_container,
+                "--name",
+                blob_name,
+                "--output",
+                "json",
             ])
             .output()
             .await?;
@@ -584,8 +624,12 @@ impl CloudImageManager for GcpImageManager {
         tracing::info!(gcs_uri = %gcs_uri, "Uploading disk image to GCS");
         let output = tokio::process::Command::new("gcloud")
             .args([
-                "storage", "cp", image_path, &gcs_uri,
-                "--project", &self.project,
+                "storage",
+                "cp",
+                image_path,
+                &gcs_uri,
+                "--project",
+                &self.project,
             ])
             .output()
             .await?;
@@ -602,17 +646,26 @@ impl CloudImageManager for GcpImageManager {
         tracing::info!(name = %name, "Creating GCE image");
         let output = tokio::process::Command::new("gcloud")
             .args([
-                "compute", "images", "create", name,
-                "--source-uri", &gcs_uri,
-                "--project", &self.project,
-                "--labels", &labels,
-                "--format", "json",
+                "compute",
+                "images",
+                "create",
+                name,
+                "--source-uri",
+                &gcs_uri,
+                "--project",
+                &self.project,
+                "--labels",
+                &labels,
+                "--format",
+                "json",
             ])
             .output()
             .await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow::anyhow!("gcloud compute images create failed: {stderr}"));
+            return Err(anyhow::anyhow!(
+                "gcloud compute images create failed: {stderr}"
+            ));
         }
 
         tracing::info!(name = %name, "GCE image created");
@@ -627,16 +680,18 @@ impl CloudImageManager for GcpImageManager {
         &self,
         store_path_hash: &str,
     ) -> Result<Option<String>, anyhow::Error> {
-        let filter = format!(
-            "labels.nix-store-hash={}",
-            store_path_hash.to_lowercase()
-        );
+        let filter = format!("labels.nix-store-hash={}", store_path_hash.to_lowercase());
         let output = tokio::process::Command::new("gcloud")
             .args([
-                "compute", "images", "list",
-                "--project", &self.project,
-                "--filter", &filter,
-                "--format", "value(name)",
+                "compute",
+                "images",
+                "list",
+                "--project",
+                &self.project,
+                "--filter",
+                &filter,
+                "--format",
+                "value(name)",
             ])
             .output()
             .await?;
@@ -658,15 +713,21 @@ impl CloudImageManager for GcpImageManager {
         tracing::info!(image = %image_id, "Deleting GCE image");
         let output = tokio::process::Command::new("gcloud")
             .args([
-                "compute", "images", "delete", image_id,
-                "--project", &self.project,
+                "compute",
+                "images",
+                "delete",
+                image_id,
+                "--project",
+                &self.project,
                 "--quiet",
             ])
             .output()
             .await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow::anyhow!("gcloud compute images delete failed: {stderr}"));
+            return Err(anyhow::anyhow!(
+                "gcloud compute images delete failed: {stderr}"
+            ));
         }
         Ok(())
     }
@@ -674,10 +735,7 @@ impl CloudImageManager for GcpImageManager {
     async fn delete_storage_object(&self, storage_uri: &str) -> Result<(), anyhow::Error> {
         tracing::info!(uri = %storage_uri, "Deleting GCS object");
         let output = tokio::process::Command::new("gcloud")
-            .args([
-                "storage", "rm", storage_uri,
-                "--project", &self.project,
-            ])
+            .args(["storage", "rm", storage_uri, "--project", &self.project])
             .output()
             .await?;
         if !output.status.success() {
@@ -698,11 +756,7 @@ pub fn extract_store_path_hash(store_path: &str) -> Option<&str> {
     // Store paths look like: /nix/store/<32-char-hash>-<name>
     let basename = store_path.strip_prefix("/nix/store/")?;
     let hash = basename.split('-').next()?;
-    if hash.len() == 32 {
-        Some(hash)
-    } else {
-        None
-    }
+    if hash.len() == 32 { Some(hash) } else { None }
 }
 
 // ---------------------------------------------------------------------------
@@ -735,16 +789,14 @@ pub async fn ensure_image(
     };
 
     // 1. Build the NixOS system toplevel to get the store path
-    let toplevel_attr = format!(
-        "{}.config.system.build.toplevel",
-        image_config.nixos_config
-    );
+    let toplevel_attr = format!("{}.config.system.build.toplevel", image_config.nixos_config);
     tracing::info!(
         pool = %pool_name,
         attr = %toplevel_attr,
         "Building NixOS system toplevel to determine store path"
     );
-    let store_path = nix::build(&toplevel_attr).await
+    let store_path = nix::build(&toplevel_attr)
+        .await
         .map_err(|e| anyhow::anyhow!("failed to build toplevel for pool {pool_name}: {e}"))?;
 
     // 2. Extract the content-addressable hash
@@ -779,7 +831,8 @@ pub async fn ensure_image(
         attr = %disk_image_ref,
         "Building NixOS disk image (configuration changed)"
     );
-    let disk_image_path = nix::build(&disk_image_ref).await
+    let disk_image_path = nix::build(&disk_image_ref)
+        .await
         .map_err(|e| anyhow::anyhow!("failed to build disk image for pool {pool_name}: {e}"))?;
 
     // 5. Register with cloud provider
@@ -873,9 +926,7 @@ pub async fn cleanup_expired_images(
         // Separate active from non-active
         let (_active, mut inactive): (Vec<_>, Vec<_>) = images
             .drain(..)
-            .partition(|img| {
-                current_hash.map_or(false, |h| h == &img.store_path_hash)
-            });
+            .partition(|img| current_hash.map_or(false, |h| h == &img.store_path_hash));
 
         // Sort inactive by created_at descending (newest first)
         inactive.sort_by(|a, b| b.created_at.cmp(&a.created_at));
@@ -980,8 +1031,14 @@ mod tests {
 
     #[test]
     fn default_disk_image_attrs() {
-        assert_eq!(default_disk_image_attr(&CloudProviderType::Aws), "amazonImage");
-        assert_eq!(default_disk_image_attr(&CloudProviderType::Azure), "azureImage");
+        assert_eq!(
+            default_disk_image_attr(&CloudProviderType::Aws),
+            "amazonImage"
+        );
+        assert_eq!(
+            default_disk_image_attr(&CloudProviderType::Azure),
+            "azureImage"
+        );
         assert_eq!(default_disk_image_attr(&CloudProviderType::Gcp), "gceImage");
     }
 }
