@@ -1632,18 +1632,12 @@ impl FleetControl for FleetControlService {
             (prev, fk.version)
         };
 
-        // Persist the new key to disk
+        // Persist the new key to disk, sealed at rest when configured.
         let key_path = self.data_dir.join("fleet-key");
         let hex: String = new_key.iter().map(|b| format!("{b:02x}")).collect();
-        tokio::fs::write(&key_path, &hex)
+        super::seal::write_maybe_sealed(&key_path, hex.as_bytes(), "fleet encryption key")
             .await
             .map_err(|e| Status::internal(format!("failed to persist rotated key: {e}")))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            let _ = tokio::fs::set_permissions(&key_path, perms).await;
-        }
 
         // Push the new per-agent derived key to all connected agents
         let node_ids = self.state.connected_nodes().await;

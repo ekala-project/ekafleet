@@ -16,6 +16,7 @@ pub mod reconciler;
 pub mod rest;
 pub mod scaling;
 pub mod scheduler;
+pub mod seal;
 pub mod state;
 pub mod webhook;
 
@@ -70,10 +71,10 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         let ca_cert_path = config.data_dir.join("ca-cert.pem");
 
         let (stored_key, stored_cert) = match (
-            tokio::fs::read_to_string(&ca_key_path).await,
+            seal::read_maybe_sealed(&ca_key_path).await,
             tokio::fs::read_to_string(&ca_cert_path).await,
         ) {
-            (Ok(key), Ok(cert)) => (Some(key), Some(cert)),
+            (Ok(key), Ok(cert)) => (Some(String::from_utf8(key.to_vec())?), Some(cert)),
             _ => (None, None),
         };
 
@@ -89,15 +90,8 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
             )
         {
             tokio::fs::create_dir_all(&config.data_dir).await?;
-            tokio::fs::write(&ca_key_path, &key_pem).await?;
+            seal::write_maybe_sealed(&ca_key_path, key_pem.as_bytes(), "CA private key").await?;
             tokio::fs::write(&ca_cert_path, &cert_pem).await?;
-
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let perms = std::fs::Permissions::from_mode(0o600);
-                tokio::fs::set_permissions(&ca_key_path, perms).await?;
-            }
 
             tracing::info!("CA key and certificate persisted to disk");
         }
@@ -123,7 +117,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     let trust_bundle_pem = ca.trust_bundle_pem().await?;
 
     // Generate or load fleet encryption key for secret distribution
-    let fleet_key = get_or_create_fleet_key(&config.data_dir)?;
+    let fleet_key = get_or_create_fleet_key(&config.data_dir).await?;
 
     let fleet_state = FleetState::new();
     let event_store = events::EventStore::new();
@@ -216,10 +210,17 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
 }
 
 /// Get or create a persistent fleet encryption key (256-bit).
-fn get_or_create_fleet_key(data_dir: &Path) -> anyhow::Result<Vec<u8>> {
+///
+/// The key is stored as hex and sealed at rest when a passphrase is configured
+/// (see [`seal`]). Legacy plaintext-hex files are read transparently.
+async fn get_or_create_fleet_key(data_dir: &Path) -> anyhow::Result<Vec<u8>> {
     let key_path = data_dir.join("fleet-key");
     if key_path.exists() {
-        let hex_str = std::fs::read_to_string(&key_path)?.trim().to_string();
+        let hex_bytes = seal::read_maybe_sealed(&key_path).await?;
+        let hex_str = String::from_utf8(hex_bytes.to_vec())
+            .map_err(|e| anyhow::anyhow!("invalid fleet key encoding: {e}"))?
+            .trim()
+            .to_string();
         let key: Vec<u8> = (0..hex_str.len())
             .step_by(2)
             .map(|i| u8::from_str_radix(&hex_str[i..i + 2], 16))
@@ -236,17 +237,8 @@ fn get_or_create_fleet_key(data_dir: &Path) -> anyhow::Result<Vec<u8>> {
         let mut key = [0u8; 32];
         rng.fill(&mut key)
             .map_err(|_| anyhow::anyhow!("RNG failure"))?;
-        if let Some(parent) = key_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
-        std::fs::write(&key_path, &hex)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            std::fs::set_permissions(&key_path, perms)?;
-        }
+        seal::write_maybe_sealed(&key_path, hex.as_bytes(), "fleet encryption key").await?;
         tracing::info!("Fleet encryption key generated and persisted");
         Ok(key.to_vec())
     }
