@@ -1471,13 +1471,43 @@ impl FleetControl for FleetControlService {
         let req = request.into_inner();
         tracing::info!(service = %req.service_name, "Promote deployment requested");
 
-        Ok(Response::new(PromoteResponse {
-            success: true,
-            message: format!(
-                "Canary deployment for '{}' promoted to full rollout",
-                req.service_name
-            ),
-        }))
+        let pending = match self.state.pending_canaries().take(&req.service_name).await {
+            Some(p) => p,
+            None => {
+                return Ok(Response::new(PromoteResponse {
+                    success: false,
+                    message: format!(
+                        "No canary deployment awaiting promotion for '{}'",
+                        req.service_name
+                    ),
+                }));
+            }
+        };
+
+        match crate::server::deployer::promote_canary(
+            &self.state,
+            &pending,
+            Some(&self.event_store),
+        )
+        .await
+        {
+            Ok(()) => Ok(Response::new(PromoteResponse {
+                success: true,
+                message: format!(
+                    "Canary deployment for '{}' promoted to full rollout",
+                    req.service_name
+                ),
+            })),
+            Err(e) => {
+                // Re-register the pending canary so the operator can retry or
+                // fail it, rather than silently losing the deployment.
+                self.state.pending_canaries().insert(pending).await;
+                Ok(Response::new(PromoteResponse {
+                    success: false,
+                    message: format!("Promotion of '{}' failed: {e}", req.service_name),
+                }))
+            }
+        }
     }
 
     async fn fail_deployment(
@@ -1487,10 +1517,25 @@ impl FleetControl for FleetControlService {
         let req = request.into_inner();
         tracing::info!(service = %req.service_name, "Fail deployment requested");
 
+        let pending = match self.state.pending_canaries().take(&req.service_name).await {
+            Some(p) => p,
+            None => {
+                return Ok(Response::new(FailDeploymentResponse {
+                    success: false,
+                    message: format!(
+                        "No canary deployment awaiting promotion for '{}'",
+                        req.service_name
+                    ),
+                }));
+            }
+        };
+
+        crate::server::deployer::fail_canary(&self.state, &pending, Some(&self.event_store)).await;
+
         Ok(Response::new(FailDeploymentResponse {
             success: true,
             message: format!(
-                "Deployment for '{}' marked as failed — rollback triggered",
+                "Deployment for '{}' marked as failed — canary rolled back",
                 req.service_name
             ),
         }))

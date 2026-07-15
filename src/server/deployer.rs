@@ -1,7 +1,10 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
+
+use tokio::sync::RwLock;
 
 use super::events::{DeployOutcome, EventStore};
 use super::scheduler::Placement;
@@ -9,6 +12,60 @@ use super::state::FleetState;
 use crate::config::{DisruptionBudget, UpdateStrategy};
 use crate::proto::server_message::Payload;
 use crate::proto::{DeployCommand, DeployStrategy, ServerMessage};
+
+/// A canary deployment that has been rolled out to its first instance, is
+/// healthy, and is waiting for an operator to promote (roll out to the rest)
+/// or fail it (roll the canary back). Holds everything needed to complete or
+/// unwind the deployment without re-running the scheduler.
+#[derive(Debug, Clone)]
+pub struct PendingCanary {
+    pub deployment_id: String,
+    pub service_name: String,
+    pub store_path: String,
+    /// The canary instance already deployed (placements[0]).
+    pub canary: Vec<Placement>,
+    /// Instances not yet deployed; rolled out on promote.
+    pub remaining: Vec<Placement>,
+    pub max_parallel: u32,
+    pub auto_revert: bool,
+    pub min_healthy_time: Duration,
+    pub healthy_deadline: Duration,
+    pub progress_deadline: Option<Duration>,
+    pub disruption_budget: Option<DisruptionBudget>,
+    pub total_replicas: u32,
+    /// Previous version for rollback on fail.
+    pub previous_store_path: Option<String>,
+}
+
+/// Registry of canary deployments awaiting manual promotion, keyed by service
+/// name (one active canary per service at a time). Shared between the reconcile
+/// loop that creates them and the Promote/Fail RPC handlers that resolve them.
+#[derive(Clone, Default)]
+pub struct PendingCanaryStore {
+    inner: Arc<RwLock<HashMap<String, PendingCanary>>>,
+}
+
+impl PendingCanaryStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub async fn insert(&self, pending: PendingCanary) {
+        self.inner
+            .write()
+            .await
+            .insert(pending.service_name.clone(), pending);
+    }
+
+    /// Remove and return the pending canary for a service, if any.
+    pub async fn take(&self, service_name: &str) -> Option<PendingCanary> {
+        self.inner.write().await.remove(service_name)
+    }
+
+    pub async fn contains(&self, service_name: &str) -> bool {
+        self.inner.read().await.contains_key(service_name)
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum DeployError {
@@ -358,6 +415,31 @@ async fn execute_canary(
             deployment_id,
             "Canary healthy — awaiting manual promotion via Promote RPC"
         );
+        // Persist everything needed to complete or unwind this canary so the
+        // Promote/Fail RPCs can act on it later.
+        let remaining = if plan.placements.len() > 1 {
+            plan.placements[1..].to_vec()
+        } else {
+            Vec::new()
+        };
+        state
+            .pending_canaries()
+            .insert(PendingCanary {
+                deployment_id: deployment_id.to_string(),
+                service_name: plan.service_name.clone(),
+                store_path: plan.store_path.clone(),
+                canary: canary.to_vec(),
+                remaining,
+                max_parallel: plan.max_parallel,
+                auto_revert: plan.auto_revert,
+                min_healthy_time: plan.min_healthy_time,
+                healthy_deadline: plan.healthy_deadline,
+                progress_deadline: plan.progress_deadline,
+                disruption_budget: plan.disruption_budget.clone(),
+                total_replicas: plan.total_replicas,
+                previous_store_path: plan.previous_store_path.clone(),
+            })
+            .await;
         return Err(DeployError::AwaitingPromotion(deployment_id.to_string()));
     }
 
@@ -383,6 +465,113 @@ async fn execute_canary(
     }
 
     Ok(())
+}
+
+/// Promote a healthy canary: roll the new version out to the remaining
+/// instances. Returns Ok once all remaining instances are deployed and healthy.
+pub async fn promote_canary(
+    state: &FleetState,
+    pending: &PendingCanary,
+    events: Option<&EventStore>,
+) -> Result<(), DeployError> {
+    tracing::info!(
+        deployment_id = %pending.deployment_id,
+        service = %pending.service_name,
+        remaining = pending.remaining.len(),
+        "Promoting canary to remaining instances"
+    );
+
+    if pending.remaining.is_empty() {
+        if let Some(es) = events {
+            es.record_deploy_complete(
+                &pending.deployment_id,
+                DeployOutcome::Succeeded,
+                "canary promoted (no remaining instances)",
+            )
+            .await;
+        }
+        return Ok(());
+    }
+
+    let remaining_plan = DeploymentPlan {
+        service_name: pending.service_name.clone(),
+        strategy: UpdateStrategy::Rolling,
+        max_parallel: pending.max_parallel,
+        placements: pending.remaining.clone(),
+        store_path: pending.store_path.clone(),
+        auto_revert: pending.auto_revert,
+        auto_promote: true,
+        min_healthy_time: pending.min_healthy_time,
+        healthy_deadline: pending.healthy_deadline,
+        progress_deadline: pending.progress_deadline,
+        disruption_budget: pending.disruption_budget.clone(),
+        total_replicas: pending.total_replicas,
+        previous_store_path: pending.previous_store_path.clone(),
+    };
+
+    let result = execute_rolling(state, &pending.deployment_id, &remaining_plan).await;
+
+    if let Some(es) = events {
+        match &result {
+            Ok(()) => {
+                es.record_deploy_complete(
+                    &pending.deployment_id,
+                    DeployOutcome::Succeeded,
+                    "canary promoted to full rollout",
+                )
+                .await;
+            }
+            Err(e) => {
+                es.record_deploy_complete(
+                    &pending.deployment_id,
+                    DeployOutcome::Failed,
+                    &format!("promotion failed: {e}"),
+                )
+                .await;
+            }
+        }
+    }
+
+    result
+}
+
+/// Fail a canary: roll the canary instance back to the previous version (if
+/// known) and record the deployment as rolled back / failed.
+pub async fn fail_canary(state: &FleetState, pending: &PendingCanary, events: Option<&EventStore>) {
+    tracing::info!(
+        deployment_id = %pending.deployment_id,
+        service = %pending.service_name,
+        "Failing canary — rolling back canary instance"
+    );
+
+    let rolled_back = if let Some(prev) = &pending.previous_store_path {
+        revert_deployed_nodes(
+            state,
+            &pending.deployment_id,
+            &pending.service_name,
+            prev,
+            &pending.canary,
+        )
+        .await;
+        true
+    } else {
+        tracing::warn!(
+            deployment_id = %pending.deployment_id,
+            service = %pending.service_name,
+            "No previous store path — canary instance left in place (first deployment?)"
+        );
+        false
+    };
+
+    if let Some(es) = events {
+        let outcome = if rolled_back {
+            DeployOutcome::RolledBack
+        } else {
+            DeployOutcome::Failed
+        };
+        es.record_deploy_complete(&pending.deployment_id, outcome, "canary manually failed")
+            .await;
+    }
 }
 
 /// Blue-green deployment: deploy all new instances, then switch.
@@ -599,4 +788,85 @@ pub fn compute_deploy_order(
     }
 
     tiers
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn placement(service: &str, instance: &str, machine: &str) -> Placement {
+        Placement {
+            service_name: service.to_string(),
+            instance_id: instance.to_string(),
+            machine_name: machine.to_string(),
+        }
+    }
+
+    fn sample_pending(service: &str, remaining: Vec<Placement>) -> PendingCanary {
+        PendingCanary {
+            deployment_id: "dep-1".to_string(),
+            service_name: service.to_string(),
+            store_path: "/nix/store/new".to_string(),
+            canary: vec![placement(service, "i0", "node-0")],
+            remaining,
+            max_parallel: 1,
+            auto_revert: true,
+            min_healthy_time: Duration::from_secs(0),
+            healthy_deadline: Duration::from_secs(1),
+            progress_deadline: None,
+            disruption_budget: None,
+            total_replicas: 3,
+            previous_store_path: Some("/nix/store/old".to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_store_insert_take_is_one_shot() {
+        let store = PendingCanaryStore::new();
+        assert!(!store.contains("web").await);
+
+        store.insert(sample_pending("web", vec![])).await;
+        assert!(store.contains("web").await);
+
+        let taken = store.take("web").await;
+        assert!(taken.is_some());
+        // A second take returns None — the pending canary is consumed.
+        assert!(store.take("web").await.is_none());
+        assert!(!store.contains("web").await);
+    }
+
+    #[tokio::test]
+    async fn promote_with_no_remaining_succeeds() {
+        // A canary that is the only replica has nothing left to roll out;
+        // promotion must succeed without contacting any agent.
+        let state = FleetState::new();
+        let pending = sample_pending("web", vec![]);
+        let result = promote_canary(&state, &pending, None).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn promote_with_unreachable_remaining_fails() {
+        // Remaining instances target a node that is not connected, so the
+        // rollout must surface a NodeFailed error rather than reporting success.
+        let state = FleetState::new();
+        let pending = sample_pending("web", vec![placement("web", "i1", "missing-node")]);
+        let result = promote_canary(&state, &pending, None).await;
+        // auto_revert is true, so an unreachable node surfaces as Reverted;
+        // either way the promotion must not report success.
+        assert!(matches!(
+            result,
+            Err(DeployError::Reverted(_)) | Err(DeployError::NodeFailed { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn fail_canary_does_not_panic_without_previous_path() {
+        // Failing a first-ever canary (no previous version) must be a no-op
+        // rollback, not a panic.
+        let state = FleetState::new();
+        let mut pending = sample_pending("web", vec![]);
+        pending.previous_store_path = None;
+        fail_canary(&state, &pending, None).await;
+    }
 }

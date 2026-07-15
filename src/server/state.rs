@@ -44,6 +44,8 @@ pub struct FleetState {
     /// Fired whenever fleet membership changes in a way that may require
     /// rescheduling (node eviction, agent disconnect, service crash).
     reconcile: ReconcileTrigger,
+    /// Canary deployments that are healthy and awaiting manual promotion.
+    pending_canaries: super::deployer::PendingCanaryStore,
 }
 
 struct FleetStateInner {
@@ -86,7 +88,13 @@ impl FleetState {
                 pending_requests: HashMap::new(),
             })),
             reconcile: ReconcileTrigger::new(),
+            pending_canaries: super::deployer::PendingCanaryStore::new(),
         }
+    }
+
+    /// Handle to the registry of canary deployments awaiting manual promotion.
+    pub fn pending_canaries(&self) -> super::deployer::PendingCanaryStore {
+        self.pending_canaries.clone()
     }
 
     /// Get a handle to the reconciliation trigger. Callers that observe a
