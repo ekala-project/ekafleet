@@ -516,6 +516,13 @@ message WireguardPeer {
   string public_key = 2;
   string endpoint = 3;
   string allowed_ip = 4;
+  // ASN.1/DER ECDSA-P256 signature over the canonical advertisement bytes
+  // (node_id || public_key || endpoint || allowed_ip), produced with the
+  // advertising node's SVID private key. Empty if unsigned (legacy/dev).
+  bytes signature = 5;
+  // PEM of the advertising node's SVID certificate, used to verify `signature`
+  // and to bind `public_key` to the node's SPIFFE identity.
+  string signing_cert_pem = 6;
 }
 
 message PolicyUpdate {

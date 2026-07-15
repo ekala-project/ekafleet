@@ -141,7 +141,7 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
     let health_checker = HealthChecker::new();
     let dns_resolver = Arc::new(DnsResolver::new("fleet.internal", vec![]));
     let wg_manager = WireguardManager::new("wg-fleet", 51820);
-    let peer_manager = Arc::new(RwLock::new(PeerManager::new(wg_manager)));
+    let peer_manager = Arc::new(RwLock::new(PeerManager::new(wg_manager, "fleet.internal")));
     let policy_enforcer = Arc::new(PolicyEnforcer::new());
 
     // Pre-allocate strings used in every heartbeat to avoid per-tick allocations

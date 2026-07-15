@@ -8,6 +8,9 @@ use super::wireguard::WireguardManager;
 pub struct PeerManager {
     wg: WireguardManager,
     peers: HashMap<String, PeerInfo>,
+    /// Trust domain used to verify that a peer advertisement's signing
+    /// certificate matches the advertised node identity.
+    trust_domain: String,
 }
 
 #[derive(Debug, Clone)]
@@ -18,10 +21,11 @@ struct PeerInfo {
 }
 
 impl PeerManager {
-    pub fn new(wg: WireguardManager) -> Self {
+    pub fn new(wg: WireguardManager, trust_domain: impl Into<String>) -> Self {
         Self {
             wg,
             peers: HashMap::new(),
+            trust_domain: trust_domain.into(),
         }
     }
 
@@ -31,6 +35,27 @@ impl PeerManager {
         &mut self,
         updates: Vec<crate::proto::WireguardPeer>,
     ) -> Result<(), super::wireguard::WgError> {
+        // Only accept advertisements whose WireGuard key is cryptographically
+        // bound to the advertising node's SVID identity. Unsigned or forged
+        // advertisements are dropped so a leaked/substituted public key cannot
+        // be installed as another node's peer.
+        let updates: Vec<crate::proto::WireguardPeer> = updates
+            .into_iter()
+            .filter(
+                |peer| match super::advert::verify_advert(peer, &self.trust_domain) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        tracing::warn!(
+                            node_id = %peer.node_id,
+                            error = %e,
+                            "Rejected unverified WireGuard peer advertisement"
+                        );
+                        false
+                    }
+                },
+            )
+            .collect();
+
         let new_ids: Vec<String> = updates.iter().map(|p| p.node_id.clone()).collect();
 
         // Add/update peers
