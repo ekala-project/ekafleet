@@ -415,7 +415,9 @@ fn build_env_lines(spec: &ServiceSpec) -> String {
         "Environment=SPIFFE_ENDPOINT_SOCKET=unix://{}",
         crate::spiffe::socket::DEFAULT_SOCKET_PATH
     ));
-    // Service name for workload attestation (PID → service mapping fallback)
+    // Informational only: exposes the service name to the workload for its own
+    // logging/config. NOT used for SPIFFE workload attestation — identity is
+    // derived from the process's systemd cgroup, which is not workload-forgeable.
     env_entries.push(format!("Environment=EKAFLEET_SERVICE={}", spec.name));
 
     env_entries.join("\n")

@@ -4,62 +4,44 @@
 /// to an ekafleet service name. This allows the Workload API to determine which
 /// SVID to serve to a given caller.
 ///
-/// Attestation strategies (tried in order):
-///   1. Check `/proc/<pid>/cgroup` for `ekafleet-<name>.service` unit
-///   2. Check `/proc/<pid>/environ` for `EKAFLEET_SERVICE=<name>` env var
+/// Attestation is **cgroup-based only**. The service name is derived from the
+/// process's systemd cgroup membership (`/proc/<pid>/cgroup`), which is set by
+/// the kernel when the supervisor launches the unit and cannot be forged by the
+/// workload itself.
+///
+/// A previous version also honored an `EKAFLEET_SERVICE` environment variable as
+/// a fallback. That was removed because a process can set any environment
+/// variable it likes, so it could claim to be any service and be issued that
+/// service's SVID — a privilege-escalation / identity-spoofing hole. Environment
+/// is an attacker-controlled input and must never be used as an identity source.
 ///
 /// Determine which ekafleet service a PID belongs to.
 /// Returns None if the PID is not part of any managed service.
 pub async fn attest_pid(pid: u32) -> Option<String> {
-    // Strategy 1: Parse systemd cgroup for ekafleet unit name
-    if let Some(name) = attest_from_cgroup(pid).await {
-        return Some(name);
-    }
-
-    // Strategy 2: Check environment variable
-    if let Some(name) = attest_from_environ(pid).await {
-        return Some(name);
-    }
-
-    None
-}
-
-/// Extract service name from /proc/<pid>/cgroup.
-/// Looks for cgroup paths containing "ekafleet-<name>.service".
-async fn attest_from_cgroup(pid: u32) -> Option<String> {
     let cgroup_path = format!("/proc/{pid}/cgroup");
     let content = tokio::fs::read_to_string(&cgroup_path).await.ok()?;
-
-    for line in content.lines() {
-        // Cgroup v2 format: "0::/system.slice/ekafleet-myapp.service"
-        // Cgroup v1 format: "1:name=systemd:/system.slice/ekafleet-myapp.service"
-        if let Some(pos) = line.find("ekafleet-") {
-            let after_prefix = &line[pos + "ekafleet-".len()..];
-            if let Some(end) = after_prefix.find(".service") {
-                let name = &after_prefix[..end];
-                if !name.is_empty() {
-                    return Some(name.to_string());
-                }
-            }
-        }
-    }
-
-    None
+    attest_from_cgroup_content(&content)
 }
 
-/// Extract service name from /proc/<pid>/environ.
-/// Looks for EKAFLEET_SERVICE=<name> in the null-delimited environ file.
-async fn attest_from_environ(pid: u32) -> Option<String> {
-    let environ_path = format!("/proc/{pid}/environ");
-    let content = tokio::fs::read(&environ_path).await.ok()?;
-
-    // Environment variables are null-terminated
-    let prefix = b"EKAFLEET_SERVICE=";
-    for var in content.split(|&b| b == 0) {
-        if var.starts_with(prefix) {
-            let value = &var[prefix.len()..];
-            let name = String::from_utf8_lossy(value);
-            if !name.is_empty() {
+/// Extract the ekafleet service name from the contents of `/proc/<pid>/cgroup`.
+///
+/// The unit is expected to appear as a full path segment named
+/// `ekafleet-<name>.service` (as written by the supervisor), e.g.
+/// `0::/system.slice/ekafleet-web.service`. Matching on a path segment (rather
+/// than a loose substring) avoids being fooled by an unrelated path component
+/// that merely contains the text `ekafleet-`.
+fn attest_from_cgroup_content(content: &str) -> Option<String> {
+    for line in content.lines() {
+        // Cgroup v2: "0::/system.slice/ekafleet-myapp.service"
+        // Cgroup v1: "1:name=systemd:/system.slice/ekafleet-myapp.service"
+        // The path is the last ':'-separated field.
+        let path = line.rsplit(':').next().unwrap_or(line);
+        for segment in path.split('/') {
+            if let Some(name) = segment
+                .strip_prefix("ekafleet-")
+                .and_then(|s| s.strip_suffix(".service"))
+                && !name.is_empty()
+            {
                 return Some(name.to_string());
             }
         }
@@ -74,32 +56,39 @@ mod tests {
 
     #[test]
     fn parse_cgroup_v2_line() {
-        // Simulate cgroup parsing logic
-        let line = "0::/system.slice/ekafleet-web-server.service";
-        let pos = line.find("ekafleet-").unwrap();
-        let after = &line[pos + "ekafleet-".len()..];
-        let end = after.find(".service").unwrap();
-        let name = &after[..end];
-        assert_eq!(name, "web-server");
+        let content = "0::/system.slice/ekafleet-web-server.service";
+        assert_eq!(
+            attest_from_cgroup_content(content),
+            Some("web-server".to_string())
+        );
     }
 
     #[test]
     fn parse_cgroup_v1_line() {
-        let line = "1:name=systemd:/system.slice/ekafleet-api.service";
-        let pos = line.find("ekafleet-").unwrap();
-        let after = &line[pos + "ekafleet-".len()..];
-        let end = after.find(".service").unwrap();
-        let name = &after[..end];
-        assert_eq!(name, "api");
+        let content = "1:name=systemd:/system.slice/ekafleet-api.service";
+        assert_eq!(attest_from_cgroup_content(content), Some("api".to_string()));
     }
 
     #[test]
-    fn parse_environ_entry() {
-        let prefix = b"EKAFLEET_SERVICE=";
-        let var = b"EKAFLEET_SERVICE=my-app";
-        assert!(var.starts_with(prefix));
-        let value = &var[prefix.len()..];
-        assert_eq!(std::str::from_utf8(value).unwrap(), "my-app");
+    fn nested_slice_path_is_parsed() {
+        let content = "0::/system.slice/some.slice/ekafleet-db.service";
+        assert_eq!(attest_from_cgroup_content(content), Some("db".to_string()));
+    }
+
+    #[test]
+    fn unrelated_cgroup_returns_none() {
+        let content = "0::/user.slice/user-1000.slice/session-3.scope";
+        assert_eq!(attest_from_cgroup_content(content), None);
+    }
+
+    #[test]
+    fn substring_match_does_not_forge_identity() {
+        // A path component that merely contains "ekafleet-" as a substring but
+        // is not a distinct `ekafleet-<name>.service` segment must not match,
+        // so an unprivileged process cannot craft a cgroup-looking path to
+        // impersonate a service.
+        let content = "0::/system.slice/notekafleet-evil.service.d/foo";
+        assert_eq!(attest_from_cgroup_content(content), None);
     }
 
     #[tokio::test]
