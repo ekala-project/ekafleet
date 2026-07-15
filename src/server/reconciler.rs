@@ -59,6 +59,58 @@ pub struct MigrationOp {
     pub dest_machine: String,
 }
 
+/// Outcome of migrating a single instance's volumes to its destination node.
+#[derive(Debug, Clone)]
+struct MigrationResult {
+    instance_id: String,
+    dest_machine: String,
+    /// `None` on success; failure reason otherwise.
+    error: Option<String>,
+}
+
+/// Summary of a partially- or fully-failed set of migrations for one service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MigrationFailureSummary {
+    /// Instance IDs whose migration failed.
+    failed_instances: Vec<String>,
+    /// Destination machines that *did* receive data before the service was
+    /// abandoned — these hold orphaned partial copies from the failed attempt.
+    orphaned_destinations: Vec<String>,
+}
+
+/// Classify a set of per-instance migration results. Returns `None` if every
+/// migration succeeded (the reschedule may proceed), or a summary of the
+/// failure otherwise (the reschedule must be skipped). This is the pure
+/// decision core of the reschedule partial-failure handling, factored out so it
+/// can be tested without a live fleet.
+fn summarize_migration_failure(results: &[MigrationResult]) -> Option<MigrationFailureSummary> {
+    let any_failed = results.iter().any(|r| r.error.is_some());
+    if !any_failed {
+        return None;
+    }
+
+    let failed_instances = results
+        .iter()
+        .filter(|r| r.error.is_some())
+        .map(|r| r.instance_id.clone())
+        .collect();
+
+    // Destinations that succeeded now hold orphaned copies, since the service
+    // as a whole will not cut over to them.
+    let mut orphaned_destinations: Vec<String> = results
+        .iter()
+        .filter(|r| r.error.is_none() && !r.dest_machine.is_empty())
+        .map(|r| r.dest_machine.clone())
+        .collect();
+    orphaned_destinations.sort();
+    orphaned_destinations.dedup();
+
+    Some(MigrationFailureSummary {
+        failed_instances,
+        orphaned_destinations,
+    })
+}
+
 /// Run a single reconciliation cycle: eval → refresh → plan → apply.
 pub async fn reconcile_once(
     config_path: &Path,
@@ -395,12 +447,19 @@ async fn apply_plan(
         };
         let max_parallel = service_cfg.scheduling.migrate.max_parallel as usize;
 
-        let mut service_failed = false;
-        for chunk in op.migrations.chunks(max_parallel) {
-            if service_failed {
-                break;
-            }
+        // Volume paths for all local RWO volumes in this service.
+        let volume_names: Vec<String> = service_cfg
+            .volumes
+            .iter()
+            .filter(|v| {
+                v.storage_class == "local"
+                    && v.access_mode == config::VolumeAccessMode::ReadWriteOnce
+            })
+            .map(|v| v.name.clone())
+            .collect();
 
+        let mut results: Vec<MigrationResult> = Vec::new();
+        for chunk in op.migrations.chunks(max_parallel.max(1)) {
             let mut handles = Vec::new();
             for migration in chunk {
                 let source_host = desired
@@ -409,21 +468,14 @@ async fn apply_plan(
                     .map(|m| m.target_host.clone())
                     .unwrap_or_default();
                 let dest_machine = migration.dest_machine.clone();
+                let instance_id = migration.instance_id.clone();
                 let service_name = op.service_name.clone();
+                let volume_names = volume_names.clone();
                 let s = state.clone();
 
-                // Build volume paths for all local volumes in this service
-                let volume_names: Vec<String> = service_cfg
-                    .volumes
-                    .iter()
-                    .filter(|v| {
-                        v.storage_class == "local"
-                            && v.access_mode == config::VolumeAccessMode::ReadWriteOnce
-                    })
-                    .map(|v| v.name.clone())
-                    .collect();
-
-                // Each migration task returns Ok(()) on success, Err(msg) on failure.
+                // Each migration task returns a per-instance MigrationResult so
+                // the caller can reason about partial failures: which instances
+                // reached the destination and which did not.
                 handles.push(tokio::spawn(async move {
                     for vol_name in &volume_names {
                         let vol_path = format!(
@@ -444,72 +496,84 @@ async fn apply_plan(
                             ),
                         };
                         let timeout = Duration::from_secs(600);
-                        match s
+                        let outcome = s
                             .send_command(&dest_machine, msg, correlation_id, timeout)
-                            .await
-                        {
-                            Ok(resp) if resp.success => {
-                                tracing::info!(
-                                    service = %service_name,
-                                    volume = %vol_name,
-                                    dest = %dest_machine,
-                                    "Volume migration completed"
-                                );
-                            }
-                            Ok(resp) => {
-                                tracing::error!(
-                                    service = %service_name,
-                                    volume = %vol_name,
-                                    dest = %dest_machine,
-                                    error = %resp.error_message,
-                                    "Volume migration failed"
-                                );
-                                return Err(format!(
-                                    "migration of volume {vol_name} to {dest_machine} failed: {}",
-                                    resp.error_message
-                                ));
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    service = %service_name,
-                                    volume = %vol_name,
-                                    dest = %dest_machine,
-                                    error = %e,
-                                    "Volume migration command failed"
-                                );
-                                return Err(format!(
-                                    "migration of volume {vol_name} to {dest_machine} failed: {e}"
-                                ));
-                            }
+                            .await;
+                        let err = match outcome {
+                            Ok(resp) if resp.success => None,
+                            Ok(resp) => Some(format!(
+                                "migration of volume {vol_name} to {dest_machine} failed: {}",
+                                resp.error_message
+                            )),
+                            Err(e) => Some(format!(
+                                "migration of volume {vol_name} to {dest_machine} failed: {e}"
+                            )),
+                        };
+                        if let Some(msg) = err {
+                            tracing::error!(
+                                service = %service_name,
+                                volume = %vol_name,
+                                dest = %dest_machine,
+                                instance = %instance_id,
+                                "Volume migration failed"
+                            );
+                            return MigrationResult {
+                                instance_id,
+                                dest_machine,
+                                error: Some(msg),
+                            };
                         }
+                        tracing::info!(
+                            service = %service_name,
+                            volume = %vol_name,
+                            dest = %dest_machine,
+                            instance = %instance_id,
+                            "Volume migration completed"
+                        );
                     }
-                    Ok(())
+                    MigrationResult {
+                        instance_id,
+                        dest_machine,
+                        error: None,
+                    }
                 }));
             }
             for handle in handles {
                 match handle.await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(msg)) => {
-                        tracing::error!(
-                            service = %op.service_name,
-                            error = %msg,
-                            "Volume migration failed — skipping reschedule for this service to prevent data loss"
-                        );
-                        service_failed = true;
-                    }
+                    Ok(result) => results.push(result),
                     Err(e) => {
+                        // A panicked task means we cannot account for that
+                        // instance's data at all; treat it as a failure with an
+                        // unknown destination so the service is skipped.
                         tracing::error!(
                             service = %op.service_name,
                             error = %e,
-                            "Volume migration task panicked — skipping reschedule"
+                            "Volume migration task panicked"
                         );
-                        service_failed = true;
+                        results.push(MigrationResult {
+                            instance_id: String::new(),
+                            dest_machine: String::new(),
+                            error: Some(format!("migration task panicked: {e}")),
+                        });
                     }
                 }
             }
         }
 
-        if service_failed {
+        // Partial-failure semantics: a reschedule is all-or-nothing. If any
+        // instance failed to migrate, skip the whole service's cutover so the
+        // service stays on its source nodes (source data is untouched — rsync
+        // copies, it does not move). Surface the destinations that *did* receive
+        // data as orphaned partial copies so an operator can reason about them;
+        // a retry is safe because the migration rsync is idempotent (--delete).
+        if let Some(summary) = summarize_migration_failure(&results) {
+            tracing::error!(
+                service = %op.service_name,
+                failed = ?summary.failed_instances,
+                partial_dests = ?summary.orphaned_destinations,
+                "Volume migration partially failed — skipping reschedule to prevent data loss; \
+                 destinations listed hold orphaned partial copies from this attempt"
+            );
             migration_failed_services.push(op.service_name.clone());
         }
     }
@@ -659,6 +723,82 @@ mod tests {
         ServiceConfig,
     };
     use crate::raft::state::FleetStateMachine;
+
+    fn mig_result(instance: &str, dest: &str, err: Option<&str>) -> MigrationResult {
+        MigrationResult {
+            instance_id: instance.to_string(),
+            dest_machine: dest.to_string(),
+            error: err.map(|e| e.to_string()),
+        }
+    }
+
+    #[test]
+    fn all_migrations_succeed_allows_reschedule() {
+        // No failures — the reschedule may proceed, so no summary is produced.
+        let results = vec![
+            mig_result("i0", "node-b", None),
+            mig_result("i1", "node-c", None),
+        ];
+        assert!(summarize_migration_failure(&results).is_none());
+    }
+
+    #[test]
+    fn empty_results_allows_reschedule() {
+        assert!(summarize_migration_failure(&[]).is_none());
+    }
+
+    #[test]
+    fn total_failure_reports_no_orphans() {
+        // Every migration failed, so nothing reached a destination — there are
+        // no orphaned partial copies to clean up, only failed instances.
+        let results = vec![
+            mig_result("i0", "node-b", Some("timeout")),
+            mig_result("i1", "node-c", Some("rsync failed")),
+        ];
+        let summary = summarize_migration_failure(&results).expect("failure expected");
+        assert_eq!(summary.failed_instances, vec!["i0", "i1"]);
+        assert!(summary.orphaned_destinations.is_empty());
+    }
+
+    #[test]
+    fn partial_failure_reports_orphaned_destinations() {
+        // i0 reached node-b, i1 failed. The whole reschedule is abandoned, so
+        // node-b now holds an orphaned partial copy that must be surfaced.
+        let results = vec![
+            mig_result("i0", "node-b", None),
+            mig_result("i1", "node-c", Some("dest unreachable")),
+        ];
+        let summary = summarize_migration_failure(&results).expect("failure expected");
+        assert_eq!(summary.failed_instances, vec!["i1"]);
+        assert_eq!(summary.orphaned_destinations, vec!["node-b"]);
+    }
+
+    #[test]
+    fn orphaned_destinations_are_deduped_and_sorted() {
+        // Two instances succeeded onto the same destination; it should appear
+        // once. Ordering is deterministic for stable logging/testing.
+        let results = vec![
+            mig_result("i0", "node-z", None),
+            mig_result("i1", "node-a", None),
+            mig_result("i2", "node-z", None),
+            mig_result("i3", "node-b", Some("boom")),
+        ];
+        let summary = summarize_migration_failure(&results).expect("failure expected");
+        assert_eq!(summary.orphaned_destinations, vec!["node-a", "node-z"]);
+    }
+
+    #[test]
+    fn panicked_task_with_empty_dest_is_not_an_orphan() {
+        // A panicked task is recorded with an empty destination; it counts as a
+        // failure but must not be reported as an orphaned destination.
+        let results = vec![
+            mig_result("i0", "node-b", None),
+            mig_result("", "", Some("migration task panicked")),
+        ];
+        let summary = summarize_migration_failure(&results).expect("failure expected");
+        assert_eq!(summary.orphaned_destinations, vec!["node-b"]);
+        assert!(summary.failed_instances.contains(&String::new()));
+    }
 
     fn empty_fleet_config() -> FleetConfig {
         FleetConfig {
