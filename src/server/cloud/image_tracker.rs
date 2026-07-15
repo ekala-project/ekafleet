@@ -1,9 +1,6 @@
 #![allow(dead_code)]
 
-use std::sync::Arc;
-
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
 
 use crate::raft::state::{Command, FleetStateMachine};
 
@@ -43,24 +40,13 @@ pub struct RegisteredImage {
 #[derive(Clone)]
 pub struct ImageTracker {
     raft: FleetStateMachine,
-    next_index: Arc<RwLock<u64>>,
 }
 
 impl ImageTracker {
     const KEY_PREFIX: &str = "cloud-image/";
 
     pub fn new(raft: FleetStateMachine) -> Self {
-        Self {
-            raft,
-            // Start high to avoid collisions with instance tracker indices
-            next_index: Arc::new(RwLock::new(2_000_000)),
-        }
-    }
-
-    async fn next_index(&self) -> u64 {
-        let mut idx = self.next_index.write().await;
-        *idx += 1;
-        *idx
+        Self { raft }
     }
 
     /// Build a KV key for an image.
@@ -84,8 +70,7 @@ impl ImageTracker {
     pub async fn put(&self, image: &RegisteredImage) {
         let key = Self::key(&image.provider, &image.region, &image.store_path_hash);
         let value = serde_json::to_vec(image).expect("RegisteredImage serialization");
-        let index = self.next_index().await;
-        self.raft.apply(index, Command::KvPut { key, value }).await;
+        self.raft.apply_next(Command::KvPut { key, value }).await;
 
         tracing::info!(
             image_id = %image.image_id,
@@ -100,8 +85,7 @@ impl ImageTracker {
     /// Remove a tracked image.
     pub async fn delete(&self, provider: &str, region: &str, store_path_hash: &str) {
         let key = Self::key(provider, region, store_path_hash);
-        let index = self.next_index().await;
-        self.raft.apply(index, Command::KvDelete { key }).await;
+        self.raft.apply_next(Command::KvDelete { key }).await;
 
         tracing::info!(store_path_hash, provider, region, "Untracked cloud image");
     }

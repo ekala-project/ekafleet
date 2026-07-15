@@ -4,7 +4,7 @@ A single Rust binary that replaces the HashiCorp stack (Nomad + Consul + Vault) 
 
 ## Two Modes
 
-- **`ekafleet server`** — control plane: priority-based scheduling, RBAC, CA, secrets, DNS authority, deployment orchestration with disruption budgets, event tracking, REST API, Raft consensus, node attestation
+- **`ekafleet server`** — control plane: priority-based scheduling, RBAC, CA, secrets, DNS authority, deployment orchestration with disruption budgets, event tracking, REST API, encrypted persistent state with restore-on-boot, node attestation
 - **`ekafleet agent`** — data plane: service supervision with lifecycle hooks, liveness/readiness/startup probes, config templating, DNS resolver, secret injection, mesh networking, SPIFFE Workload API, L7/L4 proxy with circuit breaking, persistent volumes
 
 Server mode embeds all agent capabilities and can run workloads directly.
@@ -14,7 +14,7 @@ Server mode embeds all agent capabilities and can run workloads directly.
 | Tool | ekafleet Subsystem |
 |------|-------------------|
 | Nomad | `scheduler` + `deployer` + `scaling` |
-| Consul (DNS, Connect, KV) | `dns_authority` + `dns_resolver` + `wireguard` + `certs` + `raft` |
+| Consul (DNS, Connect, KV) | `dns_authority` + `dns_resolver` + `wireguard` + `certs` + `state` |
 | Vault (KV, PKI, Dynamic) | `secrets_store` + `ca_root` + `certs` |
 | SPIRE | `ca_root` + `attestation` + `workload_api` (SPIFFE Workload API, node attestation) |
 | cert-manager | `certs` (auto-renewal) |

@@ -1,9 +1,6 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::sync::Arc;
-
-use tokio::sync::RwLock;
 
 use crate::raft::state::{Command, FleetStateMachine, TrackedCloudInstance};
 
@@ -12,22 +9,11 @@ use crate::raft::state::{Command, FleetStateMachine, TrackedCloudInstance};
 #[derive(Clone)]
 pub struct InstanceTracker {
     raft: FleetStateMachine,
-    /// Monotonically increasing index for Raft commands.
-    next_index: Arc<RwLock<u64>>,
 }
 
 impl InstanceTracker {
     pub fn new(raft: FleetStateMachine) -> Self {
-        Self {
-            raft,
-            next_index: Arc::new(RwLock::new(1_000_000)), // Start high to avoid collisions
-        }
-    }
-
-    async fn next_index(&self) -> u64 {
-        let mut idx = self.next_index.write().await;
-        *idx += 1;
-        *idx
+        Self { raft }
     }
 
     /// Record a newly created cloud instance.
@@ -43,18 +29,14 @@ impl InstanceTracker {
             .unwrap_or_default()
             .as_secs();
 
-        let index = self.next_index().await;
         self.raft
-            .apply(
-                index,
-                Command::TrackCloudInstance {
-                    instance_id: instance_id.to_string(),
-                    provider: provider.to_string(),
-                    pool: pool.to_string(),
-                    private_ip: private_ip.map(|s| s.to_string()),
-                    created_at: now,
-                },
-            )
+            .apply_next(Command::TrackCloudInstance {
+                instance_id: instance_id.to_string(),
+                provider: provider.to_string(),
+                pool: pool.to_string(),
+                private_ip: private_ip.map(|s| s.to_string()),
+                created_at: now,
+            })
             .await;
 
         tracing::info!(instance_id, provider, pool, "Tracking cloud instance");
@@ -62,15 +44,11 @@ impl InstanceTracker {
 
     /// Associate a cloud instance with a fleet node ID (when the agent joins).
     pub async fn associate_node(&self, instance_id: &str, fleet_node_id: &str) {
-        let index = self.next_index().await;
         self.raft
-            .apply(
-                index,
-                Command::UpdateCloudInstance {
-                    instance_id: instance_id.to_string(),
-                    fleet_node_id: fleet_node_id.to_string(),
-                },
-            )
+            .apply_next(Command::UpdateCloudInstance {
+                instance_id: instance_id.to_string(),
+                fleet_node_id: fleet_node_id.to_string(),
+            })
             .await;
 
         tracing::info!(
@@ -82,14 +60,10 @@ impl InstanceTracker {
 
     /// Stop tracking a cloud instance (after termination).
     pub async fn untrack(&self, instance_id: &str) {
-        let index = self.next_index().await;
         self.raft
-            .apply(
-                index,
-                Command::UntrackCloudInstance {
-                    instance_id: instance_id.to_string(),
-                },
-            )
+            .apply_next(Command::UntrackCloudInstance {
+                instance_id: instance_id.to_string(),
+            })
             .await;
 
         tracing::info!(instance_id, "Untracked cloud instance");

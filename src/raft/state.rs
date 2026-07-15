@@ -126,14 +126,32 @@ impl FleetStateMachine {
         }
     }
 
-    /// Apply a command to the state machine.
+    /// Apply a command to the state machine, allocating the next log index
+    /// atomically under the state lock. This keeps indices globally monotonic
+    /// across all callers (deployments, secrets, cloud/image trackers) so the
+    /// `last_applied` dedup guard cannot silently drop a write from one caller
+    /// because another caller advanced the index first. Returns the index used.
+    ///
+    /// After a snapshot restore, `last_applied` already reflects the restored
+    /// state, so newly allocated indices naturally continue past it.
+    pub async fn apply_next(&self, command: Command) -> u64 {
+        let mut state = self.inner.write().await;
+        let index = state.last_applied + 1;
+        Self::apply_locked(&mut state, index, command);
+        index
+    }
+
+    /// Apply a command to the state machine at an explicit index (used when
+    /// replaying a persisted log at boot).
     pub async fn apply(&self, index: u64, command: Command) {
         let mut state = self.inner.write().await;
-
         if index <= state.last_applied {
             return; // Already applied
         }
+        Self::apply_locked(&mut state, index, command);
+    }
 
+    fn apply_locked(state: &mut StateMachineInner, index: u64, command: Command) {
         match command {
             Command::Deploy {
                 service_name,
@@ -345,5 +363,103 @@ impl FleetStateMachine {
         let key = format!("replica-override/{service_name}");
         let mut state = self.inner.write().await;
         state.kv.remove(&key);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn apply_next_indices_are_monotonic() {
+        let sm = FleetStateMachine::new();
+        let i1 = sm
+            .apply_next(Command::KvPut {
+                key: "a".into(),
+                value: b"1".to_vec(),
+            })
+            .await;
+        let i2 = sm
+            .apply_next(Command::KvPut {
+                key: "b".into(),
+                value: b"2".to_vec(),
+            })
+            .await;
+        assert_eq!(i1, 1);
+        assert_eq!(i2, 2);
+        assert_eq!(sm.last_applied().await, 2);
+    }
+
+    #[tokio::test]
+    async fn interleaved_callers_do_not_drop_writes() {
+        // Regression: previously distinct callers used disjoint high index
+        // ranges with a single shared `last_applied`, so a low-index write
+        // after a high-index write was silently deduped. apply_next keeps
+        // indices globally monotonic, so every write lands.
+        let sm = FleetStateMachine::new();
+        sm.apply_next(Command::KvPut {
+            key: "first".into(),
+            value: b"x".to_vec(),
+        })
+        .await;
+        sm.apply_next(Command::KvPut {
+            key: "second".into(),
+            value: b"y".to_vec(),
+        })
+        .await;
+        assert_eq!(sm.kv_get("first").await, Some(b"x".to_vec()));
+        assert_eq!(sm.kv_get("second").await, Some(b"y".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn restore_preserves_last_applied_for_new_writes() {
+        let sm = FleetStateMachine::new();
+        sm.apply_next(Command::KvPut {
+            key: "k".into(),
+            value: b"v".to_vec(),
+        })
+        .await;
+        let snap = sm.snapshot().await;
+
+        // Simulate a fresh process restoring the snapshot.
+        let restored = FleetStateMachine::new();
+        restored.restore(&snap).await.unwrap();
+        assert_eq!(restored.last_applied().await, 1);
+        assert_eq!(restored.kv_get("k").await, Some(b"v".to_vec()));
+
+        // A post-restore write must continue past the restored index, not
+        // collide with or be deduped against it.
+        let idx = restored
+            .apply_next(Command::KvPut {
+                key: "k2".into(),
+                value: b"v2".to_vec(),
+            })
+            .await;
+        assert_eq!(idx, 2);
+        assert_eq!(restored.kv_get("k2").await, Some(b"v2".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn apply_is_idempotent_on_replay() {
+        let sm = FleetStateMachine::new();
+        sm.apply(
+            5,
+            Command::KvPut {
+                key: "k".into(),
+                value: b"a".to_vec(),
+            },
+        )
+        .await;
+        // Replaying an already-applied index is a no-op.
+        sm.apply(
+            5,
+            Command::KvPut {
+                key: "k".into(),
+                value: b"b".to_vec(),
+            },
+        )
+        .await;
+        assert_eq!(sm.kv_get("k").await, Some(b"a".to_vec()));
+        assert_eq!(sm.last_applied().await, 5);
     }
 }

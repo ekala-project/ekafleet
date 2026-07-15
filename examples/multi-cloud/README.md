@@ -36,7 +36,8 @@ Cloud autoscaling is a no-op in dev mode, but the configuration validates normal
 ## Deploy for real
 
 ```bash
-# Start server (ideally 3+ for Raft HA across providers)
+# Start server (single-node control plane; multi-node consensus is not yet
+# implemented — run one authoritative server with encrypted persistent state)
 ekafleet server --data-dir /var/lib/ekafleet --domain fleet.internal
 
 # Join server machines from each provider

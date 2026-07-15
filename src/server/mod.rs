@@ -138,6 +138,26 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     // (via `ekafleet apply --watch`), since it needs the pool/cloud configuration
     // from the evaluated Nix config. See cloud::actuator::ScalingActuator.
     let raft_state = FleetStateMachine::new();
+
+    // Persistent (encrypted) Raft storage for snapshots and log. Encryption
+    // reuses the fleet key. On boot we restore the latest snapshot and replay
+    // any log entries recorded after it, so fleet state survives restarts.
+    let raft_storage = {
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&fleet_key);
+        let storage = Arc::new(crate::raft::storage::RaftStorage::new(
+            &config.data_dir,
+            &key,
+        ));
+        if let Err(e) = storage.initialize().await {
+            tracing::warn!(error = %e, "Failed to initialize Raft storage");
+        }
+        if let Err(e) = restore_raft_state(&raft_state, &storage).await {
+            tracing::warn!(error = %e, "Failed to restore Raft state from disk, starting empty");
+        }
+        storage
+    };
+
     let instance_tracker = cloud::instance_tracker::InstanceTracker::new(raft_state.clone());
     let join_token_store = JoinTokenStore::new();
 
@@ -165,23 +185,17 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     let hk_shutdown = shutdown.clone();
 
     // Spawn housekeeping background task for periodic maintenance
-    let hk_state = fleet_state.clone();
-    let hk_join_tokens = grpc_config.join_token_store.clone();
-    let hk_raft = grpc_config.raft_state.clone();
-    let hk_metrics = metrics.clone();
-    let hk_alerts = alert_evaluator.clone();
-    let hk_events = event_store.clone();
+    let hk_deps = HousekeepingDeps {
+        fleet_state: fleet_state.clone(),
+        join_tokens: grpc_config.join_token_store.clone(),
+        raft_state: grpc_config.raft_state.clone(),
+        metrics: metrics.clone(),
+        alerts: alert_evaluator.clone(),
+        event_store: event_store.clone(),
+        raft_storage: raft_storage.clone(),
+    };
     tokio::spawn(async move {
-        housekeeping_loop(
-            hk_state,
-            hk_join_tokens,
-            hk_raft,
-            hk_metrics,
-            hk_alerts,
-            hk_events,
-            hk_shutdown,
-        )
-        .await;
+        housekeeping_loop(hk_deps, hk_shutdown).await;
     });
 
     tokio::select! {
@@ -244,17 +258,71 @@ async fn get_or_create_fleet_key(data_dir: &Path) -> anyhow::Result<Vec<u8>> {
     }
 }
 
-/// Periodic housekeeping loop that runs every 60 seconds to clean up stale
-/// resources across all server subsystems.
-async fn housekeeping_loop(
+/// Restore fleet state at boot from the persistent Raft store: load the latest
+/// snapshot into the state machine, then replay any log entries recorded after
+/// the snapshot index. Idempotent — a fresh install with no snapshot/log leaves
+/// the state machine empty.
+///
+/// This is single-node restore-on-boot. True multi-node consensus (leader
+/// election, log replication across `--peers`) is not yet implemented; today a
+/// single server is authoritative and this restores its own durable state.
+async fn restore_raft_state(
+    raft_state: &FleetStateMachine,
+    storage: &crate::raft::storage::RaftStorage,
+) -> anyhow::Result<()> {
+    let snapshot_index = match storage.load_latest_snapshot().await? {
+        Some((index, data)) => {
+            raft_state
+                .restore(&data)
+                .await
+                .map_err(|e| anyhow::anyhow!("snapshot deserialization failed: {e}"))?;
+            tracing::info!(snapshot_index = index, "Restored Raft state from snapshot");
+            index
+        }
+        None => 0,
+    };
+
+    // Replay any log entries recorded after the snapshot. `apply` is idempotent
+    // via the `last_applied` guard, so overlapping entries are ignored.
+    let entries = storage.read_log_from(snapshot_index + 1).await?;
+    let replayed = entries.len();
+    for entry in entries {
+        raft_state.apply(entry.index, entry.command).await;
+    }
+    if replayed > 0 {
+        tracing::info!(
+            replayed,
+            from_index = snapshot_index + 1,
+            "Replayed Raft log entries at boot"
+        );
+    }
+
+    Ok(())
+}
+
+/// Dependencies for the periodic housekeeping loop.
+struct HousekeepingDeps {
     fleet_state: FleetState,
     join_tokens: JoinTokenStore,
     raft_state: FleetStateMachine,
     metrics: crate::metrics::aggregator::MetricsAggregator,
     alerts: crate::metrics::alerting::AlertEvaluator,
     event_store: events::EventStore,
-    shutdown: CancellationToken,
-) {
+    raft_storage: Arc<crate::raft::storage::RaftStorage>,
+}
+
+/// Periodic housekeeping loop that runs every 60 seconds to clean up stale
+/// resources across all server subsystems.
+async fn housekeeping_loop(deps: HousekeepingDeps, shutdown: CancellationToken) {
+    let HousekeepingDeps {
+        fleet_state,
+        join_tokens,
+        raft_state,
+        metrics,
+        alerts,
+        event_store,
+        raft_storage,
+    } = deps;
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
     let mut tick_count: u64 = 0;
 
@@ -308,14 +376,22 @@ async fn housekeeping_loop(
 
         // 5. Periodic Raft snapshot and log compaction (every ~100 minutes)
         if tick_count.is_multiple_of(100) {
-            let snapshot = raft_state.snapshot().await;
             let last = raft_state.last_applied().await;
             if last > 0 {
                 tracing::info!(last_applied = last, "Taking periodic Raft snapshot");
-                // Store snapshot in Raft state for restore operations.
-                // Log compaction would require RaftStorage, which is wired
-                // separately when persistent storage is enabled.
-                let _ = snapshot; // Snapshot data available for persistence
+                let snapshot = raft_state.snapshot().await;
+                match raft_storage.save_snapshot(last, &snapshot).await {
+                    Ok(()) => {
+                        // The snapshot subsumes all log entries up to `last`;
+                        // compact them so the log does not grow without bound.
+                        if let Err(e) = raft_storage.compact_log(last).await {
+                            tracing::warn!(error = %e, "Failed to compact Raft log");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to persist Raft snapshot");
+                    }
+                }
             }
         }
     }
