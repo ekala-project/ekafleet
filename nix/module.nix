@@ -110,6 +110,27 @@ in
         default = "0.0.0.0:8080";
         description = "Listen address for the service mesh proxy.";
       };
+
+      keepGenerations = lib.mkOption {
+        type = lib.types.ints.unsigned;
+        default = 10;
+        description = ''
+          Number of most-recent system generations to keep after each
+          activation. Older generations are deleted so long-lived fleets do
+          not fill the disk. Set to 0 to disable count-based pruning.
+        '';
+      };
+
+      keepGenerationsDays = lib.mkOption {
+        type = lib.types.nullOr lib.types.ints.unsigned;
+        default = null;
+        description = ''
+          Delete system generations older than this many days after each
+          activation. `null` disables age-based pruning. Combined with
+          `keepGenerations`, a generation is removed only if it is outside
+          both bounds.
+        '';
+      };
     };
   };
 
@@ -220,7 +241,13 @@ in
             PrivateTmp = true;
           };
 
-        environment.RUST_LOG = "info";
+        environment = {
+          RUST_LOG = "info";
+          EKAFLEET_KEEP_GENERATIONS = toString cfg.agent.keepGenerations;
+        }
+        // lib.optionalAttrs (cfg.agent.keepGenerationsDays != null) {
+          EKAFLEET_KEEP_GENERATIONS_DAYS = toString cfg.agent.keepGenerationsDays;
+        };
       };
 
       systemd.services.ekafleet-workload-api = {

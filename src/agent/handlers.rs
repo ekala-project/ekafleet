@@ -51,6 +51,10 @@ pub(super) async fn handle_server_message(
                         toplevel: ds.system_path.clone(),
                         activate_script: None, // default: {toplevel}/bin/activate
                         action: crate::agent::activation::ActivationAction::Switch,
+                        // Bound generation accumulation on long-lived fleets.
+                        // Configurable via EKAFLEET_KEEP_GENERATIONS[_DAYS],
+                        // surfaced by the NixOS module.
+                        retention: Some(crate::agent::activation::GenerationRetention::from_env()),
                     };
                     match crate::agent::activation::activate_system(&params).await {
                         Ok(result) => {
