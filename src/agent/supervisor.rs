@@ -24,6 +24,10 @@ pub enum SupervisorError {
 /// and lifecycle hook semantics.
 pub struct Supervisor {
     unit_dir: PathBuf,
+    /// Directory holding indirect Nix GC roots for deployed service closures,
+    /// so `nix-collect-garbage` never reaps a store path a running service
+    /// depends on. See [`Supervisor::add_gc_root`].
+    gcroot_dir: PathBuf,
     managed_units: HashMap<String, UnitState>,
 }
 
@@ -42,8 +46,10 @@ const OCI_STORE_DIR: &str = "/var/lib/ekafleet/oci";
 impl Supervisor {
     pub fn new(data_dir: &Path) -> Self {
         let unit_dir = data_dir.join("units");
+        let gcroot_dir = data_dir.join("gcroots");
         Self {
             unit_dir,
+            gcroot_dir,
             managed_units: HashMap::new(),
         }
     }
@@ -74,6 +80,7 @@ impl Supervisor {
                         new = %version_key,
                         "Restarting service (version changed)"
                     );
+                    self.root_service_closure(name, spec).await;
                     self.write_unit_file(&unit_name, spec).await?;
                     systemctl(&["daemon-reload"]).await?;
                     systemctl(&["restart", &unit_name]).await?;
@@ -90,6 +97,7 @@ impl Supervisor {
                 None => {
                     // New service
                     tracing::info!(service = %name, "Starting new service");
+                    self.root_service_closure(name, spec).await;
                     self.write_unit_file(&unit_name, spec).await?;
                     systemctl(&["daemon-reload"]).await?;
                     systemctl(&["enable", "--now", &unit_name]).await?;
@@ -119,6 +127,7 @@ impl Supervisor {
                 tracing::info!(service = %name, "Stopping removed service");
                 systemctl(&["disable", "--now", &state.unit_name]).await?;
                 self.remove_unit_file(&state.unit_name).await?;
+                self.remove_gc_root(&name).await;
                 actions.push(SupervisorAction::Stopped(name));
             }
         }
@@ -281,6 +290,75 @@ WantedBy=multi-user.target
 
         systemctl(&["daemon-reload"]).await?;
         Ok(())
+    }
+
+    /// Register an indirect GC root for a native service's store path, so
+    /// `nix-collect-garbage` cannot reap a closure a running service depends
+    /// on. Container services (which have no store path) are skipped.
+    ///
+    /// Failure to root is logged but not fatal: the service can still run;
+    /// it is just exposed to GC until the next successful reconcile.
+    async fn root_service_closure(&self, name: &str, spec: &ServiceSpec) {
+        if is_container_service(spec) || spec.store_path.is_empty() {
+            return;
+        }
+        if let Err(e) = self.add_gc_root(name, &spec.store_path).await {
+            tracing::warn!(
+                service = %name,
+                store_path = %spec.store_path,
+                error = %e,
+                "Failed to register GC root for service closure — path is exposed to nix GC"
+            );
+        }
+    }
+
+    /// Create an indirect GC root at `{gcroot_dir}/<service>` pointing at
+    /// `store_path` via `nix-store --add-root ... --realise`. The `--realise`
+    /// also ensures the path is present in the local store.
+    async fn add_gc_root(&self, name: &str, store_path: &str) -> Result<(), SupervisorError> {
+        tokio::fs::create_dir_all(&self.gcroot_dir).await?;
+        let root_link = self.gcroot_dir.join(name);
+        let root_link_str = root_link
+            .to_str()
+            .ok_or_else(|| SupervisorError::Systemctl("invalid gcroot path".into()))?;
+
+        let output = tokio::process::Command::new("nix-store")
+            .args(["--add-root", root_link_str, "--realise", store_path])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(SupervisorError::Systemctl(format!(
+                "nix-store --add-root failed: {}",
+                stderr.trim()
+            )));
+        }
+
+        tracing::debug!(
+            service = %name,
+            store_path = %store_path,
+            root = %root_link.display(),
+            "Registered GC root for service closure"
+        );
+        Ok(())
+    }
+
+    /// Remove the indirect GC root for a service, allowing its (now unused)
+    /// closure to be collected by a future `nix-collect-garbage`.
+    async fn remove_gc_root(&self, name: &str) {
+        let root_link = self.gcroot_dir.join(name);
+        if let Err(e) = tokio::fs::remove_file(&root_link).await
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                service = %name,
+                error = %e,
+                "Failed to remove GC root for stopped service"
+            );
+        }
     }
 
     /// Get list of currently managed service names.
@@ -483,6 +561,32 @@ mod tests {
 
         let container = container_spec("api", "ghcr.io/org/api:v1.0");
         assert!(is_container_service(&container));
+    }
+
+    #[tokio::test]
+    async fn remove_gc_root_missing_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let sv = Supervisor::new(dir.path());
+        // No root exists yet; this must not panic or leave an error path.
+        sv.remove_gc_root("nonexistent").await;
+    }
+
+    #[tokio::test]
+    async fn root_service_closure_skips_containers_and_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let sv = Supervisor::new(dir.path());
+
+        // Container service: no store path, must be skipped (no nix-store call).
+        let container = container_spec("api", "ghcr.io/org/api:v1.0");
+        sv.root_service_closure("api", &container).await;
+
+        // Native service with empty store path: also skipped.
+        let empty = native_spec("web", "/bin/web", "");
+        sv.root_service_closure("web", &empty).await;
+
+        // gcroot dir should not have been populated for skipped services.
+        assert!(!sv.gcroot_dir.join("api").exists());
+        assert!(!sv.gcroot_dir.join("web").exists());
     }
 
     #[test]
