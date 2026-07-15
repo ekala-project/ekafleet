@@ -5,4 +5,4 @@
   - 2 service deployment example
   - SPIFFE / SVID bootstrap
 
-- non nixos + nix example
+- [done] non nixos + nix example (examples/standalone-nonnixos)

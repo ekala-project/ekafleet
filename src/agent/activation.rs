@@ -213,9 +213,32 @@ pub async fn current_generation() -> Option<u64> {
 }
 
 /// Set the Nix system profile to point at a toplevel store path.
+///
+/// Prefers `nix-env --profile ... --set` (present on channel-based and most
+/// installs). On flakes-only installs where `nix-env` is not on `PATH`, falls
+/// back to `nix profile install --profile ... <store-path>`, which the modern
+/// `nix` CLI provides. This lets the agent activate on a non-NixOS host that
+/// has only the flakes-enabled `nix` binary.
 async fn set_system_profile(toplevel: &str) -> Result<(), ActivationError> {
-    let output = tokio::process::Command::new("nix-env")
-        .args(["--profile", SYSTEM_PROFILE, "--set", toplevel])
+    match run_profile_set("nix-env", &["--profile", SYSTEM_PROFILE, "--set", toplevel]).await {
+        Ok(()) => Ok(()),
+        Err(ActivationError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::info!("nix-env not found; falling back to `nix profile` for system profile");
+            run_profile_set(
+                "nix",
+                &["profile", "install", "--profile", SYSTEM_PROFILE, toplevel],
+            )
+            .await
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Run a profile-mutating subcommand, mapping a non-zero exit to `ProfileFailed`
+/// and a missing binary to `Io(NotFound)` (so the caller can try a fallback).
+async fn run_profile_set(program: &str, args: &[&str]) -> Result<(), ActivationError> {
+    let output = tokio::process::Command::new(program)
+        .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -321,6 +344,30 @@ mod tests {
         };
         let result = activate_system(&params).await;
         assert!(matches!(result, Err(ActivationError::PathNotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn run_profile_set_reports_missing_binary_as_notfound() {
+        // A nonexistent program must surface as Io(NotFound) so that
+        // set_system_profile can trigger the `nix profile` fallback.
+        let result = run_profile_set(
+            "ekafleet-nonexistent-binary-xyz",
+            &["--set", "/nix/store/x"],
+        )
+        .await;
+        match result {
+            Err(ActivationError::Io(e)) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::NotFound);
+            }
+            other => panic!("expected Io(NotFound), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_profile_set_reports_nonzero_exit_as_profile_failed() {
+        // `false` exits non-zero; must map to ProfileFailed, not Io.
+        let result = run_profile_set("false", &[]).await;
+        assert!(matches!(result, Err(ActivationError::ProfileFailed(_))));
     }
 
     #[tokio::test]
