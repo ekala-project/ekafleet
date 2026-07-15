@@ -1016,6 +1016,9 @@ message CgroupControls {
   uint32 io_weight = 4;
   uint32 tasks_max = 5;
   string oom_policy = 6;
+  // Hard CPU cap as a percentage of a single core (e.g. 150 = 1.5 cores),
+  // translated to systemd CPUQuota=. Zero means unset (no hard cap).
+  uint32 cpu_quota_percent = 7;
 }
 
 // --- Fleet Key Rotation ---

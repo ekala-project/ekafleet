@@ -465,6 +465,9 @@ fn build_extra_directives(spec: &ServiceSpec) -> String {
         if cg.cpu_weight > 0 {
             extra_directives.push(format!("CPUWeight={}", cg.cpu_weight));
         }
+        if cg.cpu_quota_percent > 0 {
+            extra_directives.push(format!("CPUQuota={}%", cg.cpu_quota_percent));
+        }
         if cg.memory_high_mb > 0 {
             extra_directives.push(format!("MemoryHigh={}M", cg.memory_high_mb));
         }
@@ -638,10 +641,12 @@ mod tests {
             io_weight: 100,
             tasks_max: 50,
             oom_policy: "stop".to_string(),
+            cpu_quota_percent: 150,
         });
         let extra = build_extra_directives(&spec);
         assert!(extra.contains("Slice=system-ekafleet.slice"));
         assert!(extra.contains("CPUWeight=200"));
+        assert!(extra.contains("CPUQuota=150%"));
         assert!(extra.contains("MemoryHigh=512M"));
         assert!(extra.contains("MemoryMax=1024M"));
         assert!(extra.contains("TasksMax=50"));

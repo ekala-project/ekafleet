@@ -338,6 +338,71 @@ fn default_oom_policy() -> String {
     "stop".to_string()
 }
 
+impl ResourceConfig {
+    /// Translate declared resources into the proto [`CgroupControls`] the agent
+    /// renders into systemd unit directives. Explicit `cgroupControls` take
+    /// precedence; where they are unset, hard limits are derived from the
+    /// declared `cpu.limit` (millicores → `CPUQuota` percent-of-a-core) and
+    /// `memory.limit` (MB → `MemoryMax`). Returns `None` when nothing at all is
+    /// declared, so the agent leaves the service uncapped.
+    pub fn to_cgroup_controls(&self) -> Option<crate::proto::CgroupControls> {
+        let explicit = self.cgroup_controls.as_ref();
+
+        // Derive a hard CPU cap from cpu.limit (millicores). 1000 mc == 1 core
+        // == CPUQuota=100%. A limit below 1 mc rounds up to 1% so a declared
+        // limit is never silently dropped to "unlimited".
+        let derived_cpu_quota = self
+            .cpu
+            .as_ref()
+            .and_then(|c| c.limit)
+            .filter(|&l| l > 0)
+            .map(|mc| mc.div_ceil(10).max(1) as u32);
+
+        // Derive a hard memory cap from memory.limit (MB).
+        let derived_mem_max = self
+            .memory
+            .as_ref()
+            .and_then(|m| m.limit)
+            .filter(|&l| l > 0);
+
+        let cpu_weight = explicit.map(|c| c.cpu_weight).unwrap_or(0);
+        let io_weight = explicit.map(|c| c.io_weight).unwrap_or(0);
+        let tasks_max = explicit.and_then(|c| c.tasks_max).unwrap_or(0);
+        let memory_high_mb = explicit.and_then(|c| c.memory_high).unwrap_or(0);
+        let oom_policy = explicit.map(|c| c.oom_policy.clone()).unwrap_or_default();
+
+        // Explicit memory_max wins over the derived limit.
+        let memory_max_mb = explicit
+            .and_then(|c| c.memory_max)
+            .or(derived_mem_max)
+            .unwrap_or(0);
+
+        let cpu_quota_percent = derived_cpu_quota.unwrap_or(0);
+
+        // If nothing is declared at all, leave the service uncapped.
+        if cpu_weight == 0
+            && io_weight == 0
+            && tasks_max == 0
+            && memory_high_mb == 0
+            && memory_max_mb == 0
+            && cpu_quota_percent == 0
+            && oom_policy.is_empty()
+        {
+            return None;
+        }
+
+        Some(crate::proto::CgroupControls {
+            cpu_weight,
+            memory_high_mb,
+            memory_max_mb,
+            io_weight,
+            tasks_max,
+            oom_policy,
+            cpu_quota_percent,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResourceValue {
@@ -748,5 +813,139 @@ pub fn validate(config: &FleetConfig) -> Result<(), Vec<String>> {
         Ok(())
     } else {
         Err(errors)
+    }
+}
+
+#[cfg(test)]
+mod cgroup_tests {
+    use super::*;
+
+    fn rv(request: u64, limit: Option<u64>) -> ResourceValue {
+        ResourceValue { request, limit }
+    }
+
+    #[test]
+    fn no_resources_yields_no_controls() {
+        let rc = ResourceConfig::default();
+        assert!(rc.to_cgroup_controls().is_none());
+    }
+
+    #[test]
+    fn requests_without_limits_yield_no_controls() {
+        // Requests drive scheduling, not enforcement, so a service that only
+        // sets requests must be left uncapped.
+        let rc = ResourceConfig {
+            cpu: Some(rv(500, None)),
+            memory: Some(rv(256, None)),
+            ..Default::default()
+        };
+        assert!(rc.to_cgroup_controls().is_none());
+    }
+
+    #[test]
+    fn cpu_limit_becomes_cpu_quota_percent() {
+        // 1500 millicores == 1.5 cores == CPUQuota=150%.
+        let rc = ResourceConfig {
+            cpu: Some(rv(500, Some(1500))),
+            ..Default::default()
+        };
+        let cg = rc.to_cgroup_controls().expect("controls expected");
+        assert_eq!(cg.cpu_quota_percent, 150);
+        assert_eq!(cg.memory_max_mb, 0);
+    }
+
+    #[test]
+    fn sub_core_cpu_limit_rounds_up() {
+        // 250 millicores == 25% of a core; a limit must never round to zero.
+        let rc = ResourceConfig {
+            cpu: Some(rv(0, Some(250))),
+            ..Default::default()
+        };
+        let cg = rc.to_cgroup_controls().expect("controls expected");
+        assert_eq!(cg.cpu_quota_percent, 25);
+    }
+
+    #[test]
+    fn tiny_cpu_limit_rounds_up_to_one_percent() {
+        let rc = ResourceConfig {
+            cpu: Some(rv(0, Some(1))),
+            ..Default::default()
+        };
+        let cg = rc.to_cgroup_controls().expect("controls expected");
+        assert_eq!(cg.cpu_quota_percent, 1);
+    }
+
+    #[test]
+    fn memory_limit_becomes_memory_max() {
+        let rc = ResourceConfig {
+            memory: Some(rv(256, Some(1024))),
+            ..Default::default()
+        };
+        let cg = rc.to_cgroup_controls().expect("controls expected");
+        assert_eq!(cg.memory_max_mb, 1024);
+        assert_eq!(cg.cpu_quota_percent, 0);
+    }
+
+    #[test]
+    fn explicit_controls_are_carried_through() {
+        let rc = ResourceConfig {
+            cgroup_controls: Some(CgroupControlsConfig {
+                cpu_weight: 200,
+                memory_high: Some(512),
+                memory_max: Some(2048),
+                io_weight: 150,
+                tasks_max: Some(64),
+                oom_policy: "kill".to_string(),
+            }),
+            ..Default::default()
+        };
+        let cg = rc.to_cgroup_controls().expect("controls expected");
+        assert_eq!(cg.cpu_weight, 200);
+        assert_eq!(cg.memory_high_mb, 512);
+        assert_eq!(cg.memory_max_mb, 2048);
+        assert_eq!(cg.io_weight, 150);
+        assert_eq!(cg.tasks_max, 64);
+        assert_eq!(cg.oom_policy, "kill");
+    }
+
+    #[test]
+    fn explicit_memory_max_wins_over_derived_limit() {
+        // An explicit memory_max takes precedence over the value derived from
+        // memory.limit.
+        let rc = ResourceConfig {
+            memory: Some(rv(256, Some(1024))),
+            cgroup_controls: Some(CgroupControlsConfig {
+                cpu_weight: default_cpu_weight(),
+                memory_high: None,
+                memory_max: Some(4096),
+                io_weight: default_io_weight(),
+                tasks_max: None,
+                oom_policy: default_oom_policy(),
+            }),
+            ..Default::default()
+        };
+        let cg = rc.to_cgroup_controls().expect("controls expected");
+        assert_eq!(cg.memory_max_mb, 4096);
+    }
+
+    #[test]
+    fn derived_cpu_quota_combines_with_explicit_controls() {
+        // cpu.limit provides the hard CPU cap while explicit controls provide
+        // the weight — both must appear together.
+        let rc = ResourceConfig {
+            cpu: Some(rv(500, Some(2000))),
+            cgroup_controls: Some(CgroupControlsConfig {
+                cpu_weight: 300,
+                memory_high: None,
+                memory_max: None,
+                io_weight: default_io_weight(),
+                tasks_max: None,
+                oom_policy: default_oom_policy(),
+            }),
+            ..Default::default()
+        };
+        let cg = rc.to_cgroup_controls().expect("controls expected");
+        assert_eq!(cg.cpu_weight, 300);
+        assert_eq!(cg.cpu_quota_percent, 200);
     }
 }
