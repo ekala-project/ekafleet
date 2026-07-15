@@ -109,18 +109,20 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
             .await?
     };
 
-    // Attach authentication metadata to all outgoing requests
+    // Attach authentication metadata to all outgoing requests.
+    //
+    // When an mTLS node SVID is in use, authentication is carried by the TLS
+    // client certificate itself — the server derives identity from the verified
+    // peer cert, so no metadata marker is sent (and any such marker would be
+    // stripped server-side). Without an SVID we fall back to bearer token auth,
+    // which is also how an agent bootstraps using its one-time join token.
     let token: tonic::metadata::MetadataValue<_> = format!("Bearer {}", config.token).parse()?;
     let mtls_flag = use_mtls;
     #[allow(clippy::result_large_err)]
     let mut client =
         FleetControlClient::with_interceptor(channel, move |mut req: tonic::Request<()>| {
-            if mtls_flag {
-                // mTLS authenticated — signal to server interceptor
-                req.metadata_mut()
-                    .insert("x-ekafleet-mtls", "true".parse().unwrap());
-            } else {
-                // Legacy bearer token auth
+            if !mtls_flag {
+                // Legacy bearer token / join-token bootstrap auth.
                 req.metadata_mut().insert("authorization", token.clone());
             }
             Ok(req)

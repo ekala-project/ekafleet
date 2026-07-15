@@ -94,13 +94,13 @@ impl RegistryClient {
         let digest = Digest::from_bytes(&raw);
 
         // If the reference specified a digest, verify it matches.
-        if let Some(expected) = &image.digest {
-            if &digest != expected {
-                return Err(RegistryError::DigestMismatch {
-                    expected: expected.to_string(),
-                    actual: digest.to_string(),
-                });
-            }
+        if let Some(expected) = &image.digest
+            && &digest != expected
+        {
+            return Err(RegistryError::DigestMismatch {
+                expected: expected.to_string(),
+                actual: digest.to_string(),
+            });
         }
 
         let kind = ManifestKind::from_json(&media_type, &raw)
@@ -374,19 +374,18 @@ impl RegistryClient {
             return Ok(None);
         }
 
-        if resp.status == 401 {
-            if let Some(challenge) = resp
+        if resp.status == 401
+            && let Some(challenge) = resp
                 .www_authenticate
                 .as_deref()
                 .and_then(BearerChallenge::parse)
-            {
-                let token = self.exchange_token(&challenge, Some(scope)).await?;
-                self.tokens
-                    .write()
-                    .await
-                    .insert(scope.to_string(), token.clone());
-                return Ok(Some(token));
-            }
+        {
+            let token = self.exchange_token(&challenge, Some(scope)).await?;
+            self.tokens
+                .write()
+                .await
+                .insert(scope.to_string(), token.clone());
+            return Ok(Some(token));
         }
 
         Ok(None)
@@ -409,7 +408,7 @@ fn base64_encode(input: &str) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
     let bytes = input.as_bytes();
-    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
 
     for chunk in bytes.chunks(3) {
         let b0 = chunk[0] as u32;

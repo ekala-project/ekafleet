@@ -926,7 +926,7 @@ pub async fn cleanup_expired_images(
         // Separate active from non-active
         let (_active, mut inactive): (Vec<_>, Vec<_>) = images
             .drain(..)
-            .partition(|img| current_hash.map_or(false, |h| h == &img.store_path_hash));
+            .partition(|img| current_hash == Some(&img.store_path_hash));
 
         // Sort inactive by created_at descending (newest first)
         inactive.sort_by(|a, b| b.created_at.cmp(&a.created_at));
@@ -964,15 +964,15 @@ pub async fn cleanup_expired_images(
             }
 
             // Delete storage object
-            if let Some(uri) = &img.storage_uri {
-                if let Err(e) = manager.delete_storage_object(uri).await {
-                    tracing::warn!(
-                        pool = %pool_name,
-                        uri = %uri,
-                        error = %e,
-                        "Failed to delete storage object for expired image"
-                    );
-                }
+            if let Some(uri) = &img.storage_uri
+                && let Err(e) = manager.delete_storage_object(uri).await
+            {
+                tracing::warn!(
+                    pool = %pool_name,
+                    uri = %uri,
+                    error = %e,
+                    "Failed to delete storage object for expired image"
+                );
             }
 
             // Remove from tracker

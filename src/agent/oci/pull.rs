@@ -94,15 +94,15 @@ pub async fn pull_image(
 
         PullPolicy::IfNotPresent => {
             // Check if we have a cached manifest and bundle
-            if let Some(raw) = store.get_manifest(&manifest_key).await? {
-                if store.has_bundle(service_name).await {
-                    let digest = Digest::from_bytes(&raw);
-                    return Ok(PullResult {
-                        digest,
-                        rootfs: store.rootfs_path(service_name),
-                        pulled: false,
-                    });
-                }
+            if let Some(raw) = store.get_manifest(&manifest_key).await?
+                && store.has_bundle(service_name).await
+            {
+                let digest = Digest::from_bytes(&raw);
+                return Ok(PullResult {
+                    digest,
+                    rootfs: store.rootfs_path(service_name),
+                    pulled: false,
+                });
             }
 
             // Not present — pull
@@ -121,19 +121,20 @@ pub async fn pull_image(
             // Check if remote digest matches local
             if let Some(raw) = store.get_manifest(&manifest_key).await? {
                 let local_digest = Digest::from_bytes(&raw);
-                if let Ok(Some(remote_digest)) = client.head_manifest(image).await {
-                    if local_digest == remote_digest && store.has_bundle(service_name).await {
-                        tracing::debug!(
-                            image = %image,
-                            digest = %local_digest,
-                            "Image up-to-date"
-                        );
-                        return Ok(PullResult {
-                            digest: local_digest,
-                            rootfs: store.rootfs_path(service_name),
-                            pulled: false,
-                        });
-                    }
+                if let Ok(Some(remote_digest)) = client.head_manifest(image).await
+                    && local_digest == remote_digest
+                    && store.has_bundle(service_name).await
+                {
+                    tracing::debug!(
+                        image = %image,
+                        digest = %local_digest,
+                        "Image up-to-date"
+                    );
+                    return Ok(PullResult {
+                        digest: local_digest,
+                        rootfs: store.rootfs_path(service_name),
+                        pulled: false,
+                    });
                 }
             }
 

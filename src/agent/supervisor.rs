@@ -604,7 +604,7 @@ WantedBy=multi-user.target
         let spiffe_socket = crate::spiffe::socket::DEFAULT_SOCKET_PATH;
         let secrets_dir = format!("/var/lib/ekafleet/secrets/{}", spec.name);
 
-        let nspawn_args = vec![
+        let nspawn_args = [
             format!("--oci-bundle={bundle_path}"),
             format!("--machine={machine_name}"),
             "--network-namespace-path=/proc/1/ns/net".to_string(),

@@ -95,17 +95,17 @@ impl CloudProvider for AzureCloudProvider {
         }
 
         // Spot instances
-        if let Some(spot) = &request.spot {
-            if spot.enabled {
-                args.extend([
-                    "--priority".to_string(),
-                    "Spot".to_string(),
-                    "--eviction-policy".to_string(),
-                    "Delete".to_string(),
-                ]);
-                if let Some(max_price) = &spot.max_price {
-                    args.extend(["--max-price".to_string(), max_price.clone()]);
-                }
+        if let Some(spot) = &request.spot
+            && spot.enabled
+        {
+            args.extend([
+                "--priority".to_string(),
+                "Spot".to_string(),
+                "--eviction-policy".to_string(),
+                "Delete".to_string(),
+            ]);
+            if let Some(max_price) = &spot.max_price {
+                args.extend(["--max-price".to_string(), max_price.clone()]);
             }
         }
 

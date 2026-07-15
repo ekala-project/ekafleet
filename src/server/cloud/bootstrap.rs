@@ -35,7 +35,7 @@ pub fn encode_user_data(user_data: &str) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
     let input = user_data.as_bytes();
-    let mut output = Vec::with_capacity((input.len() + 2) / 3 * 4);
+    let mut output = Vec::with_capacity(input.len().div_ceil(3) * 4);
 
     for chunk in input.chunks(3) {
         let b0 = chunk[0] as u32;

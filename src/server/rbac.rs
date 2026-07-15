@@ -19,6 +19,16 @@ pub enum Role {
     Viewer,
 }
 
+/// Marks how a request was authenticated. Stored in request extensions by the
+/// gRPC interceptor so handlers can distinguish a verified mTLS peer (node SVID)
+/// from a bearer-token principal. This is derived server-side from the verified
+/// TLS peer certificate and can never be asserted by a client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerIdentity {
+    /// Authenticated via a client certificate verified against the fleet CA.
+    Mtls,
+}
+
 /// Permissions that can be checked against a role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Permission {

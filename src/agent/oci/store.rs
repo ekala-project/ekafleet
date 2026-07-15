@@ -158,11 +158,11 @@ impl ImageStore {
         let mut dir_entries = tokio::fs::read_dir(&dir).await?;
         while let Some(entry) = dir_entries.next_entry().await? {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if let Some(gen_str) = name.strip_prefix(&prefix) {
-                if let Ok(generation) = gen_str.parse::<u64>() {
-                    let data = tokio::fs::read(entry.path()).await?;
-                    entries.push((generation, data));
-                }
+            if let Some(gen_str) = name.strip_prefix(&prefix)
+                && let Ok(generation) = gen_str.parse::<u64>()
+            {
+                let data = tokio::fs::read(entry.path()).await?;
+                entries.push((generation, data));
             }
         }
 

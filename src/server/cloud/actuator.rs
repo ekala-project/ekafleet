@@ -449,7 +449,7 @@ impl ScalingActuator {
 
     /// Periodic reconciliation: detect orphaned cloud instances and clean them up.
     pub async fn reconcile_orphans(&self) {
-        for (pool_name, _pool_config) in &self.fleet_config.node_pools {
+        for pool_name in self.fleet_config.node_pools.keys() {
             let Some(provider) = self.providers.get(pool_name) else {
                 continue;
             };

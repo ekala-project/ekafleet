@@ -277,14 +277,13 @@ pub async fn compute_plan(
                         for dp in desired_placements {
                             if let Some(old_machine) = current_placements
                                 .get(&(service_name.clone(), dp.instance_id.clone()))
+                                && old_machine != &dp.machine_name
                             {
-                                if old_machine != &dp.machine_name {
-                                    migrations.push(MigrationOp {
-                                        instance_id: dp.instance_id.clone(),
-                                        source_machine: old_machine.clone(),
-                                        dest_machine: dp.machine_name.clone(),
-                                    });
-                                }
+                                migrations.push(MigrationOp {
+                                    instance_id: dp.instance_id.clone(),
+                                    source_machine: old_machine.clone(),
+                                    dest_machine: dp.machine_name.clone(),
+                                });
                             }
                         }
                     }

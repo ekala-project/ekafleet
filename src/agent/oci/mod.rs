@@ -180,7 +180,7 @@ impl ImageManager {
             .store
             .get_manifest(&manifest_key)
             .await?
-            .ok_or_else(|| ImageManagerError::Pull(PullError::NotFoundLocally))?;
+            .ok_or(ImageManagerError::Pull(PullError::NotFoundLocally))?;
 
         let manifest: ImageManifest = serde_json::from_slice(&raw)
             .map_err(|e| ImageManagerError::Pull(PullError::ManifestParse(e.to_string())))?;

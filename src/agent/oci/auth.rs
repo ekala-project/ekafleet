@@ -10,18 +10,13 @@ use std::collections::HashMap;
 use serde::Deserialize;
 
 /// Credentials for authenticating with an OCI registry.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum Credentials {
     /// No authentication (anonymous access).
+    #[default]
     Anonymous,
     /// HTTP Basic authentication (username + password/token).
     Basic { username: String, password: String },
-}
-
-impl Default for Credentials {
-    fn default() -> Self {
-        Self::Anonymous
-    }
 }
 
 /// Parsed `Www-Authenticate: Bearer` challenge from a 401 response.

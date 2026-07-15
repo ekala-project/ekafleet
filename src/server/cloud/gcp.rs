@@ -107,10 +107,10 @@ impl CloudProvider for GcpCloudProvider {
         }
 
         // Spot/preemptible instances
-        if let Some(spot) = &request.spot {
-            if spot.enabled {
-                args.extend(["--provisioning-model".to_string(), "SPOT".to_string()]);
-            }
+        if let Some(spot) = &request.spot
+            && spot.enabled
+        {
+            args.extend(["--provisioning-model".to_string(), "SPOT".to_string()]);
         }
 
         tracing::info!(

@@ -9,7 +9,7 @@ use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 use tonic::{Request, Response, Status, Streaming};
 
 use super::events::EventStore;
-use super::rbac::{TokenStore, extract_bearer_token};
+use super::rbac::{PeerIdentity, TokenStore, extract_bearer_token};
 use super::state::FleetState;
 use crate::attestation::join_token::JoinTokenStore;
 use crate::ca::CaSigner;
@@ -482,15 +482,12 @@ impl FleetControl for FleetControlService {
                                             image_config.nixos_config
                                         ))
                                         .await
-                                        {
-                                            if let Some(h) =
+                                            && let Some(h) =
                                                 super::cloud::image::extract_store_path_hash(
                                                     &toplevel,
                                                 )
-                                            {
-                                                active_hashes
-                                                    .insert(pool_name.clone(), h.to_string());
-                                            }
+                                        {
+                                            active_hashes.insert(pool_name.clone(), h.to_string());
                                         }
 
                                         cloud.image_id = Some(resolved_id);
@@ -1751,25 +1748,25 @@ pub async fn serve_grpc(
 
     let service_token_store = token_store.clone();
     #[allow(clippy::result_large_err)]
-    let interceptor = move |req: Request<()>| -> Result<Request<()>, Status> {
-        // Allow unauthenticated access to the Attest RPC.
-        // The Attest handler validates the join token internally.
-        if req
-            .metadata()
-            .get("x-ekafleet-attest")
-            .is_some_and(|v| v == "true")
-        {
-            return Ok(req);
-        }
+    let interceptor = move |mut req: Request<()>| -> Result<Request<()>, Status> {
+        // Strip any client-supplied authentication markers. These are internal
+        // signals derived by the server from the verified TLS peer certificate;
+        // a client must never be able to assert them itself. Removing them here
+        // closes the metadata-spoofing auth bypass.
+        req.metadata_mut().remove("x-ekafleet-mtls");
+        req.metadata_mut().remove("x-ekafleet-attest");
 
-        // Accept mTLS-authenticated requests (node SVID as client cert).
-        // When TLS client auth is enabled, the presence of a valid client cert
-        // (verified by rustls against the CA) is sufficient authentication.
-        if req
-            .metadata()
-            .get("x-ekafleet-mtls")
-            .is_some_and(|v| v == "true")
+        // Accept mTLS-authenticated requests. Authentication is established by
+        // the presence of a client certificate that rustls has *already verified*
+        // against the configured CA (client_ca_root below). `peer_certs()` only
+        // returns certificates for a genuinely completed, verified mTLS handshake,
+        // so this cannot be forged by setting a header.
+        if let Some(certs) = req.peer_certs()
+            && !certs.is_empty()
         {
+            // A verified node SVID grants the AgentConnect/operator surface.
+            // Record the identity marker for handler-level checks.
+            req.extensions_mut().insert(PeerIdentity::Mtls);
             return Ok(req);
         }
 
@@ -1791,7 +1788,6 @@ pub async fn serve_grpc(
             .ok_or_else(|| Status::unauthenticated("invalid or expired token"))?;
 
         // Stash the role in request extensions so RPC handlers can check permissions.
-        let mut req = req;
         req.extensions_mut().insert(role);
         Ok(req)
     };

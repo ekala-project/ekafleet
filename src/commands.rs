@@ -651,8 +651,8 @@ pub async fn cmd_node_list(server: String) -> anyhow::Result<()> {
         println!("No nodes connected.");
     } else {
         println!(
-            "{:<36}  {:<20}  {:<12}  {:<8}  {:<10}  {}",
-            "NODE ID", "ADDRESS", "POOL", "HEALTH", "SCHED", "SERVICES"
+            "{:<36}  {:<20}  {:<12}  {:<8}  {:<10}  SERVICES",
+            "NODE ID", "ADDRESS", "POOL", "HEALTH", "SCHED"
         );
         for node in &result.nodes {
             let health = if node.healthy { "ok" } else { "unhealthy" };
@@ -768,8 +768,8 @@ pub async fn cmd_top_nodes(server: String) -> anyhow::Result<()> {
         println!("No nodes connected.");
     } else {
         println!(
-            "{:<36}  {:<12}  {:>10}  {:>10}  {:>10}  {:>10}  {}",
-            "NODE ID", "POOL", "CPU USED", "CPU TOTAL", "MEM USED", "MEM TOTAL", "SVCS"
+            "{:<36}  {:<12}  {:>10}  {:>10}  {:>10}  {:>10}  SVCS",
+            "NODE ID", "POOL", "CPU USED", "CPU TOTAL", "MEM USED", "MEM TOTAL"
         );
         for node in &result.nodes {
             let cpu_pct = if node.cpu_total > 0 {
@@ -843,8 +843,8 @@ pub async fn cmd_deployment_list(
         println!("No deployments found.");
     } else {
         println!(
-            "{:<36}  {:<20}  {:<12}  {:<10}  {}",
-            "DEPLOYMENT ID", "SERVICE", "STATUS", "STRATEGY", "STARTED"
+            "{:<36}  {:<20}  {:<12}  {:<10}  STARTED",
+            "DEPLOYMENT ID", "SERVICE", "STATUS", "STRATEGY"
         );
         for d in &result.deployments {
             println!(
@@ -961,7 +961,7 @@ pub async fn cmd_acl_token_list(server: String) -> anyhow::Result<()> {
     if result.tokens.is_empty() {
         println!("No tokens registered.");
     } else {
-        println!("{:<12}  {}", "ROLE", "DESCRIPTION");
+        println!("{:<12}  DESCRIPTION", "ROLE");
         for token in &result.tokens {
             println!("{:<12}  {}", token.role, token.description);
         }
@@ -1075,7 +1075,7 @@ pub async fn cmd_generation_list(machine: String, server: String) -> anyhow::Res
     if result.generations.is_empty() {
         println!("No generations found on {machine}.");
     } else {
-        println!("{:>5}  {:>10}  {:<60}  {}", "GEN", "DATE", "STORE PATH", "");
+        println!("{:>5}  {:>10}  {:<60}  ", "GEN", "DATE", "STORE PATH");
         for entry in &result.generations {
             let current = if entry.current { " (current)" } else { "" };
             println!(
@@ -1458,11 +1458,10 @@ pub async fn cmd_images_gc(
 
         // Determine current active hash
         let toplevel_attr = format!("{}.config.system.build.toplevel", image_config.nixos_config);
-        if let Ok(store_path) = ekafleet::server::nix::build(&toplevel_attr).await {
-            if let Some(hash) = ekafleet::server::cloud::image::extract_store_path_hash(&store_path)
-            {
-                active_hashes.insert(pool_name.clone(), hash.to_string());
-            }
+        if let Ok(store_path) = ekafleet::server::nix::build(&toplevel_attr).await
+            && let Some(hash) = ekafleet::server::cloud::image::extract_store_path_hash(&store_path)
+        {
+            active_hashes.insert(pool_name.clone(), hash.to_string());
         }
 
         let manager_key = match cloud.provider {
@@ -1485,9 +1484,7 @@ pub async fn cmd_images_gc(
             .as_secs();
 
         for img in &all_images {
-            let is_active = active_hashes
-                .get(&img.pool)
-                .map_or(false, |h| h == &img.store_path_hash);
+            let is_active = active_hashes.get(&img.pool) == Some(&img.store_path_hash);
             if !is_active {
                 let age = now.saturating_sub(img.created_at);
                 println!(

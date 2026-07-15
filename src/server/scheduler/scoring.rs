@@ -114,10 +114,10 @@ pub(super) fn compute_score(
 
     // Data locality: strongly prefer the node where this instance's data
     // already lives. Only applied for Stateful jobs via current_machine.
-    if let Some(current) = current_machine {
-        if candidate.name == current {
-            score += 200.0;
-        }
+    if let Some(current) = current_machine
+        && candidate.name == current
+    {
+        score += 200.0;
     }
 
     score

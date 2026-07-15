@@ -315,7 +315,7 @@ async fn housekeeping_loop(
         alerts.expire_silences().await;
 
         // 5. Periodic Raft snapshot and log compaction (every ~100 minutes)
-        if tick_count % 100 == 0 {
+        if tick_count.is_multiple_of(100) {
             let snapshot = raft_state.snapshot().await;
             let last = raft_state.last_applied().await;
             if last > 0 {

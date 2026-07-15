@@ -509,7 +509,7 @@ mod tests {
         });
 
         let resp = state
-            .send_command(&"node-1", msg, cid, Duration::from_secs(5))
+            .send_command("node-1", msg, cid, Duration::from_secs(5))
             .await;
         assert!(resp.is_ok());
         assert!(resp.unwrap().success);
@@ -533,7 +533,7 @@ mod tests {
 
         // Don't complete the request — it should time out.
         let resp = state
-            .send_command(&"node-1", msg, cid, Duration::from_millis(100))
+            .send_command("node-1", msg, cid, Duration::from_millis(100))
             .await;
         assert!(resp.is_err());
         let status = resp.unwrap_err();
@@ -554,7 +554,7 @@ mod tests {
         };
 
         let resp = state
-            .send_command(&"nonexistent", msg, cid, Duration::from_secs(5))
+            .send_command("nonexistent", msg, cid, Duration::from_secs(5))
             .await;
         assert!(resp.is_err());
         let status = resp.unwrap_err();

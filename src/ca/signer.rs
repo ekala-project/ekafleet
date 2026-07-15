@@ -268,23 +268,22 @@ pub async fn serve(config: CaSignerConfig) -> anyhow::Result<()> {
         .await?;
 
     // Persist if newly generated
-    if stored_key.is_none() {
-        if let (Some(key_pem), Some(cert_pem)) =
+    if stored_key.is_none()
+        && let (Some(key_pem), Some(cert_pem)) =
             (ca.root_key_pem().await, ca.root_certificate_pem().await)
+    {
+        tokio::fs::create_dir_all(&config.data_dir).await?;
+        tokio::fs::write(&ca_key_path, &key_pem).await?;
+        tokio::fs::write(&ca_cert_path, &cert_pem).await?;
+
+        #[cfg(unix)]
         {
-            tokio::fs::create_dir_all(&config.data_dir).await?;
-            tokio::fs::write(&ca_key_path, &key_pem).await?;
-            tokio::fs::write(&ca_cert_path, &cert_pem).await?;
-
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let perms = std::fs::Permissions::from_mode(0o600);
-                tokio::fs::set_permissions(&ca_key_path, perms).await?;
-            }
-
-            tracing::info!("CA key and certificate persisted to disk");
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            tokio::fs::set_permissions(&ca_key_path, perms).await?;
         }
+
+        tracing::info!("CA key and certificate persisted to disk");
     }
 
     let ca = Arc::new(ca);

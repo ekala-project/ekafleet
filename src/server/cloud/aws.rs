@@ -81,21 +81,21 @@ impl CloudProvider for AwsCloudProvider {
         }
 
         // Spot instances
-        if let Some(spot) = &request.spot {
-            if spot.enabled {
-                let mut spot_opts = serde_json::json!({
-                    "MarketType": "spot",
+        if let Some(spot) = &request.spot
+            && spot.enabled
+        {
+            let mut spot_opts = serde_json::json!({
+                "MarketType": "spot",
+            });
+            if let Some(max_price) = &spot.max_price {
+                spot_opts["SpotOptions"] = serde_json::json!({
+                    "MaxPrice": max_price,
                 });
-                if let Some(max_price) = &spot.max_price {
-                    spot_opts["SpotOptions"] = serde_json::json!({
-                        "MaxPrice": max_price,
-                    });
-                }
-                args.extend([
-                    "--instance-market-options".to_string(),
-                    spot_opts.to_string(),
-                ]);
             }
+            args.extend([
+                "--instance-market-options".to_string(),
+                spot_opts.to_string(),
+            ]);
         }
 
         // Tags
