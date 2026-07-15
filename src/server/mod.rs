@@ -159,7 +159,10 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     };
 
     let instance_tracker = cloud::instance_tracker::InstanceTracker::new(raft_state.clone());
-    let join_token_store = JoinTokenStore::new();
+    let join_token_store = JoinTokenStore::with_persistence(&config.data_dir);
+    if let Err(e) = join_token_store.load().await {
+        tracing::warn!(error = %e, "Failed to load persisted join tokens, starting fresh");
+    }
 
     // Create a cancellation token for graceful shutdown
     let shutdown = CancellationToken::new();
