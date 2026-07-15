@@ -133,6 +133,16 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
     let workload_mgr = Arc::new(WorkloadManager::new(&config.data_dir, "fleet.internal"));
     let pending_keys = Arc::new(RwLock::new(PendingKeyStore::new()));
     let supervisor = Arc::new(RwLock::new(supervisor::Supervisor::new(&config.data_dir)));
+    // Re-adopt services this agent was already running before the restart, so
+    // orphaned units get reconciled away and unchanged ones are not needlessly
+    // restarted when the next DesiredState arrives.
+    match supervisor.write().await.adopt_existing_units().await {
+        Ok(adopted) if !adopted.is_empty() => {
+            tracing::info!(count = adopted.len(), services = ?adopted, "Re-adopted existing service units");
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "Failed to re-adopt existing service units"),
+    }
     // Secret injector initialized with zeroed key; updated when FleetKeyUpdate is received
     let secret_injector = Arc::new(RwLock::new(SecretInjector::new(
         &config.data_dir,

@@ -54,6 +54,93 @@ impl Supervisor {
         }
     }
 
+    /// Rebuild in-memory `managed_units` state from the `ekafleet-*.service`
+    /// unit files this agent previously installed. Called once at startup so a
+    /// restarted agent re-adopts the services it was already running instead of
+    /// treating them as unknown: matching versions are left untouched by the
+    /// next reconcile, and units dropped from desired state are recognised as
+    /// orphans and stopped rather than surviving indefinitely.
+    ///
+    /// The version key is recovered from the service's Nix GC root (native
+    /// services) or, failing that, from the unit's `ExecStart` line, so an
+    /// unchanged deployment does not trigger a spurious restart.
+    pub async fn adopt_existing_units(&mut self) -> Result<Vec<String>, SupervisorError> {
+        let mut adopted = Vec::new();
+
+        let mut entries = match tokio::fs::read_dir(&self.unit_dir).await {
+            Ok(e) => e,
+            // No unit dir yet means nothing was ever deployed — clean start.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(adopted),
+            Err(e) => return Err(e.into()),
+        };
+
+        while let Some(entry) = entries.next_entry().await? {
+            let file_name = entry.file_name();
+            let Some(unit_name) = file_name.to_str() else {
+                continue;
+            };
+            let Some(name) = service_name_from_unit(unit_name) else {
+                continue;
+            };
+            // Do not clobber a unit we already track (e.g. adopted twice).
+            if self.managed_units.contains_key(name) {
+                continue;
+            }
+
+            let unit_path = entry.path();
+            let version_key = self
+                .recover_version_key(name, &unit_path)
+                .await
+                .unwrap_or_default();
+
+            let running = matches!(
+                query_unit_state(unit_name).await,
+                crate::proto::ServiceState::ServiceRunning
+                    | crate::proto::ServiceState::ServiceStarting
+            );
+
+            tracing::info!(
+                service = %name,
+                unit = %unit_name,
+                running,
+                "Re-adopting existing service unit after restart"
+            );
+
+            self.managed_units.insert(
+                name.to_string(),
+                UnitState {
+                    unit_name: unit_name.to_string(),
+                    version_key,
+                    running,
+                },
+            );
+            adopted.push(name.to_string());
+        }
+
+        Ok(adopted)
+    }
+
+    /// Recover the version key (store path or container image) for an existing
+    /// unit. Prefers the native GC-root symlink target; falls back to the
+    /// unit's `ExecStart` value. Returns `None` if neither is available, in
+    /// which case the next reconcile will restart the service to reassert its
+    /// desired version.
+    async fn recover_version_key(&self, name: &str, unit_path: &Path) -> Option<String> {
+        // Native services: the GC root points at the deployed store path, which
+        // is exactly the version key.
+        let gc_root = self.gcroot_dir.join(name);
+        if let Ok(target) = tokio::fs::read_link(&gc_root).await
+            && let Some(s) = target.to_str()
+            && !s.is_empty()
+        {
+            return Some(s.to_string());
+        }
+
+        // Fall back to the ExecStart command from the unit file.
+        let content = tokio::fs::read_to_string(unit_path).await.ok()?;
+        exec_start_from_unit(&content)
+    }
+
     /// Reconcile local services with desired state.
     /// Starts new services, restarts changed ones, stops removed ones.
     pub async fn reconcile(
@@ -402,6 +489,27 @@ fn version_key_for(spec: &ServiceSpec) -> String {
     }
 }
 
+/// Extract the ekafleet service name from a unit file name, i.e. map
+/// `ekafleet-<name>.service` → `<name>`. Returns `None` for any file that is
+/// not an ekafleet-managed service unit.
+fn service_name_from_unit(unit_name: &str) -> Option<&str> {
+    unit_name
+        .strip_prefix("ekafleet-")
+        .and_then(|s| s.strip_suffix(".service"))
+        .filter(|s| !s.is_empty())
+}
+
+/// Parse the `ExecStart=` value from a systemd unit file's contents. Used as a
+/// fallback source for a service's version key when adopting existing units.
+fn exec_start_from_unit(content: &str) -> Option<String> {
+    content.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("ExecStart=")
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    })
+}
+
 /// Build environment variable lines for a systemd unit file.
 fn build_env_lines(spec: &ServiceSpec) -> String {
     let mut env_entries: Vec<String> = spec
@@ -598,6 +706,105 @@ mod tests {
     fn version_key_native() {
         let spec = native_spec("web", "/nix/store/abc/bin/web", "/nix/store/abc");
         assert_eq!(version_key_for(&spec), "/nix/store/abc");
+    }
+
+    #[test]
+    fn service_name_from_unit_parses_managed_units() {
+        assert_eq!(service_name_from_unit("ekafleet-web.service"), Some("web"));
+        assert_eq!(
+            service_name_from_unit("ekafleet-my-api.service"),
+            Some("my-api")
+        );
+    }
+
+    #[test]
+    fn service_name_from_unit_rejects_foreign_units() {
+        assert_eq!(service_name_from_unit("nginx.service"), None);
+        assert_eq!(service_name_from_unit("ekafleet-.service"), None);
+        assert_eq!(service_name_from_unit("ekafleet-web.timer"), None);
+    }
+
+    #[test]
+    fn exec_start_from_unit_extracts_command() {
+        let content =
+            "[Service]\nType=simple\nExecStart=/nix/store/abc/bin/web --flag\nRestart=on-failure\n";
+        assert_eq!(
+            exec_start_from_unit(content),
+            Some("/nix/store/abc/bin/web --flag".to_string())
+        );
+    }
+
+    #[test]
+    fn exec_start_from_unit_none_when_absent() {
+        assert_eq!(exec_start_from_unit("[Service]\nType=simple\n"), None);
+    }
+
+    #[tokio::test]
+    async fn adopt_existing_units_recovers_state_from_gc_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sv = Supervisor::new(dir.path());
+
+        // Simulate a previously-deployed native service: a unit file plus a GC
+        // root symlink pointing at its store path.
+        tokio::fs::create_dir_all(&sv.unit_dir).await.unwrap();
+        tokio::fs::create_dir_all(&sv.gcroot_dir).await.unwrap();
+        tokio::fs::write(
+            sv.unit_dir.join("ekafleet-web.service"),
+            "[Service]\nExecStart=/nix/store/old/bin/web\n",
+        )
+        .await
+        .unwrap();
+        let store_path = dir.path().join("store-web");
+        tokio::fs::write(&store_path, b"x").await.unwrap();
+        tokio::fs::symlink(&store_path, sv.gcroot_dir.join("web"))
+            .await
+            .unwrap();
+
+        let adopted = sv.adopt_existing_units().await.unwrap();
+        assert_eq!(adopted, vec!["web".to_string()]);
+
+        // The recovered version key must come from the GC root, not ExecStart.
+        let state = sv.managed_units.get("web").expect("web adopted");
+        assert_eq!(state.version_key, store_path.to_str().unwrap());
+        assert_eq!(state.unit_name, "ekafleet-web.service");
+    }
+
+    #[tokio::test]
+    async fn adopt_existing_units_falls_back_to_exec_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sv = Supervisor::new(dir.path());
+
+        // A unit with no GC root (e.g. a container service) recovers its version
+        // key from the ExecStart line.
+        tokio::fs::create_dir_all(&sv.unit_dir).await.unwrap();
+        tokio::fs::write(
+            sv.unit_dir.join("ekafleet-db.service"),
+            "[Service]\nExecStart=systemd-nspawn --oci-bundle=/var/lib/ekafleet/oci/bundles/db\n",
+        )
+        .await
+        .unwrap();
+
+        let adopted = sv.adopt_existing_units().await.unwrap();
+        assert_eq!(adopted, vec!["db".to_string()]);
+        let state = sv.managed_units.get("db").expect("db adopted");
+        assert!(state.version_key.contains("oci-bundle"));
+    }
+
+    #[tokio::test]
+    async fn adopt_existing_units_ignores_foreign_and_missing_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sv = Supervisor::new(dir.path());
+
+        // No unit dir yet — clean start, nothing adopted.
+        assert!(sv.adopt_existing_units().await.unwrap().is_empty());
+
+        // A foreign unit file must not be adopted.
+        tokio::fs::create_dir_all(&sv.unit_dir).await.unwrap();
+        tokio::fs::write(sv.unit_dir.join("nginx.service"), "[Service]\n")
+            .await
+            .unwrap();
+        assert!(sv.adopt_existing_units().await.unwrap().is_empty());
+        assert!(sv.managed_units.is_empty());
     }
 
     #[test]
