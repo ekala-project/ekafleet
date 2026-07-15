@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::{RwLock, mpsc, oneshot};
+use tokio::sync::{Notify, RwLock, mpsc, oneshot};
 use tonic::Status;
 
 use crate::proto::{
@@ -11,10 +11,39 @@ use crate::proto::{
 };
 use crate::types::NodeId;
 
+/// A trigger that wakes the reconciliation loop out-of-band, so a node death,
+/// agent disconnect, or crashed service is rescheduled immediately instead of
+/// waiting for the next periodic tick. Cloneable; all clones share one wakeup.
+#[derive(Clone, Default)]
+pub struct ReconcileTrigger {
+    notify: Arc<Notify>,
+}
+
+impl ReconcileTrigger {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Request a reconciliation as soon as possible. If no waiter is currently
+    /// parked, the request is coalesced into the next `notified()` call, so a
+    /// trigger is never lost between reconcile cycles.
+    pub fn trigger(&self) {
+        self.notify.notify_one();
+    }
+
+    /// Wait until a reconciliation has been requested.
+    pub async fn notified(&self) {
+        self.notify.notified().await;
+    }
+}
+
 /// Shared server state, accessible from gRPC handlers and background tasks.
 #[derive(Clone)]
 pub struct FleetState {
     inner: Arc<RwLock<FleetStateInner>>,
+    /// Fired whenever fleet membership changes in a way that may require
+    /// rescheduling (node eviction, agent disconnect, service crash).
+    reconcile: ReconcileTrigger,
 }
 
 struct FleetStateInner {
@@ -56,7 +85,15 @@ impl FleetState {
                 nodes: HashMap::new(),
                 pending_requests: HashMap::new(),
             })),
+            reconcile: ReconcileTrigger::new(),
         }
+    }
+
+    /// Get a handle to the reconciliation trigger. Callers that observe a
+    /// membership change fire it via [`ReconcileTrigger::trigger`]; the
+    /// reconcile loop waits on it via [`ReconcileTrigger::notified`].
+    pub fn reconcile_trigger(&self) -> ReconcileTrigger {
+        self.reconcile.clone()
     }
 
     /// Register a newly connected agent. Returns a receiver for outbound messages.
@@ -97,9 +134,14 @@ impl FleetState {
 
     /// Remove an agent when it disconnects.
     pub async fn deregister_agent(&self, node_id: &str) {
-        let mut state = self.inner.write().await;
-        state.nodes.remove(node_id);
+        {
+            let mut state = self.inner.write().await;
+            state.nodes.remove(node_id);
+        }
         tracing::info!(node_id, "Agent deregistered");
+        // A disconnected node's services may need rescheduling — reconcile now
+        // rather than waiting for the next periodic tick.
+        self.reconcile.trigger();
     }
 
     /// Evict nodes whose last heartbeat exceeds the timeout.
@@ -122,6 +164,12 @@ impl FleetState {
                 timeout_secs,
                 "Evicted dead node (heartbeat timeout)"
             );
+        }
+        drop(state);
+
+        if !evicted.is_empty() {
+            // Evicted nodes' services must be rescheduled — reconcile now.
+            self.reconcile.trigger();
         }
 
         evicted
@@ -158,21 +206,46 @@ impl FleetState {
     }
 
     /// Update running service info from agent status report.
+    ///
+    /// If a service newly reports as failed (was not failed in the previous
+    /// report), fire the reconcile trigger so the scheduler can reschedule it
+    /// promptly instead of waiting for the next periodic tick.
     pub async fn update_status(&self, node_id: &str, services: Vec<crate::proto::ServiceInstance>) {
-        let mut state = self.inner.write().await;
-        if let Some(node) = state.nodes.get_mut(node_id) {
-            node.services.clear();
-            for svc in services {
-                node.services.insert(
-                    svc.service_name.clone(),
-                    AgentServiceInfo {
-                        instance_id: svc.instance_id,
-                        store_path: svc.store_path,
-                        state: ServiceState::try_from(svc.state).unwrap_or(ServiceState::Unknown),
-                        health: HealthStatus::HealthUnknown,
-                    },
-                );
+        let mut newly_failed = false;
+        {
+            let mut state = self.inner.write().await;
+            if let Some(node) = state.nodes.get_mut(node_id) {
+                let previously_failed: std::collections::HashSet<String> = node
+                    .services
+                    .iter()
+                    .filter(|(_, info)| info.state == ServiceState::ServiceFailed)
+                    .map(|(name, _)| name.clone())
+                    .collect();
+
+                node.services.clear();
+                for svc in services {
+                    let svc_state =
+                        ServiceState::try_from(svc.state).unwrap_or(ServiceState::Unknown);
+                    if svc_state == ServiceState::ServiceFailed
+                        && !previously_failed.contains(&svc.service_name)
+                    {
+                        newly_failed = true;
+                    }
+                    node.services.insert(
+                        svc.service_name.clone(),
+                        AgentServiceInfo {
+                            instance_id: svc.instance_id,
+                            store_path: svc.store_path,
+                            state: svc_state,
+                            health: HealthStatus::HealthUnknown,
+                        },
+                    );
+                }
             }
+        }
+
+        if newly_failed {
+            self.reconcile.trigger();
         }
     }
 
@@ -472,6 +545,74 @@ impl FleetState {
 mod tests {
     use super::*;
     use crate::proto::server_message::Payload as ServerPayload;
+
+    fn instance(name: &str, state: ServiceState) -> crate::proto::ServiceInstance {
+        crate::proto::ServiceInstance {
+            service_name: name.into(),
+            instance_id: format!("{name}-inst"),
+            store_path: "/nix/store/x".into(),
+            state: state as i32,
+        }
+    }
+
+    #[tokio::test]
+    async fn trigger_coalesces_and_wakes_waiter() {
+        let trigger = ReconcileTrigger::new();
+        // A trigger fired before anyone waits is not lost.
+        trigger.trigger();
+        // notified() should return immediately without hanging.
+        tokio::time::timeout(Duration::from_millis(100), trigger.notified())
+            .await
+            .expect("pending trigger should wake an immediate waiter");
+    }
+
+    #[tokio::test]
+    async fn eviction_fires_reconcile_trigger() {
+        let state = FleetState::new();
+        let trigger = state.reconcile_trigger();
+        state
+            .register_agent("dead-node", "127.0.0.1:5000".into(), "default".into())
+            .await;
+
+        // Evict with a zero timeout so the just-registered node is reaped.
+        let evicted = state.evict_dead_nodes(0).await;
+        assert_eq!(evicted, vec!["dead-node".to_string()]);
+
+        tokio::time::timeout(Duration::from_millis(100), trigger.notified())
+            .await
+            .expect("eviction should fire the reconcile trigger");
+    }
+
+    #[tokio::test]
+    async fn newly_failed_service_fires_trigger() {
+        let state = FleetState::new();
+        let trigger = state.reconcile_trigger();
+        state
+            .register_agent("node-1", "127.0.0.1:5000".into(), "default".into())
+            .await;
+
+        // First report: running — must not fire.
+        state
+            .update_status(
+                "node-1",
+                vec![instance("web", ServiceState::ServiceRunning)],
+            )
+            .await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), trigger.notified())
+                .await
+                .is_err(),
+            "a healthy status report must not trigger reconcile"
+        );
+
+        // Second report: the same service now failed — must fire.
+        state
+            .update_status("node-1", vec![instance("web", ServiceState::ServiceFailed)])
+            .await;
+        tokio::time::timeout(Duration::from_millis(100), trigger.notified())
+            .await
+            .expect("a newly failed service should fire the reconcile trigger");
+    }
 
     #[tokio::test]
     async fn send_command_returns_response() {

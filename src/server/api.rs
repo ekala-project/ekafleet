@@ -550,11 +550,22 @@ impl FleetControl for FleetControlService {
                             let reconcile_raft = raft_state.clone();
                             let reconcile_events = event_store.clone();
 
+                            let reconcile_trigger = reconcile_state.reconcile_trigger();
                             tokio::spawn(async move {
                                 let mut interval =
                                     tokio::time::interval(std::time::Duration::from_secs(30));
                                 loop {
-                                    interval.tick().await;
+                                    // Reconcile on the periodic tick OR as soon as an
+                                    // event (node eviction, agent disconnect, service
+                                    // crash) requests it — whichever comes first.
+                                    tokio::select! {
+                                        _ = interval.tick() => {}
+                                        _ = reconcile_trigger.notified() => {
+                                            tracing::debug!(
+                                                "Reconcile triggered by fleet event"
+                                            );
+                                        }
+                                    }
 
                                     // Run scaling cycle
                                     actuator.run_cycle().await;
