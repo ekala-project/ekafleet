@@ -227,6 +227,23 @@ pub async fn compute_plan(
         }
     }
 
+    // Publish per-service resource requests so read paths (e.g. the `top` RPC)
+    // can report requested CPU/memory. CPU is in millicores, memory in MB.
+    let service_requests = services
+        .iter()
+        .map(|(name, cfg)| {
+            let cpu = cfg.resources.cpu.as_ref().map(|c| c.request).unwrap_or(0);
+            let mem = cfg
+                .resources
+                .memory
+                .as_ref()
+                .map(|m| m.request)
+                .unwrap_or(0);
+            (name.clone(), (cpu, mem))
+        })
+        .collect();
+    state.set_service_requests(service_requests).await;
+
     // Schedule services across all machines (static + cloud)
     let placement_plan = scheduler::schedule(
         &services,

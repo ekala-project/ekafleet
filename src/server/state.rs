@@ -52,6 +52,10 @@ struct FleetStateInner {
     nodes: HashMap<NodeId, NodeInfo>,
     /// Pending request-response correlations for agent commands.
     pending_requests: HashMap<String, oneshot::Sender<crate::proto::AgentCommandResponse>>,
+    /// Per-service declared resource requests, keyed by service name. Values are
+    /// `(cpu_millicores, memory_mb)`, refreshed from the desired state on each
+    /// reconcile so the `top` RPC can report requested capacity per service.
+    service_requests: HashMap<String, (u64, u64)>,
 }
 
 struct NodeInfo {
@@ -86,6 +90,7 @@ impl FleetState {
             inner: Arc::new(RwLock::new(FleetStateInner {
                 nodes: HashMap::new(),
                 pending_requests: HashMap::new(),
+                service_requests: HashMap::new(),
             })),
             reconcile: ReconcileTrigger::new(),
             pending_canaries: super::deployer::PendingCanaryStore::new(),
@@ -95,6 +100,23 @@ impl FleetState {
     /// Handle to the registry of canary deployments awaiting manual promotion.
     pub fn pending_canaries(&self) -> super::deployer::PendingCanaryStore {
         self.pending_canaries.clone()
+    }
+
+    /// Replace the per-service resource-request table. Called each reconcile with
+    /// the desired-state requests so read paths like `top` can report requested
+    /// CPU (millicores) and memory (MB) per service.
+    pub async fn set_service_requests(&self, requests: HashMap<String, (u64, u64)>) {
+        self.inner.write().await.service_requests = requests;
+    }
+
+    /// Look up the declared `(cpu_millicores, memory_mb)` request for a service.
+    pub async fn service_request(&self, service_name: &str) -> Option<(u64, u64)> {
+        self.inner
+            .read()
+            .await
+            .service_requests
+            .get(service_name)
+            .copied()
     }
 
     /// Get a handle to the reconciliation trigger. Callers that observe a
@@ -561,6 +583,28 @@ mod tests {
             store_path: "/nix/store/x".into(),
             state: state as i32,
         }
+    }
+
+    #[tokio::test]
+    async fn service_requests_roundtrip() {
+        let state = FleetState::new();
+        assert_eq!(state.service_request("api").await, None);
+
+        let mut requests = HashMap::new();
+        requests.insert("api".to_string(), (500u64, 256u64));
+        requests.insert("web".to_string(), (0u64, 0u64));
+        state.set_service_requests(requests).await;
+
+        assert_eq!(state.service_request("api").await, Some((500, 256)));
+        assert_eq!(state.service_request("web").await, Some((0, 0)));
+        assert_eq!(state.service_request("missing").await, None);
+
+        // A subsequent publish fully replaces the table.
+        let mut next = HashMap::new();
+        next.insert("api".to_string(), (1000u64, 512u64));
+        state.set_service_requests(next).await;
+        assert_eq!(state.service_request("api").await, Some((1000, 512)));
+        assert_eq!(state.service_request("web").await, None);
     }
 
     #[tokio::test]

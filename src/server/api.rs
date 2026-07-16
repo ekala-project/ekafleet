@@ -1472,15 +1472,19 @@ impl FleetControl for FleetControlService {
             })
             .collect();
 
-        let svc_usage: Vec<_> = services
-            .iter()
-            .map(|s| crate::proto::ServiceResourceUsage {
+        let mut svc_usage = Vec::with_capacity(services.len());
+        for s in &services {
+            // Per-instance requests are multiplied by the running instance count
+            // to report the total requested capacity for the service.
+            let (cpu_req, mem_req) = self.state.service_request(&s.name).await.unwrap_or((0, 0));
+            let instances = s.instances.len() as u64;
+            svc_usage.push(crate::proto::ServiceResourceUsage {
                 service_name: s.name.clone(),
                 instance_count: s.instances.len() as u32,
-                cpu_request: 0,    // Would need ServiceConfig to fill
-                memory_request: 0, // Would need ServiceConfig to fill
-            })
-            .collect();
+                cpu_request: cpu_req.saturating_mul(instances),
+                memory_request: mem_req.saturating_mul(instances),
+            });
+        }
 
         Ok(Response::new(TopResponse {
             nodes: if req.mode == "services" {
