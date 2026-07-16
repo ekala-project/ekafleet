@@ -635,6 +635,24 @@ pub fn cmd_completions(shell: clap_complete::Shell) {
     clap_complete::generate(shell, &mut cmd, "ekafleet", &mut std::io::stdout());
 }
 
+/// Print version and build information, honoring the output format.
+pub fn cmd_version(output: &OutputFormat) {
+    let name = env!("CARGO_PKG_NAME");
+    let version = env!("CARGO_PKG_VERSION");
+    match output {
+        OutputFormat::Json => {
+            let v = serde_json::json!({
+                "name": name,
+                "version": version,
+            });
+            println!("{}", serde_json::to_string_pretty(&v).unwrap());
+        }
+        OutputFormat::Text => {
+            println!("{name} {version}");
+        }
+    }
+}
+
 /// Print the effective connection context (server, namespace, whether a token
 /// and TLS CA are configured). The token value itself is never printed.
 pub fn cmd_context_show(output: &OutputFormat) {
@@ -764,40 +782,62 @@ pub async fn cmd_events(
     service: Option<String>,
     node: Option<String>,
     limit: u32,
+    follow: bool,
     server: String,
 ) -> anyhow::Result<()> {
     let mut client = connect_server(&server).await?;
-    let resp = client
-        .events(ekafleet::proto::EventsRequest {
-            category: category.unwrap_or_default(),
-            service: service.unwrap_or_default(),
-            node: node.unwrap_or_default(),
-            limit,
-        })
-        .await?;
-    let result = resp.into_inner();
+    let request = ekafleet::proto::EventsRequest {
+        category: category.unwrap_or_default(),
+        service: service.unwrap_or_default(),
+        node: node.unwrap_or_default(),
+        limit,
+    };
 
-    if result.events.is_empty() {
+    let print_event = |event: &ekafleet::proto::FleetEventProto| {
+        let svc = if event.service.is_empty() {
+            String::new()
+        } else {
+            format!(" service={}", event.service)
+        };
+        let node = if event.node.is_empty() {
+            String::new()
+        } else {
+            format!(" node={}", event.node)
+        };
+        println!(
+            "[{}] {} {}{}{} — {}",
+            event.timestamp, event.level, event.category, svc, node, event.message
+        );
+    };
+
+    let result = client.events(request.clone()).await?.into_inner();
+    if !follow && result.events.is_empty() {
         println!("No events found.");
-    } else {
-        for event in &result.events {
-            let svc = if event.service.is_empty() {
-                String::new()
-            } else {
-                format!(" service={}", event.service)
-            };
-            let node = if event.node.is_empty() {
-                String::new()
-            } else {
-                format!(" node={}", event.node)
-            };
-            println!(
-                "[{}] {} {}{}{} — {}",
-                event.timestamp, event.level, event.category, svc, node, event.message
-            );
+        return Ok(());
+    }
+    for event in &result.events {
+        print_event(event);
+    }
+
+    if !follow {
+        return Ok(());
+    }
+
+    // Follow mode: poll for new events, printing only those with a timestamp
+    // strictly greater than the newest already shown.
+    let mut last_seen = result.events.iter().map(|e| e.timestamp).max().unwrap_or(0);
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let batch = client.events(request.clone()).await?.into_inner();
+        for event in &batch.events {
+            if event.timestamp > last_seen {
+                print_event(event);
+            }
+        }
+        if let Some(max) = batch.events.iter().map(|e| e.timestamp).max() {
+            last_seen = last_seen.max(max);
         }
     }
-    Ok(())
 }
 
 pub async fn cmd_node_list(server: String) -> anyhow::Result<()> {

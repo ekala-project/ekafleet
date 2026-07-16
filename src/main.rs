@@ -5,7 +5,11 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "ekafleet", about = "Unified fleet management for ekaos")]
+#[command(
+    name = "ekafleet",
+    about = "Unified fleet management for ekaos",
+    version = env!("CARGO_PKG_VERSION")
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -278,8 +282,8 @@ enum Command {
         /// Service name
         service: String,
 
-        /// Stream logs continuously
-        #[arg(long, short)]
+        /// Stream logs continuously (alias: --watch)
+        #[arg(long, short, visible_alias = "watch")]
         follow: bool,
 
         /// Number of lines to show
@@ -343,6 +347,10 @@ enum Command {
         /// Maximum number of events to show
         #[arg(long, default_value = "50")]
         limit: u32,
+
+        /// Stream new events continuously (alias: --watch)
+        #[arg(long, short, visible_alias = "watch")]
+        follow: bool,
 
         /// Server address
         #[arg(long, default_value = "127.0.0.1:7400")]
@@ -419,6 +427,9 @@ enum Command {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
+
+    /// Print version and build information
+    Version,
 
     /// Inspect the client connection context (config file, contexts).
     Context {
@@ -923,6 +934,8 @@ async fn main() -> anyhow::Result<()> {
 
         Command::Completions { shell } => commands::cmd_completions(shell),
 
+        Command::Version => commands::cmd_version(&cli.output),
+
         Command::Context { action } => match action {
             ContextAction::Show => commands::cmd_context_show(&cli.output),
             ContextAction::List => commands::cmd_context_list(&client_cfg, &cli.output),
@@ -943,8 +956,9 @@ async fn main() -> anyhow::Result<()> {
             service,
             node,
             limit,
+            follow,
             server,
-        } => commands::cmd_events(category, service, node, limit, server).await?,
+        } => commands::cmd_events(category, service, node, limit, follow, server).await?,
 
         Command::Node { action } => match action {
             NodeAction::List { server } => commands::cmd_node_list(server).await?,
