@@ -86,6 +86,29 @@ impl ImageManager {
         }
     }
 
+    /// Create an image manager whose registry client trusts additional CA
+    /// certificates from a PEM bundle, on top of the host's platform roots.
+    ///
+    /// Use this to pull from registries fronted by a private/internal CA whose
+    /// root is not present in the system trust store. `ca_bundle_pem` is the
+    /// concatenated PEM of one or more CA certificates.
+    pub fn with_registry_ca_bundle(
+        store_path: impl Into<PathBuf>,
+        credentials: Credentials,
+        ca_bundle_pem: &[u8],
+    ) -> Result<Self, registry::RegistryError> {
+        let client = RegistryClient::with_ca_bundle(
+            credentials,
+            registry::DEFAULT_REQUEST_TIMEOUT,
+            ca_bundle_pem,
+        )?;
+        Ok(Self {
+            client,
+            store: ImageStore::new(store_path),
+            fleet_signature_policy: None,
+        })
+    }
+
     /// Apply a fleet-wide signature policy that verifies every image this
     /// manager pulls, unless a per-call policy is provided to [`Self::pull`].
     pub fn with_fleet_signature_policy(mut self, policy: FleetSignaturePolicy) -> Self {
@@ -297,6 +320,17 @@ mod tests {
         let mgr = ImageManager::new(dir.path().join("oci"), Credentials::Anonymous);
         mgr.init().await.unwrap();
         assert!(!mgr.is_cached("nonexistent").await);
+    }
+
+    #[test]
+    fn with_registry_ca_bundle_rejects_invalid_pem() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = ImageManager::with_registry_ca_bundle(
+            dir.path().join("oci"),
+            Credentials::Anonymous,
+            b"garbage",
+        );
+        assert!(result.is_err());
     }
 
     #[test]

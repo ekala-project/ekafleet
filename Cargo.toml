@@ -36,6 +36,7 @@ async-stream = "0.3"
 futures-core = "0.3"
 hyper = "1"
 hyper-util = { version = "0.1", features = ["client-legacy", "server-auto", "service", "tokio", "http1", "http2"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "http1", "http2", "tls12", "native-tokio"] }
 http-body-util = "0.1"
 tower = "0.5"
 
@@ -68,6 +69,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 rustls-pki-types = "1"
 x509-parser = "0.17"
 rustls-pemfile = "2"
+rustls-native-certs = "0.8"
 zeroize = { version = "1", features = ["derive"] }
 
 # Regex

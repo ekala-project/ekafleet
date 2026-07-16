@@ -21,9 +21,14 @@ use super::reference::ImageReference;
 /// not hang a service deployment indefinitely.
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// HTTPS connector layered over the plain HTTP connector, providing rustls TLS
+/// with a configurable root-certificate store.
+type HttpsConnector =
+    hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>;
+
 /// An OCI registry client that handles authentication and content verification.
 pub struct RegistryClient {
-    http: Client<hyper_util::client::legacy::connect::HttpConnector, http_body_util::Full<Bytes>>,
+    http: Client<HttpsConnector, http_body_util::Full<Bytes>>,
     credentials: Credentials,
     /// Cached bearer tokens keyed by scope string.
     tokens: Arc<RwLock<std::collections::HashMap<String, String>>>,
@@ -51,6 +56,8 @@ pub enum RegistryError {
     Status { status: u16, message: String },
     #[error("request timed out after {0:?}")]
     Timeout(Duration),
+    #[error("TLS configuration error: {0}")]
+    Tls(String),
 }
 
 /// Result of fetching a manifest, including the raw bytes for digest verification.
@@ -75,20 +82,83 @@ pub struct BlobResponse {
 
 impl RegistryClient {
     /// Create a new registry client with the given credentials and the default
-    /// per-request timeout.
+    /// per-request timeout, trusting the host's platform root certificates.
     pub fn new(credentials: Credentials) -> Self {
         Self::with_timeout(credentials, DEFAULT_REQUEST_TIMEOUT)
     }
 
-    /// Create a registry client with an explicit per-request timeout.
+    /// Create a registry client with an explicit per-request timeout, trusting
+    /// the host's platform root certificates.
     pub fn with_timeout(credentials: Credentials, request_timeout: Duration) -> Self {
-        let http = Client::builder(TokioExecutor::new()).build_http();
+        let http = Self::build_client(Self::platform_root_store());
         Self {
             http,
             credentials,
             tokens: Arc::new(RwLock::new(std::collections::HashMap::new())),
             request_timeout,
         }
+    }
+
+    /// Create a registry client that trusts additional CA certificates loaded
+    /// from a PEM bundle, in addition to the host's platform roots.
+    ///
+    /// This lets the agent pull from registries fronted by a private/internal
+    /// certificate authority whose root is not in the system trust store.
+    /// `ca_bundle_pem` is the concatenated PEM of one or more CA certificates.
+    pub fn with_ca_bundle(
+        credentials: Credentials,
+        request_timeout: Duration,
+        ca_bundle_pem: &[u8],
+    ) -> Result<Self, RegistryError> {
+        let mut roots = Self::platform_root_store();
+        let mut reader = std::io::BufReader::new(ca_bundle_pem);
+        let mut added = 0usize;
+        for cert in rustls_pemfile::certs(&mut reader) {
+            let cert = cert.map_err(|e| RegistryError::Tls(format!("invalid CA PEM: {e}")))?;
+            roots
+                .add(cert)
+                .map_err(|e| RegistryError::Tls(format!("rejected CA certificate: {e}")))?;
+            added += 1;
+        }
+        if added == 0 {
+            return Err(RegistryError::Tls(
+                "CA bundle contained no certificates".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            http: Self::build_client(roots),
+            credentials,
+            tokens: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            request_timeout,
+        })
+    }
+
+    /// Build a root certificate store seeded with the host's platform trust
+    /// anchors. Certificates the platform reports that rustls cannot parse are
+    /// skipped rather than aborting client construction.
+    fn platform_root_store() -> rustls::RootCertStore {
+        let mut roots = rustls::RootCertStore::empty();
+        let loaded = rustls_native_certs::load_native_certs();
+        for cert in loaded.certs {
+            let _ = roots.add(cert);
+        }
+        roots
+    }
+
+    /// Construct the underlying HTTPS client from a root certificate store.
+    fn build_client(
+        roots: rustls::RootCertStore,
+    ) -> Client<HttpsConnector, http_body_util::Full<Bytes>> {
+        let tls = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let https = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_tls_config(tls)
+            .https_or_http()
+            .enable_all_versions()
+            .build();
+        Client::builder(TokioExecutor::new()).build(https)
     }
 
     /// Send a request under the configured per-request timeout, mapping an
@@ -517,5 +587,33 @@ mod tests {
             Err(other) => panic!("expected timeout, got {other:?}"),
             Ok(_) => panic!("expected timeout, got a successful response"),
         }
+    }
+
+    #[test]
+    fn ca_bundle_rejects_empty_pem() {
+        match RegistryClient::with_ca_bundle(
+            Credentials::Anonymous,
+            DEFAULT_REQUEST_TIMEOUT,
+            b"not a certificate",
+        ) {
+            Err(RegistryError::Tls(_)) => {}
+            Err(other) => panic!("expected TLS error, got {other:?}"),
+            Ok(_) => panic!("expected TLS error for a bundle with no certificates"),
+        }
+    }
+
+    #[test]
+    fn ca_bundle_accepts_valid_certificate() {
+        // A self-signed CA certificate in PEM form.
+        let cert = rcgen::generate_simple_self_signed(vec!["registry.internal".to_string()])
+            .expect("generate self-signed cert");
+        let pem = cert.cert.pem();
+        let client = RegistryClient::with_ca_bundle(
+            Credentials::Anonymous,
+            DEFAULT_REQUEST_TIMEOUT,
+            pem.as_bytes(),
+        )
+        .expect("valid CA bundle must build a client");
+        assert_eq!(client.request_timeout, DEFAULT_REQUEST_TIMEOUT);
     }
 }
