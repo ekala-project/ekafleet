@@ -178,6 +178,45 @@ pub struct HttpApiState {
 
 /// Start the HTTP API server with REST endpoints for all operations.
 /// The /health endpoint is public; all other endpoints require authentication via RBAC tokens.
+/// TLS material for serving the REST API over HTTPS. Both fields hold PEM;
+/// `cert_pem` may be a combined cert-chain + private-key bundle (as issued for
+/// the server SVID), in which case `key_pem` can be the same string.
+pub struct HttpTlsConfig {
+    pub cert_pem: String,
+    pub key_pem: String,
+}
+
+/// Build a rustls `ServerConfig` from PEM cert-chain and private key. The
+/// private key is read from `key_pem` (PKCS#8, PKCS#1, or SEC1); certificates
+/// come from `cert_pem`.
+fn build_rustls_config(tls: &HttpTlsConfig) -> anyhow::Result<rustls::ServerConfig> {
+    let mut cert_reader = std::io::BufReader::new(tls.cert_pem.as_bytes());
+    let certs = rustls_pemfile::certs(&mut cert_reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| anyhow::anyhow!("failed to parse HTTP TLS certificate: {e}"))?;
+    if certs.is_empty() {
+        anyhow::bail!("HTTP TLS certificate PEM contained no certificates");
+    }
+
+    let mut key_reader = std::io::BufReader::new(tls.key_pem.as_bytes());
+    let key = rustls_pemfile::private_key(&mut key_reader)
+        .map_err(|e| anyhow::anyhow!("failed to parse HTTP TLS private key: {e}"))?
+        .ok_or_else(|| anyhow::anyhow!("HTTP TLS key PEM contained no private key"))?;
+
+    // Pin the ring crypto provider to match the gRPC server (tonic tls-ring).
+    // When multiple providers are compiled in, rustls cannot pick a
+    // process-level default automatically, so we specify it explicitly.
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| anyhow::anyhow!("failed to configure TLS protocol versions: {e}"))?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| anyhow::anyhow!("invalid HTTP TLS cert/key: {e}"))?;
+    Ok(config)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_http(
     addr: SocketAddr,
     fleet_state: FleetState,
@@ -186,6 +225,7 @@ pub async fn serve_http(
     metrics: MetricsAggregator,
     alert_evaluator: AlertEvaluator,
     instance_tracker: Option<super::cloud::instance_tracker::InstanceTracker>,
+    tls: Option<HttpTlsConfig>,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<()> {
     use axum::extract::State;
@@ -254,12 +294,77 @@ pub async fn serve_http(
         .route("/health", get(health))
         .merge(authenticated_routes);
 
-    tracing::info!(%addr, "HTTP server listening");
-
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move { shutdown.cancelled().await })
-        .await?;
+
+    let Some(tls) = tls else {
+        tracing::info!(%addr, "HTTP server listening");
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move { shutdown.cancelled().await })
+            .await?;
+        return Ok(());
+    };
+
+    tracing::info!(%addr, "HTTPS server listening");
+    let rustls_config = build_rustls_config(&tls)?;
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(rustls_config));
+
+    // Manual accept loop: terminate TLS per-connection, then hand the stream to
+    // hyper-util's auto (HTTP/1 + HTTP/2) connection builder driving the axum
+    // service. `axum::serve` does not accept a pre-terminated TLS stream, so we
+    // drive the connections ourselves.
+    let make_service = app.into_make_service_with_connect_info::<SocketAddr>();
+    let mut make_service = make_service;
+    loop {
+        let (stream, peer) = tokio::select! {
+            _ = shutdown.cancelled() => break,
+            accepted = listener.accept() => match accepted {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(error = %e, "HTTPS accept failed");
+                    continue;
+                }
+            },
+        };
+
+        let acceptor = acceptor.clone();
+        let tower_service = match tower::Service::call(&mut make_service, peer).await {
+            Ok(svc) => svc,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to build connection service");
+                continue;
+            }
+        };
+        let shutdown = shutdown.clone();
+
+        tokio::spawn(async move {
+            let tls_stream = match acceptor.accept(stream).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::debug!(%peer, error = %e, "TLS handshake failed");
+                    return;
+                }
+            };
+
+            let io = hyper_util::rt::TokioIo::new(tls_stream);
+            let hyper_service = hyper_util::service::TowerToHyperService::new(tower_service);
+            let builder =
+                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+            let conn = builder.serve_connection_with_upgrades(io, hyper_service);
+            tokio::pin!(conn);
+
+            tokio::select! {
+                res = conn.as_mut() => {
+                    if let Err(e) = res {
+                        tracing::debug!(%peer, error = %e, "HTTPS connection error");
+                    }
+                }
+                _ = shutdown.cancelled() => {
+                    conn.as_mut().graceful_shutdown();
+                    let _ = conn.await;
+                }
+            }
+        });
+    }
 
     Ok(())
 }
@@ -319,8 +424,10 @@ async fn rest_status(
 /// GET /v1/services — Service placement listing (JSON).
 async fn rest_services(
     axum::extract::State(state): axum::extract::State<HttpApiState>,
+    query: axum::extract::Query<PageQuery>,
 ) -> axum::Json<serde_json::Value> {
     let (_, services, _) = state.fleet_state.fleet_status().await;
+    let services = query.slice(&services);
     let data: Vec<serde_json::Value> = services
         .iter()
         .map(|s| {
@@ -340,11 +447,35 @@ async fn rest_services(
     axum::Json(serde_json::json!(data))
 }
 
+/// Shared offset/limit pagination for list endpoints. `limit` is capped at
+/// 1000; both parameters are optional and default to returning up to the first
+/// 1000 items.
+#[derive(serde::Deserialize)]
+struct PageQuery {
+    #[serde(default)]
+    offset: Option<usize>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+impl PageQuery {
+    /// Return the requested window of `items` honoring `offset` and a
+    /// 1000-capped `limit`.
+    fn slice<'a, T>(&self, items: &'a [T]) -> &'a [T] {
+        let offset = self.offset.unwrap_or(0).min(items.len());
+        let limit = self.limit.unwrap_or(1000).min(1000);
+        let end = offset.saturating_add(limit).min(items.len());
+        &items[offset..end]
+    }
+}
+
 /// GET /v1/capacity — Resource utilization report (JSON).
 async fn rest_capacity(
     axum::extract::State(state): axum::extract::State<HttpApiState>,
+    query: axum::extract::Query<PageQuery>,
 ) -> axum::Json<serde_json::Value> {
     let (nodes, _, pools) = state.fleet_state.fleet_status().await;
+    let pools = query.slice(&pools);
     let mut total_cpu = 0u64;
     let mut total_mem = 0u64;
     let mut total_disk = 0u64;
@@ -380,17 +511,22 @@ async fn rest_events(
     axum::extract::State(state): axum::extract::State<HttpApiState>,
     query: axum::extract::Query<EventsQuery>,
 ) -> axum::Json<serde_json::Value> {
-    let limit = query.limit.unwrap_or(50).min(1000);
+    let offset = query.offset.unwrap_or(0);
+    let limit = (query.limit.unwrap_or(50) as usize).min(1000);
+    // Fetch enough to cover the requested window, then skip past the offset.
+    let fetched = offset.saturating_add(limit);
     let events = state
         .event_store
-        .query(None, query.service.as_deref(), limit as usize)
+        .query(None, query.service.as_deref(), fetched)
         .await;
-    axum::Json(serde_json::json!(events))
+    let window: Vec<_> = events.into_iter().skip(offset).take(limit).collect();
+    axum::Json(serde_json::json!(window))
 }
 
 #[derive(serde::Deserialize)]
 struct EventsQuery {
     service: Option<String>,
+    offset: Option<usize>,
     limit: Option<u32>,
 }
 
@@ -399,9 +535,14 @@ async fn rest_deployments(
     axum::extract::State(state): axum::extract::State<HttpApiState>,
     query: axum::extract::Query<DeploymentsQuery>,
 ) -> axum::Json<serde_json::Value> {
-    let limit = query.limit.unwrap_or(50).min(1000);
-    let history = state.event_store.all_deploy_history(limit as usize).await;
-    axum::Json(serde_json::json!(history))
+    let offset = query.offset.unwrap_or(0);
+    let limit = (query.limit.unwrap_or(50) as usize).min(1000);
+    let history = state
+        .event_store
+        .all_deploy_history(offset.saturating_add(limit))
+        .await;
+    let window: Vec<_> = history.into_iter().skip(offset).take(limit).collect();
+    axum::Json(serde_json::json!(window))
 }
 
 /// GET /v1/deployments/:service — Per-service deployment history (JSON).
@@ -410,16 +551,19 @@ async fn rest_service_deployments(
     axum::extract::Path(service): axum::extract::Path<String>,
     query: axum::extract::Query<DeploymentsQuery>,
 ) -> axum::Json<serde_json::Value> {
-    let limit = query.limit.unwrap_or(50).min(1000);
+    let offset = query.offset.unwrap_or(0);
+    let limit = (query.limit.unwrap_or(50) as usize).min(1000);
     let history = state
         .event_store
-        .deploy_history(&service, limit as usize)
+        .deploy_history(&service, offset.saturating_add(limit))
         .await;
-    axum::Json(serde_json::json!(history))
+    let window: Vec<_> = history.into_iter().skip(offset).take(limit).collect();
+    axum::Json(serde_json::json!(window))
 }
 
 #[derive(serde::Deserialize)]
 struct DeploymentsQuery {
+    offset: Option<usize>,
     limit: Option<u32>,
 }
 
@@ -527,9 +671,11 @@ async fn rest_query(
 /// GET /v1/alerts/silences — List all active silences.
 async fn rest_list_silences(
     axum::extract::State(state): axum::extract::State<HttpApiState>,
+    query: axum::extract::Query<PageQuery>,
 ) -> axum::Json<serde_json::Value> {
     let silences = state.alert_evaluator.list_silences().await;
-    axum::Json(serde_json::json!(silences))
+    let window = query.slice(&silences);
+    axum::Json(serde_json::json!(window))
 }
 
 /// POST /v1/alerts/silences — Create a silence (JSON body).
@@ -637,10 +783,14 @@ async fn rest_service_metrics(
 /// GET /v1/cloud/instances — List all tracked cloud-provisioned machine instances.
 async fn rest_cloud_instances(
     axum::extract::State(state): axum::extract::State<HttpApiState>,
+    query: axum::extract::Query<PageQuery>,
 ) -> axum::Json<serde_json::Value> {
     let instances = if let Some(tracker) = &state.instance_tracker {
         let all = tracker.all().await;
-        all.values()
+        let values: Vec<_> = all.values().cloned().collect();
+        query
+            .slice(&values)
+            .iter()
             .map(|i| {
                 serde_json::json!({
                     "instance_id": i.cloud_instance_id,

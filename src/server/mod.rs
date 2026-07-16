@@ -115,6 +115,21 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         ca_cert_pem: String::from_utf8(ca_chain_pem)?,
     };
 
+    // Optional HTTPS for the REST API. Opt-in via EKAFLEET_HTTP_TLS; when set,
+    // the REST server reuses the server SVID (combined cert-chain + key bundle)
+    // to terminate TLS. Left unset, the REST API is served over plaintext HTTP.
+    let http_tls = if std::env::var("EKAFLEET_HTTP_TLS")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false)
+    {
+        Some(rest::HttpTlsConfig {
+            cert_pem: tls.cert_pem.clone(),
+            key_pem: tls.cert_pem.clone(),
+        })
+    } else {
+        None
+    };
+
     // Initialize certificate issuer for SPIFFE SVID issuance
     let cert_issuer = CertIssuer::new(ca.clone());
 
@@ -217,6 +232,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
             metrics,
             alert_evaluator,
             Some(instance_tracker),
+            http_tls,
             http_shutdown,
         ) => {
             result?;
