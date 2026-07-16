@@ -1806,6 +1806,18 @@ pub async fn serve_grpc(
         req.metadata_mut().remove("x-ekafleet-mtls");
         req.metadata_mut().remove("x-ekafleet-attest");
 
+        // Extract the request namespace (CLI `--namespace`) and stash it in
+        // extensions so handlers can scope operations. Absent/invalid markers
+        // fall back to the default namespace.
+        let namespace = req
+            .metadata()
+            .get(super::rbac::NAMESPACE_METADATA_KEY)
+            .and_then(|v| v.to_str().ok())
+            .filter(|v| !v.is_empty())
+            .map(|v| super::rbac::RequestNamespace(v.to_string()))
+            .unwrap_or_default();
+        req.extensions_mut().insert(namespace);
+
         // Accept mTLS-authenticated requests. Authentication is established by
         // the presence of a client certificate that rustls has *already verified*
         // against the configured CA (client_ca_root below). `peer_certs()` only

@@ -29,6 +29,25 @@ pub enum PeerIdentity {
     Mtls,
 }
 
+/// The namespace a request is scoped to, carried by the CLI in the
+/// `x-ekafleet-namespace` metadata and stashed in request extensions by the
+/// gRPC interceptor. Handlers read this to scope operations; when the marker
+/// is absent it defaults to [`DEFAULT_NAMESPACE`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestNamespace(pub String);
+
+/// Metadata key the CLI uses to convey the request namespace.
+pub const NAMESPACE_METADATA_KEY: &str = "x-ekafleet-namespace";
+
+/// Namespace used when a request carries no namespace marker.
+pub const DEFAULT_NAMESPACE: &str = "default";
+
+impl Default for RequestNamespace {
+    fn default() -> Self {
+        Self(DEFAULT_NAMESPACE.to_string())
+    }
+}
+
 /// Permissions that can be checked against a role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Permission {

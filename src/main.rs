@@ -1,3 +1,4 @@
+mod client_config;
 mod commands;
 
 use clap::{Parser, Subcommand};
@@ -12,6 +13,27 @@ struct Cli {
     /// Output format: "text" (default) or "json" for machine-readable output
     #[arg(long, short, default_value = "text", global = true)]
     output: OutputFormat,
+
+    /// Named context from the client config file to use for connection
+    /// settings. Defaults to the file's `currentContext`.
+    #[arg(long, global = true)]
+    context: Option<String>,
+
+    /// Override the server address (`host:port`) for this invocation.
+    #[arg(long, global = true)]
+    server: Option<String>,
+
+    /// Override the bearer auth token for this invocation.
+    #[arg(long, global = true)]
+    token: Option<String>,
+
+    /// Override the namespace to scope operations to.
+    #[arg(long, global = true)]
+    namespace: Option<String>,
+
+    /// Override the PEM CA certificate path; when set the CLI connects over TLS.
+    #[arg(long, global = true)]
+    ca_cert: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
@@ -398,6 +420,12 @@ enum Command {
         shell: clap_complete::Shell,
     },
 
+    /// Inspect the client connection context (config file, contexts).
+    Context {
+        #[command(subcommand)]
+        action: ContextAction,
+    },
+
     /// Take a Raft state snapshot for disaster recovery
     Snapshot {
         /// Path to save the snapshot
@@ -434,6 +462,14 @@ enum Command {
         #[command(subcommand)]
         action: ImagesAction,
     },
+}
+
+#[derive(Subcommand)]
+enum ContextAction {
+    /// Show the effective connection context (after resolving config, env, flags).
+    Show,
+    /// List the contexts defined in the config file.
+    List,
 }
 
 #[derive(Subcommand)]
@@ -752,6 +788,21 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
+    // Resolve the connection context once (config file + env + CLI flags) and
+    // install it process-wide so `connect_server` picks up TLS/auth/namespace.
+    let client_cfg = client_config::ClientConfig::load()?;
+    let overrides = client_config::Overrides {
+        context: cli.context.clone(),
+        server: cli.server.clone(),
+        token: cli.token.clone(),
+        ca_cert: cli.ca_cert.clone(),
+        namespace: cli.namespace.clone(),
+    };
+    client_config::init_context(client_config::ClientContext::resolve(
+        &client_cfg,
+        &overrides,
+    ));
+
     match cli.command {
         Command::Proxy {
             listen,
@@ -871,6 +922,11 @@ async fn main() -> anyhow::Result<()> {
         } => commands::cmd_dispatch(service, params, server).await?,
 
         Command::Completions { shell } => commands::cmd_completions(shell),
+
+        Command::Context { action } => match action {
+            ContextAction::Show => commands::cmd_context_show(&cli.output),
+            ContextAction::List => commands::cmd_context_list(&client_cfg, &cli.output),
+        },
 
         Command::Snapshot { output, server } => commands::cmd_snapshot(output, server).await?,
 

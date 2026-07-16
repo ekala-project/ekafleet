@@ -7,13 +7,104 @@ use ekafleet::{agent, server};
 use std::path::PathBuf;
 
 use super::OutputFormat;
+use super::client_config;
 
-pub async fn connect_server(
-    server: &str,
-) -> anyhow::Result<FleetControlClient<tonic::transport::Channel>> {
-    let endpoint = format!("http://{server}");
-    let client = FleetControlClient::connect(endpoint).await?;
-    Ok(client)
+/// The CLI's gRPC client type. A bearer token (when configured) is injected on
+/// every request by an interceptor, so the inner service is the intercepted
+/// channel rather than a bare [`tonic::transport::Channel`].
+pub type FleetClient = FleetControlClient<
+    tonic::service::interceptor::InterceptedService<tonic::transport::Channel, AuthInterceptor>,
+>;
+
+/// Metadata key used to scope every request to a namespace. The proto request
+/// messages have no namespace field, so the CLI carries it out-of-band here;
+/// this keeps namespace scoping additive and avoids touching 40+ messages.
+pub const NAMESPACE_METADATA_KEY: &str = "x-ekafleet-namespace";
+
+/// Injects the configured bearer token (`authorization`) and namespace
+/// (`x-ekafleet-namespace`) into the metadata of every outgoing request. The
+/// token is omitted when none is configured (e.g. dev mode); the namespace is
+/// omitted when it is the default.
+#[derive(Clone)]
+pub struct AuthInterceptor {
+    token: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
+    namespace: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
+}
+
+impl tonic::service::Interceptor for AuthInterceptor {
+    fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
+        if let Some(token) = &self.token {
+            req.metadata_mut().insert("authorization", token.clone());
+        }
+        if let Some(ns) = &self.namespace {
+            req.metadata_mut()
+                .insert(NAMESPACE_METADATA_KEY, ns.clone());
+        }
+        Ok(req)
+    }
+}
+
+/// Connect to the control plane at `server`, applying the resolved client
+/// context (TLS CA and bearer token). The `server` argument still takes
+/// precedence for the address so per-command `--server` flags keep working;
+/// TLS and auth come from the global context resolved in `main`.
+pub async fn connect_server(server: &str) -> anyhow::Result<FleetClient> {
+    let ctx = client_config::context();
+
+    // Per-command `--server` flags default to the historical address. Treat a
+    // non-default value as an explicit override; otherwise defer to the
+    // context resolved from the config file / env / global `--server`.
+    let server = if server == client_config::DEFAULT_SERVER {
+        ctx.server.as_str()
+    } else {
+        server
+    };
+
+    let channel = if let Some(ca_path) = &ctx.ca_cert {
+        let ca_pem = std::fs::read(ca_path)
+            .map_err(|e| anyhow::anyhow!("failed to read CA cert {}: {e}", ca_path.display()))?;
+        let ca_cert = tonic::transport::Certificate::from_pem(ca_pem);
+        let mut tls = tonic::transport::ClientTlsConfig::new().ca_certificate(ca_cert);
+        // When connecting by IP, the CA validates the chain but SNI/hostname
+        // verification needs a name; use the server's canonical identity.
+        if server.starts_with(|c: char| c.is_ascii_digit()) {
+            tls = tls.domain_name("ekafleet");
+        }
+        tonic::transport::Endpoint::from_shared(format!("https://{server}"))?
+            .tls_config(tls)?
+            .connect()
+            .await?
+    } else {
+        tonic::transport::Endpoint::from_shared(format!("http://{server}"))?
+            .connect()
+            .await?
+    };
+
+    let token = match &ctx.token {
+        Some(t) => Some(
+            format!("Bearer {t}")
+                .parse()
+                .map_err(|e| anyhow::anyhow!("invalid auth token: {e}"))?,
+        ),
+        None => None,
+    };
+
+    // Only send the namespace marker when it differs from the default, so
+    // default-namespace traffic is byte-for-byte unchanged.
+    let namespace = if ctx.namespace == client_config::DEFAULT_NAMESPACE {
+        None
+    } else {
+        Some(
+            ctx.namespace
+                .parse()
+                .map_err(|e| anyhow::anyhow!("invalid namespace: {e}"))?,
+        )
+    };
+
+    Ok(FleetControlClient::with_interceptor(
+        channel,
+        AuthInterceptor { token, namespace },
+    ))
 }
 
 /// Execute ssh, replacing the current process.
@@ -542,6 +633,75 @@ pub fn cmd_completions(shell: clap_complete::Shell) {
     use clap::CommandFactory;
     let mut cmd = super::Cli::command();
     clap_complete::generate(shell, &mut cmd, "ekafleet", &mut std::io::stdout());
+}
+
+/// Print the effective connection context (server, namespace, whether a token
+/// and TLS CA are configured). The token value itself is never printed.
+pub fn cmd_context_show(output: &OutputFormat) {
+    let ctx = client_config::context();
+    match output {
+        OutputFormat::Json => {
+            let v = serde_json::json!({
+                "server": ctx.server,
+                "namespace": ctx.namespace,
+                "tokenConfigured": ctx.token.is_some(),
+                "caCert": ctx.ca_cert.as_ref().map(|p| p.display().to_string()),
+                "configPath": client_config::config_path().map(|p| p.display().to_string()),
+            });
+            println!("{}", serde_json::to_string_pretty(&v).unwrap());
+        }
+        OutputFormat::Text => {
+            println!("server:     {}", ctx.server);
+            println!("namespace:  {}", ctx.namespace);
+            println!(
+                "token:      {}",
+                if ctx.token.is_some() {
+                    "<configured>"
+                } else {
+                    "<none>"
+                }
+            );
+            println!(
+                "ca-cert:    {}",
+                ctx.ca_cert
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "<none>".to_string())
+            );
+            if let Some(path) = client_config::config_path() {
+                println!("config:     {}", path.display());
+            }
+        }
+    }
+}
+
+/// List the contexts defined in the config file and mark the current one.
+pub fn cmd_context_list(config: &client_config::ClientConfig, output: &OutputFormat) {
+    let mut names: Vec<&String> = config.contexts.keys().collect();
+    names.sort();
+    match output {
+        OutputFormat::Json => {
+            let v = serde_json::json!({
+                "currentContext": config.current_context,
+                "contexts": names,
+            });
+            println!("{}", serde_json::to_string_pretty(&v).unwrap());
+        }
+        OutputFormat::Text => {
+            if names.is_empty() {
+                println!("(no contexts defined)");
+                return;
+            }
+            for name in names {
+                let marker = if config.current_context.as_deref() == Some(name.as_str()) {
+                    "* "
+                } else {
+                    "  "
+                };
+                println!("{marker}{name}");
+            }
+        }
+    }
 }
 
 pub async fn cmd_snapshot(output: PathBuf, server: String) -> anyhow::Result<()> {
