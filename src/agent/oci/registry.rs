@@ -4,6 +4,7 @@
 //! registry, with automatic token-based authentication.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use hyper::body::Bytes;
 use hyper_util::client::legacy::Client;
@@ -15,12 +16,19 @@ use super::digest::{Digest, DigestVerifier};
 use super::manifest::{ACCEPT_MANIFESTS, ManifestKind};
 use super::reference::ImageReference;
 
+/// Default per-request timeout applied to every registry HTTP request
+/// (manifest, blob/layer, and token exchange). A stalled layer download must
+/// not hang a service deployment indefinitely.
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// An OCI registry client that handles authentication and content verification.
 pub struct RegistryClient {
     http: Client<hyper_util::client::legacy::connect::HttpConnector, http_body_util::Full<Bytes>>,
     credentials: Credentials,
     /// Cached bearer tokens keyed by scope string.
     tokens: Arc<RwLock<std::collections::HashMap<String, String>>>,
+    /// Per-request timeout bounding each individual manifest/blob fetch.
+    request_timeout: Duration,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -41,6 +49,8 @@ pub enum RegistryError {
     Body(String),
     #[error("registry returned HTTP {status}: {message}")]
     Status { status: u16, message: String },
+    #[error("request timed out after {0:?}")]
+    Timeout(Duration),
 }
 
 /// Result of fetching a manifest, including the raw bytes for digest verification.
@@ -64,13 +74,33 @@ pub struct BlobResponse {
 }
 
 impl RegistryClient {
-    /// Create a new registry client with the given credentials.
+    /// Create a new registry client with the given credentials and the default
+    /// per-request timeout.
     pub fn new(credentials: Credentials) -> Self {
+        Self::with_timeout(credentials, DEFAULT_REQUEST_TIMEOUT)
+    }
+
+    /// Create a registry client with an explicit per-request timeout.
+    pub fn with_timeout(credentials: Credentials, request_timeout: Duration) -> Self {
         let http = Client::builder(TokioExecutor::new()).build_http();
         Self {
             http,
             credentials,
             tokens: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            request_timeout,
+        }
+    }
+
+    /// Send a request under the configured per-request timeout, mapping an
+    /// elapsed deadline to [`RegistryError::Timeout`].
+    async fn send(
+        &self,
+        req: hyper::Request<http_body_util::Full<Bytes>>,
+    ) -> Result<hyper::Response<hyper::body::Incoming>, RegistryError> {
+        match tokio::time::timeout(self.request_timeout, self.http.request(req)).await {
+            Ok(Ok(resp)) => Ok(resp),
+            Ok(Err(e)) => Err(RegistryError::Http(e.to_string())),
+            Err(_) => Err(RegistryError::Timeout(self.request_timeout)),
         }
     }
 
@@ -174,11 +204,7 @@ impl RegistryClient {
             .body(http_body_util::Full::new(Bytes::new()))
             .map_err(|e| RegistryError::Http(e.to_string()))?;
 
-        let resp = self
-            .http
-            .request(req)
-            .await
-            .map_err(|e| RegistryError::Http(e.to_string()))?;
+        let resp = self.send(req).await?;
 
         match resp.status().as_u16() {
             200 => {
@@ -278,11 +304,7 @@ impl RegistryClient {
             .body(http_body_util::Full::new(Bytes::new()))
             .map_err(|e| RegistryError::Http(e.to_string()))?;
 
-        let resp = self
-            .http
-            .request(req)
-            .await
-            .map_err(|e| RegistryError::Http(e.to_string()))?;
+        let resp = self.send(req).await?;
 
         let status = resp.status().as_u16();
         let www_auth = resp
@@ -330,11 +352,7 @@ impl RegistryClient {
             .body(http_body_util::Full::new(Bytes::new()))
             .map_err(|e| RegistryError::Http(e.to_string()))?;
 
-        let resp = self
-            .http
-            .request(req)
-            .await
-            .map_err(|e| RegistryError::Auth(format!("token exchange HTTP error: {e}")))?;
+        let resp = self.send(req).await?;
 
         if resp.status() != 200 {
             return Err(RegistryError::Auth(format!(
@@ -460,5 +478,44 @@ mod tests {
             username: "user".to_string(),
             password: "pass".to_string(),
         });
+    }
+
+    #[test]
+    fn default_timeout_is_applied() {
+        let client = RegistryClient::new(Credentials::Anonymous);
+        assert_eq!(client.request_timeout, DEFAULT_REQUEST_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn request_times_out() {
+        // A listener that accepts connections but never sends a response, so the
+        // request hangs until the per-request timeout elapses.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                // Hold the connection open without ever replying.
+                tokio::spawn(async move {
+                    let _held = stream;
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                });
+            }
+        });
+
+        let client =
+            RegistryClient::with_timeout(Credentials::Anonymous, Duration::from_millis(100));
+        let req = hyper::Request::builder()
+            .method("GET")
+            .uri(format!("http://{addr}/v2/"))
+            .body(http_body_util::Full::new(Bytes::new()))
+            .unwrap();
+        match client.send(req).await {
+            Err(RegistryError::Timeout(_)) => {}
+            Err(other) => panic!("expected timeout, got {other:?}"),
+            Ok(_) => panic!("expected timeout, got a successful response"),
+        }
     }
 }
