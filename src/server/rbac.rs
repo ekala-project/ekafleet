@@ -65,6 +65,18 @@ pub fn token_id(token: &str) -> String {
     format!("token:{hex}")
 }
 
+/// Derive the storage key for a raw bearer token: the full SHA-256 digest as
+/// hex. The token store is keyed by this digest rather than the raw secret so
+/// that (1) authentication lookups compare fixed-length, uniformly-distributed
+/// digest bytes — the short-circuiting equality inside the map leaks nothing
+/// about the secret's contents or length, giving effectively constant-time
+/// comparison — and (2) the persisted `tokens.json` never contains raw token
+/// values at rest.
+fn token_key(token: &str) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, token.as_bytes());
+    digest.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// The namespace a request is scoped to, carried by the CLI in the
 /// `x-ekafleet-namespace` metadata and stashed in request extensions by the
 /// gRPC interceptor. Handlers read this to scope operations; when the marker
@@ -245,7 +257,7 @@ impl TokenStore {
             created_at: now,
             expires_at: ttl_secs.map(|ttl| now + ttl),
         };
-        self.tokens.write().await.insert(token.to_string(), entry);
+        self.tokens.write().await.insert(token_key(token), entry);
         tracing::info!(role = ?role, description = %description, "Token registered");
         self.persist().await;
     }
@@ -259,7 +271,7 @@ impl TokenStore {
     /// Synchronous token validation for use in interceptors.
     /// Returns the role if the token exists and is not expired.
     pub fn authenticate_sync(tokens: &HashMap<String, TokenEntry>, token: &str) -> Option<Role> {
-        let entry = tokens.get(token)?;
+        let entry = tokens.get(&token_key(token))?;
         if entry.is_expired() {
             None
         } else {
@@ -274,7 +286,7 @@ impl TokenStore {
         tokens: &HashMap<String, TokenEntry>,
         token: &str,
     ) -> Option<(Role, TokenIdentity)> {
-        let entry = tokens.get(token)?;
+        let entry = tokens.get(&token_key(token))?;
         if entry.is_expired() {
             return None;
         }
@@ -294,7 +306,7 @@ impl TokenStore {
 
     /// Revoke a token.
     pub async fn revoke(&self, token: &str) -> bool {
-        let removed = self.tokens.write().await.remove(token).is_some();
+        let removed = self.tokens.write().await.remove(&token_key(token)).is_some();
         if removed {
             self.persist().await;
         }
@@ -390,7 +402,7 @@ mod tests {
             .tokens
             .write()
             .await
-            .insert("expired-tok".to_string(), entry);
+            .insert(token_key("expired-tok"), entry);
 
         assert!(store.authenticate("expired-tok").await.is_none());
     }
@@ -443,6 +455,21 @@ mod tests {
         assert_ne!(token_id("abc"), token_id("abd"));
         assert!(token_id("abc").starts_with("token:"));
         assert!(!token_id("abc").contains("abc"));
+    }
+
+    #[tokio::test]
+    async fn store_keys_by_digest_never_raw_token() {
+        let store = TokenStore::new();
+        store.register("secret-tok", Role::Admin, "ci").await;
+
+        let guard = store.tokens.read().await;
+        // The raw secret must never appear as a map key.
+        assert!(!guard.contains_key("secret-tok"));
+        // The digest key is present and is a 64-char lowercase hex SHA-256.
+        let key = token_key("secret-tok");
+        assert_eq!(key.len(), 64);
+        assert!(key.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(guard.contains_key(&key));
     }
 
     #[test]
