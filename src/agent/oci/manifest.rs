@@ -42,6 +42,10 @@ pub struct Descriptor {
     /// Platform selector (present in image index entries).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform: Option<Platform>,
+    /// Arbitrary descriptor annotations. Cosign stores the signature payload
+    /// and (for keyless signing) the Fulcio certificate and Rekor bundle here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<std::collections::HashMap<String, String>>,
 }
 
 // ---------------------------------------------------------------------------

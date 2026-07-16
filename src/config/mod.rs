@@ -32,15 +32,20 @@ pub struct FleetConfig {
     pub signature_policy: Option<SignaturePolicyConfig>,
 }
 
-/// Fleet-wide cosign image signature policy. A single trusted public key is
-/// used to verify the cosign signature of every container image before its
-/// layers are pulled.
+/// Fleet-wide cosign image signature policy applied to the cosign signature of
+/// every container image before its layers are pulled. Supports both static-key
+/// and sigstore keyless (Fulcio/Rekor) verification.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct SignaturePolicyConfig {
-    /// PEM-encoded public key (ECDSA P-256 or Ed25519, SPKI format) that image
-    /// signatures are verified against.
-    pub public_key_pem: String,
+    /// PEM-encoded public key (ECDSA P-256 or Ed25519, SPKI format) for
+    /// static-key verification. Mutually exclusive with `keyless`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key_pem: Option<String>,
+    /// Keyless (Fulcio/Rekor) verification parameters. Mutually exclusive with
+    /// `public_key_pem`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyless: Option<KeylessPolicyConfig>,
     /// When true, an image that has no valid signature is rejected. When false
     /// the policy is advisory: verification is attempted and failures are
     /// logged, but the pull is allowed to proceed.
@@ -48,17 +53,165 @@ pub struct SignaturePolicyConfig {
     pub enforce: bool,
 }
 
+/// Configuration for sigstore keyless (Fulcio/Rekor) verification.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct KeylessPolicyConfig {
+    /// PEM bundle of trusted Fulcio root/intermediate CA certificates. A signing
+    /// certificate must chain to one of these.
+    pub fulcio_roots_pem: String,
+    /// Accepted signer identities. A signing certificate must match one.
+    pub identities: Vec<KeylessIdentityConfig>,
+    /// PEM-encoded Rekor transparency-log public key. When set, the signature
+    /// bundle's Rekor Signed Entry Timestamp is verified against it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rekor_public_key_pem: Option<String>,
+}
+
+/// An accepted keyless signer identity (SAN subject + OIDC issuer).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct KeylessIdentityConfig {
+    /// The Subject Alternative Name identity (email or URI), matched exactly.
+    pub subject: String,
+    /// The OIDC issuer that authenticated the signer, matched exactly.
+    pub issuer: String,
+}
+
 impl SignaturePolicyConfig {
-    /// Parse the configured PEM public key into a runtime signature policy.
+    /// Parse this configuration into a runtime signature policy.
     pub fn to_runtime_policy(
         &self,
     ) -> Result<
         crate::agent::oci::signature::SignaturePolicy,
         crate::agent::oci::signature::SignatureError,
     > {
-        let key = crate::agent::oci::signature::parse_public_key_pem(&self.public_key_pem)?;
-        Ok(crate::agent::oci::signature::SignaturePolicy { key })
+        use crate::agent::oci::signature::{
+            KeylessIdentity, KeylessPolicy, SignatureError, SignaturePolicy, parse_public_key_pem,
+        };
+
+        match (&self.public_key_pem, &self.keyless) {
+            (Some(pem), None) => {
+                let key = parse_public_key_pem(pem)?;
+                Ok(SignaturePolicy::Key(key))
+            }
+            (None, Some(keyless)) => {
+                let fulcio_roots = parse_cert_bundle_pem(&keyless.fulcio_roots_pem)?;
+                let rekor_public_key = match &keyless.rekor_public_key_pem {
+                    Some(pem) => Some(parse_spki_pem(pem)?),
+                    None => None,
+                };
+                let identities = keyless
+                    .identities
+                    .iter()
+                    .map(|i| KeylessIdentity {
+                        subject: i.subject.clone(),
+                        issuer: i.issuer.clone(),
+                    })
+                    .collect();
+                Ok(SignaturePolicy::Keyless(Box::new(KeylessPolicy {
+                    fulcio_roots,
+                    identities,
+                    rekor_public_key,
+                })))
+            }
+            (Some(_), Some(_)) => Err(SignatureError::InvalidKey(
+                "signature policy sets both publicKeyPem and keyless; choose one".into(),
+            )),
+            (None, None) => Err(SignatureError::InvalidKey(
+                "signature policy must set either publicKeyPem or keyless".into(),
+            )),
+        }
     }
+}
+
+/// Parse a PEM bundle of one or more X.509 certificates into their DER bytes.
+fn parse_cert_bundle_pem(
+    pem: &str,
+) -> Result<Vec<Vec<u8>>, crate::agent::oci::signature::SignatureError> {
+    use crate::agent::oci::signature::SignatureError;
+
+    let mut reader = std::io::BufReader::new(pem.as_bytes());
+    let mut out = Vec::new();
+    for cert in rustls_pemfile::certs(&mut reader) {
+        let cert = cert.map_err(|e| SignatureError::InvalidKey(format!("invalid CA PEM: {e}")))?;
+        out.push(cert.as_ref().to_vec());
+    }
+    if out.is_empty() {
+        return Err(SignatureError::InvalidKey(
+            "Fulcio root bundle contained no certificates".into(),
+        ));
+    }
+    Ok(out)
+}
+
+/// Parse a PEM-encoded SPKI public key into its DER bytes (used for the Rekor
+/// transparency-log key).
+fn parse_spki_pem(pem: &str) -> Result<Vec<u8>, crate::agent::oci::signature::SignatureError> {
+    use crate::agent::oci::signature::SignatureError;
+
+    let base64_content: String = pem
+        .lines()
+        .filter(|line| !line.starts_with("-----"))
+        .collect();
+    let decoded = base64_content.trim().replace(['\n', '\r', ' '], "");
+    // Reuse the SPKI algorithm detection to validate it is a supported key,
+    // then return the raw subjectPublicKey point for ECDSA verification.
+    match crate::agent::oci::signature::parse_public_key_pem(pem)? {
+        crate::agent::oci::signature::SigningKey::EcdsaP256(_)
+        | crate::agent::oci::signature::SigningKey::Ed25519(_) => {}
+    }
+    // Rekor keys are ECDSA P-256; return the raw uncompressed point extracted
+    // from the SPKI so it can be used directly by the ring verifier.
+    let der = base64_decode_spki(&decoded)
+        .map_err(|e| SignatureError::InvalidKey(format!("Rekor key base64: {e}")))?;
+    extract_ec_point_from_spki(&der)
+        .ok_or_else(|| SignatureError::InvalidKey("Rekor key is not an EC SPKI".into()))
+}
+
+/// Minimal standalone base64 decoder for SPKI content (standard alphabet).
+fn base64_decode_spki(input: &str) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    for chunk in input.as_bytes().chunks(4) {
+        let mut buf = [0u8; 4];
+        let mut len = 0;
+        for (i, &b) in chunk.iter().enumerate() {
+            if b == b'=' {
+                break;
+            }
+            buf[i] = match b {
+                b'A'..=b'Z' => b - b'A',
+                b'a'..=b'z' => b - b'a' + 26,
+                b'0'..=b'9' => b - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                _ => return Err(format!("invalid base64 char: {b}")),
+            };
+            len = i + 1;
+        }
+        if len >= 2 {
+            out.push((buf[0] << 2) | (buf[1] >> 4));
+        }
+        if len >= 3 {
+            out.push((buf[1] << 4) | (buf[2] >> 2));
+        }
+        if len >= 4 {
+            out.push((buf[2] << 6) | buf[3]);
+        }
+    }
+    Ok(out)
+}
+
+/// Extract the raw uncompressed EC point (0x04 || X || Y) from an SPKI DER by
+/// locating the trailing 65-byte P-256 point.
+fn extract_ec_point_from_spki(spki_der: &[u8]) -> Option<Vec<u8>> {
+    // A P-256 uncompressed point is 65 bytes starting with 0x04. In a standard
+    // SPKI it is the final BIT STRING content, so search from the end.
+    spki_der
+        .windows(65)
+        .rev()
+        .find(|w| w[0] == 0x04)
+        .map(|w| w.to_vec())
 }
 
 /// Script hooks executed at various deployment lifecycle points.
@@ -974,33 +1127,78 @@ mod nix_module_tests {
 
     #[test]
     fn signature_policy_config_roundtrips_and_defaults_enforce() {
-        // `enforce` defaults to true when omitted.
+        // `enforce` defaults to true when omitted; static-key mode.
         let json =
             r#"{"publicKeyPem": "-----BEGIN PUBLIC KEY-----\nMEE=\n-----END PUBLIC KEY-----"}"#;
         let cfg: SignaturePolicyConfig =
             serde_json::from_str(json).expect("signature policy must deserialize");
         assert!(cfg.enforce, "enforce should default to true");
+        assert!(cfg.public_key_pem.is_some());
+        assert!(cfg.keyless.is_none());
 
         // Explicit false is honored, and the value round-trips.
         let cfg = SignaturePolicyConfig {
             public_key_pem: cfg.public_key_pem,
+            keyless: None,
             enforce: false,
         };
         let encoded = serde_json::to_string(&cfg).unwrap();
         let decoded: SignaturePolicyConfig = serde_json::from_str(&encoded).unwrap();
         assert!(!decoded.enforce);
-        assert_eq!(decoded.public_key_pem, cfg.public_key_pem);
+        assert!(decoded.public_key_pem.is_some());
+    }
+
+    #[test]
+    fn signature_policy_keyless_config_deserializes() {
+        let json = r#"{
+            "keyless": {
+                "fulcioRootsPem": "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----",
+                "identities": [
+                    {"subject": "ci@example.com", "issuer": "https://accounts.example.com"}
+                ]
+            },
+            "enforce": false
+        }"#;
+        let cfg: SignaturePolicyConfig =
+            serde_json::from_str(json).expect("keyless policy must deserialize");
+        assert!(!cfg.enforce);
+        assert!(cfg.public_key_pem.is_none());
+        let keyless = cfg.keyless.expect("expected keyless mode");
+        assert_eq!(keyless.identities.len(), 1);
+        assert_eq!(keyless.identities[0].subject, "ci@example.com");
+        assert!(keyless.rekor_public_key_pem.is_none());
     }
 
     #[test]
     fn signature_policy_to_runtime_policy_rejects_invalid_pem() {
         let cfg = SignaturePolicyConfig {
-            public_key_pem: "not a valid pem".to_string(),
+            public_key_pem: Some("not a valid pem".to_string()),
+            keyless: None,
             enforce: true,
         };
         assert!(
             cfg.to_runtime_policy().is_err(),
             "invalid PEM must not yield a runtime policy"
+        );
+    }
+
+    #[test]
+    fn keyless_runtime_policy_rejects_empty_fulcio_bundle() {
+        let cfg = SignaturePolicyConfig {
+            public_key_pem: None,
+            keyless: Some(KeylessPolicyConfig {
+                fulcio_roots_pem: "no certs here".to_string(),
+                identities: vec![KeylessIdentityConfig {
+                    subject: "ci@example.com".to_string(),
+                    issuer: "https://accounts.example.com".to_string(),
+                }],
+                rekor_public_key_pem: None,
+            }),
+            enforce: true,
+        };
+        assert!(
+            cfg.to_runtime_policy().is_err(),
+            "an empty Fulcio bundle must be rejected"
         );
     }
 }

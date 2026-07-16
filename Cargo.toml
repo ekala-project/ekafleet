@@ -67,7 +67,7 @@ rcgen = { version = "0.13", features = ["x509-parser"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 rustls-pki-types = "1"
-x509-parser = "0.17"
+x509-parser = { version = "0.17", features = ["verify"] }
 rustls-pemfile = "2"
 rustls-native-certs = "0.8"
 zeroize = { version = "1", features = ["derive"] }

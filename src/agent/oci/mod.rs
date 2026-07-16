@@ -339,9 +339,7 @@ mod tests {
         let mgr = ImageManager::new(dir.path().join("oci"), Credentials::Anonymous);
         assert!(mgr.fleet_signature_policy.is_none());
 
-        let policy = SignaturePolicy {
-            key: signature::SigningKey::Ed25519(vec![0u8; 32]),
-        };
+        let policy = SignaturePolicy::Key(signature::SigningKey::Ed25519(vec![0u8; 32]));
         let mgr = mgr.with_fleet_signature_policy(FleetSignaturePolicy {
             policy,
             enforce: false,

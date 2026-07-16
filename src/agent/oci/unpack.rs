@@ -243,12 +243,14 @@ mod tests {
                 digest: Digest::from_bytes(b"config"),
                 size: 0,
                 platform: None,
+                annotations: None,
             },
             layers: vec![super::super::manifest::Descriptor {
                 media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
                 digest,
                 size: layer_data.len() as u64,
                 platform: None,
+                annotations: None,
             }],
         };
 
@@ -284,6 +286,7 @@ mod tests {
             digest: d,
             size,
             platform: None,
+            annotations: None,
         };
 
         let manifest = ImageManifest {
@@ -294,6 +297,7 @@ mod tests {
                 digest: Digest::from_bytes(b"config"),
                 size: 0,
                 platform: None,
+                annotations: None,
             },
             layers: vec![desc(d1, layer1.len() as u64), desc(d2, layer2.len() as u64)],
         };
@@ -331,6 +335,7 @@ mod tests {
             digest: d,
             size,
             platform: None,
+            annotations: None,
         };
 
         let manifest = ImageManifest {
@@ -341,6 +346,7 @@ mod tests {
                 digest: Digest::from_bytes(b"config"),
                 size: 0,
                 platform: None,
+                annotations: None,
             },
             layers: vec![desc(d1, layer1.len() as u64), desc(d2, layer2.len() as u64)],
         };

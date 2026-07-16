@@ -101,6 +101,7 @@ mod tests {
             digest: Digest::from_bytes(data),
             size: data.len() as u64,
             platform: None,
+            annotations: None,
         }
     }
 
@@ -132,6 +133,7 @@ mod tests {
                 digest: config_digest.clone(),
                 size: config_data.len() as u64,
                 platform: None,
+                annotations: None,
             },
             layers: vec![make_descriptor(active_data)],
         };
