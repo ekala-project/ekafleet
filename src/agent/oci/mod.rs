@@ -47,10 +47,22 @@ use registry::RegistryClient;
 use signature::{SignatureError, SignaturePolicy};
 use store::ImageStore;
 
+/// A fleet-wide image signature policy applied to every image pulled by this
+/// manager, independent of any per-service configuration.
+pub struct FleetSignaturePolicy {
+    /// The trusted signing key used to verify every image.
+    pub policy: SignaturePolicy,
+    /// When true, an image without a valid signature is rejected. When false,
+    /// verification failures are logged but the pull proceeds.
+    pub enforce: bool,
+}
+
 /// High-level OCI image manager combining registry, store, and unpacking.
 pub struct ImageManager {
     client: RegistryClient,
     store: ImageStore,
+    /// Optional fleet-wide signature policy applied to every pull.
+    fleet_signature_policy: Option<FleetSignaturePolicy>,
 }
 
 /// Result of resolving an image's config.
@@ -70,7 +82,15 @@ impl ImageManager {
         Self {
             client: RegistryClient::new(credentials),
             store: ImageStore::new(store_path),
+            fleet_signature_policy: None,
         }
+    }
+
+    /// Apply a fleet-wide signature policy that verifies every image this
+    /// manager pulls, unless a per-call policy is provided to [`Self::pull`].
+    pub fn with_fleet_signature_policy(mut self, policy: FleetSignaturePolicy) -> Self {
+        self.fleet_signature_policy = Some(policy);
+        self
     }
 
     /// Initialize the store directories.
@@ -80,8 +100,11 @@ impl ImageManager {
 
     /// Pull an image and return the rootfs path and image config.
     ///
-    /// If `signature_policy` is `Some`, the image's cosign signature is
-    /// verified against the provided public key before downloading layers.
+    /// If `signature_policy` is `Some`, the image's cosign signature is verified
+    /// against the provided public key before downloading layers. Otherwise, if
+    /// this manager has a fleet-wide signature policy, that policy is applied to
+    /// every image: an enforcing policy rejects unsigned images, while a
+    /// non-enforcing (advisory) policy logs verification failures but proceeds.
     pub async fn pull(
         &self,
         image: &str,
@@ -90,15 +113,52 @@ impl ImageManager {
         signature_policy: Option<&SignaturePolicy>,
     ) -> Result<ResolvedImage, ImageManagerError> {
         let image_ref: ImageReference = image.parse()?;
-        let result = pull::pull_image(
+
+        // A per-call policy takes precedence; otherwise fall back to the
+        // fleet-wide policy (if any).
+        let effective_policy =
+            signature_policy.or(self.fleet_signature_policy.as_ref().map(|f| &f.policy));
+
+        // A fleet policy that isn't being enforced (and has no per-call override)
+        // is advisory: attempt verification for observability, but do not block
+        // the pull on failure.
+        let advisory_only = signature_policy.is_none()
+            && self
+                .fleet_signature_policy
+                .as_ref()
+                .is_some_and(|f| !f.enforce);
+
+        let result = match pull::pull_image(
             &self.client,
             &self.store,
             &image_ref,
             service_name,
             policy,
-            signature_policy,
+            effective_policy,
         )
-        .await?;
+        .await
+        {
+            Ok(r) => r,
+            Err(PullError::Signature(e)) if advisory_only => {
+                tracing::warn!(
+                    image = %image_ref,
+                    service = service_name,
+                    error = %e,
+                    "Advisory signature policy: verification failed but pull is not enforced"
+                );
+                // Retry without signature verification since the policy is advisory.
+                pull::pull_image(
+                    &self.client,
+                    &self.store,
+                    &image_ref,
+                    service_name,
+                    policy,
+                    None,
+                )
+                .await?
+            }
+            Err(e) => return Err(e.into()),
+        };
 
         // Read the image config to get entrypoint/env/etc.
         let config = self.read_image_config(&image_ref, service_name).await?;
@@ -237,6 +297,23 @@ mod tests {
         let mgr = ImageManager::new(dir.path().join("oci"), Credentials::Anonymous);
         mgr.init().await.unwrap();
         assert!(!mgr.is_cached("nonexistent").await);
+    }
+
+    #[test]
+    fn with_fleet_signature_policy_sets_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = ImageManager::new(dir.path().join("oci"), Credentials::Anonymous);
+        assert!(mgr.fleet_signature_policy.is_none());
+
+        let policy = SignaturePolicy {
+            key: signature::SigningKey::Ed25519(vec![0u8; 32]),
+        };
+        let mgr = mgr.with_fleet_signature_policy(FleetSignaturePolicy {
+            policy,
+            enforce: false,
+        });
+        let stored = mgr.fleet_signature_policy.as_ref().unwrap();
+        assert!(!stored.enforce);
     }
 
     #[test]

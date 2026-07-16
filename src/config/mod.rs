@@ -25,6 +25,40 @@ pub struct FleetConfig {
     /// Organizational policy rules evaluated during plan/apply.
     #[serde(default)]
     pub policies: Vec<crate::server::policy::PolicyRule>,
+    /// Fleet-wide OCI image signature policy. When set, it applies to every
+    /// container image pulled by any service in the fleet, rather than being
+    /// configured per-service.
+    #[serde(default)]
+    pub signature_policy: Option<SignaturePolicyConfig>,
+}
+
+/// Fleet-wide cosign image signature policy. A single trusted public key is
+/// used to verify the cosign signature of every container image before its
+/// layers are pulled.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SignaturePolicyConfig {
+    /// PEM-encoded public key (ECDSA P-256 or Ed25519, SPKI format) that image
+    /// signatures are verified against.
+    pub public_key_pem: String,
+    /// When true, an image that has no valid signature is rejected. When false
+    /// the policy is advisory: verification is attempted and failures are
+    /// logged, but the pull is allowed to proceed.
+    #[serde(default = "default_true")]
+    pub enforce: bool,
+}
+
+impl SignaturePolicyConfig {
+    /// Parse the configured PEM public key into a runtime signature policy.
+    pub fn to_runtime_policy(
+        &self,
+    ) -> Result<
+        crate::agent::oci::signature::SignaturePolicy,
+        crate::agent::oci::signature::SignatureError,
+    > {
+        let key = crate::agent::oci::signature::parse_public_key_pem(&self.public_key_pem)?;
+        Ok(crate::agent::oci::signature::SignaturePolicy { key })
+    }
 }
 
 /// Script hooks executed at various deployment lifecycle points.
@@ -936,6 +970,38 @@ mod nix_module_tests {
         assert_eq!(svc.scheduling.job_type, JobType::Service);
         assert_eq!(svc.scheduling.update.strategy, UpdateStrategy::Rolling);
         assert_eq!(svc.ports["http"].port, 8080);
+    }
+
+    #[test]
+    fn signature_policy_config_roundtrips_and_defaults_enforce() {
+        // `enforce` defaults to true when omitted.
+        let json =
+            r#"{"publicKeyPem": "-----BEGIN PUBLIC KEY-----\nMEE=\n-----END PUBLIC KEY-----"}"#;
+        let cfg: SignaturePolicyConfig =
+            serde_json::from_str(json).expect("signature policy must deserialize");
+        assert!(cfg.enforce, "enforce should default to true");
+
+        // Explicit false is honored, and the value round-trips.
+        let cfg = SignaturePolicyConfig {
+            public_key_pem: cfg.public_key_pem,
+            enforce: false,
+        };
+        let encoded = serde_json::to_string(&cfg).unwrap();
+        let decoded: SignaturePolicyConfig = serde_json::from_str(&encoded).unwrap();
+        assert!(!decoded.enforce);
+        assert_eq!(decoded.public_key_pem, cfg.public_key_pem);
+    }
+
+    #[test]
+    fn signature_policy_to_runtime_policy_rejects_invalid_pem() {
+        let cfg = SignaturePolicyConfig {
+            public_key_pem: "not a valid pem".to_string(),
+            enforce: true,
+        };
+        assert!(
+            cfg.to_runtime_policy().is_err(),
+            "invalid PEM must not yield a runtime policy"
+        );
     }
 }
 

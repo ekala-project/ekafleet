@@ -633,6 +633,7 @@ mod tests {
             hooks: Default::default(),
             admission_webhooks: vec![],
             policies: vec![],
+            signature_policy: None,
         }
     }
 
