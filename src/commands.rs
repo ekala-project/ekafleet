@@ -268,7 +268,7 @@ pub async fn cmd_plan(config: PathBuf, server: String) -> anyhow::Result<()> {
 pub async fn cmd_apply(
     config: PathBuf,
     auto_approve: bool,
-    watch: bool,
+    follow: bool,
     server: String,
 ) -> anyhow::Result<()> {
     let mut client = connect_server(&server).await?;
@@ -276,7 +276,7 @@ pub async fn cmd_apply(
         .apply(ekafleet::proto::ApplyRequest {
             config_path: config.display().to_string(),
             auto_approve,
-            watch,
+            watch: follow,
         })
         .await?
         .into_inner();

@@ -183,9 +183,9 @@ enum Command {
         #[arg(long)]
         auto_approve: bool,
 
-        /// Continuous reconciliation mode
-        #[arg(long)]
-        watch: bool,
+        /// Continuous reconciliation mode (alias: --watch)
+        #[arg(long, visible_alias = "watch")]
+        follow: bool,
 
         /// Server address
         #[arg(long, default_value = "127.0.0.1:7400")]
@@ -873,9 +873,9 @@ async fn main() -> anyhow::Result<()> {
         Command::Apply {
             config,
             auto_approve,
-            watch,
+            follow,
             server,
-        } => commands::cmd_apply(config, auto_approve, watch, server).await?,
+        } => commands::cmd_apply(config, auto_approve, follow, server).await?,
 
         Command::Status { server } => commands::cmd_status(server, &cli.output).await?,
 
