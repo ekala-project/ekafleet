@@ -30,16 +30,22 @@ async fn start_server() -> (SocketAddr, SocketAddr, String, String) {
 
     let ca_cert_pem = ca.root_certificate_pem().await.unwrap();
 
-    // Issue server cert
-    let (server_cert_pem, _chain_pem, _) = ca
+    // Issue server cert. Leaves are signed by the short-lived intermediate CA,
+    // so the served identity must present leaf + intermediate for a
+    // root-anchored client to build the chain.
+    let (server_cert_pem, chain_pem, _) = ca
         .issue_certificate("ekafleet-server", &[], None)
         .await
         .unwrap();
     let cert_pem_str = String::from_utf8(server_cert_pem).unwrap();
+    let chain_pem_str = String::from_utf8(chain_pem).unwrap();
+    // Identity cert chain: leaf (from the combined bundle) followed by the
+    // intermediate+root chain; the key is parsed from the combined bundle.
+    let identity_chain = format!("{cert_pem_str}\n{chain_pem_str}");
 
     // Build TLS identity
     let identity =
-        tonic::transport::Identity::from_pem(cert_pem_str.as_bytes(), cert_pem_str.as_bytes());
+        tonic::transport::Identity::from_pem(identity_chain.as_bytes(), cert_pem_str.as_bytes());
     let tls_config = tonic::transport::ServerTlsConfig::new().identity(identity);
 
     let fleet_state = ekafleet::server::state::FleetState::new();

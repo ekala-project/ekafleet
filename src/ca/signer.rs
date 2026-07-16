@@ -255,6 +255,8 @@ pub async fn serve(config: CaSignerConfig) -> anyhow::Result<()> {
     // Load or generate CA key material
     let ca_key_path = config.data_dir.join("ca-key.pem");
     let ca_cert_path = config.data_dir.join("ca-cert.pem");
+    let int_key_path = config.data_dir.join("ca-intermediate-key.pem");
+    let int_cert_path = config.data_dir.join("ca-intermediate-cert.pem");
 
     let (stored_key, stored_cert) = match (
         tokio::fs::read_to_string(&ca_key_path).await,
@@ -264,10 +266,23 @@ pub async fn serve(config: CaSignerConfig) -> anyhow::Result<()> {
         _ => (None, None),
     };
 
-    ca.initialize(stored_key.as_deref(), stored_cert.as_deref())
-        .await?;
+    let (stored_int_key, stored_int_cert) = match (
+        tokio::fs::read_to_string(&int_key_path).await,
+        tokio::fs::read_to_string(&int_cert_path).await,
+    ) {
+        (Ok(key), Ok(cert)) => (Some(key), Some(cert)),
+        _ => (None, None),
+    };
 
-    // Persist if newly generated
+    ca.initialize_with_intermediate(
+        stored_key.as_deref(),
+        stored_cert.as_deref(),
+        stored_int_key.as_deref(),
+        stored_int_cert.as_deref(),
+    )
+    .await?;
+
+    // Persist root if newly generated
     if stored_key.is_none()
         && let (Some(key_pem), Some(cert_pem)) =
             (ca.root_key_pem().await, ca.root_certificate_pem().await)
@@ -284,6 +299,27 @@ pub async fn serve(config: CaSignerConfig) -> anyhow::Result<()> {
         }
 
         tracing::info!("CA key and certificate persisted to disk");
+    }
+
+    // Persist the intermediate whenever it differs from disk (first boot or
+    // rotation on expiry).
+    if let (Some(int_key), Some(int_cert)) = (
+        ca.intermediate_key_pem().await,
+        ca.intermediate_certificate_pem().await,
+    ) && stored_int_cert.as_deref() != Some(int_cert.as_str())
+    {
+        tokio::fs::create_dir_all(&config.data_dir).await?;
+        tokio::fs::write(&int_key_path, &int_key).await?;
+        tokio::fs::write(&int_cert_path, &int_cert).await?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            tokio::fs::set_permissions(&int_key_path, perms).await?;
+        }
+
+        tracing::info!("Intermediate CA key and certificate persisted to disk");
     }
 
     let ca = Arc::new(ca);

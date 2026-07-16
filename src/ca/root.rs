@@ -16,15 +16,31 @@ pub struct RootCa {
     inner: Arc<RwLock<CaState>>,
 }
 
+/// Default lifetime of an intermediate CA certificate. Intermediates are
+/// short-lived relative to the root so they can be rotated (and, on
+/// compromise, allowed to expire) without touching the long-lived root key.
+const DEFAULT_INTERMEDIATE_TTL: Duration = Duration::from_secs(90 * 24 * 3600); // 90 days
+
+/// Re-issue the intermediate when its remaining lifetime drops below this
+/// threshold, so leaves are never signed by an intermediate that will expire
+/// before the leaves they sign.
+const INTERMEDIATE_RENEW_BEFORE: Duration = Duration::from_secs(7 * 24 * 3600); // 7 days
+
 struct CaState {
     /// Fleet domain for SPIFFE URIs (e.g., fleet.internal)
     domain: String,
-    /// Root CA keypair (used for signing leaf certificates)
+    /// Root CA keypair. Signs only intermediate CA certificates, never leaves.
     root_keypair: Option<KeyPair>,
     /// Root CA certificate (PEM-encoded)
     root_cert_pem: Option<String>,
     /// Root CA certificate (DER-encoded, for distribution)
     root_cert_der: Option<Vec<u8>>,
+    /// Short-lived intermediate CA keypair. Signs all leaf certificates.
+    intermediate_keypair: Option<KeyPair>,
+    /// Intermediate CA certificate (PEM-encoded), signed by the root.
+    intermediate_cert_pem: Option<String>,
+    /// Unix-epoch second at which the current intermediate certificate expires.
+    intermediate_expires_at: u64,
     /// Default leaf certificate lifetime
     default_ttl: Duration,
 }
@@ -37,17 +53,36 @@ impl RootCa {
                 root_keypair: None,
                 root_cert_pem: None,
                 root_cert_der: None,
+                intermediate_keypair: None,
+                intermediate_cert_pem: None,
+                intermediate_expires_at: 0,
                 default_ttl: Duration::from_secs(3600), // 1 hour default
             })),
         }
     }
 
     /// Initialize the CA. Generates a new root key/cert if none exists,
-    /// or loads from persisted PEM state.
+    /// or loads from persisted PEM state. Always ensures a valid short-lived
+    /// intermediate CA exists (loading a persisted one, or minting a fresh one
+    /// signed by the root).
     pub async fn initialize(
         &self,
         stored_key_pem: Option<&str>,
         stored_cert_pem: Option<&str>,
+    ) -> Result<(), CaError> {
+        self.initialize_with_intermediate(stored_key_pem, stored_cert_pem, None, None)
+            .await
+    }
+
+    /// Like [`initialize`], but also accepts a persisted intermediate CA
+    /// key/cert. When the stored intermediate is missing, unparsable, or within
+    /// [`INTERMEDIATE_RENEW_BEFORE`] of expiry, a fresh intermediate is minted.
+    pub async fn initialize_with_intermediate(
+        &self,
+        stored_key_pem: Option<&str>,
+        stored_cert_pem: Option<&str>,
+        stored_int_key_pem: Option<&str>,
+        stored_int_cert_pem: Option<&str>,
     ) -> Result<(), CaError> {
         let mut state = self.inner.write().await;
         match (stored_key_pem, stored_cert_pem) {
@@ -73,7 +108,7 @@ impl RootCa {
                 params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
                 params.distinguished_name.push(
                     DnType::CommonName,
-                    format!("ekafleet CA ({})", state.domain),
+                    format!("ekafleet Root CA ({})", state.domain),
                 );
                 params
                     .distinguished_name
@@ -104,6 +139,110 @@ impl RootCa {
                 state.root_cert_der = Some(cert_der);
             }
         }
+
+        // Load a persisted intermediate if it is still comfortably valid;
+        // otherwise mint a fresh one signed by the root.
+        let now = unix_now();
+        let loaded = match (stored_int_key_pem, stored_int_cert_pem) {
+            (Some(int_key_pem), Some(int_cert_pem)) => match KeyPair::from_pem(int_key_pem) {
+                Ok(kp) => match intermediate_not_after(int_cert_pem) {
+                    Ok(expires_at)
+                        if expires_at > now.saturating_add(INTERMEDIATE_RENEW_BEFORE.as_secs()) =>
+                    {
+                        state.intermediate_keypair = Some(kp);
+                        state.intermediate_cert_pem = Some(int_cert_pem.to_string());
+                        state.intermediate_expires_at = expires_at;
+                        tracing::info!("Loaded existing intermediate CA");
+                        true
+                    }
+                    _ => {
+                        tracing::info!(
+                            "Persisted intermediate CA is missing, expired, or near expiry; \
+                                 minting a fresh intermediate"
+                        );
+                        false
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to load intermediate CA key; minting fresh");
+                    false
+                }
+            },
+            _ => false,
+        };
+
+        if !loaded {
+            Self::mint_intermediate(&mut state)?;
+        }
+
+        Ok(())
+    }
+
+    /// Rotate the intermediate CA: mint a fresh intermediate signed by the
+    /// root, replacing the current one. Returns the new intermediate cert PEM
+    /// and its private-key PEM so the caller can persist them.
+    pub async fn rotate_intermediate(&self) -> Result<(String, String), CaError> {
+        let mut state = self.inner.write().await;
+        Self::mint_intermediate(&mut state)?;
+        let cert = state
+            .intermediate_cert_pem
+            .clone()
+            .ok_or(CaError::NotInitialized)?;
+        let key = state
+            .intermediate_keypair
+            .as_ref()
+            .map(|kp| kp.serialize_pem())
+            .ok_or(CaError::NotInitialized)?;
+        Ok((cert, key))
+    }
+
+    /// Mint a fresh intermediate CA certificate signed by the root, and store
+    /// it in `state`. The root must already be present.
+    fn mint_intermediate(state: &mut CaState) -> Result<(), CaError> {
+        let root_keypair = state.root_keypair.as_ref().ok_or(CaError::NotInitialized)?;
+        let root_cert_pem = state
+            .root_cert_pem
+            .as_ref()
+            .ok_or(CaError::NotInitialized)?;
+
+        let int_keypair = KeyPair::generate()
+            .map_err(|e| CaError::KeyGeneration(format!("intermediate keypair: {e}")))?;
+
+        let mut params = CertificateParams::new(vec![])
+            .map_err(|e| CaError::KeyGeneration(format!("intermediate params: {e}")))?;
+        // Path length 0: this intermediate may sign leaves but not further CAs.
+        params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+        params.distinguished_name.push(
+            DnType::CommonName,
+            format!("ekafleet Intermediate CA ({})", state.domain),
+        );
+        params
+            .distinguished_name
+            .push(DnType::OrganizationName, "ekafleet");
+        params.key_usages.push(KeyUsagePurpose::KeyCertSign);
+        params.key_usages.push(KeyUsagePurpose::CrlSign);
+        params.not_after = time::OffsetDateTime::now_utc()
+            + time::Duration::seconds(DEFAULT_INTERMEDIATE_TTL.as_secs() as i64);
+        params.serial_number = Some(generate_serial()?);
+
+        // Reconstruct the root issuer to sign the intermediate.
+        let root_params = CertificateParams::from_ca_cert_pem(root_cert_pem)
+            .map_err(|e| CaError::Signing(format!("parse root cert: {e}")))?;
+        let root_cert = root_params
+            .self_signed(root_keypair)
+            .map_err(|e| CaError::Signing(format!("reconstruct root cert: {e}")))?;
+
+        let int_cert = params
+            .signed_by(&int_keypair, &root_cert, root_keypair)
+            .map_err(|e| CaError::Signing(format!("sign intermediate: {e}")))?;
+
+        let expires_at = unix_now().saturating_add(DEFAULT_INTERMEDIATE_TTL.as_secs());
+
+        tracing::info!(domain = %state.domain, expires_at, "Intermediate CA issued");
+
+        state.intermediate_keypair = Some(int_keypair);
+        state.intermediate_cert_pem = Some(int_cert.pem());
+        state.intermediate_expires_at = expires_at;
         Ok(())
     }
 
@@ -116,12 +255,7 @@ impl RootCa {
         store_path: Option<&str>,
     ) -> Result<(Vec<u8>, Vec<u8>, u64), CaError> {
         let state = self.inner.read().await;
-
-        let keypair = state.root_keypair.as_ref().ok_or(CaError::NotInitialized)?;
-        let ca_cert_pem = state
-            .root_cert_pem
-            .as_ref()
-            .ok_or(CaError::NotInitialized)?;
+        let issuer = state.intermediate_issuer()?;
 
         // Workload attestation: verify the Nix store path if provided
         if let Some(path) = store_path
@@ -131,13 +265,9 @@ impl RootCa {
         }
 
         let spiffe_uri = format!("spiffe://{}/service/{}", state.domain, service_name);
-        let expires_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-            + state.default_ttl.as_secs();
+        let expires_at = unix_now() + state.default_ttl.as_secs();
 
-        // Generate a leaf keypair and certificate signed by our CA
+        // Generate a leaf keypair and certificate signed by the intermediate CA.
         let leaf_keypair = KeyPair::generate()
             .map_err(|e| CaError::Signing(format!("leaf keypair generation: {e}")))?;
 
@@ -170,15 +300,8 @@ impl RootCa {
         let serial = generate_serial()?;
         leaf_params.serial_number = Some(serial);
 
-        // Parse the CA cert for signing
-        let ca_cert_params = CertificateParams::from_ca_cert_pem(ca_cert_pem)
-            .map_err(|e| CaError::Signing(format!("parse CA cert: {e}")))?;
-        let ca_cert = ca_cert_params
-            .self_signed(keypair)
-            .map_err(|e| CaError::Signing(format!("reconstruct CA cert: {e}")))?;
-
         let leaf_cert = leaf_params
-            .signed_by(&leaf_keypair, &ca_cert, keypair)
+            .signed_by(&leaf_keypair, &issuer.cert, issuer.keypair)
             .map_err(|e| CaError::Signing(format!("sign leaf cert: {e}")))?;
 
         tracing::info!(
@@ -188,9 +311,9 @@ impl RootCa {
             "Certificate issued"
         );
 
-        // Return: leaf cert+key PEM combined, CA chain PEM, expiry
+        // Return: leaf cert+key PEM combined, CA chain PEM (intermediate+root), expiry
         let leaf_pem = format!("{}\n{}", leaf_cert.pem(), leaf_keypair.serialize_pem());
-        let chain_pem = ca_cert_pem.clone();
+        let chain_pem = state.chain_pem()?;
 
         Ok((leaf_pem.into_bytes(), chain_pem.into_bytes(), expires_at))
     }
@@ -210,12 +333,7 @@ impl RootCa {
         store_path: Option<&str>,
     ) -> Result<(Vec<u8>, Vec<u8>, u64), CaError> {
         let state = self.inner.read().await;
-
-        let keypair = state.root_keypair.as_ref().ok_or(CaError::NotInitialized)?;
-        let ca_cert_pem = state
-            .root_cert_pem
-            .as_ref()
-            .ok_or(CaError::NotInitialized)?;
+        let issuer = state.intermediate_issuer()?;
 
         // Workload attestation: verify the Nix store path if provided
         if let Some(path) = store_path
@@ -230,11 +348,7 @@ impl RootCa {
             .map_err(|e| CaError::InvalidCsr(format!("failed to parse CSR: {e}")))?;
 
         // Override TTL and serial on the CSR's params
-        let expires_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-            + state.default_ttl.as_secs();
+        let expires_at = unix_now() + state.default_ttl.as_secs();
 
         // Set validity period on the CSR params
         csr_params.params.not_after = time::OffsetDateTime::now_utc()
@@ -243,16 +357,10 @@ impl RootCa {
         let serial = generate_serial()?;
         csr_params.params.serial_number = Some(serial);
 
-        // Parse the CA cert for signing
-        let ca_cert_params = CertificateParams::from_ca_cert_pem(ca_cert_pem)
-            .map_err(|e| CaError::Signing(format!("parse CA cert: {e}")))?;
-        let ca_cert = ca_cert_params
-            .self_signed(keypair)
-            .map_err(|e| CaError::Signing(format!("reconstruct CA cert: {e}")))?;
-
-        // Sign the CSR with the CA key — the cert uses the CSR's public key
+        // Sign the CSR with the intermediate CA key — the cert uses the CSR's
+        // public key.
         let signed_cert = csr_params
-            .signed_by(&ca_cert, keypair)
+            .signed_by(&issuer.cert, issuer.keypair)
             .map_err(|e| CaError::Signing(format!("sign CSR: {e}")))?;
 
         let spiffe_uri = format!("spiffe://{}/service/{}", state.domain, service_name);
@@ -263,9 +371,10 @@ impl RootCa {
             "Certificate issued from CSR"
         );
 
-        // Return cert PEM only (no private key — it stays with the requester)
+        // Return cert PEM only (no private key — it stays with the requester),
+        // plus the intermediate+root chain.
         let cert_pem = signed_cert.pem();
-        let chain_pem = ca_cert_pem.clone();
+        let chain_pem = state.chain_pem()?;
 
         Ok((cert_pem.into_bytes(), chain_pem.into_bytes(), expires_at))
     }
@@ -295,18 +404,9 @@ impl RootCa {
         spiffe_uri: &str,
     ) -> Result<(Vec<u8>, Vec<u8>, u64), CaError> {
         let state = self.inner.read().await;
+        let issuer = state.intermediate_issuer()?;
 
-        let keypair = state.root_keypair.as_ref().ok_or(CaError::NotInitialized)?;
-        let ca_cert_pem = state
-            .root_cert_pem
-            .as_ref()
-            .ok_or(CaError::NotInitialized)?;
-
-        let expires_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-            + state.default_ttl.as_secs();
+        let expires_at = unix_now() + state.default_ttl.as_secs();
 
         let leaf_keypair = KeyPair::generate()
             .map_err(|e| CaError::Signing(format!("leaf keypair generation: {e}")))?;
@@ -338,14 +438,8 @@ impl RootCa {
         let serial = generate_serial()?;
         leaf_params.serial_number = Some(serial);
 
-        let ca_cert_params = CertificateParams::from_ca_cert_pem(ca_cert_pem)
-            .map_err(|e| CaError::Signing(format!("parse CA cert: {e}")))?;
-        let ca_cert = ca_cert_params
-            .self_signed(keypair)
-            .map_err(|e| CaError::Signing(format!("reconstruct CA cert: {e}")))?;
-
         let leaf_cert = leaf_params
-            .signed_by(&leaf_keypair, &ca_cert, keypair)
+            .signed_by(&leaf_keypair, &issuer.cert, issuer.keypair)
             .map_err(|e| CaError::Signing(format!("sign leaf cert: {e}")))?;
 
         tracing::info!(
@@ -355,8 +449,20 @@ impl RootCa {
             "SVID certificate issued"
         );
 
-        let leaf_pem = format!("{}\n{}", leaf_cert.pem(), leaf_keypair.serialize_pem());
-        let chain_pem = ca_cert_pem.clone();
+        // The cert bundle includes the intermediate so a TLS peer presenting
+        // this identity sends leaf → intermediate, letting a root-anchored
+        // verifier build the path. Then the private key.
+        let intermediate_pem = state
+            .intermediate_cert_pem
+            .as_ref()
+            .ok_or(CaError::NotInitialized)?;
+        let leaf_pem = format!(
+            "{}\n{}\n{}",
+            leaf_cert.pem(),
+            intermediate_pem,
+            leaf_keypair.serialize_pem()
+        );
+        let chain_pem = state.chain_pem()?;
 
         Ok((leaf_pem.into_bytes(), chain_pem.into_bytes(), expires_at))
     }
@@ -379,11 +485,90 @@ impl RootCa {
         state.root_keypair.as_ref().map(|kp| kp.serialize_pem())
     }
 
+    /// Get the intermediate CA certificate PEM (for persistence and for
+    /// distribution as part of issued chains).
+    pub async fn intermediate_certificate_pem(&self) -> Option<String> {
+        let state = self.inner.read().await;
+        state.intermediate_cert_pem.clone()
+    }
+
+    /// Get the intermediate CA private key PEM (for persistence — must be
+    /// encrypted at rest, same as the root key).
+    pub async fn intermediate_key_pem(&self) -> Option<String> {
+        let state = self.inner.read().await;
+        state
+            .intermediate_keypair
+            .as_ref()
+            .map(|kp| kp.serialize_pem())
+    }
+
     /// Set the default TTL for issued certificates.
     pub async fn set_default_ttl(&self, ttl: Duration) {
         let mut state = self.inner.write().await;
         state.default_ttl = ttl;
     }
+}
+
+/// A reconstructed intermediate CA issuer usable for signing leaves: the
+/// intermediate certificate (rebuilt from its stored PEM) plus a borrow of the
+/// intermediate private key.
+struct IntermediateIssuer<'a> {
+    cert: rcgen::Certificate,
+    keypair: &'a KeyPair,
+}
+
+impl CaState {
+    /// Rebuild the intermediate issuer for leaf signing. rcgen's `signed_by`
+    /// takes the issuer's certificate (for its subject DN) and the issuer's
+    /// private key; reconstructing the intermediate via `self_signed` with the
+    /// correct DN yields an issuer whose subject matches the persisted
+    /// intermediate, so leaves chain correctly to intermediate → root.
+    fn intermediate_issuer(&self) -> Result<IntermediateIssuer<'_>, CaError> {
+        let keypair = self
+            .intermediate_keypair
+            .as_ref()
+            .ok_or(CaError::NotInitialized)?;
+        let cert_pem = self
+            .intermediate_cert_pem
+            .as_ref()
+            .ok_or(CaError::NotInitialized)?;
+        let params = CertificateParams::from_ca_cert_pem(cert_pem)
+            .map_err(|e| CaError::Signing(format!("parse intermediate cert: {e}")))?;
+        let cert = params
+            .self_signed(keypair)
+            .map_err(|e| CaError::Signing(format!("reconstruct intermediate cert: {e}")))?;
+        Ok(IntermediateIssuer { cert, keypair })
+    }
+
+    /// The CA chain to return with a leaf: the intermediate certificate
+    /// followed by the root certificate, so a verifier anchored on the root can
+    /// build the full path.
+    fn chain_pem(&self) -> Result<String, CaError> {
+        let intermediate = self
+            .intermediate_cert_pem
+            .as_ref()
+            .ok_or(CaError::NotInitialized)?;
+        let root = self.root_cert_pem.as_ref().ok_or(CaError::NotInitialized)?;
+        Ok(format!("{intermediate}\n{root}"))
+    }
+}
+
+/// Current time as Unix epoch seconds.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Parse an intermediate certificate PEM and return its `notAfter` as Unix
+/// epoch seconds.
+fn intermediate_not_after(cert_pem: &str) -> Result<u64, CaError> {
+    let der = pem_to_der(cert_pem)?;
+    let (_, cert) = x509_parser::parse_x509_certificate(&der)
+        .map_err(|e| CaError::KeyGeneration(format!("parse intermediate cert: {e}")))?;
+    let ts = cert.validity().not_after.timestamp();
+    Ok(ts.max(0) as u64)
 }
 
 /// Generate a random 20-byte serial number for X.509 certificates.

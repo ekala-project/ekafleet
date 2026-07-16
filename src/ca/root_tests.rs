@@ -230,3 +230,142 @@ async fn sign_csr_rejects_invalid_csr() {
         "invalid CSR must be rejected"
     );
 }
+
+/// Extract the first PEM certificate block from a bundle.
+fn first_cert_block(pem: &str) -> String {
+    let start = pem.find("-----BEGIN CERTIFICATE-----").unwrap();
+    let end = pem.find("-----END CERTIFICATE-----").unwrap() + "-----END CERTIFICATE-----".len();
+    pem[start..end].to_string()
+}
+
+/// Parse a single-cert PEM into an x509 issuer/subject CN pair.
+fn issuer_subject_cn(cert_pem: &str) -> (String, String) {
+    let der = pem_to_der(cert_pem).unwrap();
+    let (_, cert) = x509_parser::parse_x509_certificate(&der).unwrap();
+    let issuer = cert
+        .issuer()
+        .iter_common_name()
+        .next()
+        .map(|a| a.as_str().unwrap().to_string())
+        .unwrap_or_default();
+    let subject = cert
+        .subject()
+        .iter_common_name()
+        .next()
+        .map(|a| a.as_str().unwrap().to_string())
+        .unwrap_or_default();
+    (issuer, subject)
+}
+
+#[tokio::test]
+async fn intermediate_is_distinct_from_root() {
+    let ca = initialized_ca().await;
+
+    let root = ca.root_certificate_pem().await.unwrap();
+    let intermediate = ca.intermediate_certificate_pem().await.unwrap();
+
+    assert!(intermediate.contains("BEGIN CERTIFICATE"));
+    assert_ne!(root, intermediate, "intermediate must differ from root");
+
+    let (root_issuer, root_subject) = issuer_subject_cn(&root);
+    assert_eq!(root_issuer, root_subject, "root must be self-signed");
+
+    let (int_issuer, int_subject) = issuer_subject_cn(&intermediate);
+    assert_eq!(
+        int_issuer, root_subject,
+        "intermediate must be issued by the root"
+    );
+    assert_ne!(
+        int_subject, root_subject,
+        "intermediate subject must differ from root"
+    );
+}
+
+#[tokio::test]
+async fn leaf_is_signed_by_intermediate_and_chain_contains_both() {
+    let ca = initialized_ca().await;
+
+    let (leaf_pem, chain_pem, _) = ca
+        .issue_certificate("chain-svc", b"csr", None)
+        .await
+        .unwrap();
+    let leaf_str = String::from_utf8(leaf_pem).unwrap();
+    let chain_str = String::from_utf8(chain_pem).unwrap();
+
+    // The chain must carry two certificates: intermediate then root.
+    let cert_count = chain_str.matches("-----BEGIN CERTIFICATE-----").count();
+    assert_eq!(cert_count, 2, "chain must contain intermediate + root");
+
+    // The leaf's issuer must be the intermediate, not the root.
+    let leaf_cert = first_cert_block(&leaf_str);
+    let (leaf_issuer, _) = issuer_subject_cn(&leaf_cert);
+    let intermediate = ca.intermediate_certificate_pem().await.unwrap();
+    let (_, int_subject) = issuer_subject_cn(&intermediate);
+    assert_eq!(
+        leaf_issuer, int_subject,
+        "leaf must be issued by the intermediate CA"
+    );
+}
+
+#[tokio::test]
+async fn server_svid_bundle_includes_intermediate() {
+    let ca = initialized_ca().await;
+
+    let (cert_pem, chain_pem, _) = ca.issue_server_svid("srv-chain").await.unwrap();
+    let cert_str = String::from_utf8(cert_pem).unwrap();
+    let chain_str = String::from_utf8(chain_pem).unwrap();
+
+    // The identity bundle sent on the wire must carry leaf + intermediate.
+    let leaf_and_int = cert_str.matches("-----BEGIN CERTIFICATE-----").count();
+    assert_eq!(
+        leaf_and_int, 2,
+        "server SVID bundle must include leaf + intermediate"
+    );
+    assert!(
+        cert_str.contains("PRIVATE KEY"),
+        "bundle must carry the key"
+    );
+
+    let chain_count = chain_str.matches("-----BEGIN CERTIFICATE-----").count();
+    assert_eq!(chain_count, 2, "chain must contain intermediate + root");
+}
+
+#[tokio::test]
+async fn expired_intermediate_is_reminted_on_load() {
+    let ca1 = initialized_ca().await;
+    let root_key = ca1.root_key_pem().await.unwrap();
+    let root_cert = ca1.root_certificate_pem().await.unwrap();
+    let int_cert = ca1.intermediate_certificate_pem().await.unwrap();
+
+    // Reload with the root but a bogus/empty intermediate: a fresh intermediate
+    // must be minted rather than failing.
+    let ca2 = RootCa::new("test.internal");
+    ca2.initialize_with_intermediate(
+        Some(&root_key),
+        Some(&root_cert),
+        None,
+        Some("-----BEGIN CERTIFICATE-----\ngarbage\n-----END CERTIFICATE-----"),
+    )
+    .await
+    .unwrap();
+
+    let int_cert2 = ca2.intermediate_certificate_pem().await.unwrap();
+    assert!(int_cert2.contains("BEGIN CERTIFICATE"));
+    assert_ne!(
+        int_cert, int_cert2,
+        "a fresh intermediate must be minted when the stored one is unusable"
+    );
+}
+
+#[tokio::test]
+async fn rotate_intermediate_replaces_current() {
+    let ca = initialized_ca().await;
+    let before = ca.intermediate_certificate_pem().await.unwrap();
+
+    let (rotated_cert, rotated_key) = ca.rotate_intermediate().await.unwrap();
+    assert!(rotated_key.contains("PRIVATE KEY"));
+    assert_ne!(before, rotated_cert, "rotation must produce a new cert");
+
+    let after = ca.intermediate_certificate_pem().await.unwrap();
+    assert_eq!(after, rotated_cert, "rotated cert must be the active one");
+}
