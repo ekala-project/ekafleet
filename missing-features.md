@@ -190,15 +190,22 @@ intermediates so root rotation and revocation are practical.
 
 ---
 
-## P3 — Polish
+## P3 — Polish (complete)
 
-- OCI: keyless (Fulcio/Rekor) signature verification; custom registry CA bundle;
-  fleet-wide (not per-service) image signature policy; per-layer pull timeouts.
-- CLI: flag-name consistency (`--follow` vs `--watch`); add `ekafleet version`.
-- Audit log should record *which* token performed each action.
-- `top` RPC leaves service cpu/mem request fields at 0 (`src/server/api.rs:1406`) —
-  needs `ServiceConfig` join to populate.
-- Constant-time comparison for bearer tokens (entropy is high; low real risk).
+- [x] OCI: keyless (Fulcio/Rekor) signature verification; custom registry CA
+  bundle; fleet-wide (not per-service) image signature policy; per-layer pull
+  timeouts. (Per-layer timeouts are covered by the per-request deadline applied
+  to every manifest/blob/token fetch in `RegistryClient::send_with_timeout`.)
+- [x] CLI: flag-name consistency (`--follow` vs `--watch`); add `ekafleet
+  version`. (`apply` now uses `--follow` with `--watch` as a visible alias,
+  matching `logs`/`events`; `version` command already present.)
+- [x] Audit log records *which* token performed each action via the non-secret
+  `TokenIdentity` derived server-side from the verified bearer token.
+- [x] `top` RPC populates service cpu/mem request fields from the
+  `service_request` join (`src/server/state.rs`).
+- [x] Constant-time comparison for bearer tokens: the ACL token store is keyed
+  by SHA-256 digest, so lookups compare fixed-length digest bytes and the
+  persisted `tokens.json` no longer stores raw secrets.
 
 ---
 
