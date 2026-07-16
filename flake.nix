@@ -48,6 +48,17 @@
 
       nixosModules.default = import ./nix/module.nix;
       nixosModules.ekafleet = import ./nix/module.nix;
+
+      # Typed fleet-configuration schema and eval helper. `fleetModule` is a
+      # NixOS-style options module describing the fleet config; `evalFleet`
+      # runs a raw `fleet` attrset through it and returns the checked result
+      # ready for `builtins.toJSON` / `nix eval --json`.
+      lib = {
+        fleetModule = import ./nix/lib/fleet-module.nix;
+        evalFleet =
+          { lib, userConfig }:
+          (import ./nix/lib/eval-fleet.nix { inherit lib; }) { inherit userConfig; };
+      };
     }
     // (
       let

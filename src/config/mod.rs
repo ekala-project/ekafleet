@@ -817,6 +817,129 @@ pub fn validate(config: &FleetConfig) -> Result<(), Vec<String>> {
 }
 
 #[cfg(test)]
+mod nix_module_tests {
+    use super::*;
+
+    /// The `nix/lib/fleet-module.nix` schema emits every option, including
+    /// explicit `null` for unset `Option` fields and camelCase keys. This
+    /// round-trip guards that the serde schema stays in lockstep with the Nix
+    /// option module: if a field is renamed or its default shape changes on
+    /// one side without the other, this deserialization fails.
+    #[test]
+    fn module_shaped_json_deserializes() {
+        // Mirrors the shape produced by evaluating a config through
+        // fleet-module.nix (nulls present, renamed keys `type`/secret `type`,
+        // nested defaults filled in).
+        let json = r#"{
+            "name": "example",
+            "domain": "fleet.internal",
+            "admissionWebhooks": [],
+            "policies": [],
+            "hooks": {
+                "preDeploy": null, "postDeploy": null,
+                "preDrain": null, "postDrain": null
+            },
+            "nodePools": {
+                "default": {
+                    "labels": {"env": "prod"},
+                    "scaling": null,
+                    "schedulerAlgorithm": "spread",
+                    "memoryOversubscription": false,
+                    "cloud": null
+                }
+            },
+            "machines": {
+                "node-1": {
+                    "targetHost": "10.0.0.1",
+                    "labels": {},
+                    "capacity": {"cpu": 8000, "memory": 16384, "disk": 200000},
+                    "pool": "default",
+                    "reserved": {"cpu": 500, "memory": 512, "disk": 0},
+                    "taints": [],
+                    "extendedResources": {}
+                }
+            },
+            "services": {
+                "api": {
+                    "command": "run",
+                    "container": null,
+                    "environment": {"LOG": "info"},
+                    "identity": {"allowedCallers": [], "allowedTargets": []},
+                    "lifecycle": {
+                        "preStop": null, "postStart": null,
+                        "stopSignal": "SIGTERM",
+                        "terminationGracePeriodSeconds": 30
+                    },
+                    "ports": {
+                        "http": {
+                            "port": 8080, "protocol": null, "hostname": null,
+                            "healthCheck": null,
+                            "liveness": {
+                                "path": "/", "interval": 10, "timeout": 5,
+                                "healthy_threshold": 3, "unhealthy_threshold": 3
+                            },
+                            "readiness": null, "startup": null
+                        }
+                    },
+                    "resources": {
+                        "cgroupControls": null,
+                        "cpu": {"request": 500, "limit": 1000},
+                        "disk": null,
+                        "extended": {},
+                        "memory": {"request": 256, "limit": 512}
+                    },
+                    "scheduling": {
+                        "affinity": [], "constraints": [],
+                        "disruptionBudget": {"maxUnavailable": null, "minAvailable": 2},
+                        "migrate": {
+                            "healthyDeadline": 300, "maxParallel": 1,
+                            "migrateOnReschedule": true, "minHealthyTime": 10
+                        },
+                        "parameterized": null, "periodic": null,
+                        "pool": "default", "priority": 50, "replicas": 3,
+                        "reschedule": {
+                            "attempts": null, "delayFunction": "exponential",
+                            "delaySecs": 30, "intervalSecs": 86400, "maxDelaySecs": 3600
+                        },
+                        "restart": {
+                            "attempts": 2, "delaySecs": 15,
+                            "intervalSecs": 1800, "mode": "fail"
+                        },
+                        "serviceAffinity": [],
+                        "spread": [{
+                            "attribute": "labels.zone", "maxSkew": null,
+                            "minDomains": null, "required": false,
+                            "targets": [], "weight": 50
+                        }],
+                        "tolerations": [], "type": "service",
+                        "update": {
+                            "autoPromote": false, "autoRevert": true,
+                            "canary": 0, "healthCheck": "checks",
+                            "healthyDeadline": 300, "maxParallel": 1,
+                            "minHealthyTime": 10, "progressDeadline": null,
+                            "strategy": "rolling"
+                        }
+                    },
+                    "secrets": {},
+                    "sidecars": [],
+                    "templates": {},
+                    "volumes": []
+                }
+            }
+        }"#;
+
+        let config: FleetConfig =
+            serde_json::from_str(json).expect("module-shaped JSON must deserialize");
+        assert_eq!(config.name, "example");
+        assert!(validate(&config).is_ok());
+        let svc = &config.services["api"];
+        assert_eq!(svc.scheduling.job_type, JobType::Service);
+        assert_eq!(svc.scheduling.update.strategy, UpdateStrategy::Rolling);
+        assert_eq!(svc.ports["http"].port, 8080);
+    }
+}
+
+#[cfg(test)]
 mod cgroup_tests {
     use super::*;
 
