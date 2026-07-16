@@ -68,6 +68,8 @@ pub struct FleetControlService {
     pub(super) grpc_addr: String,
     pub(super) event_store: EventStore,
     pub(super) token_store: TokenStore,
+    /// Append-only audit log recording which principal performed each action.
+    pub(super) audit_log: super::audit::AuditLog,
 }
 
 impl FleetControlService {
@@ -102,7 +104,35 @@ impl FleetControlService {
             grpc_addr: grpc_addr.to_string(),
             event_store,
             token_store,
+            audit_log: super::audit::AuditLog::new(),
         }
+    }
+
+    /// Record an audit-log entry, attributing it to the principal that issued
+    /// `request`. Bearer-token principals are identified by their non-secret
+    /// token id; verified mTLS peers are recorded as `mtls-peer`.
+    pub(super) async fn audit<T>(
+        &self,
+        request: &Request<T>,
+        action: super::audit::AuditAction,
+        resource: &str,
+        detail: &str,
+        outcome: super::audit::AuditOutcome,
+    ) {
+        let actor = request
+            .extensions()
+            .get::<super::rbac::TokenIdentity>()
+            .map(|id| id.actor())
+            .or_else(|| {
+                request
+                    .extensions()
+                    .get::<super::rbac::PeerIdentity>()
+                    .map(|_| "mtls-peer".to_string())
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+        self.audit_log
+            .record(&actor, action, resource, detail, outcome)
+            .await;
     }
 
     /// Configure the service with a certificate issuer for SPIFFE SVID issuance.
@@ -368,6 +398,14 @@ impl FleetControl for FleetControlService {
         &self,
         request: Request<ApplyRequest>,
     ) -> Result<Response<Self::ApplyStream>, Status> {
+        self.audit(
+            &request,
+            super::audit::AuditAction::Apply,
+            &request.get_ref().config_path,
+            "apply requested",
+            super::audit::AuditOutcome::Success,
+        )
+        .await;
         let req = request.into_inner();
         tracing::info!(
             config = %req.config_path,
@@ -758,6 +796,18 @@ impl FleetControl for FleetControlService {
         &self,
         request: Request<RollbackRequest>,
     ) -> Result<Response<RollbackResponse>, Status> {
+        self.audit(
+            &request,
+            super::audit::AuditAction::Rollback,
+            if request.get_ref().machine.is_empty() {
+                "all"
+            } else {
+                &request.get_ref().machine
+            },
+            &format!("rollback to generation {}", request.get_ref().to_generation),
+            super::audit::AuditOutcome::Success,
+        )
+        .await;
         let req = request.into_inner();
         tracing::info!(
             machine = %req.machine,
@@ -844,6 +894,14 @@ impl FleetControl for FleetControlService {
         &self,
         request: Request<DrainRequest>,
     ) -> Result<Response<DrainResponse>, Status> {
+        self.audit(
+            &request,
+            super::audit::AuditAction::Drain,
+            &request.get_ref().machine,
+            &format!("drain deadline {}s", request.get_ref().deadline_seconds),
+            super::audit::AuditOutcome::Success,
+        )
+        .await;
         let req = request.into_inner();
         tracing::info!(machine = %req.machine, deadline = req.deadline_seconds, "Drain requested");
 
@@ -899,6 +957,14 @@ impl FleetControl for FleetControlService {
         &self,
         request: Request<ScaleRequest>,
     ) -> Result<Response<ScaleResponse>, Status> {
+        self.audit(
+            &request,
+            super::audit::AuditAction::Scale,
+            &request.get_ref().service_name,
+            &format!("scale to {}", request.get_ref().desired_count),
+            super::audit::AuditOutcome::Success,
+        )
+        .await;
         let req = request.into_inner();
         tracing::info!(
             service = %req.service_name,
@@ -1468,6 +1534,14 @@ impl FleetControl for FleetControlService {
         &self,
         request: Request<PromoteRequest>,
     ) -> Result<Response<PromoteResponse>, Status> {
+        self.audit(
+            &request,
+            super::audit::AuditAction::Apply,
+            &request.get_ref().service_name,
+            "promote canary deployment",
+            super::audit::AuditOutcome::Success,
+        )
+        .await;
         let req = request.into_inner();
         tracing::info!(service = %req.service_name, "Promote deployment requested");
 
@@ -1514,6 +1588,14 @@ impl FleetControl for FleetControlService {
         &self,
         request: Request<FailDeploymentRequest>,
     ) -> Result<Response<FailDeploymentResponse>, Status> {
+        self.audit(
+            &request,
+            super::audit::AuditAction::Rollback,
+            &request.get_ref().service_name,
+            "fail canary deployment",
+            super::audit::AuditOutcome::Success,
+        )
+        .await;
         let req = request.into_inner();
         tracing::info!(service = %req.service_name, "Fail deployment requested");
 
@@ -1545,7 +1627,7 @@ impl FleetControl for FleetControlService {
         &self,
         request: Request<CreateAclTokenRequest>,
     ) -> Result<Response<CreateAclTokenResponse>, Status> {
-        let req = request.into_inner();
+        let req = request.get_ref().clone();
 
         let role = match req.role.as_str() {
             "admin" => super::rbac::Role::Admin,
@@ -1576,6 +1658,15 @@ impl FleetControl for FleetControlService {
             "ACL token created"
         );
 
+        self.audit(
+            &request,
+            super::audit::AuditAction::TokenCreate,
+            &super::rbac::token_id(&token),
+            &format!("create {} token: {}", req.role, req.description),
+            super::audit::AuditOutcome::Success,
+        )
+        .await;
+
         Ok(Response::new(CreateAclTokenResponse {
             token,
             role: req.role,
@@ -1586,10 +1677,22 @@ impl FleetControl for FleetControlService {
         &self,
         request: Request<RevokeAclTokenRequest>,
     ) -> Result<Response<RevokeAclTokenResponse>, Status> {
-        let req = request.into_inner();
-        tracing::info!(token_prefix = %&req.token[..8.min(req.token.len())], "ACL token revoke requested");
+        let token = request.get_ref().token.clone();
+        tracing::info!(token_prefix = %&token[..8.min(token.len())], "ACL token revoke requested");
 
-        let revoked = self.token_store.revoke(&req.token).await;
+        let revoked = self.token_store.revoke(&token).await;
+        self.audit(
+            &request,
+            super::audit::AuditAction::TokenRevoke,
+            &super::rbac::token_id(&token),
+            "revoke ACL token",
+            if revoked {
+                super::audit::AuditOutcome::Success
+            } else {
+                super::audit::AuditOutcome::Failed
+            },
+        )
+        .await;
         Ok(Response::new(RevokeAclTokenResponse { success: revoked }))
     }
 
@@ -1846,11 +1949,15 @@ pub async fn serve_grpc(
         // We use blocking_read() for non-blocking access — the store is rarely written to.
         let tokens = token_store.inner_ref();
         let guard = tokens.blocking_read();
-        let role = super::rbac::TokenStore::authenticate_sync(&guard, raw_token)
-            .ok_or_else(|| Status::unauthenticated("invalid or expired token"))?;
+        let (role, identity) =
+            super::rbac::TokenStore::authenticate_sync_identity(&guard, raw_token)
+                .ok_or_else(|| Status::unauthenticated("invalid or expired token"))?;
+        drop(guard);
 
-        // Stash the role in request extensions so RPC handlers can check permissions.
+        // Stash the role in request extensions so RPC handlers can check permissions,
+        // and the token identity so handlers can attribute audit-log entries.
         req.extensions_mut().insert(role);
+        req.extensions_mut().insert(identity);
         Ok(req)
     };
 

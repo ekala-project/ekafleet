@@ -29,6 +29,42 @@ pub enum PeerIdentity {
     Mtls,
 }
 
+/// A non-secret, stable identifier for the bearer token that authenticated a
+/// request. Stashed in request extensions by the gRPC interceptor so audit-log
+/// entries can record *which* token performed each action without exposing the
+/// token value itself. The id is a truncated SHA-256 of the raw token, which is
+/// stable across restarts but not reversible to the secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenIdentity {
+    /// Truncated SHA-256 hex digest of the token, prefixed with `token:`.
+    pub id: String,
+    /// Human-readable description recorded when the token was registered.
+    pub description: String,
+    /// Role granted by the token.
+    pub role: Role,
+}
+
+impl TokenIdentity {
+    /// A stable actor string for the audit log, e.g. `token:1a2b3c4d5e6f (ci)`.
+    pub fn actor(&self) -> String {
+        if self.description.is_empty() {
+            self.id.clone()
+        } else {
+            format!("{} ({})", self.id, self.description)
+        }
+    }
+}
+
+/// Derive a stable, non-secret identifier from a raw bearer token.
+pub fn token_id(token: &str) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, token.as_bytes());
+    let hex: String = digest.as_ref()[..6]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("token:{hex}")
+}
+
 /// The namespace a request is scoped to, carried by the CLI in the
 /// `x-ekafleet-namespace` metadata and stashed in request extensions by the
 /// gRPC interceptor. Handlers read this to scope operations; when the marker
@@ -231,6 +267,25 @@ impl TokenStore {
         }
     }
 
+    /// Synchronous token authentication returning both the role and a stable,
+    /// non-secret identity for audit logging. Returns `None` for unknown or
+    /// expired tokens.
+    pub fn authenticate_sync_identity(
+        tokens: &HashMap<String, TokenEntry>,
+        token: &str,
+    ) -> Option<(Role, TokenIdentity)> {
+        let entry = tokens.get(token)?;
+        if entry.is_expired() {
+            return None;
+        }
+        let identity = TokenIdentity {
+            id: token_id(token),
+            description: entry.description.clone(),
+            role: entry.role,
+        };
+        Some((entry.role, identity))
+    }
+
     /// Look up the role for a bearer token.
     pub async fn authenticate(&self, token: &str) -> Option<Role> {
         let store = self.tokens.read().await;
@@ -362,6 +417,32 @@ mod tests {
         let store2 = TokenStore::with_persistence(dir.path());
         store2.load().await.unwrap();
         assert_eq!(store2.authenticate("persist-tok").await, Some(Role::Admin));
+    }
+
+    #[tokio::test]
+    async fn authenticate_sync_identity_returns_stable_id() {
+        let store = TokenStore::new();
+        store.register("secret-tok", Role::Operator, "ci").await;
+        let guard = store.tokens.read().await;
+
+        let (role, id) =
+            TokenStore::authenticate_sync_identity(&guard, "secret-tok").expect("known token");
+        assert_eq!(role, Role::Operator);
+        assert!(id.id.starts_with("token:"));
+        // Id is derived from the token, never the token itself.
+        assert!(!id.id.contains("secret-tok"));
+        assert_eq!(id.id, token_id("secret-tok"));
+        assert_eq!(id.actor(), format!("{} (ci)", token_id("secret-tok")));
+
+        assert!(TokenStore::authenticate_sync_identity(&guard, "nope").is_none());
+    }
+
+    #[test]
+    fn token_id_is_deterministic_and_non_reversible() {
+        assert_eq!(token_id("abc"), token_id("abc"));
+        assert_ne!(token_id("abc"), token_id("abd"));
+        assert!(token_id("abc").starts_with("token:"));
+        assert!(!token_id("abc").contains("abc"));
     }
 
     #[test]
