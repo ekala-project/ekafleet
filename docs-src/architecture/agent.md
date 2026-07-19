@@ -18,6 +18,7 @@ Start with `ekafleet agent --join <server>:7400 --join-token <TOKEN> --ca-cert <
 - **L7/L4 proxy** — HTTP reverse proxy with circuit breaking and retries, plus L4 TCP proxy for non-HTTP protocols
 - **Config templating** — Renders config file templates with fleet context (service discovery, secrets, metadata)
 - **Volume management** — Provisions and manages persistent volumes for stateful services
+- **GC root management** — Creates indirect Nix GC roots for deployed service closures (prevents `nix-collect-garbage` from reaping live services); removes roots on service teardown
 
 ## Connection Lifecycle
 

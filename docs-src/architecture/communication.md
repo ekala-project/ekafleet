@@ -62,7 +62,7 @@ service FleetControl {
   rpc Apply(ApplyRequest) returns (stream ApplyEvent);
   rpc Status(StatusRequest) returns (FleetStatus);
 
-  // Node attestation (unauthenticated)
+  // Node attestation (requires Attest permission)
   rpc Attest(NodeAttestationRequest) returns (NodeAttestationResult);
 
   // Cluster operations
@@ -108,7 +108,7 @@ service FleetControl {
 }
 ```
 
-The `Attest` RPC bypasses bearer token authentication. It is used by new agents to bootstrap their SPIFFE node identity via a one-time join token.
+All RPCs enforce RBAC via `require_permission()`. The `Attest` RPC requires `Attest` permission (granted to Operator and Admin). Authentication is via bearer token or mTLS (the SPIFFE ID is extracted from the verified peer cert and mapped to a role).
 
 ### SPIFFE Workload API (Unix Socket)
 

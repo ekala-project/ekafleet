@@ -15,21 +15,13 @@ Start with `ekafleet server`. The server runs the control plane and can optional
 - **Cloud provider management** — Provisions and destroys AWS, Azure, and GCP VMs for pool autoscaling; tracks cloud instances in Raft state; correlates agents with cloud VMs by IP
 - **Event tracking** — Records deployment, scheduling, health, scaling, and node events
 - **REST API** — JSON endpoints for status, services, capacity, events, deployment history, and cloud instances
-- **Raft consensus** — Multi-server HA with consistent state replication
+- **Persistent state** — Encrypted Raft-style log and snapshots with automatic restore-on-boot
 
-## High Availability
+## State Machine
 
-For production, run 3 server nodes in a Raft cluster:
+The server maintains a persistent state machine backed by encrypted log entries and snapshots (AES-256-GCM). On startup, `restore_raft_state` loads the latest snapshot and replays trailing log entries so fleet state survives restarts. Multi-node consensus (`--peers`) is parsed but not yet wired; today a single server is authoritative.
 
-```bash
-# First server (bootstrap)
-ekafleet server --data-dir /var/lib/ekafleet
-
-# Additional servers
-ekafleet server --data-dir /var/lib/ekafleet --peers node1:7400,node2:7400
-```
-
-The Raft state machine stores:
+The state machine stores:
 - Fleet state (what's deployed where)
 - Encrypted secrets
 - Scheduling plans
@@ -42,14 +34,19 @@ Server state is stored in `--data-dir` (default: `/var/lib/ekafleet`):
 
 ```text
 /var/lib/ekafleet/
-├── server-id        # Persistent server identity (UUIDv4)
-├── ca-key.pem       # Root CA private key (mode 0600)
-├── ca-cert.pem      # Root CA certificate
-├── fleet-key        # Fleet encryption key (mode 0600, hex-encoded)
+├── server-id               # Persistent server identity (UUIDv4)
+├── ca-key.pem              # Root CA private key (sealed¹, mode 0600)
+├── ca-cert.pem             # Root CA certificate
+├── ca-intermediate-key.pem # Short-lived intermediate CA key (sealed¹, mode 0600)
+├── ca-intermediate-cert.pem# Intermediate CA certificate
+├── fleet-key               # Fleet encryption key (sealed¹, mode 0600)
+├── tokens.json             # Persisted ACL tokens (keyed by SHA-256 digest)
 └── raft/
-    ├── log/         # Raft log entries (JSON files)
-    └── snapshots/   # State machine snapshots
+    ├── log/                # Encrypted log entries (AES-256-GCM)
+    └── snapshots/          # Encrypted state machine snapshots
 ```
+
+¹ When `EKAFLEET_SEAL_PASSPHRASE` is set, key files are encrypted at rest using PBKDF2-HMAC-SHA256 + AES-256-GCM envelope encryption. Without it, they are stored as plaintext with a warning. In-memory copies of all key material are wrapped in `Zeroizing<T>` so they are cleared on drop.
 
 Log compaction happens automatically after snapshots to prevent unbounded growth.
 
@@ -82,7 +79,7 @@ For development and quick bootstrapping, `ekafleet server` (without `--ca-socket
 The server handles SPIFFE-style node attestation via the `Attest` RPC:
 - **Join token**: One-time-use tokens registered via `ekafleet token create`; consumed on attestation and cannot be replayed
 - After attestation, the server issues a node SVID and the agent connects via mTLS
-- The `Attest` RPC bypasses bearer token authentication (the join token itself is the credential)
+- The `Attest` RPC requires `Attest` permission (granted to Operator and Admin roles)
 
 ## Fleet Encryption Key
 
@@ -114,6 +111,27 @@ During `plan` and `apply`, the server evaluates organizational policy rules from
 - **enforce** — Violations block the service from being created or updated
 - **warn** — Violations are logged but do not block deployment
 
+## Authentication & RBAC
+
+The gRPC API supports two authentication methods:
+
+- **Bearer token**: Validated against the token store; the token's role is inserted into request extensions
+- **mTLS (SPIFFE SVID)**: The SPIFFE ID is extracted from the verified peer certificate's SAN URI and mapped to a role based on the path: `/server/*` → Admin, `/agent/*` → Operator, others → Viewer
+
+Every gRPC handler enforces RBAC via `require_permission()`:
+
+| Permission | Roles | RPCs |
+|---|---|---|
+| Read | Admin, Operator, Viewer | status, plan, logs, events, list_*, top, snapshot, inspect, diff |
+| Deploy | Admin, Operator | apply, rollback, restore, dispatch, exec, switch_generation, system_* |
+| Scale | Admin, Operator | scale |
+| Drain | Admin, Operator | drain |
+| AgentConnect | Admin, Operator | stream_control |
+| Attest | Admin, Operator | attest |
+| ManageTokens | Admin only | create/revoke/list_acl_tokens, rotate_fleet_key |
+
+Client-supplied `x-ekafleet-mtls` and `x-ekafleet-attest` metadata headers are stripped at the interceptor boundary to prevent spoofing.
+
 ## ACL Token Management
 
-The server maintains an RBAC token store with three roles: **admin**, **operator**, and **viewer**. Tokens can be created, listed, and revoked via both the gRPC API and the `ekafleet acl token` CLI commands. The token store is shared between the gRPC and REST API layers, so tokens created via gRPC are immediately valid for REST API authentication and vice versa.
+The server maintains an RBAC token store with three roles: **admin**, **operator**, and **viewer**. Tokens can be created, listed, and revoked via both the gRPC API and the `ekafleet acl token` CLI commands. Token management requires the **ManageTokens** permission (Admin only). The token store is shared between the gRPC and REST API layers. Tokens are persisted to `tokens.json` keyed by SHA-256 digest (the raw token value is never stored at rest).

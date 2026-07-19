@@ -194,9 +194,9 @@ ekafleet is a single binary that consolidates capabilities from 10+ separate too
 
 | Feature | ekafleet | Kubernetes | Nomad + Consul | Notes |
 |---------|----------|------------|----------------|-------|
-| Consensus (server HA) | **Yes** (Raft) | **Yes** (etcd/Raft) | **Yes** (Raft) | 3-node HA cluster |
+| Consensus (server HA) | *Planned* | **Yes** (etcd/Raft) | **Yes** (Raft) | Single-node with durable state; multi-node Raft planned |
 | Gossip protocol | **Yes** (SWIM) | No | **Yes** (Serf/SWIM) | Failure detection, catalog propagation |
-| Leader election | **Yes** (Raft) | **Yes** (etcd) | **Yes** (Raft) | |
+| Leader election | *Planned* | **Yes** (etcd) | **Yes** (Raft) | `--peers` parsed, not yet wired |
 | Graceful degradation | **Yes** | **Yes** | **Yes** | Agents continue when server unreachable |
 | State snapshots | **Yes** | **Yes** (etcd backup) | **Yes** (snapshot) | Raft snapshot/restore |
 | Disaster recovery CLI | **Yes** | **Yes** (etcdctl) | **Yes** (snapshot save/restore) | `ekafleet snapshot` / `ekafleet restore` |

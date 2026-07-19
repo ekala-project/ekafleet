@@ -10,7 +10,7 @@ ekafleet is a single binary with multiple subcommands. For development and quick
 SERVER NODE:
   ekafleet-ca-signer.service     <- PrivateNetwork, no caps, owns CA key
        | Unix socket (/run/ekafleet/ca.sock)
-  ekafleet-server.service        <- Control plane (Raft, scheduler, API)
+  ekafleet-server.service        <- Control plane (state machine, scheduler, API)
 
 AGENT NODE:
   ekafleet-agent.service         <- Root, manages systemd/WG/nft/secrets
@@ -37,7 +37,7 @@ Three subsystems are split into separate processes for security:
 | **Workload API** | Workload private keys must not share address space with the remote exec handler or container supervisor | `PrivateNetwork`, `DynamicUser`, no capabilities |
 | **Proxy** | Untrusted network traffic parsing must not have root access or fleet key access | `DynamicUser`, only `CAP_NET_BIND_SERVICE` |
 
-Everything else stays in-process: Raft/scheduler/reconciler need tight coupling for consistency, the REST/gRPC APIs share state, and the heartbeat/health/renewal tasks are lightweight with no secrets.
+Everything else stays in-process: the state machine, scheduler, and reconciler need tight coupling for consistency, the REST/gRPC APIs share state, and the heartbeat/health/renewal tasks are lightweight with no secrets.
 
 ## Subsystems
 
@@ -47,7 +47,7 @@ Everything else stays in-process: Raft/scheduler/reconciler need tight coupling 
 |-----------|---------|
 | **scheduler** | Priority-based placement with constraints, affinities, taints, spread, preemption |
 | **nix_eval** | Evaluates fleet.nix via `nix eval` |
-| **raft** | Consensus for server HA (3-node) |
+| **raft** | Persistent state machine with encrypted log and snapshots; restore-on-boot |
 | **ca_root** | Root Certificate Authority, signs CSRs, issues SPIFFE SVIDs (isolated via `ca-signer` process) |
 | **attestation** | Node attestation (join token, future: TPM, Nix store path) |
 | **dns_authority** | Authoritative DNS for the fleet domain |
@@ -55,7 +55,7 @@ Everything else stays in-process: Raft/scheduler/reconciler need tight coupling 
 | **secrets_store** | Encrypted secret storage (Raft-backed) |
 | **scaling** | Autoscaling engine based on metrics |
 | **api** | gRPC + HTTP REST API + SSE event stream |
-| **rbac** | Role-based access control (admin/operator/viewer) |
+| **rbac** | Role-based access control (admin/operator/viewer) with per-handler permission enforcement |
 | **audit** | Structured audit trail of control-plane actions |
 | **events** | Fleet event timeline and deployment history |
 | **policy** | Organizational policy engine for admission control |

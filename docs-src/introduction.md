@@ -4,7 +4,7 @@ ekafleet is a single Rust binary that replaces the entire HashiCorp stack (Nomad
 
 ## One Binary, Two Modes
 
-- **`ekafleet server`** — Control plane: scheduling, RBAC, CA, secrets, DNS authority, deployment orchestration with disruption budgets, event tracking, REST API, Raft consensus, node attestation
+- **`ekafleet server`** — Control plane: scheduling, RBAC, CA, secrets, DNS authority, deployment orchestration with disruption budgets, event tracking, REST API, encrypted persistent state with restore-on-boot, node attestation
 - **`ekafleet agent`** — Data plane: system activation, service supervision with lifecycle hooks, liveness/readiness/startup probes, config templating, DNS resolver, secret injection, mesh networking, SPIFFE Workload API, L7/L4 proxy with circuit breaking, persistent volumes
 
 Server mode embeds all agent capabilities, meaning a server node can also run workloads. This follows the same pattern as k3s and Nomad.
@@ -47,4 +47,4 @@ Running a production fleet typically requires deploying and maintaining a dozen 
 | Scaling | Metric-based autoscaling, manual scaling, pool-level scaling, node maintenance windows, descheduler/rebalancer |
 | Operations | Structured CLI output (`-o json`), shell completions, disaster recovery (snapshot/restore), local dev mode |
 | Federation | Multi-region cluster federation, cross-cluster service discovery, SPIFFE trust domain federation |
-| HA | Raft consensus for server state, gossip for failure detection |
+| HA | Encrypted persistent state with restore-on-boot, gossip for failure detection; multi-node Raft planned |
