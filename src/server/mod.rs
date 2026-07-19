@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use state::FleetState;
 use tokio_util::sync::CancellationToken;
+use zeroize::Zeroizing;
 
 use crate::attestation::join_token::JoinTokenStore;
 use crate::ca::CaSigner;
@@ -80,7 +81,10 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
             seal::read_maybe_sealed(&ca_key_path).await,
             tokio::fs::read_to_string(&ca_cert_path).await,
         ) {
-            (Ok(key), Ok(cert)) => (Some(String::from_utf8(key.to_vec())?), Some(cert)),
+            (Ok(key), Ok(cert)) => (
+                Some(Zeroizing::new(String::from_utf8(key.to_vec())?)),
+                Some(cert),
+            ),
             _ => (None, None),
         };
 
@@ -88,15 +92,18 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
             seal::read_maybe_sealed(&int_key_path).await,
             tokio::fs::read_to_string(&int_cert_path).await,
         ) {
-            (Ok(key), Ok(cert)) => (Some(String::from_utf8(key.to_vec())?), Some(cert)),
+            (Ok(key), Ok(cert)) => (
+                Some(Zeroizing::new(String::from_utf8(key.to_vec())?)),
+                Some(cert),
+            ),
             _ => (None, None),
         };
 
         root_ca
             .initialize_with_intermediate(
-                stored_key.as_deref(),
+                stored_key.as_deref().map(|s| s.as_str()),
                 stored_cert.as_deref(),
-                stored_int_key.as_deref(),
+                stored_int_key.as_deref().map(|s| s.as_str()),
                 stored_int_cert.as_deref(),
             )
             .await?;
@@ -279,14 +286,18 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
 ///
 /// The key is stored as hex and sealed at rest when a passphrase is configured
 /// (see [`seal`]). Legacy plaintext-hex files are read transparently.
-async fn get_or_create_fleet_key(data_dir: &Path) -> anyhow::Result<Vec<u8>> {
+/// The returned key is wrapped in [`Zeroizing`] so it is cleared from memory on
+/// drop, consistent with how the WireGuard private key is handled.
+async fn get_or_create_fleet_key(data_dir: &Path) -> anyhow::Result<Zeroizing<Vec<u8>>> {
     let key_path = data_dir.join("fleet-key");
     if key_path.exists() {
         let hex_bytes = seal::read_maybe_sealed(&key_path).await?;
-        let hex_str = String::from_utf8(hex_bytes.to_vec())
-            .map_err(|e| anyhow::anyhow!("invalid fleet key encoding: {e}"))?
-            .trim()
-            .to_string();
+        let hex_str = Zeroizing::new(
+            String::from_utf8(hex_bytes.to_vec())
+                .map_err(|e| anyhow::anyhow!("invalid fleet key encoding: {e}"))?
+                .trim()
+                .to_string(),
+        );
         let key: Vec<u8> = (0..hex_str.len())
             .step_by(2)
             .map(|i| u8::from_str_radix(&hex_str[i..i + 2], 16))
@@ -296,17 +307,17 @@ async fn get_or_create_fleet_key(data_dir: &Path) -> anyhow::Result<Vec<u8>> {
             anyhow::bail!("fleet key must be 32 bytes, got {}", key.len());
         }
         tracing::info!("Fleet encryption key loaded from disk");
-        Ok(key)
+        Ok(Zeroizing::new(key))
     } else {
         use ring::rand::{SecureRandom, SystemRandom};
         let rng = SystemRandom::new();
-        let mut key = [0u8; 32];
-        rng.fill(&mut key)
+        let mut key = Zeroizing::new([0u8; 32]);
+        rng.fill(key.as_mut())
             .map_err(|_| anyhow::anyhow!("RNG failure"))?;
         let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
         seal::write_maybe_sealed(&key_path, hex.as_bytes(), "fleet encryption key").await?;
         tracing::info!("Fleet encryption key generated and persisted");
-        Ok(key.to_vec())
+        Ok(Zeroizing::new(key.to_vec()))
     }
 }
 

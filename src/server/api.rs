@@ -41,7 +41,7 @@ use crate::server::cloud::instance_tracker::InstanceTracker;
 
 /// Fleet encryption key with version tracking for rotation.
 pub struct FleetKeyState {
-    pub key: Vec<u8>,
+    pub key: zeroize::Zeroizing<Vec<u8>>,
     pub version: u64,
 }
 
@@ -92,7 +92,7 @@ impl FleetControlService {
             trust_bundle_pem: None,
             domain: domain.to_string(),
             fleet_key: Arc::new(RwLock::new(FleetKeyState {
-                key: Vec::new(),
+                key: zeroize::Zeroizing::new(Vec::new()),
                 version: 0,
             })),
             secret_store: Arc::new(RwLock::new(SecretStore::new(&[0u8; 32]))),
@@ -149,7 +149,7 @@ impl FleetControlService {
     }
 
     /// Configure the fleet encryption key and secret store.
-    pub fn with_fleet_key(self, key: Vec<u8>) -> Self {
+    pub fn with_fleet_key(self, key: zeroize::Zeroizing<Vec<u8>>) -> Self {
         // Initialize the secret store with this key and set version 1
         let store = SecretStore::new(
             <&[u8; 32]>::try_from(key.as_slice()).expect("fleet key must be 32 bytes"),
@@ -1823,7 +1823,7 @@ impl FleetControl for FleetControlService {
             let mut fk = self.fleet_key.write().await;
             let prev = fk.version;
             fk.version += 1;
-            fk.key = new_key.to_vec();
+            fk.key = zeroize::Zeroizing::new(new_key.to_vec());
             (prev, fk.version)
         };
 
@@ -1903,7 +1903,7 @@ pub struct GrpcServerConfig {
     pub ca: Arc<dyn CaSigner>,
     pub trust_bundle_pem: String,
     pub domain: String,
-    pub fleet_key: Vec<u8>,
+    pub fleet_key: zeroize::Zeroizing<Vec<u8>>,
     pub join_token_store: JoinTokenStore,
     pub raft_state: FleetStateMachine,
     pub instance_tracker: InstanceTracker,
