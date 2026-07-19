@@ -23,10 +23,45 @@ pub enum Role {
 /// gRPC interceptor so handlers can distinguish a verified mTLS peer (node SVID)
 /// from a bearer-token principal. This is derived server-side from the verified
 /// TLS peer certificate and can never be asserted by a client.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PeerIdentity {
-    /// Authenticated via a client certificate verified against the fleet CA.
-    Mtls,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerIdentity {
+    /// The SPIFFE ID extracted from the peer certificate SAN, e.g.
+    /// `spiffe://fleet.internal/agent/node-1`.
+    pub spiffe_id: String,
+    /// Role derived from the SPIFFE ID path structure.
+    pub role: Role,
+}
+
+impl PeerIdentity {
+    /// Derive a `PeerIdentity` from a SPIFFE URI. The path determines the role:
+    /// - `/server/...` → Admin (peer server in an HA cluster)
+    /// - `/agent/...`  → Operator (data-plane agent)
+    /// - anything else → Viewer (unknown workload identity)
+    pub fn from_spiffe_id(spiffe_id: String) -> Self {
+        let path = spiffe_id
+            .find("//")
+            .and_then(|i| spiffe_id[i + 2..].find('/'))
+            .map(|i| {
+                let abs = spiffe_id.find("//").unwrap() + 2 + i;
+                &spiffe_id[abs..]
+            })
+            .unwrap_or("");
+
+        let role = if path.starts_with("/server/") {
+            Role::Admin
+        } else if path.starts_with("/agent/") {
+            Role::Operator
+        } else {
+            Role::Viewer
+        };
+
+        Self { spiffe_id, role }
+    }
+
+    /// Actor string for audit logging, e.g. `spiffe://fleet.internal/agent/node-1`.
+    pub fn actor(&self) -> String {
+        self.spiffe_id.clone()
+    }
 }
 
 /// A non-secret, stable identifier for the bearer token that authenticated a
@@ -132,6 +167,36 @@ impl Role {
             Role::Viewer => matches!(permission, Permission::Read),
         }
     }
+}
+
+/// Check that a gRPC request carries a principal (bearer token or mTLS peer)
+/// with the given permission. Returns `Ok(())` on success, or a tonic
+/// `PERMISSION_DENIED` status on failure.
+#[allow(clippy::result_large_err)]
+pub fn require_permission<T>(
+    request: &tonic::Request<T>,
+    perm: Permission,
+) -> Result<(), tonic::Status> {
+    // Bearer-token auth stashes the Role directly.
+    if let Some(role) = request.extensions().get::<Role>() {
+        if role.has_permission(perm) {
+            return Ok(());
+        }
+        return Err(tonic::Status::permission_denied(format!(
+            "{role:?} role does not have {perm:?} permission"
+        )));
+    }
+    // mTLS peer identity carries a derived role.
+    if let Some(peer) = request.extensions().get::<PeerIdentity>() {
+        if peer.role.has_permission(perm) {
+            return Ok(());
+        }
+        return Err(tonic::Status::permission_denied(format!(
+            "mTLS peer {} ({:?}) does not have {perm:?} permission",
+            peer.spiffe_id, peer.role
+        )));
+    }
+    Err(tonic::Status::unauthenticated("no authenticated principal"))
 }
 
 /// Metadata for a registered token.
@@ -306,7 +371,12 @@ impl TokenStore {
 
     /// Revoke a token.
     pub async fn revoke(&self, token: &str) -> bool {
-        let removed = self.tokens.write().await.remove(&token_key(token)).is_some();
+        let removed = self
+            .tokens
+            .write()
+            .await
+            .remove(&token_key(token))
+            .is_some();
         if removed {
             self.persist().await;
         }
@@ -477,5 +547,31 @@ mod tests {
         assert_eq!(extract_bearer_token(Some("Bearer abc123")), Some("abc123"));
         assert_eq!(extract_bearer_token(Some("abc123")), None);
         assert_eq!(extract_bearer_token(None), None);
+    }
+
+    #[test]
+    fn peer_identity_server_is_admin() {
+        let peer = PeerIdentity::from_spiffe_id("spiffe://fleet.internal/server/abc".to_string());
+        assert_eq!(peer.role, Role::Admin);
+        assert_eq!(peer.actor(), "spiffe://fleet.internal/server/abc");
+    }
+
+    #[test]
+    fn peer_identity_agent_is_operator() {
+        let peer = PeerIdentity::from_spiffe_id("spiffe://fleet.internal/agent/node-1".to_string());
+        assert_eq!(peer.role, Role::Operator);
+    }
+
+    #[test]
+    fn peer_identity_workload_is_viewer() {
+        let peer =
+            PeerIdentity::from_spiffe_id("spiffe://fleet.internal/workload/api-server".to_string());
+        assert_eq!(peer.role, Role::Viewer);
+    }
+
+    #[test]
+    fn peer_identity_unknown_is_viewer() {
+        let peer = PeerIdentity::from_spiffe_id("spiffe://unknown/unidentified".to_string());
+        assert_eq!(peer.role, Role::Viewer);
     }
 }

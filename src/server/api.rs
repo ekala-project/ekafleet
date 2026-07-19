@@ -9,7 +9,7 @@ use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 use tonic::{Request, Response, Status, Streaming};
 
 use super::events::EventStore;
-use super::rbac::{PeerIdentity, TokenStore, extract_bearer_token};
+use super::rbac::{PeerIdentity, Permission, TokenStore, extract_bearer_token, require_permission};
 use super::state::FleetState;
 use crate::attestation::join_token::JoinTokenStore;
 use crate::ca::CaSigner;
@@ -127,7 +127,7 @@ impl FleetControlService {
                 request
                     .extensions()
                     .get::<super::rbac::PeerIdentity>()
-                    .map(|_| "mtls-peer".to_string())
+                    .map(|peer| peer.actor())
             })
             .unwrap_or_else(|| "unknown".to_string());
         self.audit_log
@@ -177,6 +177,7 @@ impl FleetControl for FleetControlService {
         &self,
         request: Request<Streaming<AgentMessage>>,
     ) -> Result<Response<Self::StreamControlStream>, Status> {
+        require_permission(&request, Permission::AgentConnect)?;
         let remote = request
             .remote_addr()
             .map(|a| a.to_string())
@@ -310,6 +311,7 @@ impl FleetControl for FleetControlService {
     type ApplyStream = Pin<Box<ReceiverStream<Result<ApplyEvent, Status>>>>;
 
     async fn plan(&self, request: Request<PlanRequest>) -> Result<Response<PlanResponse>, Status> {
+        require_permission(&request, Permission::Read)?;
         let req = request.into_inner();
         tracing::info!(config = %req.config_path, "Plan requested");
 
@@ -398,6 +400,7 @@ impl FleetControl for FleetControlService {
         &self,
         request: Request<ApplyRequest>,
     ) -> Result<Response<Self::ApplyStream>, Status> {
+        require_permission(&request, Permission::Deploy)?;
         self.audit(
             &request,
             super::audit::AuditAction::Apply,
@@ -684,6 +687,7 @@ impl FleetControl for FleetControlService {
         &self,
         request: Request<NodeAttestationRequest>,
     ) -> Result<Response<NodeAttestationResult>, Status> {
+        require_permission(&request, Permission::Attest)?;
         let req = request.into_inner();
         tracing::info!(
             attestation_type = %req.attestation_type,
@@ -780,8 +784,9 @@ impl FleetControl for FleetControlService {
 
     async fn status(
         &self,
-        _request: Request<StatusRequest>,
+        request: Request<StatusRequest>,
     ) -> Result<Response<FleetStatus>, Status> {
+        require_permission(&request, Permission::Read)?;
         let (nodes, services, pools) = self.state.fleet_status().await;
 
         Ok(Response::new(FleetStatus {
@@ -796,6 +801,7 @@ impl FleetControl for FleetControlService {
         &self,
         request: Request<RollbackRequest>,
     ) -> Result<Response<RollbackResponse>, Status> {
+        require_permission(&request, Permission::Deploy)?;
         self.audit(
             &request,
             super::audit::AuditAction::Rollback,
@@ -894,6 +900,7 @@ impl FleetControl for FleetControlService {
         &self,
         request: Request<DrainRequest>,
     ) -> Result<Response<DrainResponse>, Status> {
+        require_permission(&request, Permission::Drain)?;
         self.audit(
             &request,
             super::audit::AuditAction::Drain,
@@ -957,6 +964,7 @@ impl FleetControl for FleetControlService {
         &self,
         request: Request<ScaleRequest>,
     ) -> Result<Response<ScaleResponse>, Status> {
+        require_permission(&request, Permission::Scale)?;
         self.audit(
             &request,
             super::audit::AuditAction::Scale,
@@ -1010,8 +1018,9 @@ impl FleetControl for FleetControlService {
 
     async fn snapshot(
         &self,
-        _request: Request<SnapshotRequest>,
+        request: Request<SnapshotRequest>,
     ) -> Result<Response<SnapshotResponse>, Status> {
+        require_permission(&request, Permission::Read)?;
         tracing::info!("Snapshot requested");
 
         let data = self.raft_state.snapshot().await;
@@ -1024,6 +1033,7 @@ impl FleetControl for FleetControlService {
         &self,
         request: Request<RestoreRequest>,
     ) -> Result<Response<RestoreResponse>, Status> {
+        require_permission(&request, Permission::Deploy)?;
         let req = request.into_inner();
         tracing::info!(data_len = req.data.len(), "Restore requested");
 
@@ -1043,6 +1053,7 @@ impl FleetControl for FleetControlService {
         &self,
         request: Request<crate::proto::DispatchRequest>,
     ) -> Result<Response<crate::proto::DispatchResponse>, Status> {
+        require_permission(&request, Permission::Deploy)?;
         let req = request.into_inner();
         tracing::info!(
             service = %req.service_name,
@@ -1092,6 +1103,7 @@ impl FleetControl for FleetControlService {
     }
 
     async fn exec(&self, request: Request<ExecRequest>) -> Result<Response<ExecResponse>, Status> {
+        require_permission(&request, Permission::Deploy)?;
         let req = request.into_inner();
         tracing::info!(
             service = %req.service_name,
@@ -1168,6 +1180,7 @@ impl FleetControl for FleetControlService {
         &self,
         request: Request<LogsRequest>,
     ) -> Result<Response<Self::LogsStream>, Status> {
+        require_permission(&request, Permission::Read)?;
         let req = request.into_inner();
         tracing::info!(
             service = %req.service_name,
@@ -1264,6 +1277,7 @@ impl FleetControl for FleetControlService {
         &self,
         request: Request<EventsRequest>,
     ) -> Result<Response<EventsResponse>, Status> {
+        require_permission(&request, Permission::Read)?;
         let req = request.into_inner();
         let limit = if req.limit == 0 {
             50
@@ -1316,8 +1330,9 @@ impl FleetControl for FleetControlService {
 
     async fn list_nodes(
         &self,
-        _request: Request<ListNodesRequest>,
+        request: Request<ListNodesRequest>,
     ) -> Result<Response<ListNodesResponse>, Status> {
+        require_permission(&request, Permission::Read)?;
         let (nodes, services, _) = self.state.fleet_status().await;
 
         let mut details: Vec<NodeDetail> = Vec::with_capacity(nodes.len());
@@ -1367,6 +1382,7 @@ impl FleetControl for FleetControlService {
         &self,
         request: Request<GetNodeRequest>,
     ) -> Result<Response<NodeDetail>, Status> {
+        require_permission(&request, Permission::Read)?;
         let req = request.into_inner();
         let (nodes, services, _) = self.state.fleet_status().await;
 
@@ -1417,6 +1433,7 @@ impl FleetControl for FleetControlService {
         &self,
         request: Request<UpdateNodeRequest>,
     ) -> Result<Response<UpdateNodeResponse>, Status> {
+        require_permission(&request, Permission::Deploy)?;
         let req = request.into_inner();
         tracing::info!(
             node = %req.node_id,
@@ -1432,6 +1449,7 @@ impl FleetControl for FleetControlService {
     }
 
     async fn top(&self, request: Request<TopRequest>) -> Result<Response<TopResponse>, Status> {
+        require_permission(&request, Permission::Read)?;
         let req = request.into_inner();
         let (nodes, services, _) = self.state.fleet_status().await;
 
@@ -1504,6 +1522,7 @@ impl FleetControl for FleetControlService {
         &self,
         request: Request<ListDeploymentsRequest>,
     ) -> Result<Response<ListDeploymentsResponse>, Status> {
+        require_permission(&request, Permission::Read)?;
         let req = request.into_inner();
         let _limit = if req.limit == 0 {
             20
@@ -1538,6 +1557,7 @@ impl FleetControl for FleetControlService {
         &self,
         request: Request<PromoteRequest>,
     ) -> Result<Response<PromoteResponse>, Status> {
+        require_permission(&request, Permission::Deploy)?;
         self.audit(
             &request,
             super::audit::AuditAction::Apply,
@@ -1592,6 +1612,7 @@ impl FleetControl for FleetControlService {
         &self,
         request: Request<FailDeploymentRequest>,
     ) -> Result<Response<FailDeploymentResponse>, Status> {
+        require_permission(&request, Permission::Deploy)?;
         self.audit(
             &request,
             super::audit::AuditAction::Rollback,
@@ -1631,6 +1652,7 @@ impl FleetControl for FleetControlService {
         &self,
         request: Request<CreateAclTokenRequest>,
     ) -> Result<Response<CreateAclTokenResponse>, Status> {
+        require_permission(&request, Permission::ManageTokens)?;
         let req = request.get_ref().clone();
 
         let role = match req.role.as_str() {
@@ -1681,6 +1703,7 @@ impl FleetControl for FleetControlService {
         &self,
         request: Request<RevokeAclTokenRequest>,
     ) -> Result<Response<RevokeAclTokenResponse>, Status> {
+        require_permission(&request, Permission::ManageTokens)?;
         let token = request.get_ref().token.clone();
         tracing::info!(token_prefix = %&token[..8.min(token.len())], "ACL token revoke requested");
 
@@ -1702,8 +1725,9 @@ impl FleetControl for FleetControlService {
 
     async fn list_acl_tokens(
         &self,
-        _request: Request<ListAclTokensRequest>,
+        request: Request<ListAclTokensRequest>,
     ) -> Result<Response<ListAclTokensResponse>, Status> {
+        require_permission(&request, Permission::ManageTokens)?;
         let tokens = self.token_store.list().await;
         let infos = tokens
             .into_iter()
@@ -1719,6 +1743,7 @@ impl FleetControl for FleetControlService {
         &self,
         request: Request<ListGenerationsRequest>,
     ) -> Result<Response<ListGenerationsResponse>, Status> {
+        require_permission(&request, Permission::Read)?;
         self.handle_list_generations(request.into_inner()).await
     }
 
@@ -1726,6 +1751,7 @@ impl FleetControl for FleetControlService {
         &self,
         request: Request<SwitchGenerationRequest>,
     ) -> Result<Response<SwitchGenerationResponse>, Status> {
+        require_permission(&request, Permission::Deploy)?;
         self.handle_switch_generation(request.into_inner()).await
     }
 
@@ -1733,6 +1759,7 @@ impl FleetControl for FleetControlService {
         &self,
         request: Request<DiffGenerationsRequest>,
     ) -> Result<Response<DiffGenerationsResponse>, Status> {
+        require_permission(&request, Permission::Read)?;
         self.handle_diff_generations(request.into_inner()).await
     }
 
@@ -1740,6 +1767,7 @@ impl FleetControl for FleetControlService {
         &self,
         request: Request<SystemGcRequest>,
     ) -> Result<Response<SystemGcResponse>, Status> {
+        require_permission(&request, Permission::Deploy)?;
         self.handle_system_gc(request.into_inner()).await
     }
 
@@ -1747,6 +1775,7 @@ impl FleetControl for FleetControlService {
         &self,
         request: Request<SystemRebootRequest>,
     ) -> Result<Response<SystemRebootResponse>, Status> {
+        require_permission(&request, Permission::Deploy)?;
         self.handle_system_reboot(request.into_inner()).await
     }
 
@@ -1754,6 +1783,7 @@ impl FleetControl for FleetControlService {
         &self,
         request: Request<SystemRebuildRequest>,
     ) -> Result<Response<SystemRebuildResponse>, Status> {
+        require_permission(&request, Permission::Deploy)?;
         self.handle_system_rebuild(request.into_inner()).await
     }
 
@@ -1761,13 +1791,15 @@ impl FleetControl for FleetControlService {
         &self,
         request: Request<InspectServiceRequest>,
     ) -> Result<Response<InspectServiceResponse>, Status> {
+        require_permission(&request, Permission::Read)?;
         self.handle_inspect_service(request.into_inner()).await
     }
 
     async fn rotate_fleet_key(
         &self,
-        _request: Request<RotateFleetKeyRequest>,
+        request: Request<RotateFleetKeyRequest>,
     ) -> Result<Response<RotateFleetKeyResponse>, Status> {
+        require_permission(&request, Permission::ManageTokens)?;
         tracing::info!("Fleet key rotation requested");
 
         // Generate a new 256-bit key
@@ -1930,12 +1962,21 @@ pub async fn serve_grpc(
         // against the configured CA (client_ca_root below). `peer_certs()` only
         // returns certificates for a genuinely completed, verified mTLS handshake,
         // so this cannot be forged by setting a header.
+        //
+        // Extract the SPIFFE ID from the leaf certificate's SAN URI and derive
+        // a role from the path structure (/server/* → Admin, /agent/* → Operator).
         if let Some(certs) = req.peer_certs()
-            && !certs.is_empty()
+            && let Some(leaf) = certs.first()
         {
-            // A verified node SVID grants the AgentConnect/operator surface.
-            // Record the identity marker for handler-level checks.
-            req.extensions_mut().insert(PeerIdentity::Mtls);
+            let peer = crate::proxy::mtls::SpiffeAuthorizer::extract_spiffe_id_from_der(leaf)
+                .map(PeerIdentity::from_spiffe_id)
+                .unwrap_or_else(|| {
+                    // Cert is CA-verified but has no SPIFFE SAN — treat as Viewer.
+                    PeerIdentity::from_spiffe_id("spiffe://unknown/unidentified".to_string())
+                });
+            let role = peer.role;
+            req.extensions_mut().insert(role);
+            req.extensions_mut().insert(peer);
             return Ok(req);
         }
 
