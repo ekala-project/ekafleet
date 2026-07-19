@@ -16,68 +16,50 @@ for the stated goal · **P2** = correctness/UX gap · **P3** = polish.
 
 ## P0 — Security & correctness show-stoppers
 
-### P0.1 gRPC auth is bypassable via client-set metadata
-**Where**: `src/server/api.rs:1757-1774`, agent side `src/agent/mod.rs:118-125`.
+### ~~P0.1 gRPC auth is bypassable via client-set metadata~~ (complete)
 
-The gRPC interceptor authenticates a request if it carries `x-ekafleet-mtls: true`
-**or** `x-ekafleet-attest: true`. Both are ordinary gRPC metadata headers that the
-*client* sets on itself (`agent/mod.rs:121`). The server never inspects the real
-TLS peer certificate — it trusts a self-asserted flag. Any client that can reach
-the gRPC port can send `x-ekafleet-mtls: true` and obtain full, unauthenticated
-control-plane access (deploy, drain, rotate keys, mint ACL tokens).
+Resolved. The gRPC interceptor now:
+- Strips client-supplied `x-ekafleet-mtls` / `x-ekafleet-attest` headers at entry.
+- Derives mTLS identity from the rustls-verified peer certificate chain via
+  `req.peer_certs()`, extracting the SPIFFE ID from the leaf cert SAN URI.
+- Maps SPIFFE ID paths to roles: `/server/*` → Admin, `/agent/*` → Operator,
+  others → Viewer.
+- Every gRPC handler enforces RBAC via `require_permission()` before processing.
+- Audit logs record the full SPIFFE URI for mTLS peers.
 
-**Fix**:
-- Derive the mTLS identity from the actual rustls peer certificate chain
-  (tonic exposes `Certificates` via connection info / `TlsConnectInfo`), not a header.
-- Extract the SPIFFE ID from the verified client cert SAN and map it to a role.
-- Gate the unauthenticated `attest` path by **RPC method name**, not a client claim.
-- Strip incoming `x-ekafleet-*` auth headers at the server boundary before trusting them.
+### ~~P0.2 CA private key and fleet master key stored in plaintext~~ (complete)
 
-### P0.2 CA private key and fleet master key stored in plaintext
-**Where**: `src/server/mod.rs:69` (`ca-key.pem`), `src/server/mod.rs:220-250` (`fleet-key`).
+Resolved. At-rest sealing via `src/server/seal.rs` (PBKDF2-HMAC-SHA256 +
+AES-256-GCM envelope) encrypts CA keys and the fleet master key when
+`EKAFLEET_SEAL_PASSPHRASE` is set. In-memory key material (fleet key, CA key
+PEM strings) is wrapped in `zeroize::Zeroizing<T>` so it is cleared on drop,
+consistent with the WireGuard key handling.
 
-Both are written to `data_dir` as unencrypted PEM/hex with only `0o600` perms
-(`mod.rs:98`, `:247`). Filesystem read (backup leak, stolen disk, path traversal,
-misconfigured volume) = total fleet compromise: forge any SVID, decrypt every
-secret. SPIRE/Vault seal these behind a KEK or HSM.
+### ~~P0.3 Deployed service closures are not GC-rooted~~ (complete)
 
-**Fix** (in priority order):
-- Minimum: seal both with a passphrase-derived KEK (Argon2id) or host-bound key (age/TPM).
-- Better: pluggable seal provider (env passphrase → TPM → KMS/HSM).
-- Zeroize in-memory copies on drop (WireGuard key already uses `Zeroizing`; CA/fleet keys do not — inconsistent).
+Implemented in `src/agent/supervisor.rs`. The supervisor creates indirect GC roots
+at `{data_dir}/gcroots/{service}` via `nix-store --add-root ... --realise` when a
+service is deployed (`add_gc_root`, line 402) and removes them on teardown
+(`remove_gc_root`, line 436). The `adopt_existing_units` path also recovers GC root
+symlinks for services that survive an agent restart.
 
-### P0.3 Deployed service closures are not GC-rooted
-**Where**: no `gcroots` / `nix-store --add-root` / `--indirect` anywhere in `src/`.
+### P0.4 No multi-node Raft consensus
+**Where**: `src/raft/mod.rs` (`state`, `storage`). `--peers` is parsed
+(`src/main.rs`) but not wired to a consensus protocol.
 
-`nix-copy-closure` ships store paths to agents, but nothing pins them. A routine
-`nix-collect-garbage` on an agent deletes live service closures out from under
-running services. Only the *system* profile is rooted (via `nix-env --profile`,
-`src/agent/activation.rs`). This directly contradicts the reproducibility promise.
+There is no leader election, no log replication, no membership changes. The system
+is honestly scoped to single-node with durable state: `FleetStateMachine` is
+persisted via encrypted snapshots and log replay (AES-256-GCM, `raft/storage.rs`),
+and `restore_raft_state` (`src/server/mod.rs:321`) replays the latest snapshot +
+trailing log entries at boot. Two servers today would be two independent brains.
 
-**Fix**:
-- Create an indirect GC root per deployed service path:
-  `nix-store --add-root /nix/var/nix/gcroots/ekafleet/<service-id> --indirect <path>`.
-- Remove the root on service teardown.
-- Optional NixOS module timer for `nix-collect-garbage` that is aware of ekafleet roots.
+**Resolved**: restore-on-startup is implemented — snapshots and log entries are
+replayed at boot via `restore_raft_state`, and periodic housekeeping takes snapshots
+and compacts the log.
 
-### P0.4 No Raft consensus despite HA claims
-**Where**: `src/raft/mod.rs` is two lines (`state`, `storage`). `--peers` is parsed
-(`src/main.rs`) but never wired. `FleetStateMachine::new()` is a single in-memory
-instance (`src/server/mod.rs:146`).
-
-There is no leader election, no log replication, no membership changes. The README
-advertises "Raft consensus" and the module hardens a multi-server story, but two
-servers today = two independent brains and silent state divergence on partition.
-
-**Fix** — pick one:
-- Integrate `openraft`: wrap `FleetStateMachine` as the state machine, use the
-  existing encrypted `raft/storage.rs` as the log/snapshot store, wire `--peers`
-  to the transport, restore-on-startup from snapshot + log replay.
-- **Or** honestly scope to single-node HA (leader + warm standby via snapshot ship)
-  and correct the README until real consensus lands.
-
-Also: on restart the state machine starts empty — snapshots are taken but never
-replayed at boot. Fix restore-on-startup regardless of which path is chosen.
+**Remaining**: multi-node consensus (leader election, log replication across
+`--peers`). Candidate approach: integrate `openraft`, wrap `FleetStateMachine` as
+the state machine, use the existing encrypted storage as the log/snapshot store.
 
 ---
 
@@ -221,8 +203,9 @@ intermediates so root rotation and revocation are practical.
 
 ## Suggested sequencing
 
-1. **P0.1** (auth bypass) — highest value, smallest blast radius, fully local fix.
-2. **P0.2 / P0.3** (key sealing, GC roots) — protect against catastrophic loss.
-3. **P0.4** (consensus *or* honest single-node scoping + restore-on-boot).
-4. **P1.1 / P1.2** (event reconcile, real attestation) — core orchestration + identity.
-5. Remaining P1, then P2, then P3.
+1. ~~**P0.1** (auth bypass)~~ — **done**: SPIFFE ID extraction, RBAC enforcement.
+2. ~~**P0.2** (key sealing)~~ — **done**: seal module + Zeroizing wrappers.
+3. ~~**P0.3** (GC roots)~~ — **done**: supervisor creates/removes indirect roots.
+4. **P0.4** (multi-node consensus) — restore-on-boot done; Raft replication remains.
+5. **P1.1 / P1.2** (event reconcile, real attestation) — core orchestration + identity.
+6. Remaining P1, then P2, then P3.
