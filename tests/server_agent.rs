@@ -69,15 +69,21 @@ async fn start_server() -> (SocketAddr, SocketAddr, String, String) {
 
     let expected_token = format!("Bearer {token}");
     #[allow(clippy::result_large_err)]
-    let interceptor = move |req: tonic::Request<()>| -> Result<tonic::Request<()>, tonic::Status> {
-        match req.metadata().get("authorization") {
-            Some(val) if val == expected_token.as_str() => Ok(req),
-            Some(_) => Err(tonic::Status::unauthenticated("invalid token")),
-            None => Err(tonic::Status::unauthenticated(
-                "missing authorization header",
-            )),
-        }
-    };
+    let interceptor =
+        move |mut req: tonic::Request<()>| -> Result<tonic::Request<()>, tonic::Status> {
+            match req.metadata().get("authorization") {
+                Some(val) if val == expected_token.as_str() => {
+                    // Insert Admin role so require_permission() checks pass.
+                    req.extensions_mut()
+                        .insert(ekafleet::server::rbac::Role::Admin);
+                    Ok(req)
+                }
+                Some(_) => Err(tonic::Status::unauthenticated("invalid token")),
+                None => Err(tonic::Status::unauthenticated(
+                    "missing authorization header",
+                )),
+            }
+        };
 
     // Start gRPC server
     tokio::spawn(async move {
