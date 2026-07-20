@@ -69,6 +69,9 @@ struct NodeInfo {
     /// Whether this node is eligible for new scheduling.
     /// Set to false during maintenance windows.
     schedulable: bool,
+    /// WireGuard mesh IP reported via heartbeat. Used by the reconciler to
+    /// populate VXLAN tunnel endpoints for cross-node namespace networking.
+    mesh_ip: Option<std::net::Ipv4Addr>,
 }
 
 struct AgentServiceInfo {
@@ -155,6 +158,7 @@ impl FleetState {
                 services: HashMap::new(),
                 tx,
                 schedulable: true,
+                mesh_ip: None,
             },
         );
 
@@ -220,6 +224,20 @@ impl FleetState {
                 node.available_resources = res;
             }
         }
+    }
+
+    /// Update the WireGuard mesh IP for a node (reported via heartbeat).
+    pub async fn update_mesh_ip(&self, node_id: &str, ip: std::net::Ipv4Addr) {
+        let mut state = self.inner.write().await;
+        if let Some(node) = state.nodes.get_mut(node_id) {
+            node.mesh_ip = Some(ip);
+        }
+    }
+
+    /// Get the WireGuard mesh IP for a node, if reported.
+    pub async fn mesh_ip_for_node(&self, node_id: &str) -> Option<std::net::Ipv4Addr> {
+        let state = self.inner.read().await;
+        state.nodes.get(node_id).and_then(|n| n.mesh_ip)
     }
 
     /// Update health reports from an agent.
