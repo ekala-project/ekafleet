@@ -58,6 +58,9 @@
         evalFleet =
           { lib, userConfig }:
           (import ./nix/lib/eval-fleet.nix { inherit lib; }) { inherit userConfig; };
+        # Service catalog: curated templates for common service types.
+        # Usage: `let catalog = ekafleet.lib.catalog { inherit pkgs; };`
+        catalog = import ./nix/lib/catalog.nix;
       };
     }
     // (
