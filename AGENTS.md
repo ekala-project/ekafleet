@@ -43,43 +43,177 @@ validation checks.
 
 | Area | Path | What to protect |
 |------|------|-----------------|
-| Certificate Authority | `src/ca/` | Root CA key, leaf issuance, SPIFFE attestation |
-| Secret Storage | `src/secrets/` | AES-256-GCM encryption at rest, secret scoping |
-| Auth & RBAC | `src/server/api.rs`, `src/server/rbac.rs` | mTLS SPIFFE ID extraction + bearer token validation, per-handler RBAC enforcement |
+| Certificate Authority | `src/ca/` | Root + intermediate CA keys, leaf issuance, SPIFFE SVIDs |
+| Secret Storage | `src/secrets/` | AES-256-GCM encryption, per-agent HKDF key derivation, AAD binding |
+| Auth & RBAC | `src/server/api.rs`, `src/server/rbac.rs` | mTLS SPIFFE ID extraction, bearer tokens, namespace-scoped RBAC |
 | Seal Module | `src/server/seal.rs` | PBKDF2+AES-256-GCM envelope encryption for key material at rest |
-| WireGuard Keys | `src/mesh/` | Private key handling (stdin, never argv), zeroize |
+| Workload Attestation | `src/spiffe/workload_attestor.rs` | Cgroup-only attestation (no env var fallback), PID→service mapping |
+| Raft Storage | `src/raft/storage.rs` | AES-256-GCM encrypted log + snapshots, restore-on-boot |
+| WireGuard Keys | `src/mesh/wireguard.rs` | Private key handling (stdin, never argv), `Zeroizing<String>` |
+| OCI Signatures | `src/agent/oci/signature.rs` | Cosign/sigstore image signature verification |
 | Gossip Auth | `src/gossip/` | HMAC-SHA256 on all membership messages |
-| Token Generation | `src/main.rs:generate_token` | 256-bit random via `ring::rand::SystemRandom` |
+| Token Generation | `src/commands.rs` | 256-bit random via `ring::rand::SystemRandom` |
 
 ## Architecture
 
 ```
 src/
-├── main.rs           # CLI entry, subcommand dispatch, tracing init
-├── lib.rs            # Re-exports all modules for integration tests
-├── config.rs         # Fleet config types (serde, from nix eval JSON)
+├── main.rs              # CLI entry, subcommand dispatch, tracing init
+├── commands.rs          # CLI command implementations (plan, apply, status, drain, acl, etc.)
+├── client_config.rs     # Client-side connection config
+├── lib.rs               # Re-exports all modules for integration tests
+├── types.rs             # Shared type definitions
+├── config/
+│   ├── mod.rs           # FleetConfig, ServiceConfig, MachineConfig (serde, from nix eval JSON)
+│   └── scheduling.rs    # Scheduling, update strategy, disruption budget types
 ├── server/
-│   ├── api.rs        # gRPC (tonic) + HTTP (axum), TLS, bearer auth
-│   ├── state.rs      # FleetState: in-memory agent registry, heartbeats
-│   ├── scheduler.rs  # Filter + score placement
-│   ├── deployer.rs   # Rolling / canary / blue-green
-│   ├── reconciler.rs # Desired-vs-actual reconciliation loop
-│   ├── scaling.rs    # Autoscaling logic
-│   └── nix.rs        # nix eval/build subprocess wrapper
+│   ├── mod.rs           # Server startup, CA init, fleet key, restore-on-boot
+│   ├── api.rs           # gRPC service (tonic), TLS, SPIFFE ID extraction, RBAC interceptor
+│   ├── api_system.rs    # System-level RPC handlers (gc, reboot, rebuild, inspect, generations)
+│   ├── rest.rs          # HTTP/REST API (axum) + embedded dashboard
+│   ├── rbac.rs          # Roles, permissions, namespace-scoped tokens, require_permission()
+│   ├── seal.rs          # PBKDF2+AES-256-GCM envelope encryption for key material at rest
+│   ├── state.rs         # FleetState: in-memory agent registry, heartbeats, command relay
+│   ├── reconciler.rs    # Desired-vs-actual reconciliation, ServiceConfig→ServiceSpec conversion
+│   ├── deployer.rs      # Rolling / canary / blue-green deployment orchestration
+│   ├── scheduler/       # Filter + score placement (constraints, affinity, spread, preemption)
+│   ├── scaling.rs       # Service + pool autoscaling logic
+│   ├── nix.rs           # nix eval/build/copy subprocess wrapper (configurable timeouts)
+│   ├── namespace.rs     # Namespace registry with resource quotas
+│   ├── quota.rs         # Per-pool/namespace resource quota enforcement
+│   ├── audit.rs         # Structured audit trail with actor attribution
+│   ├── events.rs        # Fleet event timeline and deployment history
+│   ├── policy.rs        # Organizational policy engine for admission control
+│   ├── webhook.rs       # Outbound webhook notifications
+│   ├── federation.rs    # Multi-region cluster federation
+│   ├── rebalance.rs     # Descheduler for workload rebalancing
+│   ├── agent_msg.rs     # Inbound agent message dispatch
+│   └── cloud/
+│       ├── mod.rs       # Cloud provider registry
+│       ├── actuator.rs  # Scaling actuator (provision/destroy VMs)
+│       ├── aws.rs       # AWS EC2 provider
+│       ├── azure.rs     # Azure VM provider
+│       ├── gcp.rs       # GCP Compute Engine provider
+│       ├── bootstrap.rs # Cloud VM agent bootstrap (join token, user-data)
+│       ├── image.rs     # NixOS cloud image building + registration
+│       ├── image_tracker.rs # Image version tracking in Raft state
+│       └── instance_tracker.rs # Cloud VM ↔ fleet node correlation
 ├── agent/
-│   ├── mod.rs        # Agent main loop, gRPC client, bidirectional stream
-│   ├── supervisor.rs # systemd unit management
-│   └── health.rs     # Health probes (HTTP, TCP, exec)
-├── ca/               # Root CA → issuer → client certificate flow
-├── secrets/          # AES-256-GCM encryption at rest + injection
-├── dns/              # Authority (server) + caching resolver (agent)
-├── mesh/             # WireGuard tunnel setup + peer management
-├── proxy/            # L7 reverse proxy routing
-├── policy/           # nftables rule generation
-├── metrics/          # Collection + aggregation
-├── gossip/           # SWIM membership protocol
-├── raft/             # Persistent state machine + encrypted log/snapshots (restore-on-boot)
-└── spiffe/           # SPIFFE workload identity
+│   ├── mod.rs           # Agent main loop, gRPC client, bidirectional stream
+│   ├── handlers.rs      # Server message dispatch (DesiredState, Deploy, Secret, etc.)
+│   ├── supervisor.rs    # systemd unit management, cgroup enforcement, GC roots
+│   ├── health.rs        # Liveness/readiness/startup probes (HTTP, TCP, exec)
+│   ├── activation.rs    # NixOS system closure activation, generation pruning
+│   ├── types.rs         # Agent-side state types (LocalState, NodeIdentity)
+│   ├── helpers.rs       # SVID installation helpers
+│   ├── template.rs      # Config file template rendering
+│   ├── exec.rs          # Remote command execution in service cgroups
+│   ├── logs.rs          # Journal log streaming
+│   ├── storage.rs       # Persistent volume provisioning
+│   ├── migrate.rs       # Volume data migration (rsync)
+│   ├── snapshot.rs      # Volume snapshots
+│   └── oci/
+│       ├── mod.rs       # OCI container lifecycle (pull, unpack, run via nspawn)
+│       ├── registry.rs  # OCI registry client with TLS + custom CA bundle
+│       ├── auth.rs      # Registry authentication (token, basic)
+│       ├── manifest.rs  # OCI manifest parsing (v2, list)
+│       ├── pull.rs      # Layer pulling with content verification
+│       ├── unpack.rs    # Layer unpacking (tar+gzip)
+│       ├── store.rs     # Content-addressable image store
+│       ├── reference.rs # Image reference parsing
+│       ├── digest.rs    # SHA-256 digest types
+│       ├── bundle.rs    # OCI bundle assembly for nspawn
+│       ├── signature.rs # Cosign/sigstore image signature verification
+│       └── gc.rs        # Image garbage collection
+├── attestation/
+│   ├── mod.rs           # Attestation framework
+│   └── join_token.rs    # One-time join token store (persisted)
+├── ca/
+│   ├── mod.rs           # CA trait definitions (CaSigner)
+│   ├── root.rs          # Root CA with short-lived intermediate (90-day rotation)
+│   ├── issuer.rs        # Certificate issuance (SPIFFE SVIDs)
+│   ├── csr.rs           # CSR generation (ECDSA P-256)
+│   ├── signer.rs        # Direct + remote (Unix socket) CA signer implementations
+│   ├── client.rs        # CA client for remote signer
+│   └── pki.rs           # PKI utilities
+├── secrets/
+│   ├── mod.rs           # Secrets module
+│   ├── store.rs         # AES-256-GCM encrypted secret store with AAD binding
+│   ├── key_derivation.rs# Per-agent HKDF-SHA256 key derivation + re-encryption
+│   ├── injector.rs      # Agent-side secret file injection (mode 0400)
+│   ├── dynamic.rs       # Dynamic secret engine (PostgreSQL/MySQL credential rotation)
+│   ├── transit.rs       # Transit encryption (encrypt/decrypt named keys)
+│   └── versioned.rs     # Secret versioning with rollback
+├── dns/
+│   ├── mod.rs           # DNS module
+│   ├── authority.rs     # Authoritative DNS server for fleet domain
+│   ├── resolver.rs      # Caching resolver (agent-side)
+│   ├── listener.rs      # UDP DNS listener
+│   └── external.rs      # External service DNS registration
+├── mesh/
+│   ├── mod.rs           # Mesh module
+│   ├── wireguard.rs     # Kernel WireGuard interface management (Zeroizing keys)
+│   ├── peers.rs         # Peer list management
+│   └── advert.rs        # Peer key advertisement with SPIFFE ID verification
+├── proxy/
+│   ├── mod.rs           # Proxy module
+│   ├── router.rs        # L7 HTTP reverse proxy
+│   ├── l4.rs            # L4 TCP proxy
+│   ├── circuit.rs       # Circuit breaker
+│   ├── ratelimit.rs     # Rate limiting
+│   ├── affinity.rs      # Session affinity
+│   ├── splitting.rs     # Traffic splitting
+│   ├── upstream.rs      # Upstream health tracking
+│   ├── mtls.rs          # mTLS + SPIFFE ID extraction from peer certs
+│   ├── listener.rs      # Proxy listener management
+│   ├── standalone.rs    # Standalone proxy process mode
+│   └── tracing_ctx.rs   # Distributed tracing context propagation
+├── policy/
+│   ├── mod.rs           # Policy module
+│   └── nftables.rs      # nftables rule generation from identity contracts
+├── metrics/
+│   ├── mod.rs           # Metrics module
+│   ├── aggregator.rs    # Fleet-wide metrics aggregation
+│   ├── alerting.rs      # Threshold-based alerting with webhook delivery
+│   ├── collector.rs     # Prometheus endpoint scraping
+│   └── node.rs          # Node-level resource metrics (/proc)
+├── gossip/
+│   ├── mod.rs           # Gossip module
+│   ├── swim.rs          # SWIM protocol implementation
+│   └── catalog.rs       # Service catalog propagation
+├── raft/
+│   ├── mod.rs           # Raft module
+│   ├── state.rs         # FleetStateMachine (deployments, secrets, DNS, KV, cloud instances)
+│   └── storage.rs       # Encrypted log + snapshot persistence (AES-256-GCM)
+└── spiffe/
+    ├── mod.rs           # SPIFFE module
+    ├── workload_api.rs  # Workload API manager (SVID store, trust bundles)
+    ├── workload_server.rs # gRPC Workload API v2 server
+    ├── workload_attestor.rs # Cgroup-based PID→service attestation (no env var fallback)
+    ├── socket.rs        # Unix domain socket management
+    └── federation.rs    # Trust domain federation
+
+nix/
+├── module.nix           # NixOS module (server + agent + ca-signer + workload-api + proxy services)
+├── package.nix          # Package derivation
+├── overlay.nix          # Nixpkgs overlay
+├── dev-shell.nix        # Development shell
+├── lib/
+│   ├── fleet-module.nix # Typed fleet config schema (NixOS-style options)
+│   ├── eval-fleet.nix   # Fleet config evaluation helper
+│   └── catalog.nix      # Service catalog helpers (mkWebService, mkStaticSite, mkResources, mkHealthCheck)
+└── tests/               # NixOS VM integration tests
+
+examples/
+├── self-hosted/         # Bare-metal fleet (3 nodes, no cloud)
+├── single-cloud/        # AWS with autoscaled worker pool
+├── multi-cloud/         # Multi-region across AWS + GCP
+├── standalone-nonnixos/ # Agent on non-NixOS host with Nix
+└── custodial-hosting/   # Multi-tenant hosting platform using service catalog
+
+tests/
+├── cli.rs               # CLI integration tests (assert_cmd)
+└── server_agent.rs      # gRPC workflow integration tests (TLS, auth, RBAC, streaming)
 ```
 
 ## gRPC / Proto
@@ -98,10 +232,14 @@ src/
 
 ## Testing
 
-- Unit tests: inline `#[cfg(test)]` modules (state, reconciler, scheduler, policy, etc.)
-- Integration tests: `tests/cli.rs` (assert_cmd) and `tests/server_agent.rs` (gRPC workflows)
-- NixOS VM tests: `nix/tests/` (module-basic, rest-api, cli-operations, server-agent)
-- Helpers: `free_port()` (bind port 0), `start_server()` (spawn with tempdir)
+- Unit tests: inline `#[cfg(test)]` modules (448+ tests across state, reconciler, scheduler,
+  policy, config, rbac, secrets, CA, seal, supervisor, attestor, OCI, etc.)
+- Integration tests: `tests/cli.rs` (assert_cmd, 37 tests) and `tests/server_agent.rs`
+  (gRPC workflows with TLS + RBAC, 23 tests)
+- NixOS VM tests: `nix/tests/` (module-basic, rest-api, cli-operations, server-agent,
+  lifecycle, fleet-module, oci-container)
+- Helpers: `free_port()` (bind port 0), `start_server()` (spawn with tempdir + Role::Admin
+  in interceptor for RBAC)
 - Always use `tempfile::tempdir()` for isolation — never write to fixed paths
 - `doCheck = false` in `nix/package.nix` — tests run via `cargo test`, not nix build
 - Run NixOS VM tests: `nix flake check` (requires KVM)
