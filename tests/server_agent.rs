@@ -570,6 +570,7 @@ async fn acl_token_create_list_revoke_roundtrip() {
         .create_acl_token(ekafleet::proto::CreateAclTokenRequest {
             role: "viewer".into(),
             description: "test viewer token".into(),
+            namespace: String::new(),
         })
         .await
         .unwrap()
@@ -625,6 +626,7 @@ async fn acl_token_create_rejects_invalid_role() {
         .create_acl_token(ekafleet::proto::CreateAclTokenRequest {
             role: "superadmin".into(),
             description: "invalid role".into(),
+            namespace: String::new(),
         })
         .await;
 

@@ -886,11 +886,15 @@ message FailDeploymentResponse {
 message CreateACLTokenRequest {
   string role = 1;
   string description = 2;
+  // Optional namespace binding. When set, the token can only access
+  // resources within this namespace. Empty means fleet-wide access.
+  string namespace = 3;
 }
 
 message CreateACLTokenResponse {
   string token = 1;
   string role = 2;
+  string namespace = 3;
 }
 
 message RevokeACLTokenRequest {
@@ -910,6 +914,7 @@ message ListACLTokensResponse {
 message ACLTokenInfo {
   string description = 1;
   string role = 2;
+  string namespace = 3;
 }
 
 // --- NixOS Generation Management ---

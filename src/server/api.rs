@@ -1674,13 +1674,20 @@ impl FleetControl for FleetControlService {
             .map_err(|_| Status::internal("RNG failure"))?;
         let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
 
+        let namespace = if req.namespace.is_empty() {
+            None
+        } else {
+            Some(req.namespace.clone())
+        };
+
         self.token_store
-            .register(&token, role, &req.description)
+            .register_with_opts(&token, role, &req.description, None, namespace)
             .await;
 
         tracing::info!(
             role = %req.role,
             description = %req.description,
+            namespace = %req.namespace,
             "ACL token created"
         );
 
@@ -1696,6 +1703,7 @@ impl FleetControl for FleetControlService {
         Ok(Response::new(CreateAclTokenResponse {
             token,
             role: req.role,
+            namespace: req.namespace,
         }))
     }
 
@@ -1731,10 +1739,13 @@ impl FleetControl for FleetControlService {
         let tokens = self.token_store.list().await;
         let infos = tokens
             .into_iter()
-            .map(|(description, role)| crate::proto::AclTokenInfo {
-                description,
-                role: format!("{role:?}").to_lowercase(),
-            })
+            .map(
+                |(description, role, namespace)| crate::proto::AclTokenInfo {
+                    description,
+                    role: format!("{role:?}").to_lowercase(),
+                    namespace: namespace.unwrap_or_default(),
+                },
+            )
             .collect();
         Ok(Response::new(ListAclTokensResponse { tokens: infos }))
     }

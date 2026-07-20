@@ -1120,6 +1120,7 @@ pub async fn cmd_deployment_fail(service: String, server: String) -> anyhow::Res
 pub async fn cmd_acl_token_create(
     role: String,
     description: String,
+    namespace: String,
     server: String,
 ) -> anyhow::Result<()> {
     let mut client = connect_server(&server).await?;
@@ -1127,11 +1128,15 @@ pub async fn cmd_acl_token_create(
         .create_acl_token(ekafleet::proto::CreateAclTokenRequest {
             role: role.clone(),
             description,
+            namespace: namespace.clone(),
         })
         .await?;
     let result = resp.into_inner();
-    println!("Token: {}", result.token);
-    println!("Role:  {}", result.role);
+    println!("Token:     {}", result.token);
+    println!("Role:      {}", result.role);
+    if !namespace.is_empty() {
+        println!("Namespace: {namespace}");
+    }
     Ok(())
 }
 

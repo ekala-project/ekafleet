@@ -602,6 +602,9 @@ enum AclTokenAction {
         /// Description for this token
         #[arg(long, default_value = "")]
         description: String,
+        /// Namespace binding (empty for fleet-wide access)
+        #[arg(long, default_value = "")]
+        namespace: String,
         /// Server address
         #[arg(long, default_value = "127.0.0.1:7400")]
         server: String,
@@ -996,8 +999,9 @@ async fn main() -> anyhow::Result<()> {
                 AclTokenAction::Create {
                     role,
                     description,
+                    namespace,
                     server,
-                } => commands::cmd_acl_token_create(role, description, server).await?,
+                } => commands::cmd_acl_token_create(role, description, namespace, server).await?,
                 AclTokenAction::Revoke { token, server } => {
                     commands::cmd_acl_token_revoke(token, server).await?
                 }

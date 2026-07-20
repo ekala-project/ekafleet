@@ -77,6 +77,9 @@ pub struct TokenIdentity {
     pub description: String,
     /// Role granted by the token.
     pub role: Role,
+    /// Optional namespace binding. When set, operations are restricted to
+    /// this namespace. `None` means fleet-wide access.
+    pub namespace: Option<String>,
 }
 
 impl TokenIdentity {
@@ -170,23 +173,39 @@ impl Role {
 }
 
 /// Check that a gRPC request carries a principal (bearer token or mTLS peer)
-/// with the given permission. Returns `Ok(())` on success, or a tonic
-/// `PERMISSION_DENIED` status on failure.
+/// with the given permission, and that namespace-scoped tokens match the
+/// request's namespace. Returns `Ok(())` on success, or a tonic
+/// `PERMISSION_DENIED` / `UNAUTHENTICATED` status on failure.
 #[allow(clippy::result_large_err)]
 pub fn require_permission<T>(
     request: &tonic::Request<T>,
     perm: Permission,
 ) -> Result<(), tonic::Status> {
+    let request_ns = request
+        .extensions()
+        .get::<RequestNamespace>()
+        .map(|ns| ns.0.as_str())
+        .unwrap_or(DEFAULT_NAMESPACE);
+
     // Bearer-token auth stashes the Role directly.
     if let Some(role) = request.extensions().get::<Role>() {
-        if role.has_permission(perm) {
-            return Ok(());
+        if !role.has_permission(perm) {
+            return Err(tonic::Status::permission_denied(format!(
+                "{role:?} role does not have {perm:?} permission"
+            )));
         }
-        return Err(tonic::Status::permission_denied(format!(
-            "{role:?} role does not have {perm:?} permission"
-        )));
+        // Enforce namespace binding from the token identity.
+        if let Some(identity) = request.extensions().get::<TokenIdentity>()
+            && let Some(bound_ns) = &identity.namespace
+            && bound_ns != request_ns
+        {
+            return Err(tonic::Status::permission_denied(format!(
+                "token is scoped to namespace '{bound_ns}', cannot access '{request_ns}'"
+            )));
+        }
+        return Ok(());
     }
-    // mTLS peer identity carries a derived role.
+    // mTLS peer identity carries a derived role (never namespace-scoped).
     if let Some(peer) = request.extensions().get::<PeerIdentity>() {
         if peer.role.has_permission(perm) {
             return Ok(());
@@ -208,6 +227,10 @@ pub struct TokenEntry {
     created_at: u64,
     /// Optional Unix timestamp when the token expires. None = never expires.
     expires_at: Option<u64>,
+    /// Optional namespace binding. When set, the token can only access
+    /// resources within this namespace. `None` means unrestricted (fleet-wide).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    namespace: Option<String>,
 }
 
 impl TokenEntry {
@@ -304,7 +327,8 @@ impl TokenStore {
 
     /// Register a token with a role. The initial admin token is registered at startup.
     pub async fn register(&self, token: &str, role: Role, description: &str) {
-        self.register_with_ttl(token, role, description, None).await;
+        self.register_with_opts(token, role, description, None, None)
+            .await;
     }
 
     /// Register a token with a role and optional TTL in seconds.
@@ -315,12 +339,28 @@ impl TokenStore {
         description: &str,
         ttl_secs: Option<u64>,
     ) {
+        self.register_with_opts(token, role, description, ttl_secs, None)
+            .await;
+    }
+
+    /// Register a token with a role, optional TTL, and optional namespace binding.
+    /// When `namespace` is `Some`, the token can only access resources within that
+    /// namespace. `None` means fleet-wide (unrestricted) access.
+    pub async fn register_with_opts(
+        &self,
+        token: &str,
+        role: Role,
+        description: &str,
+        ttl_secs: Option<u64>,
+        namespace: Option<String>,
+    ) {
         let now = now_epoch();
         let entry = TokenEntry {
             role,
             description: description.to_string(),
             created_at: now,
             expires_at: ttl_secs.map(|ttl| now + ttl),
+            namespace,
         };
         self.tokens.write().await.insert(token_key(token), entry);
         tracing::info!(role = ?role, description = %description, "Token registered");
@@ -359,6 +399,7 @@ impl TokenStore {
             id: token_id(token),
             description: entry.description.clone(),
             role: entry.role,
+            namespace: entry.namespace.clone(),
         };
         Some((entry.role, identity))
     }
@@ -383,13 +424,13 @@ impl TokenStore {
         removed
     }
 
-    /// List all tokens (returns description and role, not the token value itself).
-    pub async fn list(&self) -> Vec<(String, Role)> {
+    /// List all tokens (returns description, role, and optional namespace).
+    pub async fn list(&self) -> Vec<(String, Role, Option<String>)> {
         let tokens = self.tokens.read().await;
         tokens
             .values()
             .filter(|e| !e.is_expired())
-            .map(|e| (e.description.clone(), e.role))
+            .map(|e| (e.description.clone(), e.role, e.namespace.clone()))
             .collect()
     }
 }
@@ -467,6 +508,7 @@ mod tests {
             description: "expired".to_string(),
             created_at: now.saturating_sub(100),
             expires_at: Some(now.saturating_sub(1)),
+            namespace: None,
         };
         store
             .tokens
@@ -573,5 +615,36 @@ mod tests {
     fn peer_identity_unknown_is_viewer() {
         let peer = PeerIdentity::from_spiffe_id("spiffe://unknown/unidentified".to_string());
         assert_eq!(peer.role, Role::Viewer);
+    }
+
+    #[tokio::test]
+    async fn namespace_scoped_token_blocks_cross_namespace() {
+        let store = TokenStore::new();
+        store
+            .register_with_opts(
+                "ns-tok",
+                Role::Operator,
+                "scoped",
+                None,
+                Some("team-a".into()),
+            )
+            .await;
+
+        let guard = store.tokens.read().await;
+        let (role, identity) =
+            TokenStore::authenticate_sync_identity(&guard, "ns-tok").expect("known token");
+        assert_eq!(role, Role::Operator);
+        assert_eq!(identity.namespace.as_deref(), Some("team-a"));
+    }
+
+    #[tokio::test]
+    async fn unscoped_token_has_no_namespace() {
+        let store = TokenStore::new();
+        store.register("global-tok", Role::Admin, "global").await;
+
+        let guard = store.tokens.read().await;
+        let (_, identity) =
+            TokenStore::authenticate_sync_identity(&guard, "global-tok").expect("known token");
+        assert!(identity.namespace.is_none());
     }
 }
