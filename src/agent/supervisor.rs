@@ -246,6 +246,7 @@ impl Supervisor {
 
         let env_lines = build_env_lines(spec);
         let extra_lines = build_extra_directives(spec);
+        let netns_line = build_netns_directive(spec);
 
         let unit_content = format!(
             r#"[Unit]
@@ -257,7 +258,7 @@ Type=simple
 ExecStart={command}
 Restart=on-failure
 RestartSec=5
-{extra}
+{netns}{extra}
 {env}
 
 [Install]
@@ -265,6 +266,7 @@ WantedBy=multi-user.target
 "#,
             name = spec.name,
             command = spec.command,
+            netns = netns_line,
             extra = extra_lines,
             env = env_lines,
         );
@@ -292,11 +294,18 @@ WantedBy=multi-user.target
         let spiffe_socket = crate::spiffe::socket::DEFAULT_SOCKET_PATH;
         let secrets_dir = format!("/var/lib/ekafleet/secrets/{}", spec.name);
 
+        // Determine network namespace: non-default namespaces use their own
+        // netns for isolation; default namespace uses host networking.
+        let netns_path = if crate::agent::netns::is_default_namespace(&spec.namespace) {
+            "/proc/1/ns/net".to_string()
+        } else {
+            format!("/run/netns/ekafleet-{}", spec.namespace)
+        };
+
         let mut nspawn_args = vec![
             format!("--oci-bundle={bundle_path}"),
             format!("--machine={machine_name}"),
-            // Share host network — preserves nftables policy enforcement
-            "--network-namespace-path=/proc/1/ns/net".to_string(),
+            format!("--network-namespace-path={netns_path}"),
             // Bind-mount SPIFFE workload API socket
             format!("--bind={spiffe_socket}"),
             // Bind-mount secrets directory (read-only inside container)
@@ -508,6 +517,19 @@ fn exec_start_from_unit(content: &str) -> Option<String> {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
     })
+}
+
+/// Build a `NetworkNamespacePath=` directive for non-default namespaces.
+/// Returns an empty string for the default namespace (host networking).
+fn build_netns_directive(spec: &ServiceSpec) -> String {
+    if crate::agent::netns::is_default_namespace(&spec.namespace) {
+        String::new()
+    } else {
+        format!(
+            "NetworkNamespacePath=/run/netns/ekafleet-{}\n",
+            spec.namespace
+        )
+    }
 }
 
 /// Build environment variable lines for a systemd unit file.
@@ -999,5 +1021,19 @@ WantedBy=multi-user.target
 
         // Verify EKAFLEET_SERVICE is set
         assert!(content.contains("EKAFLEET_SERVICE=api"));
+    }
+
+    #[test]
+    fn build_netns_directive_empty_for_default() {
+        let spec = native_spec("web", "/bin/web", "/nix/store/x");
+        assert!(build_netns_directive(&spec).is_empty());
+    }
+
+    #[test]
+    fn build_netns_directive_set_for_namespace() {
+        let mut spec = native_spec("web", "/bin/web", "/nix/store/x");
+        spec.namespace = "customer-a".to_string();
+        let directive = build_netns_directive(&spec);
+        assert!(directive.contains("NetworkNamespacePath=/run/netns/ekafleet-customer-a"));
     }
 }

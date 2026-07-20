@@ -251,6 +251,7 @@ mod tests {
             lifecycle: Default::default(),
             volumes: Vec::new(),
             sidecars: Vec::new(),
+            namespace: String::new(),
         }
     }
 

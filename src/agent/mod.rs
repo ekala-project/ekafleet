@@ -3,6 +3,7 @@ pub mod exec;
 pub mod health;
 pub mod logs;
 pub mod migrate;
+pub mod netns;
 pub mod oci;
 pub mod snapshot;
 pub mod storage;
@@ -153,6 +154,7 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
     let wg_manager = WireguardManager::new("wg-fleet", 51820);
     let peer_manager = Arc::new(RwLock::new(PeerManager::new(wg_manager, "fleet.internal")));
     let policy_enforcer = Arc::new(PolicyEnforcer::new());
+    let netns_manager = Arc::new(netns::NamespaceNetworkManager::new());
 
     // Pre-allocate strings used in every heartbeat to avoid per-tick allocations
     let version: Arc<str> = Arc::from(env!("CARGO_PKG_VERSION"));
@@ -370,6 +372,7 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
                                 &peer_manager,
                                 &policy_enforcer,
                                 &health_checker,
+                                &netns_manager,
                                 &tx,
                                 &node_id,
                             )

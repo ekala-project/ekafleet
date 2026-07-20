@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -25,6 +26,10 @@ struct StateMachineInner {
     /// Cloud-provisioned machine instances tracked across the fleet.
     #[serde(default)]
     cloud_instances: HashMap<String, TrackedCloudInstance>,
+    /// Per-namespace IP allocations: namespace → (service_name → assigned IP).
+    /// Server-assigned so IPs are globally unique within a namespace across all nodes.
+    #[serde(default)]
+    namespace_ips: HashMap<String, HashMap<String, Ipv4Addr>>,
     /// Last applied log index
     last_applied: u64,
 }
@@ -110,6 +115,15 @@ pub enum Command {
     },
     UntrackCloudInstance {
         instance_id: String,
+    },
+    AllocateNamespaceIp {
+        namespace: String,
+        service_name: String,
+        ip: Ipv4Addr,
+    },
+    ReleaseNamespaceIp {
+        namespace: String,
+        service_name: String,
     },
 }
 
@@ -257,6 +271,28 @@ impl FleetStateMachine {
             Command::UntrackCloudInstance { instance_id } => {
                 state.cloud_instances.remove(&instance_id);
             }
+            Command::AllocateNamespaceIp {
+                namespace,
+                service_name,
+                ip,
+            } => {
+                state
+                    .namespace_ips
+                    .entry(namespace)
+                    .or_default()
+                    .insert(service_name, ip);
+            }
+            Command::ReleaseNamespaceIp {
+                namespace,
+                service_name,
+            } => {
+                if let Some(ns_ips) = state.namespace_ips.get_mut(&namespace) {
+                    ns_ips.remove(&service_name);
+                    if ns_ips.is_empty() {
+                        state.namespace_ips.remove(&namespace);
+                    }
+                }
+            }
         }
 
         state.last_applied = index;
@@ -336,6 +372,60 @@ impl FleetStateMachine {
             .values()
             .find(|i| i.private_ip.as_deref() == Some(ip))
             .cloned()
+    }
+
+    /// Get all IP allocations for a namespace.
+    pub async fn namespace_ips(&self, namespace: &str) -> HashMap<String, Ipv4Addr> {
+        let state = self.inner.read().await;
+        state
+            .namespace_ips
+            .get(namespace)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Get the assigned IP for a specific service in a namespace.
+    pub async fn namespace_ip_for_service(
+        &self,
+        namespace: &str,
+        service_name: &str,
+    ) -> Option<Ipv4Addr> {
+        let state = self.inner.read().await;
+        state
+            .namespace_ips
+            .get(namespace)
+            .and_then(|ips| ips.get(service_name).copied())
+    }
+
+    /// Allocate the next available IP in a namespace subnet.
+    /// Returns the allocated IP, or None if the subnet is exhausted.
+    pub async fn allocate_next_namespace_ip(
+        &self,
+        namespace: &str,
+        service_name: &str,
+        subnet_third_octet: u8,
+    ) -> Option<Ipv4Addr> {
+        let state = self.inner.read().await;
+        let existing = state.namespace_ips.get(namespace);
+
+        // Check if service already has an IP
+        if let Some(ips) = existing
+            && let Some(ip) = ips.get(service_name)
+        {
+            return Some(*ip);
+        }
+
+        // Find next available host part (start at .2, .1 is the gateway)
+        let used: Vec<u8> = existing
+            .map(|ips| ips.values().map(|ip| ip.octets()[3]).collect())
+            .unwrap_or_default();
+
+        for host in 2..=254 {
+            if !used.contains(&host) {
+                return Some(Ipv4Addr::new(10, 200, subnet_third_octet, host));
+            }
+        }
+        None // Subnet exhausted
     }
 
     /// Set a runtime replica count override for a service.

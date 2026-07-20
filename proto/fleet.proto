@@ -360,6 +360,40 @@ message DesiredState {
   string correlation_id = 1;
   repeated ServiceSpec services = 2;
   string system_path = 3;
+  // Network topology for namespaces this agent participates in.
+  // Same-host implementation uses this for bridge/subnet setup.
+  // Cross-node will extend it with remote peer entries.
+  repeated NamespaceNetworkConfig namespace_networks = 4;
+}
+
+// Network configuration for a namespace on this agent.
+message NamespaceNetworkConfig {
+  string namespace = 1;
+  // Subnet for this namespace (e.g., "10.200.1.0/24").
+  string subnet = 2;
+  // Gateway IP on the bridge (e.g., "10.200.1.1").
+  string gateway = 3;
+  // VXLAN Network Identifier for cross-node tunneling.
+  // Unique per namespace. Unused in same-host phase but reserved now
+  // so agents can pre-create VXLAN interfaces when remote peers appear.
+  uint32 vni = 4;
+  // Remote nodes that also host services in this namespace.
+  // Empty in same-host phase; populated for cross-node.
+  repeated NamespaceRemotePeer remote_peers = 5;
+}
+
+message NamespaceRemotePeer {
+  string node_id = 1;
+  // WireGuard mesh IP of the remote node (tunnel underlay).
+  string tunnel_endpoint = 2;
+  // Services on the remote node in this namespace, with their IPs.
+  repeated RemoteServiceEndpoint services = 3;
+}
+
+message RemoteServiceEndpoint {
+  string service_name = 1;
+  string ip = 2;
+  repeated uint32 ports = 3;
 }
 
 message ServiceSpec {
@@ -393,6 +427,16 @@ message ServiceSpec {
   // When set, the service runs as a systemd-nspawn container instead of
   // a native process. Mutually exclusive with command/store_path.
   string container_image = 14;
+
+  // Namespace this service belongs to. Empty or "default" means host
+  // networking (backward compatible). Non-default namespaces get isolated
+  // network namespaces with per-namespace bridges.
+  string namespace = 15;
+
+  // Server-assigned IP within the namespace subnet. The agent configures
+  // this on the service's veth interface. Globally unique within the
+  // namespace across all nodes.
+  string namespace_ip = 16;
 }
 
 message VolumeMount {
@@ -491,6 +535,9 @@ message DnsRecord {
   DnsRecordType record_type = 2;
   repeated string values = 3;
   uint32 ttl = 4;
+  // Namespace this record belongs to. Empty = fleet-wide (infrastructure).
+  // Scoped records are only returned to queries from within the same namespace.
+  string namespace = 5;
 }
 
 enum DnsRecordType {
@@ -533,6 +580,13 @@ message NetworkPolicy {
   string source_service = 1;
   string target_service = 2;
   repeated uint32 allowed_ports = 3;
+  // Namespace this policy applies to.
+  string namespace = 4;
+  // Resolved IPs for cross-node enforcement. Empty in same-host phase
+  // (isolation is via separate netns, no rules needed). Populated for
+  // cross-node to allow specific remote namespace IPs through the tunnel.
+  string source_ip = 5;
+  string target_ip = 6;
 }
 
 // --- Node Attestation ---

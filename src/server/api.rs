@@ -944,6 +944,7 @@ impl FleetControl for FleetControlService {
                 correlation_id: uuid::Uuid::new_v4().to_string(),
                 services: vec![],
                 system_path: String::new(),
+                namespace_networks: vec![],
             })),
         };
 

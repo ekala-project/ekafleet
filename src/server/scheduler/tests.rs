@@ -96,6 +96,7 @@ fn make_service(name: &str, cpu: u64, memory: u64, replicas: u32) -> (String, Se
             lifecycle: Default::default(),
             volumes: Vec::new(),
             sidecars: Vec::new(),
+            namespace: String::new(),
         },
     )
 }
@@ -169,6 +170,7 @@ fn constraint_filtering() {
             lifecycle: Default::default(),
             volumes: Vec::new(),
             sidecars: Vec::new(),
+            namespace: String::new(),
         },
     )]
     .into();
@@ -218,6 +220,7 @@ fn system_job_all_nodes() {
             lifecycle: Default::default(),
             volumes: Vec::new(),
             sidecars: Vec::new(),
+            namespace: String::new(),
         },
     )]
     .into();
@@ -299,6 +302,7 @@ fn pool_affinity_prefers_correct_pool() {
             lifecycle: Default::default(),
             volumes: Vec::new(),
             sidecars: Vec::new(),
+            namespace: String::new(),
         },
     )]
     .into();
@@ -372,6 +376,7 @@ fn pool_affinity_spills_when_full() {
             lifecycle: Default::default(),
             volumes: Vec::new(),
             sidecars: Vec::new(),
+            namespace: String::new(),
         },
     )]
     .into();
@@ -450,6 +455,7 @@ fn pool_hard_constraint_blocks_spillover() {
             lifecycle: Default::default(),
             volumes: Vec::new(),
             sidecars: Vec::new(),
+            namespace: String::new(),
         },
     )]
     .into();
@@ -566,6 +572,7 @@ fn pool_labels_merged() {
             lifecycle: Default::default(),
             volumes: Vec::new(),
             sidecars: Vec::new(),
+            namespace: String::new(),
         },
     )]
     .into();
@@ -660,6 +667,7 @@ fn system_job_on_pool() {
             lifecycle: Default::default(),
             volumes: Vec::new(),
             sidecars: Vec::new(),
+            namespace: String::new(),
         },
     )]
     .into();
@@ -715,6 +723,7 @@ fn constraint_numeric_operators() {
             lifecycle: Default::default(),
             volumes: Vec::new(),
             sidecars: Vec::new(),
+            namespace: String::new(),
         },
     )]
     .into();
@@ -767,6 +776,7 @@ fn constraint_regexp() {
             lifecycle: Default::default(),
             volumes: Vec::new(),
             sidecars: Vec::new(),
+            namespace: String::new(),
         },
     )]
     .into();
@@ -819,6 +829,7 @@ fn constraint_is_set() {
             lifecycle: Default::default(),
             volumes: Vec::new(),
             sidecars: Vec::new(),
+            namespace: String::new(),
         },
     )]
     .into();
@@ -888,6 +899,7 @@ fn multiple_spread_blocks() {
             lifecycle: Default::default(),
             volumes: Vec::new(),
             sidecars: Vec::new(),
+            namespace: String::new(),
         },
     )]
     .into();
@@ -944,6 +956,7 @@ fn priority_ordering() {
                 lifecycle: Default::default(),
                 volumes: Vec::new(),
                 sidecars: Vec::new(),
+                namespace: String::new(),
             },
         ),
         (
@@ -977,6 +990,7 @@ fn priority_ordering() {
                 lifecycle: Default::default(),
                 volumes: Vec::new(),
                 sidecars: Vec::new(),
+                namespace: String::new(),
             },
         ),
     ]
@@ -1060,6 +1074,7 @@ fn taint_blocks_non_tolerating_service() {
             lifecycle: Default::default(),
             volumes: Vec::new(),
             sidecars: Vec::new(),
+            namespace: String::new(),
         },
     )]
     .into();
@@ -1106,6 +1121,7 @@ fn sysbatch_runs_on_all_nodes() {
             lifecycle: Default::default(),
             volumes: Vec::new(),
             sidecars: Vec::new(),
+            namespace: String::new(),
         },
     )]
     .into();
@@ -1153,6 +1169,7 @@ fn stateful_sticky_placement_prefers_current_node() {
             lifecycle: Default::default(),
             volumes: Vec::new(),
             sidecars: Vec::new(),
+            namespace: String::new(),
         },
     )]
     .into();
@@ -1209,6 +1226,7 @@ fn non_stateful_ignores_current_placement() {
             lifecycle: Default::default(),
             volumes: Vec::new(),
             sidecars: Vec::new(),
+            namespace: String::new(),
         },
     )]
     .into();
@@ -1265,6 +1283,7 @@ fn stateful_sticky_falls_back_when_node_gone() {
             lifecycle: Default::default(),
             volumes: Vec::new(),
             sidecars: Vec::new(),
+            namespace: String::new(),
         },
     )]
     .into();

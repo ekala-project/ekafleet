@@ -299,6 +299,10 @@ pub struct ServiceConfig {
     /// Sidecar processes to run alongside this service.
     #[serde(default)]
     pub sidecars: Vec<SidecarConfig>,
+    /// Namespace this service belongs to. Empty or "default" means host
+    /// networking. Non-default namespaces get isolated network namespaces.
+    #[serde(default)]
+    pub namespace: String,
 }
 
 /// OCI container configuration for a service.

@@ -5,6 +5,7 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::{RwLock, mpsc};
 
 use super::helpers::install_received_svid;
+use super::netns::NamespaceNetworkManager;
 use super::supervisor;
 use super::types::{LocalState, PendingKeyStore};
 use crate::agent::health::HealthChecker;
@@ -31,6 +32,7 @@ pub(super) async fn handle_server_message(
     peer_manager: &Arc<RwLock<PeerManager>>,
     policy_enforcer: &Arc<PolicyEnforcer>,
     health_checker: &HealthChecker,
+    netns_manager: &Arc<NamespaceNetworkManager>,
     tx: &mpsc::Sender<AgentMessage>,
     node_id: &str,
 ) {
@@ -40,6 +42,7 @@ pub(super) async fn handle_server_message(
                 correlation_id = %ds.correlation_id,
                 services = ds.services.len(),
                 system_path = %ds.system_path,
+                namespace_networks = ds.namespace_networks.len(),
                 "Received desired state"
             );
 
@@ -71,13 +74,76 @@ pub(super) async fn handle_server_message(
                 }
             }
 
+            // Set up namespace networks from DesiredState topology
+            let mut active_namespaces = Vec::new();
+            for ns_cfg in &ds.namespace_networks {
+                if let Err(e) = netns_manager
+                    .ensure_namespace(&ns_cfg.namespace, &ns_cfg.subnet, &ns_cfg.gateway)
+                    .await
+                {
+                    tracing::error!(
+                        namespace = %ns_cfg.namespace,
+                        error = %e,
+                        "Failed to create namespace network"
+                    );
+                }
+                active_namespaces.push(ns_cfg.namespace.clone());
+            }
+
+            // Add services to their namespace networks (non-default only)
+            for svc in &ds.services {
+                if !crate::agent::netns::is_default_namespace(&svc.namespace)
+                    && !svc.namespace_ip.is_empty()
+                    && let Ok(ip) = svc.namespace_ip.parse::<std::net::Ipv4Addr>()
+                    && let Err(e) = netns_manager
+                        .add_service(&svc.namespace, &svc.name, ip)
+                        .await
+                {
+                    tracing::error!(
+                        service = %svc.name,
+                        namespace = %svc.namespace,
+                        error = %e,
+                        "Failed to add service to namespace network"
+                    );
+                }
+            }
+
             let mut state = local_state.write().await;
             state.system_path = ds.system_path;
+
+            // Detect services removed from desired state so we can clean up
+            // their namespace network entries.
+            let previous_services: Vec<(String, String)> = state
+                .desired_services
+                .values()
+                .filter(|s| !crate::agent::netns::is_default_namespace(&s.namespace))
+                .map(|s| (s.namespace.clone(), s.name.clone()))
+                .collect();
+
             state.desired_services.clear();
             for svc in &ds.services {
                 state.desired_services.insert(svc.name.clone(), svc.clone());
             }
             drop(state);
+
+            // Remove services that are no longer in desired state from namespace networks
+            for (ns, name) in &previous_services {
+                if !ds.services.iter().any(|s| s.name == *name)
+                    && let Err(e) = netns_manager.remove_service(ns, name).await
+                {
+                    tracing::warn!(
+                        namespace = %ns,
+                        service = %name,
+                        error = %e,
+                        "Failed to remove service from namespace network"
+                    );
+                }
+            }
+
+            // GC namespaces that are no longer referenced
+            if let Err(e) = netns_manager.gc_namespaces(&active_namespaces).await {
+                tracing::warn!(error = %e, "Failed to GC namespace networks");
+            }
 
             // Request SPIFFE SVIDs for each assigned service
             let trust_domain = workload_mgr
@@ -189,9 +255,16 @@ pub(super) async fn handle_server_message(
                     .iter()
                     .filter_map(|v| v.parse().ok())
                     .collect();
-                dns_resolver
-                    .update_cache(&record.name, ips, Duration::from_secs(record.ttl as u64))
-                    .await;
+                let ttl = Duration::from_secs(record.ttl as u64);
+                if record.namespace.is_empty() {
+                    // Fleet-wide record
+                    dns_resolver.update_cache(&record.name, ips, ttl).await;
+                } else {
+                    // Namespace-scoped record
+                    dns_resolver
+                        .update_namespace_cache(&record.namespace, &record.name, ips, ttl)
+                        .await;
+                }
             }
         }
         ServerPayload::Cert(response) => {

@@ -548,15 +548,25 @@ fn service_config_to_spec(name: &str, cfg: &config::ServiceConfig) -> crate::pro
         volumes,
         cgroup_controls,
         container_image,
+        namespace: cfg.namespace.clone(),
+        namespace_ip: String::new(), // populated below from Raft IP allocations
     }
 }
 
 /// Collect the per-node `DesiredState` messages for all services that need to be
 /// deployed or updated, and send them to the relevant agents before the deployer
 /// sends lightweight `DeployCommand` triggers.
-async fn send_desired_state(desired: &FleetConfig, plan: &ReconcilePlan, state: &FleetState) {
+async fn send_desired_state(
+    desired: &FleetConfig,
+    plan: &ReconcilePlan,
+    state: &FleetState,
+    raft_state: &FleetStateMachine,
+) {
     // Group placements by machine name so each agent gets one DesiredState.
     let mut per_node: HashMap<String, Vec<crate::proto::ServiceSpec>> = HashMap::new();
+    // Track which namespaces each node participates in.
+    let mut per_node_namespaces: HashMap<String, std::collections::HashSet<String>> =
+        HashMap::new();
 
     let all_ops = plan
         .creates
@@ -568,23 +578,62 @@ async fn send_desired_state(desired: &FleetConfig, plan: &ReconcilePlan, state: 
         let Some(cfg) = desired.services.get(&op.service_name) else {
             continue;
         };
-        let spec = service_config_to_spec(&op.service_name, cfg);
+        let mut spec = service_config_to_spec(&op.service_name, cfg);
+
+        // Populate server-assigned namespace IP from Raft state
+        if !cfg.namespace.is_empty()
+            && cfg.namespace != "default"
+            && let Some(ip) = raft_state
+                .namespace_ip_for_service(&cfg.namespace, &op.service_name)
+                .await
+        {
+            spec.namespace_ip = ip.to_string();
+        }
 
         for placement in &op.placements {
             per_node
                 .entry(placement.machine_name.clone())
                 .or_default()
                 .push(spec.clone());
+
+            // Track namespace participation for this node
+            if !cfg.namespace.is_empty() && cfg.namespace != "default" {
+                per_node_namespaces
+                    .entry(placement.machine_name.clone())
+                    .or_default()
+                    .insert(cfg.namespace.clone());
+            }
         }
     }
 
     for (node, services) in per_node {
+        // Build NamespaceNetworkConfig for namespaces this node participates in
+        let namespace_networks = per_node_namespaces
+            .get(&node)
+            .map(|namespaces| {
+                namespaces
+                    .iter()
+                    .map(|ns| {
+                        let third_octet = namespace_subnet_octet(ns);
+                        crate::proto::NamespaceNetworkConfig {
+                            namespace: ns.clone(),
+                            subnet: format!("10.200.{third_octet}.0/24"),
+                            gateway: format!("10.200.{third_octet}.1"),
+                            vni: third_octet as u32,
+                            remote_peers: vec![], // same-host phase: no remote peers
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let msg = crate::proto::ServerMessage {
             payload: Some(crate::proto::server_message::Payload::DesiredState(
                 crate::proto::DesiredState {
                     correlation_id: String::new(),
                     services,
                     system_path: String::new(),
+                    namespace_networks,
                 },
             )),
         };
@@ -592,6 +641,17 @@ async fn send_desired_state(desired: &FleetConfig, plan: &ReconcilePlan, state: 
             tracing::warn!(node = %node, "Failed to send DesiredState to agent");
         }
     }
+}
+
+/// Derive a deterministic third octet (1-254) for a namespace's subnet.
+/// Uses a simple hash to map namespace name → octet, avoiding 0 and 255.
+fn namespace_subnet_octet(namespace: &str) -> u8 {
+    let mut hash: u64 = 0;
+    for b in namespace.bytes() {
+        hash = hash.wrapping_mul(31).wrapping_add(b as u64);
+    }
+    // Map to 1..=254 (avoiding 0 and 255)
+    ((hash % 254) + 1) as u8
 }
 
 /// Execute a reconciliation plan.
@@ -606,7 +666,7 @@ async fn apply_plan(
     // hooks, etc.) to each affected agent before the deployer sends lightweight
     // DeployCommand triggers. This ensures agents have the complete service
     // definition — including resource limits — before starting workloads.
-    send_desired_state(desired, plan, state).await;
+    send_desired_state(desired, plan, state, raft_state).await;
 
     // Execute volume migrations for reschedules before deploying.
     // Migrations run first so data is available on the destination node
@@ -1173,6 +1233,7 @@ mod tests {
                 lifecycle: Default::default(),
                 volumes: vec![],
                 sidecars: vec![],
+                namespace: String::new(),
             },
         );
         // Policy: requires at least 2 replicas.

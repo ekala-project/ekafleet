@@ -24,6 +24,21 @@ pub struct PolicyRule {
     pub description: String,
 }
 
+/// A DNAT port-forwarding rule for inbound traffic to namespace services.
+#[derive(Debug, Clone)]
+pub struct PortForwardRule {
+    /// External port on the host interface.
+    pub external_port: u16,
+    /// Internal namespace IP to forward to.
+    pub internal_ip: Ipv4Addr,
+    /// Internal port (usually same as external).
+    pub internal_port: u16,
+    /// Protocol: "tcp" or "udp".
+    pub protocol: String,
+    /// Human-readable description.
+    pub description: String,
+}
+
 /// An egress network policy rule controlling outbound traffic from a service.
 #[derive(Debug, Clone)]
 pub struct EgressRule {
@@ -181,6 +196,66 @@ table inet {table} {{
         Ok(())
     }
 
+    /// Initialize namespace NAT rules: masquerade for outbound traffic from
+    /// customer workload subnets (10.200.0.0/16) and optional DNAT port-forwarding
+    /// rules for inbound traffic.
+    pub async fn apply_namespace_nat(
+        &self,
+        port_forwards: &[PortForwardRule],
+    ) -> Result<(), NftError> {
+        let mut rules = String::new();
+
+        // Masquerade: customer workload subnets → outbound internet
+        rules.push_str(&format!(
+            r#"
+table inet {table} {{
+    chain ekafleet_postrouting {{
+        type nat hook postrouting priority 100;
+        ip saddr 10.200.0.0/16 masquerade
+    }}
+"#,
+            table = self.table_name,
+        ));
+
+        // DNAT: inbound port-forwarding to namespace services
+        if !port_forwards.is_empty() {
+            rules.push_str(
+                r#"
+    chain ekafleet_prerouting {
+        type nat hook prerouting priority -100;
+"#,
+            );
+
+            for pf in port_forwards {
+                let desc: String = pf
+                    .description
+                    .chars()
+                    .filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '-' || *c == '_')
+                    .take(128)
+                    .collect();
+
+                let proto = if pf.protocol == "udp" { "udp" } else { "tcp" };
+                rules.push_str(&format!(
+                    "        {proto} dport {ext} dnat to {ip}:{int} comment \"{desc}\"\n",
+                    ext = pf.external_port,
+                    ip = pf.internal_ip,
+                    int = pf.internal_port,
+                ));
+            }
+
+            rules.push_str("    }\n");
+        }
+
+        rules.push_str("}\n");
+
+        self.apply_ruleset(&rules).await?;
+        tracing::info!(
+            port_forwards = port_forwards.len(),
+            "Namespace NAT rules applied"
+        );
+        Ok(())
+    }
+
     /// Flush all rules in the ekafleet table.
     pub async fn flush(&self) -> Result<(), NftError> {
         let cmd = format!("flush table inet {}", self.table_name);
@@ -327,6 +402,19 @@ mod tests {
         let enforcer = PolicyEnforcer::new();
         let rules = enforcer.generate_rules(&[]);
         assert!(rules.is_empty());
+    }
+
+    #[test]
+    fn port_forward_rule_fields() {
+        let pf = PortForwardRule {
+            external_port: 25565,
+            internal_ip: Ipv4Addr::new(10, 200, 1, 2),
+            internal_port: 25565,
+            protocol: "tcp".into(),
+            description: "customer-a-minecraft".into(),
+        };
+        assert_eq!(pf.external_port, 25565);
+        assert_eq!(pf.internal_ip, Ipv4Addr::new(10, 200, 1, 2));
     }
 
     #[test]
