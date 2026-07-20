@@ -186,6 +186,9 @@ message Heartbeat {
   NodeResources available_resources = 3;
   string pool = 4;
   string version = 5;
+  // WireGuard mesh IP (10.100.x.y) reported by the agent so the server
+  // can populate VXLAN tunnel endpoints for cross-node namespace networking.
+  string mesh_ip = 6;
 }
 
 message NodeResources {

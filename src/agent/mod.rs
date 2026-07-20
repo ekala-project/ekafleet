@@ -170,6 +170,7 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
             available_resources: Some(collect_resources()),
             pool: String::new(),
             version: version.to_string(),
+            mesh_ip: String::new(),
         })),
     })
     .await?;
@@ -216,6 +217,7 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
                     available_resources: Some(collect_resources()),
                     pool: String::new(),
                     version: hb_version.to_string(),
+                    mesh_ip: String::new(),
                 })),
             };
             if heartbeat_tx.send(msg).await.is_err() {

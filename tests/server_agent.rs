@@ -273,6 +273,7 @@ async fn grpc_rejects_unauthenticated_client() {
                 available_resources: None,
                 pool: String::new(),
                 version: String::new(),
+                mesh_ip: String::new(),
             },
         )),
     })
@@ -328,6 +329,7 @@ async fn grpc_rejects_wrong_token() {
                 available_resources: None,
                 pool: String::new(),
                 version: String::new(),
+                mesh_ip: String::new(),
             },
         )),
     })
@@ -365,6 +367,7 @@ async fn agent_connects_and_registers_via_heartbeat() {
                 }),
                 pool: String::new(),
                 version: String::new(),
+                mesh_ip: String::new(),
             },
         )),
     })
