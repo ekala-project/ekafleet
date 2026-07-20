@@ -74,16 +74,14 @@ A node death does not trigger a reschedule; orphaned workloads wait up to the ne
 k8s/Nomad reconcile on events. Add a reconcile trigger channel fired on: agent
 disconnect, heartbeat timeout, service crash report, and config change.
 
-### P1.2 Workload attestation trusts a spoofable env var
-**Where**: `src/spiffe/workload_attestor.rs:52-69`.
+### ~~P1.2 Workload attestation trusts a spoofable env var~~ (complete)
 
-Identity falls back to reading `EKAFLEET_SERVICE=<name>` from `/proc/<pid>/environ`.
-Any workload can set that variable and be issued another service's SVID. The cgroup
-strategy (`:29-48`) is sounder but is only tried first, not enforced.
-
-**Fix**: make cgroup/systemd-unit attestation authoritative; drop the env fallback
-or restrict it to a signed selector. Re-verify PID→unit on each SVID fetch to
-handle PID reuse.
+Resolved. The env var fallback was removed from `src/spiffe/workload_attestor.rs`.
+Attestation is now cgroup-based only: the service name is derived from the process's
+systemd cgroup membership (`/proc/<pid>/cgroup`), which is set by the kernel and
+cannot be forged by the workload itself. The `EKAFLEET_SERVICE` env var is still
+*set* in service units (for the service's own use) but is never trusted as an
+identity source.
 
 ### P1.3 Node attestation is pure TOFU
 **Where**: join token store is in-memory (`src/attestation/join_token.rs`), lost on
