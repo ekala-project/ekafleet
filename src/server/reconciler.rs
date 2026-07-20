@@ -439,6 +439,161 @@ pub async fn compute_plan(
     }
 }
 
+/// Convert a fleet `ServiceConfig` to a proto `ServiceSpec` for sending to agents.
+fn service_config_to_spec(name: &str, cfg: &config::ServiceConfig) -> crate::proto::ServiceSpec {
+    let health_check_to_proto = |hc: &config::HealthCheckConfig| -> crate::proto::HealthCheckSpec {
+        crate::proto::HealthCheckSpec {
+            probe: hc.path.as_ref().map(|path| {
+                crate::proto::health_check_spec::Probe::Http(crate::proto::HttpProbe {
+                    path: path.clone(),
+                    port: 0,
+                })
+            }),
+            interval_seconds: hc.interval,
+            timeout_seconds: hc.timeout,
+            healthy_threshold: hc.healthy_threshold,
+            unhealthy_threshold: hc.unhealthy_threshold,
+        }
+    };
+
+    // Find the first port's health checks for the unified field and separate probes.
+    let first_port = cfg.ports.values().next();
+
+    let health_check = first_port
+        .and_then(|p| p.health_check.as_ref())
+        .map(&health_check_to_proto);
+    let liveness_probe = first_port
+        .and_then(|p| p.liveness.as_ref())
+        .map(&health_check_to_proto);
+    let readiness_probe = first_port
+        .and_then(|p| p.readiness.as_ref())
+        .map(&health_check_to_proto);
+    let startup_probe = first_port
+        .and_then(|p| p.startup.as_ref())
+        .map(&health_check_to_proto);
+
+    let ports = cfg
+        .ports
+        .iter()
+        .map(|(pname, pcfg)| crate::proto::PortSpec {
+            name: pname.clone(),
+            port: pcfg.port as u32,
+            protocol: pcfg.protocol.clone().unwrap_or_default(),
+            hostname: pcfg.hostname.clone().unwrap_or_default(),
+        })
+        .collect();
+
+    let resources = Some(crate::proto::ResourceRequirements {
+        cpu_request: cfg.resources.cpu.as_ref().map(|c| c.request).unwrap_or(0),
+        memory_request: cfg
+            .resources
+            .memory
+            .as_ref()
+            .map(|m| m.request)
+            .unwrap_or(0),
+        cpu_limit: cfg
+            .resources
+            .cpu
+            .as_ref()
+            .and_then(|c| c.limit)
+            .unwrap_or(0),
+        memory_limit: cfg
+            .resources
+            .memory
+            .as_ref()
+            .and_then(|m| m.limit)
+            .unwrap_or(0),
+    });
+
+    let lifecycle = Some(crate::proto::LifecycleHooks {
+        pre_stop: cfg.lifecycle.pre_stop.clone().unwrap_or_default(),
+        post_start: cfg.lifecycle.post_start.clone().unwrap_or_default(),
+        stop_signal: cfg.lifecycle.stop_signal.clone(),
+        termination_grace_period_seconds: cfg.lifecycle.termination_grace_period_seconds as u32,
+    });
+
+    let volumes = cfg
+        .volumes
+        .iter()
+        .map(|v| crate::proto::VolumeMount {
+            name: v.name.clone(),
+            mount_path: v.mount_path.clone(),
+            size_mb: v.size_mb,
+            storage_class: v.storage_class.clone(),
+            access_mode: format!("{:?}", v.access_mode),
+            reclaim_retain: v.reclaim_retain,
+        })
+        .collect();
+
+    let cgroup_controls = cfg.resources.to_cgroup_controls();
+
+    let container_image = cfg
+        .container
+        .as_ref()
+        .map(|c| c.image.clone())
+        .unwrap_or_default();
+
+    crate::proto::ServiceSpec {
+        name: name.to_string(),
+        store_path: String::new(), // populated by deployer
+        command: cfg.command.clone().unwrap_or_default(),
+        environment: cfg.environment.clone(),
+        resources,
+        health_check,
+        ports,
+        liveness_probe,
+        readiness_probe,
+        startup_probe,
+        lifecycle,
+        volumes,
+        cgroup_controls,
+        container_image,
+    }
+}
+
+/// Collect the per-node `DesiredState` messages for all services that need to be
+/// deployed or updated, and send them to the relevant agents before the deployer
+/// sends lightweight `DeployCommand` triggers.
+async fn send_desired_state(desired: &FleetConfig, plan: &ReconcilePlan, state: &FleetState) {
+    // Group placements by machine name so each agent gets one DesiredState.
+    let mut per_node: HashMap<String, Vec<crate::proto::ServiceSpec>> = HashMap::new();
+
+    let all_ops = plan
+        .creates
+        .iter()
+        .chain(plan.updates.iter())
+        .chain(plan.reschedules.iter());
+
+    for op in all_ops {
+        let Some(cfg) = desired.services.get(&op.service_name) else {
+            continue;
+        };
+        let spec = service_config_to_spec(&op.service_name, cfg);
+
+        for placement in &op.placements {
+            per_node
+                .entry(placement.machine_name.clone())
+                .or_default()
+                .push(spec.clone());
+        }
+    }
+
+    for (node, services) in per_node {
+        let msg = crate::proto::ServerMessage {
+            payload: Some(crate::proto::server_message::Payload::DesiredState(
+                crate::proto::DesiredState {
+                    correlation_id: String::new(),
+                    services,
+                    system_path: String::new(),
+                },
+            )),
+        };
+        if !state.send_to_agent(&node, msg).await {
+            tracing::warn!(node = %node, "Failed to send DesiredState to agent");
+        }
+    }
+}
+
 /// Execute a reconciliation plan.
 async fn apply_plan(
     desired: &FleetConfig,
@@ -447,6 +602,12 @@ async fn apply_plan(
     raft_state: &FleetStateMachine,
     events: Option<&super::events::EventStore>,
 ) -> Result<(), deployer::DeployError> {
+    // Send full ServiceSpec (with cgroup controls, health checks, lifecycle
+    // hooks, etc.) to each affected agent before the deployer sends lightweight
+    // DeployCommand triggers. This ensures agents have the complete service
+    // definition — including resource limits — before starting workloads.
+    send_desired_state(desired, plan, state).await;
+
     // Execute volume migrations for reschedules before deploying.
     // Migrations run first so data is available on the destination node
     // before the service starts there. Services whose migrations fail are

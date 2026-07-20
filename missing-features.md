@@ -135,10 +135,14 @@ wrong. Remaining gap: partial-failure semantics and health-gating of the destina
 before cutover need hardening and a test. (Creates/updates/destroys correctly carry
 no migrations.)
 
-### P2.4 No cgroup resource enforcement
-`cgroup_controls` is always `None`; declared CPU/memory requests/limits are not
-translated to systemd `CPUQuota`/`MemoryMax`. Services can exceed their "limits"
-and OOM the host. Wire limits into generated unit properties.
+### ~~P2.4 No cgroup resource enforcement~~ (complete)
+
+Resolved. The reconciler now calls `to_cgroup_controls()` when building
+`ServiceSpec` protos and sends full `DesiredState` messages (with cgroup controls,
+health checks, lifecycle hooks, volumes) to agents before the deployer sends
+lightweight `DeployCommand` triggers. The agent supervisor renders `CPUQuota`,
+`MemoryMax`, `CPUWeight`, `MemoryHigh`, `IOWeight`, `TasksMax`, and `OOMPolicy`
+into systemd unit directives.
 
 ### P2.5 Agent does not re-adopt services on restart
 On agent restart, prior systemd units survive but supervisor state is lost; orphans
