@@ -145,6 +145,50 @@ pub(super) async fn handle_server_message(
                 }
             }
 
+            // Set up VXLAN tunnels for cross-node namespace networking
+            let local_mesh_ip = peer_manager.read().await.wireguard().mesh_ip();
+            for ns_cfg in &ds.namespace_networks {
+                if ns_cfg.remote_peers.is_empty() {
+                    // No remote peers — tear down any existing VXLAN tunnel
+                    let _ = netns_manager.remove_vxlan_tunnel(&ns_cfg.namespace).await;
+                    continue;
+                }
+
+                let peers: Vec<super::netns::RemotePeerInfo> = ns_cfg
+                    .remote_peers
+                    .iter()
+                    .filter_map(|rp| {
+                        let endpoint: std::net::Ipv4Addr = rp.tunnel_endpoint.parse().ok()?;
+                        let services = rp
+                            .services
+                            .iter()
+                            .filter_map(|s| {
+                                let ip: std::net::Ipv4Addr = s.ip.parse().ok()?;
+                                Some((s.service_name.clone(), ip))
+                            })
+                            .collect();
+                        Some(super::netns::RemotePeerInfo {
+                            node_id: rp.node_id.clone(),
+                            tunnel_endpoint: endpoint,
+                            services,
+                        })
+                    })
+                    .collect();
+
+                if let Err(e) = netns_manager
+                    .ensure_vxlan_tunnel(&ns_cfg.namespace, ns_cfg.vni, local_mesh_ip, &peers)
+                    .await
+                {
+                    tracing::error!(
+                        namespace = %ns_cfg.namespace,
+                        vni = ns_cfg.vni,
+                        peers = peers.len(),
+                        error = %e,
+                        "VXLAN tunnel setup failed"
+                    );
+                }
+            }
+
             // GC namespaces that are no longer referenced
             if let Err(e) = netns_manager.gc_namespaces(&active_namespaces).await {
                 tracing::warn!(error = %e, "Failed to GC namespace networks");
