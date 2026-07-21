@@ -85,6 +85,8 @@ table inet {table} {{
         tcp dport 7400 accept
         # Allow HTTP API
         tcp dport 7402 accept
+        # Allow VXLAN namespace overlay (cross-node, arrives via WireGuard)
+        iifname "wg-fleet" udp dport 4789 accept
     }}
 
     chain output {{
