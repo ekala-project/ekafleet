@@ -13,8 +13,11 @@ pub struct DnsAuthority {
 }
 
 struct ZoneData {
-    /// service_name → list of (ip, port)
+    /// Fleet-wide records: service_name → list of (ip, port)
     records: HashMap<String, Vec<ServiceEndpoint>>,
+    /// Namespace-scoped records: (namespace, service_name) → list of (ip, port).
+    /// These are only returned to queries scoped to the matching namespace.
+    namespace_records: HashMap<(String, String), Vec<ServiceEndpoint>>,
 }
 
 #[derive(Debug, Clone)]
@@ -30,6 +33,7 @@ impl DnsAuthority {
             domain: domain.to_string(),
             inner: Arc::new(RwLock::new(ZoneData {
                 records: HashMap::new(),
+                namespace_records: HashMap::new(),
             })),
         }
     }
@@ -90,6 +94,61 @@ impl DnsAuthority {
     /// Get the domain this authority serves.
     pub fn domain(&self) -> &str {
         &self.domain
+    }
+
+    /// Update records for a namespace-scoped service.
+    pub async fn update_namespace_service(
+        &self,
+        namespace: &str,
+        service_name: &str,
+        endpoints: Vec<(Ipv4Addr, u16, bool)>,
+    ) {
+        let mut zone = self.inner.write().await;
+        let entries: Vec<ServiceEndpoint> = endpoints
+            .into_iter()
+            .map(|(ip, port, healthy)| ServiceEndpoint { ip, port, healthy })
+            .collect();
+        zone.namespace_records
+            .insert((namespace.to_string(), service_name.to_string()), entries);
+    }
+
+    /// Remove all namespace-scoped records for a service.
+    pub async fn remove_namespace_service(&self, namespace: &str, service_name: &str) {
+        let mut zone = self.inner.write().await;
+        zone.namespace_records
+            .remove(&(namespace.to_string(), service_name.to_string()));
+    }
+
+    /// Resolve a service name to healthy A record IPs, scoped to a namespace.
+    /// Checks namespace-scoped records first, then falls back to fleet-wide.
+    pub async fn resolve_a_in_namespace(
+        &self,
+        service_name: &str,
+        namespace: &str,
+    ) -> Vec<Ipv4Addr> {
+        let zone = self.inner.read().await;
+        if !namespace.is_empty() {
+            if let Some(endpoints) = zone
+                .namespace_records
+                .get(&(namespace.to_string(), service_name.to_string()))
+            {
+                return endpoints
+                    .iter()
+                    .filter(|e| e.healthy)
+                    .map(|e| e.ip)
+                    .collect();
+            }
+        }
+        zone.records
+            .get(service_name)
+            .map(|endpoints| {
+                endpoints
+                    .iter()
+                    .filter(|e| e.healthy)
+                    .map(|e| e.ip)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Get all service names with records.
