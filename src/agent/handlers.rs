@@ -78,7 +78,12 @@ pub(super) async fn handle_server_message(
             let mut active_namespaces = Vec::new();
             for ns_cfg in &ds.namespace_networks {
                 if let Err(e) = netns_manager
-                    .ensure_namespace(&ns_cfg.namespace, &ns_cfg.subnet, &ns_cfg.gateway)
+                    .ensure_namespace(
+                        &ns_cfg.namespace,
+                        &ns_cfg.subnet,
+                        &ns_cfg.gateway,
+                        ns_cfg.vni,
+                    )
                     .await
                 {
                     tracing::error!(
