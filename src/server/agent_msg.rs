@@ -18,10 +18,10 @@ pub(super) async fn process_agent_message(
             state
                 .update_heartbeat(node_id, hb.available_resources)
                 .await;
-            if !hb.mesh_ip.is_empty() {
-                if let Ok(ip) = hb.mesh_ip.parse::<std::net::Ipv4Addr>() {
-                    state.update_mesh_ip(node_id, ip).await;
-                }
+            if !hb.mesh_ip.is_empty()
+                && let Ok(ip) = hb.mesh_ip.parse::<std::net::Ipv4Addr>()
+            {
+                state.update_mesh_ip(node_id, ip).await;
             }
         }
         Some(Payload::Health(report)) => {

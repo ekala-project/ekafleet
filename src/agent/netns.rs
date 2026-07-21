@@ -374,36 +374,36 @@ impl NamespaceNetworkManager {
         // Remove FDB/neigh entries for peers that are no longer present
         let current_peer_ids: Vec<String> = ns.remote_peers.keys().cloned().collect();
         for old_id in &current_peer_ids {
-            if !remote_peers.iter().any(|rp| rp.node_id == *old_id) {
-                if let Some(old_peer) = ns.remote_peers.remove(old_id) {
-                    let ep = old_peer.tunnel_endpoint.to_string();
-                    // Remove headend replication entry
+            if !remote_peers.iter().any(|rp| rp.node_id == *old_id)
+                && let Some(old_peer) = ns.remote_peers.remove(old_id)
+            {
+                let ep = old_peer.tunnel_endpoint.to_string();
+                // Remove headend replication entry
+                let _ = run_bridge_fdb_netns(
+                    &ns.netns_name,
+                    &["del", "00:00:00:00:00:00", "dev", &vxlan_name, "dst", &ep],
+                )
+                .await;
+                // Remove per-service entries
+                for (_, ip) in &old_peer.services {
+                    let mac = mac_for_namespace_ip(*ip);
                     let _ = run_bridge_fdb_netns(
                         &ns.netns_name,
-                        &["del", "00:00:00:00:00:00", "dev", &vxlan_name, "dst", &ep],
+                        &["del", &mac, "dev", &vxlan_name, "dst", &ep],
                     )
                     .await;
-                    // Remove per-service entries
-                    for (_, ip) in &old_peer.services {
-                        let mac = mac_for_namespace_ip(*ip);
-                        let _ = run_bridge_fdb_netns(
-                            &ns.netns_name,
-                            &["del", &mac, "dev", &vxlan_name, "dst", &ep],
-                        )
-                        .await;
-                        let ip_str = ip.to_string();
-                        let _ = run_ip_netns(
-                            &ns.netns_name,
-                            &["neigh", "del", &ip_str, "dev", &vxlan_name],
-                        )
-                        .await;
-                    }
-                    tracing::info!(
-                        namespace = %namespace,
-                        peer = %old_id,
-                        "Removed VXLAN remote peer"
-                    );
+                    let ip_str = ip.to_string();
+                    let _ = run_ip_netns(
+                        &ns.netns_name,
+                        &["neigh", "del", &ip_str, "dev", &vxlan_name],
+                    )
+                    .await;
                 }
+                tracing::info!(
+                    namespace = %namespace,
+                    peer = %old_id,
+                    "Removed VXLAN remote peer"
+                );
             }
         }
 

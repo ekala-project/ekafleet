@@ -127,17 +127,16 @@ impl DnsAuthority {
         namespace: &str,
     ) -> Vec<Ipv4Addr> {
         let zone = self.inner.read().await;
-        if !namespace.is_empty() {
-            if let Some(endpoints) = zone
+        if !namespace.is_empty()
+            && let Some(endpoints) = zone
                 .namespace_records
                 .get(&(namespace.to_string(), service_name.to_string()))
-            {
-                return endpoints
-                    .iter()
-                    .filter(|e| e.healthy)
-                    .map(|e| e.ip)
-                    .collect();
-            }
+        {
+            return endpoints
+                .iter()
+                .filter(|e| e.healthy)
+                .map(|e| e.ip)
+                .collect();
         }
         zone.records
             .get(service_name)
