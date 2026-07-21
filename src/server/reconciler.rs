@@ -606,21 +606,82 @@ async fn send_desired_state(
         }
     }
 
-    for (node, services) in per_node {
+    // Build cross-reference: namespace → [(node_id, [(service_name, ip, ports)])]
+    // Used to populate remote_peers so each node knows about other nodes in
+    // the same namespace for VXLAN tunnel setup.
+    let mut ns_to_nodes: HashMap<String, Vec<(String, Vec<crate::proto::RemoteServiceEndpoint>)>> =
+        HashMap::new();
+    for (node_id, services) in &per_node {
+        for svc in services {
+            if !svc.namespace.is_empty()
+                && svc.namespace != "default"
+                && !svc.namespace_ip.is_empty()
+            {
+                let ports: Vec<u32> = svc.ports.iter().map(|p| p.port).collect();
+                let entry = ns_to_nodes.entry(svc.namespace.clone()).or_default();
+                if let Some((_, svc_list)) = entry.iter_mut().find(|(n, _)| n == node_id) {
+                    svc_list.push(crate::proto::RemoteServiceEndpoint {
+                        service_name: svc.name.clone(),
+                        ip: svc.namespace_ip.clone(),
+                        ports,
+                    });
+                } else {
+                    entry.push((
+                        node_id.clone(),
+                        vec![crate::proto::RemoteServiceEndpoint {
+                            service_name: svc.name.clone(),
+                            ip: svc.namespace_ip.clone(),
+                            ports,
+                        }],
+                    ));
+                }
+            }
+        }
+    }
+
+    // Pre-fetch mesh IPs for all participating nodes to avoid repeated async lookups
+    let mut mesh_ips: HashMap<String, std::net::Ipv4Addr> = HashMap::new();
+    for node_id in per_node.keys() {
+        if let Some(ip) = state.mesh_ip_for_node(node_id).await {
+            mesh_ips.insert(node_id.clone(), ip);
+        }
+    }
+
+    for (node, services) in &per_node {
         // Build NamespaceNetworkConfig for namespaces this node participates in
         let namespace_networks = per_node_namespaces
-            .get(&node)
+            .get(node)
             .map(|namespaces| {
                 namespaces
                     .iter()
                     .map(|ns| {
                         let third_octet = namespace_subnet_octet(ns);
+
+                        // Populate remote_peers: other nodes in the same namespace
+                        let remote_peers = ns_to_nodes
+                            .get(ns)
+                            .map(|nodes| {
+                                nodes
+                                    .iter()
+                                    .filter(|(other, _)| other != node)
+                                    .filter_map(|(other, svcs)| {
+                                        let endpoint = mesh_ips.get(other)?;
+                                        Some(crate::proto::NamespaceRemotePeer {
+                                            node_id: other.clone(),
+                                            tunnel_endpoint: endpoint.to_string(),
+                                            services: svcs.clone(),
+                                        })
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+
                         crate::proto::NamespaceNetworkConfig {
                             namespace: ns.clone(),
                             subnet: format!("10.200.{third_octet}.0/24"),
                             gateway: format!("10.200.{third_octet}.1"),
                             vni: third_octet as u32,
-                            remote_peers: vec![], // same-host phase: no remote peers
+                            remote_peers,
                         }
                     })
                     .collect()
@@ -631,14 +692,43 @@ async fn send_desired_state(
             payload: Some(crate::proto::server_message::Payload::DesiredState(
                 crate::proto::DesiredState {
                     correlation_id: String::new(),
-                    services,
+                    services: services.clone(),
                     system_path: String::new(),
                     namespace_networks,
                 },
             )),
         };
-        if !state.send_to_agent(&node, msg).await {
+        if !state.send_to_agent(node, msg).await {
             tracing::warn!(node = %node, "Failed to send DesiredState to agent");
+        }
+    }
+
+    // Push namespace-scoped DNS records so services can resolve each other
+    // across nodes within the same namespace.
+    for (node, namespaces) in &per_node_namespaces {
+        let mut records = Vec::new();
+        for ns in namespaces {
+            if let Some(nodes) = ns_to_nodes.get(ns) {
+                for (_, svcs) in nodes {
+                    for svc in svcs {
+                        records.push(crate::proto::DnsRecord {
+                            name: svc.service_name.clone(),
+                            record_type: crate::proto::DnsRecordType::A as i32,
+                            values: vec![svc.ip.clone()],
+                            ttl: 30,
+                            namespace: ns.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        if !records.is_empty() {
+            let dns_msg = crate::proto::ServerMessage {
+                payload: Some(crate::proto::server_message::Payload::Dns(
+                    crate::proto::DnsUpdate { records },
+                )),
+            };
+            let _ = state.send_to_agent(node, dns_msg).await;
         }
     }
 }
