@@ -73,8 +73,8 @@ src/
 │   ├── rest.rs          # HTTP/REST API (axum) + embedded dashboard
 │   ├── rbac.rs          # Roles, permissions, namespace-scoped tokens, require_permission()
 │   ├── seal.rs          # PBKDF2+AES-256-GCM envelope encryption for key material at rest
-│   ├── state.rs         # FleetState: in-memory agent registry, heartbeats, command relay
-│   ├── reconciler.rs    # Desired-vs-actual reconciliation, ServiceConfig→ServiceSpec conversion
+│   ├── state.rs         # FleetState: in-memory agent registry, heartbeats, mesh IPs, command relay
+│   ├── reconciler.rs    # Desired-vs-actual reconciliation, ServiceConfig→ServiceSpec, namespace topology
 │   ├── deployer.rs      # Rolling / canary / blue-green deployment orchestration
 │   ├── scheduler/       # Filter + score placement (constraints, affinity, spread, preemption)
 │   ├── scaling.rs       # Service + pool autoscaling logic
@@ -106,6 +106,7 @@ src/
 │   ├── activation.rs    # NixOS system closure activation, generation pruning
 │   ├── types.rs         # Agent-side state types (LocalState, NodeIdentity)
 │   ├── helpers.rs       # SVID installation helpers
+│   ├── netns.rs         # Per-namespace network isolation (netns, bridge, veth, VXLAN overlay)
 │   ├── template.rs      # Config file template rendering
 │   ├── exec.rs          # Remote command execution in service cgroups
 │   ├── logs.rs          # Journal log streaming
@@ -146,8 +147,8 @@ src/
 │   └── versioned.rs     # Secret versioning with rollback
 ├── dns/
 │   ├── mod.rs           # DNS module
-│   ├── authority.rs     # Authoritative DNS server for fleet domain
-│   ├── resolver.rs      # Caching resolver (agent-side)
+│   ├── authority.rs     # Authoritative DNS server for fleet domain (namespace-scoped zones)
+│   ├── resolver.rs      # Caching resolver (agent-side, namespace-scoped lookups)
 │   ├── listener.rs      # UDP DNS listener
 │   └── external.rs      # External service DNS registration
 ├── mesh/
@@ -170,7 +171,7 @@ src/
 │   └── tracing_ctx.rs   # Distributed tracing context propagation
 ├── policy/
 │   ├── mod.rs           # Policy module
-│   └── nftables.rs      # nftables rule generation from identity contracts
+│   └── nftables.rs      # nftables rule generation, namespace NAT, VXLAN input rules
 ├── metrics/
 │   ├── mod.rs           # Metrics module
 │   ├── aggregator.rs    # Fleet-wide metrics aggregation
@@ -180,10 +181,10 @@ src/
 ├── gossip/
 │   ├── mod.rs           # Gossip module
 │   ├── swim.rs          # SWIM protocol implementation
-│   └── catalog.rs       # Service catalog propagation
+│   └── catalog.rs       # Service catalog propagation (namespace-scoped)
 ├── raft/
 │   ├── mod.rs           # Raft module
-│   ├── state.rs         # FleetStateMachine (deployments, secrets, DNS, KV, cloud instances)
+│   ├── state.rs         # FleetStateMachine (deployments, secrets, DNS, KV, cloud instances, namespace IPs)
 │   └── storage.rs       # Encrypted log + snapshot persistence (AES-256-GCM)
 └── spiffe/
     ├── mod.rs           # SPIFFE module

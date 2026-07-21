@@ -4,8 +4,8 @@ A single Rust binary that replaces the HashiCorp stack (Nomad + Consul + Vault) 
 
 ## Two Modes
 
-- **`ekafleet server`** — control plane: priority-based scheduling, RBAC, CA, secrets, DNS authority, deployment orchestration with disruption budgets, event tracking, REST API, encrypted persistent state with restore-on-boot, node attestation
-- **`ekafleet agent`** — data plane: service supervision with lifecycle hooks, liveness/readiness/startup probes, config templating, DNS resolver, secret injection, mesh networking, SPIFFE Workload API, L7/L4 proxy with circuit breaking, persistent volumes
+- **`ekafleet server`** — control plane: priority-based scheduling, RBAC, CA, secrets, DNS authority, deployment orchestration with disruption budgets, event tracking, REST API, encrypted persistent state with restore-on-boot, node attestation, namespace IP allocation
+- **`ekafleet agent`** — data plane: service supervision with lifecycle hooks, liveness/readiness/startup probes, config templating, DNS resolver, secret injection, mesh networking, SPIFFE Workload API, L7/L4 proxy with circuit breaking, persistent volumes, per-namespace network isolation with VXLAN overlay
 
 Server mode embeds all agent capabilities and can run workloads directly.
 
@@ -21,7 +21,7 @@ Server mode embeds all agent capabilities and can run workloads directly.
 | external-dns | `dns_authority` |
 | nginx/Traefik | `proxy_l7` + `proxy_l4` (circuit breaking, retries) |
 | deploy-rs | `deployer` + `nix_eval` |
-| Cilium/Calico | `nftables` |
+| Cilium/Calico | `nftables` + `netns` + `vxlan` |
 
 ## Quick Start
 
@@ -113,6 +113,48 @@ Fleet configuration is pure Nix, consumed via `nix eval`:
     };
   };
 }
+```
+
+## Namespace Networking
+
+Services can be isolated into namespaces with dedicated network stacks. Each non-default namespace gets its own Linux network namespace with a bridge and per-service veth pairs. Services in the same namespace can communicate freely; services in different namespaces are isolated by default.
+
+```nix
+services.customer-a-web = {
+  command = "${pkgs.web}/bin/server";
+  namespace = "customer-a";           # isolated network namespace
+  ports.http.port = 8080;
+};
+
+services.customer-a-db = {
+  command = "${pkgs.postgres}/bin/postgres";
+  namespace = "customer-a";           # same namespace, reachable from web
+};
+
+services.customer-b-app = {
+  namespace = "customer-b";           # different namespace, fully isolated
+};
+```
+
+**How it works:**
+
+- **Same node**: Services in the same namespace share a bridge (`10.200.{ns}.0/24`). The server assigns globally unique IPs via Raft so there are no conflicts.
+- **Cross node**: When a namespace spans multiple nodes, VXLAN tunnels carry traffic through the WireGuard mesh (`10.100.0.0/16`). The server populates tunnel endpoints automatically from agent heartbeats.
+- **DNS**: Namespace-scoped DNS records ensure `web.service.fleet.internal` resolves to the correct IP within each namespace. Fleet-wide records remain visible to all.
+- **Default namespace**: Services without a `namespace` field (or `namespace = "default"`) use host networking, preserving backward compatibility for infrastructure services.
+
+```
+Node 1                                    Node 2
+┌─────────────────────────┐              ┌─────────────────────────┐
+│ netns: ekafleet-cust-a  │              │ netns: ekafleet-cust-a  │
+│ ┌─────────────────────┐ │              │ ┌─────────────────────┐ │
+│ │ br-a (10.200.1.1)   │ │              │ │ br-a (10.200.1.1)   │ │
+│ │  ├─ web  10.200.1.2 │ │  VXLAN/WG   │ │  ├─ db   10.200.1.3 │ │
+│ │  └─ vxlan (VNI 1)  ─┼─┼─────────────┼─┤  └─ vxlan (VNI 1)   │ │
+│ └─────────────────────┘ │              │ └─────────────────────┘ │
+│                         │              │                         │
+│ wg-fleet 10.100.0.1/16  │              │ wg-fleet 10.100.0.2/16  │
+└─────────────────────────┘              └─────────────────────────┘
 ```
 
 ## CLI
