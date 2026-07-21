@@ -202,6 +202,7 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
     let heartbeat_tx = tx.clone();
     let hb_node_id: Arc<str> = Arc::from(node_id.as_str());
     let hb_version = version.clone();
+    let hb_peer_manager = peer_manager.clone();
     let hb_shutdown = shutdown.child_token();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
@@ -210,6 +211,12 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
                 _ = hb_shutdown.cancelled() => break,
                 _ = interval.tick() => {}
             }
+            let mesh_ip = hb_peer_manager
+                .read()
+                .await
+                .wireguard()
+                .mesh_ip()
+                .to_string();
             let msg = AgentMessage {
                 payload: Some(Payload::Heartbeat(Heartbeat {
                     node_id: hb_node_id.to_string(),
@@ -217,7 +224,7 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
                     available_resources: Some(collect_resources()),
                     pool: String::new(),
                     version: hb_version.to_string(),
-                    mesh_ip: String::new(),
+                    mesh_ip,
                 })),
             };
             if heartbeat_tx.send(msg).await.is_err() {
