@@ -113,7 +113,7 @@ ekafleet is a single binary that consolidates capabilities from 10+ separate too
 | External service registration | **Yes** | **Yes** (ExternalName) | **Yes** | Non-fleet services in DNS catalog |
 | Distributed tracing | **Yes** | No (needs Istio) | **Yes** (via Envoy) | W3C Trace Context propagation |
 | mTLS enforcement | **Yes** | No (needs Istio) | **Yes** | SPIFFE ID-based caller authorization |
-| Gossip-based discovery | *Partial* | No | **Yes** (Serf) | SWIM + catalog implemented in `src/gossip/` but not yet started by server or agent |
+| Gossip-based discovery | *Partial* | No | **Yes** (Serf) | SWIM membership runs on server and agents; the service catalog is not yet carried over gossip |
 | Multi-region federation | **Yes** | *Partial* (Federation v2) | **Yes** (WAN) | Cross-cluster service discovery |
 
 ## Security & Identity
@@ -195,7 +195,7 @@ ekafleet is a single binary that consolidates capabilities from 10+ separate too
 | Feature | ekafleet | Kubernetes | Nomad + Consul | Notes |
 |---------|----------|------------|----------------|-------|
 | Consensus (server HA) | *Planned* | **Yes** (etcd/Raft) | **Yes** (Raft) | Single-node with durable state; multi-node Raft planned |
-| Gossip protocol | *Partial* (SWIM) | No | **Yes** (Serf/SWIM) | HMAC-authenticated SWIM implemented; not yet started at runtime |
+| Gossip protocol | *Partial* (SWIM) | No | **Yes** (Serf/SWIM) | HMAC-authenticated SWIM runs on server and agents (shared key, not encrypted; membership is advisory) |
 | Leader election | *Planned* | **Yes** (etcd) | **Yes** (Raft) | `--peers` parsed, not yet wired |
 | Graceful degradation | **Yes** | **Yes** | **Yes** | Agents continue when server unreachable |
 | State snapshots | **Yes** | **Yes** (etcd backup) | **Yes** (snapshot) | Raft snapshot/restore |

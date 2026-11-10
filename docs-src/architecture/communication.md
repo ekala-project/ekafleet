@@ -15,6 +15,7 @@ The primary communication channel is a bidirectional gRPC stream over TCP port 7
 | `MetricsSummary` | Aggregated metrics from local services |
 | `Nack` | Reject an invalid server command |
 | `NodeAttestationResponse` | Response to attestation challenge (TPM, future) |
+| `PeerAdvert` | This node's WireGuard key, endpoint and mesh address, signed with its node SVID (mTLS streams only) |
 
 ### Agent → Server Messages (continued)
 
@@ -31,7 +32,7 @@ The primary communication channel is a bidirectional gRPC stream over TCP port 7
 | `SecretUpdate` | Push an encrypted secret for a service |
 | `DnsUpdate` | DNS record updates for the local resolver cache |
 | `CertificateResponse` | Signed certificate + chain + service name |
-| `PeerUpdate` | WireGuard peer list update |
+| `PeerUpdate` | The full set of verified, SVID-signed WireGuard adverts (sent on connect and whenever it changes) |
 | `PolicyUpdate` | Network policy rules to apply |
 | `TrustBundleUpdate` | CA certificate + trust domain |
 | `NodeAttestationChallenge` | Server challenge during attestation |
@@ -45,6 +46,8 @@ The primary communication channel is a bidirectional gRPC stream over TCP port 7
 | `SystemRebootCommand` | Initiate a system reboot |
 | `SystemRebuildCommand` | Run nixos-rebuild switch |
 | `InspectServiceCommand` | Query systemd unit properties and cgroup accounting |
+| `MigrateVolumeCommand` | Move a persistent volume's data to another node |
+| `GossipConfig` | Gossip key, the server's gossip port and current members (sent on connect and on fleet-key rotation) |
 
 ### Request-Response Correlation
 
@@ -123,15 +126,15 @@ service SpiffeWorkloadAPI {
 
 ## Gossip: UDP (SWIM)
 
-Port 7401. Used for:
+Port 7401 (`--gossip-listen`; `off` disables it). The server and every agent run SWIM membership: each member pings the others every second, marks a member *suspect* after 3 seconds without a reply and *dead* after 10, and marks it alive again when it answers.
 
-- **Membership** — Alive/suspect/dead detection (2-5 second failure detection)
-- **Service catalog** — Eventually-consistent service discovery between agents
-- **DNS cache hints** — Cache invalidation signals between agents
+**Bootstrap.** Agents do not have the gossip key until they connect. The server derives it from the fleet key (HKDF-SHA256, salt `ekafleet-gossip-hmac-v1`) and sends it in `GossipConfig` over the authenticated control stream, with its gossip port and the members it currently sees as alive. The agent starts SWIM on the first `GossipConfig`, seeded with the server and those members. Rotating the fleet key sends a new `GossipConfig`, and gossip switches to the new key.
 
-The gossip layer works independently of the server, providing continued service discovery even during server outages.
+**Message authentication.** Every message is `type || timestamp || node_id || HMAC-SHA256` over all the preceding fields. Messages with a bad tag, an invalid node ID, or a timestamp more than 30 seconds from the receiver's clock are dropped. There is no indirect probe (ping-req), so a packet cannot make a node send traffic to a third party.
 
-> **Status:** the SWIM implementation (`src/gossip/`, HMAC-SHA256 authenticated with a shared cluster key) is not yet started by the server or agent.
+**What gossip is not.** The key is shared by every connected agent, so any agent can claim any node ID in gossip. Gossip is not encrypted. Gossip membership is therefore advisory: identity comes from node SVIDs on the control stream, and WireGuard peer keys travel as SVID-signed adverts over that stream, never over gossip. Agents keep gossiping with each other while the server is down, but an agent that restarts cannot rejoin until the server is reachable.
+
+> **Status:** the service catalog (`src/gossip/catalog.rs`) and DNS cache hints are not yet carried over gossip.
 
 ## HTTP API
 

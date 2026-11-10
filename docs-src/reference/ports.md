@@ -8,7 +8,7 @@
 | 7401 | UDP | Server + Agent | Gossip (SWIM membership protocol) |
 | 7402 | TCP (HTTP) | Server | HTTP API (health, metrics) |
 | 53 | UDP/TCP | Server + Agent | DNS (authority on server, resolver on agent) |
-| 51820 | UDP | Server + Agent | WireGuard mesh |
+| 51820 | UDP | Agent | WireGuard mesh (when `--wireguard-endpoint` is set; port taken from it) |
 | 80 | TCP | Agent (ingress) | L7 proxy HTTP |
 | 443 | TCP | Agent (ingress) | L7 proxy HTTPS |
 

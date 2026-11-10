@@ -47,4 +47,4 @@ Running a production fleet typically requires deploying and maintaining a dozen 
 | Scaling | Metric-based autoscaling, manual scaling, pool-level scaling, node maintenance windows, descheduler/rebalancer |
 | Operations | Structured CLI output (`-o json`), shell completions, disaster recovery (snapshot/restore), local dev mode |
 | Federation | Multi-region cluster federation, cross-cluster service discovery, SPIFFE trust domain federation |
-| HA | Encrypted persistent state with restore-on-boot; multi-node Raft and gossip-based failure detection planned |
+| HA | Encrypted persistent state with restore-on-boot; SWIM gossip membership runs between server and agents; multi-node Raft planned |

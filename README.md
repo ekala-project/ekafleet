@@ -41,6 +41,13 @@ JOIN_TOKEN=$(EKAFLEET_TOKEN=$ADMIN_TOKEN ekafleet --server 10.0.0.1:7400 \
 # from then on. The token is consumed and cannot be replayed.
 ekafleet agent --join 10.0.0.1:7400 --join-token $JOIN_TOKEN --ca-cert /path/to/ca.pem
 
+# Optionally join the WireGuard mesh as 10.100.0.2. The agent advertises its
+# WireGuard key signed with its node SVID; the server checks the signature and
+# chain and relays it, and every other agent verifies it again before adding
+# the peer.
+ekafleet agent --join 10.0.0.1:7400 --ca-cert /path/to/ca.pem \
+  --wireguard-endpoint 10.0.0.2:51820 --mesh-index 2
+
 # Or join with legacy bearer token auth
 ekafleet agent --join 10.0.0.1:7400 --token $ADMIN_TOKEN
 
@@ -144,7 +151,7 @@ services.customer-b-app = {
 **How it works:**
 
 - **Same node**: Services in the same namespace share a bridge (`10.200.{ns}.0/24`). The server assigns globally unique IPs via Raft so there are no conflicts.
-- **Cross node**: When a namespace spans multiple nodes, VXLAN tunnels carry traffic through the WireGuard mesh (`10.100.0.0/16`). The server populates tunnel endpoints automatically from agent heartbeats.
+- **Cross node**: When a namespace spans multiple nodes, VXLAN tunnels carry traffic through the WireGuard mesh (`10.100.0.0/16`). The server populates tunnel endpoints automatically from agent heartbeats. Agents join the mesh with `--wireguard-endpoint` and `--mesh-index`; see [Mesh Networking](docs-src/operations/mesh.md).
 - **DNS**: Namespace-scoped DNS records ensure `web.service.fleet.internal` resolves to the correct IP within each namespace. Fleet-wide records remain visible to all.
 - **Default namespace**: Services without a `namespace` field (or `namespace = "default"`) use host networking, preserving backward compatibility for infrastructure services.
 
@@ -161,6 +168,11 @@ Node 1                                    Node 2
 │ wg-fleet 10.100.0.1/16  │              │ wg-fleet 10.100.0.2/16  │
 └─────────────────────────┘              └─────────────────────────┘
 ```
+
+## Gossip and Mesh Trust
+
+- **Gossip (UDP 7401)**: the server and agents run SWIM membership and failure detection. Messages are authenticated with HMAC-SHA256 under a key derived from the fleet key, which agents receive over their authenticated control stream. The key is shared, so gossip only reports liveness. It is not used for identity, and it is not encrypted. The service catalog is not yet carried over gossip.
+- **WireGuard peers**: a peer's key is trusted only through an advert signed with that node's SPIFFE SVID. The SVID must chain to the fleet CA and name the advertised node. Adverts travel over the mTLS control stream, never over gossip. See [Mesh Networking](docs-src/operations/mesh.md#signed-peer-adverts) and [Communication](docs-src/architecture/communication.md#gossip-udp-swim).
 
 ## CLI
 
