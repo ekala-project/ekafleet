@@ -225,63 +225,72 @@ pub async fn activate_system(
 
 /// Prune old system profile generations according to `policy`.
 ///
-/// Uses `nix-env --profile <system> --delete-generations`, which accepts
-/// `+N` (keep the last N generations, delete the rest) and `<N>d` (delete
-/// generations older than N days).
+/// A generation is deleted only when it falls outside *every* configured
+/// bound: it is not among the `keep_last` most recent generations, and it is
+/// older than `older_than_days`. The current generation is never deleted.
 ///
-/// The current generation is never deleted. On flakes-only installs where
-/// `nix-env` is absent, falls back to `nix profile wipe-history` with the
-/// matching `--older-than` bound (count-based pruning is not expressible there,
-/// so only the age bound is applied in that case).
+/// `nix-env --delete-generations` accepts a single `+N` or `Nd` selector, so
+/// combining both bounds cannot be expressed as one selector (`10d +10` is
+/// rejected with `invalid generation number '10d'`). Instead the generation
+/// set is computed here from the profile links and passed to `nix-env` as
+/// explicit generation numbers.
 ///
-/// Returns without error when the policy is a no-op. Pruning failures are
-/// surfaced as `ProfileFailed` but are non-fatal to activation (the caller
-/// logs and continues).
+/// On flakes-only installs where `nix-env` is absent, falls back to
+/// `nix profile wipe-history --older-than`, which only expresses the age bound.
+/// That fallback is used only when no count bound is set, because applying the
+/// age bound alone would delete generations the count bound must keep.
+///
+/// Returns without error when the policy is a no-op or nothing is outside the
+/// policy. Pruning failures are surfaced as `ProfileFailed` but are non-fatal
+/// to activation (the caller logs and continues).
 pub async fn prune_generations(policy: GenerationRetention) -> Result<(), ActivationError> {
     if policy.is_noop() {
         return Ok(());
     }
 
-    // Build the nix-env delete-generations selectors.
-    let mut selectors: Vec<String> = Vec::new();
-    if let Some(days) = policy.older_than_days {
-        selectors.push(format!("{days}d"));
-    }
-    if let Some(keep) = policy.keep_last {
-        selectors.push(format!("+{keep}"));
-    }
-
-    let mut args: Vec<&str> = vec!["--profile", SYSTEM_PROFILE, "--delete-generations"];
-    for s in &selectors {
-        args.push(s.as_str());
+    let profile = Path::new(SYSTEM_PROFILE);
+    let (generations, current) = list_generations(profile).await?;
+    let doomed = generations_to_delete(&generations, current, policy, std::time::SystemTime::now());
+    if doomed.is_empty() {
+        tracing::debug!(
+            ?policy,
+            "No system generations outside the retention policy"
+        );
+        return Ok(());
     }
 
+    let args = delete_generations_args(SYSTEM_PROFILE, &doomed);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
     match run_profile_set("nix-env", &args).await {
         Ok(()) => {
-            tracing::info!(?policy, "Pruned old system generations");
+            tracing::info!(?policy, deleted = ?doomed, "Pruned old system generations");
             Ok(())
         }
         Err(ActivationError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Flakes-only fallback: only the age bound is expressible.
-            if let Some(days) = policy.older_than_days {
-                let older = format!("{days}d");
-                run_profile_set(
-                    "nix",
-                    &[
-                        "profile",
-                        "wipe-history",
-                        "--profile",
-                        SYSTEM_PROFILE,
-                        "--older-than",
-                        &older,
-                    ],
-                )
-                .await?;
-                tracing::info!(?policy, "Pruned old system generations via nix profile");
-            } else {
-                tracing::warn!(
-                    "nix-env absent and no age bound set; count-based generation pruning skipped"
-                );
+            match (policy.keep_last, policy.older_than_days) {
+                (None, Some(days)) => {
+                    let older = format!("{days}d");
+                    run_profile_set(
+                        "nix",
+                        &[
+                            "profile",
+                            "wipe-history",
+                            "--profile",
+                            SYSTEM_PROFILE,
+                            "--older-than",
+                            &older,
+                        ],
+                    )
+                    .await?;
+                    tracing::info!(?policy, "Pruned old system generations via nix profile");
+                }
+                _ => {
+                    tracing::warn!(
+                        ?policy,
+                        "nix-env absent and `nix profile wipe-history` cannot express a count \
+                         bound; generation pruning skipped"
+                    );
+                }
             }
             Ok(())
         }
@@ -436,6 +445,118 @@ async fn previous_generation_path() -> Result<Option<PathBuf>, ActivationError> 
     }
 }
 
+/// A system profile generation found on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Generation {
+    /// Generation number (`N` in `<profile>-N-link`).
+    number: u64,
+    /// When the generation link was created (its `lstat` mtime, as Nix uses).
+    created: std::time::SystemTime,
+}
+
+/// Build the `nix-env` arguments that delete exactly `generations` from
+/// `profile`. Each generation is passed as its own explicit number, which
+/// `nix-env --delete-generations` accepts in any quantity.
+fn delete_generations_args(profile: &str, generations: &[u64]) -> Vec<String> {
+    let mut args = vec![
+        "--profile".to_string(),
+        profile.to_string(),
+        "--delete-generations".to_string(),
+    ];
+    args.extend(generations.iter().map(u64::to_string));
+    args
+}
+
+/// Select the generations that fall outside `policy` and may be deleted.
+///
+/// A generation is kept if any of these hold:
+///   - it is `current`;
+///   - it is among the `keep_last` highest-numbered generations;
+///   - it was created less than `older_than_days` days before `now`, or it is
+///     the newest generation created before that cutoff (it was the active
+///     generation at the cutoff, matching `nix-env --delete-generations Nd`).
+///
+/// An unset bound keeps nothing on its own. Returns generation numbers in
+/// ascending order.
+fn generations_to_delete(
+    generations: &[Generation],
+    current: Option<u64>,
+    policy: GenerationRetention,
+    now: std::time::SystemTime,
+) -> Vec<u64> {
+    if policy.is_noop() {
+        return Vec::new();
+    }
+
+    let mut sorted: Vec<Generation> = generations.to_vec();
+    sorted.sort_by_key(|g| std::cmp::Reverse(g.number)); // newest first
+
+    let cutoff = policy
+        .older_than_days
+        .map(|days| now - std::time::Duration::from_secs(days.saturating_mul(86_400)));
+    // The newest generation older than the cutoff stays, like `nix-env ... Nd`.
+    let active_at_cutoff =
+        cutoff.and_then(|cutoff| sorted.iter().find(|g| g.created < cutoff).map(|g| g.number));
+
+    let mut doomed: Vec<u64> = sorted
+        .iter()
+        .enumerate()
+        .filter(|(rank, g)| {
+            let is_current = current == Some(g.number);
+            let kept_by_count = policy.keep_last.is_some_and(|n| (*rank as u64) < n);
+            let kept_by_age = cutoff
+                .is_some_and(|cutoff| g.created >= cutoff || active_at_cutoff == Some(g.number));
+            !is_current && !kept_by_count && !kept_by_age
+        })
+        .map(|(_, g)| g.number)
+        .collect();
+    doomed.sort_unstable();
+    doomed
+}
+
+/// List the generations of `profile` and the generation it currently points at.
+///
+/// Generations are the `<name>-<N>-link` symlinks next to the profile. The
+/// current generation is read from the profile symlink's target.
+async fn list_generations(
+    profile: &Path,
+) -> Result<(Vec<Generation>, Option<u64>), ActivationError> {
+    let (Some(dir), Some(name)) = (profile.parent(), profile.file_name()) else {
+        return Ok((Vec::new(), None));
+    };
+    let prefix = format!("{}-", name.to_string_lossy());
+
+    let mut generations = Vec::new();
+    let mut entries = tokio::fs::read_dir(dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let file_name = entry.file_name();
+        let Some(number) = parse_generation_link(&file_name.to_string_lossy(), &prefix) else {
+            continue;
+        };
+        let created = tokio::fs::symlink_metadata(entry.path())
+            .await?
+            .modified()?;
+        generations.push(Generation { number, created });
+    }
+
+    let current = tokio::fs::read_link(profile).await.ok().and_then(|target| {
+        target
+            .file_name()
+            .and_then(|f| parse_generation_link(&f.to_string_lossy(), &prefix))
+    });
+
+    Ok((generations, current))
+}
+
+/// Parse `N` from a `<prefix>N-link` generation link name.
+fn parse_generation_link(file_name: &str, prefix: &str) -> Option<u64> {
+    file_name
+        .strip_prefix(prefix)?
+        .strip_suffix("-link")?
+        .parse()
+        .ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -568,5 +689,149 @@ mod tests {
             result,
             Err(ActivationError::ActivateScriptNotFound(_))
         ));
+    }
+
+    fn gen_at(number: u64, now: std::time::SystemTime, days_ago: u64) -> Generation {
+        Generation {
+            number,
+            created: now - std::time::Duration::from_secs(days_ago * 86_400),
+        }
+    }
+
+    /// Ten generations, numbered 1..=10, generation N created (10 - N) * 3 days
+    /// ago, so generation 10 is brand new and generation 1 is 27 days old.
+    fn ten_generations(now: std::time::SystemTime) -> Vec<Generation> {
+        (1..=10).map(|n| gen_at(n, now, (10 - n) * 3)).collect()
+    }
+
+    #[test]
+    fn delete_args_pass_each_generation_explicitly() {
+        let args = delete_generations_args("/nix/var/nix/profiles/system", &[1, 2, 7]);
+        assert_eq!(
+            args,
+            [
+                "--profile",
+                "/nix/var/nix/profiles/system",
+                "--delete-generations",
+                "1",
+                "2",
+                "7",
+            ]
+        );
+        // No `+N` / `Nd` selectors: nix-env only accepts one of those, alone.
+        assert!(
+            args[3..]
+                .iter()
+                .all(|a| a.chars().all(|c| c.is_ascii_digit()))
+        );
+    }
+
+    #[test]
+    fn count_bound_alone_keeps_last_n() {
+        let now = std::time::SystemTime::now();
+        let policy = GenerationRetention {
+            keep_last: Some(3),
+            older_than_days: None,
+        };
+        let doomed = generations_to_delete(&ten_generations(now), Some(10), policy, now);
+        assert_eq!(doomed, [1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn age_bound_alone_matches_nix_env_days_selector() {
+        let now = std::time::SystemTime::now();
+        let policy = GenerationRetention {
+            keep_last: None,
+            older_than_days: Some(10),
+        };
+        // Generations 7..=10 are 9, 6, 3 and 0 days old. Generation 6 (12 days)
+        // was active at the cutoff and is kept, like `nix-env ... 10d`.
+        let doomed = generations_to_delete(&ten_generations(now), Some(10), policy, now);
+        assert_eq!(doomed, [1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn both_bounds_delete_only_outside_both() {
+        let now = std::time::SystemTime::now();
+        let gens = ten_generations(now);
+
+        // Count keeps 8..=10; age keeps 6..=10. Union is 6..=10.
+        let policy = GenerationRetention {
+            keep_last: Some(3),
+            older_than_days: Some(10),
+        };
+        assert_eq!(
+            generations_to_delete(&gens, Some(10), policy, now),
+            [1, 2, 3, 4, 5]
+        );
+
+        // Count keeps 4..=10; age keeps 9..=10 (8 is active at the cutoff, so
+        // it is kept too). The count bound is the wider one here.
+        let policy = GenerationRetention {
+            keep_last: Some(7),
+            older_than_days: Some(4),
+        };
+        assert_eq!(
+            generations_to_delete(&gens, Some(10), policy, now),
+            [1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn current_generation_is_never_deleted() {
+        let now = std::time::SystemTime::now();
+        let policy = GenerationRetention {
+            keep_last: Some(1),
+            older_than_days: Some(1),
+        };
+        // The profile points at an old generation (e.g. after a rollback).
+        let doomed = generations_to_delete(&ten_generations(now), Some(2), policy, now);
+        assert!(!doomed.contains(&2));
+        assert!(!doomed.contains(&10));
+        // Generation 9 was active at the one-day cutoff, so the age bound keeps it.
+        assert_eq!(doomed, [1, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn nothing_outside_policy_deletes_nothing() {
+        let now = std::time::SystemTime::now();
+        let policy = GenerationRetention {
+            keep_last: Some(20),
+            older_than_days: Some(1),
+        };
+        assert!(generations_to_delete(&ten_generations(now), Some(10), policy, now).is_empty());
+        assert!(generations_to_delete(&[], None, policy, now).is_empty());
+    }
+
+    #[test]
+    fn parse_generation_link_names() {
+        assert_eq!(parse_generation_link("system-42-link", "system-"), Some(42));
+        assert_eq!(parse_generation_link("system-link", "system-"), None);
+        assert_eq!(parse_generation_link("system-x-link", "system-"), None);
+        assert_eq!(parse_generation_link("other-3-link", "system-"), None);
+        assert_eq!(parse_generation_link("system-3", "system-"), None);
+    }
+
+    #[tokio::test]
+    async fn list_generations_reads_profile_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("system");
+        for n in [1, 2, 5] {
+            std::os::unix::fs::symlink(
+                format!("/nix/store/fake-{n}"),
+                dir.path().join(format!("system-{n}-link")),
+            )
+            .unwrap();
+        }
+        std::os::unix::fs::symlink("system-5-link", &profile).unwrap();
+        // Unrelated entries are ignored.
+        std::fs::write(dir.path().join("system-9-link.tmp"), "").unwrap();
+        std::os::unix::fs::symlink("/nix/store/x", dir.path().join("other-3-link")).unwrap();
+
+        let (gens, current) = list_generations(&profile).await.unwrap();
+        let mut numbers: Vec<u64> = gens.iter().map(|g| g.number).collect();
+        numbers.sort_unstable();
+        assert_eq!(numbers, [1, 2, 5]);
+        assert_eq!(current, Some(5));
     }
 }
