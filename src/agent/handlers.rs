@@ -703,6 +703,9 @@ pub(super) async fn handle_server_message(
                     .await;
             });
         }
+        ServerPayload::Gossip(_) => {
+            // Handled by the agent run loop (it owns the gossip membership).
+        }
         ServerPayload::MigrateVolumeCommand(cmd) => {
             let correlation_id = cmd.correlation_id.clone();
             let tx = tx.clone();
