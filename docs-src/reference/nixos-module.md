@@ -37,6 +37,7 @@ Enable `services.ekafleet.server` to deploy the control plane. This creates two 
 | `httpListen` | string | `0.0.0.0:7402` | HTTP API listen address |
 | `domain` | string | `fleet.internal` | SPIFFE trust domain |
 | `caSocketPath` | string | `/run/ekafleet/ca.sock` | Unix socket for CA signer |
+| `gossipListen` | string | `0.0.0.0:7401` | UDP address for SWIM gossip; `"off"` disables it |
 
 ## Agent Node
 
@@ -71,6 +72,9 @@ Enable `services.ekafleet.agent` to deploy the data plane. This creates three sy
 | `caCert` | path or null | `null` | CA certificate PEM for TLS verification |
 | `workloadApiSocketPath` | string | `/run/ekafleet/workload-api.sock` | Workload API socket path |
 | `proxyListen` | string | `0.0.0.0:8080` | Proxy listen address |
+| `gossipListen` | string | `0.0.0.0:7401` | UDP address for SWIM gossip; `"off"` disables it |
+| `wireguard.endpoint` | string or null | `null` | Join the WireGuard mesh, reachable at this `ip:port` (needs a node SVID) |
+| `wireguard.meshIndex` | int or null | `null` | Unique mesh index (1-65534); required with `wireguard.endpoint` |
 
 ## Combined Node (Server + Agent)
 

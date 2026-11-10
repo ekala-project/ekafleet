@@ -61,7 +61,8 @@ Other messages:
 | `TrustBundle` | Update trust domain + CA bundle in all SPIFFE directories |
 | `FleetKey` | Install fleet encryption key for SecretInjector |
 | `AttestChallenge` | Handle attestation challenge (TPM, future) |
-| `Peers` | Add/update/remove WireGuard peers |
+| `Peers` | Verify each SVID-signed advert, then add/update/remove WireGuard peers |
+| `Gossip` | Start SWIM with the server-provided key, or switch to a rotated key |
 | `Policy` | Generate and apply nftables rules |
 
 ### Server-Initiated Commands
@@ -102,7 +103,8 @@ The agent continues operating autonomously:
 | Health checks | Continue polling |
 | DNS resolution | Serve from cache |
 | Certificates | Valid until expiry (default 1 hour) |
-| Gossip | Still works between agents |
+| Gossip | Continues between running agents (membership only) |
+| WireGuard mesh | Installed peers keep working; no peer changes until the server returns |
 | System activation | **Blocked** until server returns |
 | New deployments | **Blocked** until server returns |
 

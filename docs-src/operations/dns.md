@@ -66,6 +66,6 @@ Health-aware DNS applies to external services too — unhealthy endpoints are re
 
 ## Gossip-Based Discovery
 
-The service catalog is also propagated between agents via gossip. This provides eventually-consistent service discovery that works even when the server is unreachable.
+The service catalog is designed to be propagated between agents via gossip, for eventually-consistent service discovery while the server is unreachable.
 
-> **Status:** the SWIM membership and catalog code lives in `src/gossip/` but is not yet started by the server or agent.
+> **Status:** SWIM membership now runs on the server and agents (see [Communication](../architecture/communication.md#gossip-udp-swim)), but the service catalog (`src/gossip/catalog.rs`) is not yet carried over it. DNS records come from the server.

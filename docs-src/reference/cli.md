@@ -45,6 +45,7 @@ ekafleet server [OPTIONS]
 | `--token` | *(required)* | Bearer token for agent authentication (also reads `EKAFLEET_TOKEN` env) |
 | `--domain` | `fleet.internal` | SPIFFE trust domain for fleet identities |
 | `--ca-socket` | | Path to CA signer Unix socket (uses external ca-signer daemon) |
+| `--gossip-listen` | `0.0.0.0:7401` | UDP address for SWIM gossip; `off` disables it |
 
 ### `ekafleet agent`
 
@@ -61,7 +62,10 @@ ekafleet agent [OPTIONS]
 | `--join-token` | | One-time join token for SPIFFE node attestation (preferred; needs `--ca-cert`; env `EKAFLEET_JOIN_TOKEN`) |
 | `--node-id` | *(UUID on first start)* | Node ID to attest as; persisted in `<data-dir>/node-id`; env `EKAFLEET_NODE_ID` |
 | `--data-dir` | `/var/lib/ekafleet` | Data directory for local state |
-| `--ca-cert` | | Path to CA certificate PEM for TLS verification |
+| `--ca-cert` | | Path to CA certificate PEM for TLS verification (also the trust anchor for WireGuard peer adverts) |
+| `--gossip-listen` | `0.0.0.0:7401` | UDP address for SWIM gossip; `off` disables it. Gossip starts when the server sends the key |
+| `--wireguard-endpoint` | | Join the WireGuard mesh, reachable by other nodes at this `ip:port`. Needs a node SVID and `--mesh-index` |
+| `--mesh-index` | | Unique mesh index 1-65534; mesh address `10.100.<index/256>.<index%256>` |
 
 ### `ekafleet ca-signer`
 

@@ -51,8 +51,9 @@ validation checks.
 | Workload Attestation | `src/spiffe/workload_attestor.rs` | Cgroup-only attestation (no env var fallback), PID→service mapping |
 | Raft Storage | `src/raft/storage.rs` | AES-256-GCM encrypted log + snapshots, restore-on-boot |
 | WireGuard Keys | `src/mesh/wireguard.rs` | Private key handling (stdin, never argv), `Zeroizing<String>` |
+| WireGuard Peer Adverts | `src/mesh/advert.rs`, `src/server/peers.rs`, `src/mesh/peers.rs` | Adverts signed with the node SVID key (ECDSA P-256, domain-separated, covers `issued_at`); chain verified to the fleet CA, SPIFFE ID must match `node_id`; server accepts only from that node's mTLS stream, rejects stale/replayed adverts and key/address conflicts; agents re-verify against their pinned CA |
 | OCI Signatures | `src/agent/oci/signature.rs` | Cosign/sigstore image signature verification |
-| Gossip Auth | `src/gossip/` | HMAC-SHA256 on all membership messages |
+| Gossip Auth | `src/gossip/`, `src/agent/gossip.rs` | HMAC-SHA256 over every message field with a shared key derived from the fleet key (HKDF) and handed to agents over the control stream; 30s freshness window; no ping-req. Any agent holding the key can claim any node ID, so gossip membership is advisory: never use it for identity or peer keys |
 | Token Generation | `src/commands.rs` | 256-bit random via `ring::rand::SystemRandom` |
 
 ## Architecture
@@ -89,6 +90,7 @@ src/
 │   ├── federation.rs    # Multi-region cluster federation
 │   ├── rebalance.rs     # Descheduler for workload rebalancing
 │   ├── agent_msg.rs     # Inbound agent message dispatch
+│   ├── peers.rs         # PeerRegistry: verified WireGuard adverts relayed to agents
 │   └── cloud/
 │       ├── mod.rs       # Cloud provider registry
 │       ├── actuator.rs  # Scaling actuator (provision/destroy VMs)
@@ -108,6 +110,7 @@ src/
 │   ├── types.rs         # Agent-side state types (LocalState, NodeIdentity)
 │   ├── helpers.rs       # SVID installation helpers, persistent node ID
 │   ├── join.rs          # Join-token attestation (Attest RPC → node SVID)
+│   ├── gossip.rs        # Starts SWIM from the server's GossipConfig
 │   ├── netns.rs         # Per-namespace network isolation (netns, bridge, veth, VXLAN overlay)
 │   ├── template.rs      # Config file template rendering
 │   ├── exec.rs          # Remote command execution in service cgroups
@@ -156,8 +159,8 @@ src/
 ├── mesh/
 │   ├── mod.rs           # Mesh module
 │   ├── wireguard.rs     # Kernel WireGuard interface management (Zeroizing keys)
-│   ├── peers.rs         # Peer list management
-│   └── advert.rs        # Peer key advertisement with SPIFFE ID verification
+│   ├── peers.rs         # Agent peer set: re-verifies relayed adverts, refuses rollback/conflicts
+│   └── advert.rs        # SVID-signed peer adverts: signing, chain + SPIFFE ID + signature verification
 ├── proxy/
 │   ├── mod.rs           # Proxy module
 │   ├── router.rs        # L7 HTTP reverse proxy
@@ -181,9 +184,9 @@ src/
 │   ├── collector.rs     # Prometheus endpoint scraping
 │   └── node.rs          # Node-level resource metrics (/proc)
 ├── gossip/
-│   ├── mod.rs           # Gossip module
-│   ├── swim.rs          # SWIM protocol implementation
-│   └── catalog.rs       # Service catalog propagation (namespace-scoped)
+│   ├── mod.rs           # Gossip module, cluster key derivation from the fleet key
+│   ├── swim.rs          # SWIM membership (HMAC-authenticated, runs on server and agents)
+│   └── catalog.rs       # Service catalog propagation (namespace-scoped; not yet wired in)
 ├── raft/
 │   ├── mod.rs           # Raft module
 │   ├── state.rs         # FleetStateMachine (deployments, secrets, DNS, KV, cloud instances, namespace IPs)
@@ -228,8 +231,8 @@ tests/
 - Auth: `Bearer <token>` in `authorization` header, or mTLS with SPIFFE SVID (SPIFFE ID extracted from peer cert SAN, mapped to role: `/server/*`→Admin, `/agent/*`→Operator)
 - RBAC: every handler calls `require_permission()` — see `Permission` enum in `rbac.rs`
 - Proto module carries `#![allow(clippy::result_large_err)]` in `lib.rs`
-- `ServerMessage` has 19 variants: 10 fire-and-forget + 9 correlated commands
-- `AgentMessage` has 8 variants: 7 reports + `AgentCommandResponse` (with nested result oneof)
+- `ServerMessage` has 21 variants: 11 fire-and-forget (including `GossipConfig`) + 10 correlated commands
+- `AgentMessage` has 9 variants: 7 reports + `PeerAdvert` + `AgentCommandResponse` (with nested result oneof)
 - Request-response pattern: server sends command with `correlation_id`, agent returns
   `AgentCommandResponse` with the same ID. Correlation managed by `FleetState::send_command()`
 
