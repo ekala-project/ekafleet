@@ -25,7 +25,7 @@ Status legend: **Done** = implemented, wired into the runtime, and tested ·
 | P1.1 Event-driven reconcile | **Partial** | Trigger exists, but the loop only runs during `apply --follow` |
 | P1.2 Workload attestation env var | Done | Cgroup-only attestation |
 | P1.3 Node attestation is TOFU | **Partial** | Join-token flow wired end to end (create → Attest → node SVID → mTLS); no node SVID renewal; no TPM or instance binding |
-| P1.4 WireGuard keys / gossip | **Partial** | Gossip runs on server and agents (HMAC key from the fleet key, handed out over mTLS); nothing signs or sends WireGuard adverts yet |
+| P1.4 WireGuard keys / gossip | **Partial** | SVID-signed WireGuard adverts are verified and relayed by the server and re-verified by agents; gossip runs with a shared HMAC key; mesh addresses are assigned by hand |
 | P1.5 Non-NixOS support | **Partial** | Example + `nix profile` fallback; no VM/container test |
 | P1.6 Generation retention | Done | `GenerationRetention` + module options (one bug: combining both bounds fails) |
 | P2.1 Promote/fail RPCs | Done | Pending-canary registry, real promote/fail |
@@ -173,36 +173,44 @@ in the same file.
 - There is no hardware or instance binding: no TPM, cloud instance-identity
   document, or host-key attestor.
 
-### P1.4 WireGuard peer keys are not identity-bound; gossip is plaintext — **Partial**
+### P1.4 WireGuard peer keys are identity-bound; gossip uses a shared key — **Partial**
 
-**Exists** (commit 060a672): `src/mesh/advert.rs` provides `sign_advert` and
-`verify_advert`. An ECDSA P-256 signature from the node SVID covers
-`(node_id, public_key, endpoint, allowed_ip)`, and the cert's SPIFFE URI SAN must
-match `spiffe://<domain>/agent/<node_id>`. `PeerManager::apply_update`
-(`src/mesh/peers.rs:45`) drops unsigned or forged adverts. `WireguardPeer` carries
-`signature` / `signing_cert_pem` (`proto/fleet.proto`). Unit tests are in
-`advert.rs`: tampering, identity mismatch, wrong domain, and a foreign cert.
+**Done**:
+- Agents run with `--wireguard-endpoint ip:port --mesh-index N` (module:
+  `services.ekafleet.agent.wireguard`). The agent brings up `wg-fleet`, then
+  signs an advert `(node_id, public_key, endpoint, allowed_ip, issued_at)` with
+  its node SVID key (ECDSA P-256, domain-separated by
+  `ekafleet-wireguard-advert-v1`), attaches its SVID chain and sends it as
+  `AgentMessage::PeerAdvert` (`src/agent/mod.rs`, `src/mesh/advert.rs`).
+- The server (`src/server/peers.rs`) accepts an advert only from an mTLS stream
+  whose SVID names the advertised node (bearer-token streams are refused). It
+  checks that the SVID chains to the fleet CA, the SPIFFE ID matches, the
+  signature is valid, `issued_at` is fresh and newer than the node's last
+  advert, the address is a single `/32`, and the key and address are not
+  another node's. It then relays the full set as `PeerUpdate`, and withdraws
+  a node's advert when its stream ends.
+- Agents re-verify every relayed advert against their pinned `--ca-cert` and
+  the trust domain from their own SVID (no longer hardcoded), skip their own,
+  refuse older adverts per node and duplicate keys or addresses, and then
+  configure WireGuard (`src/mesh/peers.rs`).
+- Gossip runs: the server starts SWIM on UDP `--gossip-listen` (default
+  `0.0.0.0:7401`) with an HMAC key derived from the fleet key and sends it to
+  agents over the control stream (`ServerMessage::GossipConfig`).
+- Tests: unit tests for verification (unsigned, tampered fields, self-signed
+  and foreign-CA certs, another node's SVID, server SVIDs, expiry, malformed
+  fields), the server registry and the agent's selection; `tests/peers.rs`
+  against the real server; `server-agent.nix` brings up a two-node mesh and
+  pings across it.
 
 **Remaining**:
-- Nothing calls `sign_advert` outside tests, and the server never builds a
-  `ServerPayload::Peers` message. The only handler is on the agent side
-  (`src/agent/handlers.rs:343`), so peer distribution is not wired at all, signed
-  or unsigned.
-- The agent constructs `PeerManager` with a hardcoded `"fleet.internal"` trust
-  domain (`src/agent/mod.rs:155`) instead of the fleet's domain.
-- Gossip runs: the server starts SWIM on UDP `--gossip-listen` (default
-  `0.0.0.0:7401`). It derives the HMAC-SHA256 cluster key from the fleet key with
-  HKDF (`gossip::derive_cluster_key`) and sends it, with the alive member list, to
-  each agent over the authenticated control stream (`ServerMessage::GossipConfig`).
-  The agent starts SWIM on the first config and swaps the key on rotation. Messages
-  carry a timestamp (30s window) and node ID under the HMAC, so stale replays and
-  tampering are dropped. `server-agent.nix` checks a two-VM gossip join.
-- Gossip is still authenticated only by a shared key, not encrypted and not bound
-  to node SVIDs. Any holder of the key (every connected agent) can claim any
-  node ID in gossip. Gossip membership is therefore advisory and must not be used
-  for authorization or peer keys. `ServiceCatalog` is still not wired in.
-- Remaining work: server-side peer distribution over the mTLS control channel and
-  agent-side signing with its SVID; optionally, per-node gossip identity.
+- Mesh addresses come from a hand-assigned `--mesh-index`; the server does
+  not allocate them (it does refuse duplicates).
+- Adverts are re-signed only when the agent connects. Node SVIDs last 1h and
+  are not renewed (P1.3), so a long-lived advert stops verifying when its SVID
+  expires.
+- Gossip is authenticated only by a shared key: any agent can claim any node
+  ID in gossip. It is advisory and is not used for peer keys. It is not
+  encrypted. `ServiceCatalog` is not wired in.
 
 ### P1.5 Non-NixOS-with-Nix support is claimed but does not exist — **Partial**
 
@@ -443,8 +451,7 @@ Follow-ups:
    3-node test remain.
 3. **P1.1**: run reconciliation as a server-owned task, not only under
    `apply --follow`.
-4. **P1.3 / P1.4**: wire join-token attestation and signed peer distribution end
-   to end, then add hardware/instance attestation and identity-bound or encrypted
-   gossip.
+4. **P1.3 / P1.4**: SVID renewal and server-allocated mesh addresses, then
+   hardware/instance attestation and identity-bound or encrypted gossip.
 5. Remaining Partial P1/P2 items (P1.6 dual-bound bug, P2.2 true blue-green, P2.7
    default to `evalFleet`, P2.8/P2.9 UX), then tests for each.

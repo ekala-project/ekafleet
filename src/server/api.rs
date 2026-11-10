@@ -73,6 +73,11 @@ pub struct FleetControlService {
     pub(super) audit_log: super::audit::AuditLog,
     /// Gossip membership, when enabled; agents get its key and seeds.
     pub(super) gossip: Option<ServerGossip>,
+    /// Verified WireGuard peer adverts, relayed to all agents. Present once
+    /// the trust bundle is known (see `with_cert_issuer`).
+    pub(super) peers: Option<Arc<super::peers::PeerRegistry>>,
+    /// Counter identifying control-stream connections.
+    pub(super) next_conn: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl FleetControlService {
@@ -109,6 +114,8 @@ impl FleetControlService {
             token_store,
             audit_log: super::audit::AuditLog::new(),
             gossip: None,
+            peers: None,
+            next_conn: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         }
     }
 
@@ -208,6 +215,12 @@ impl FleetControlService {
     /// Configure the service with a certificate issuer for SPIFFE SVID issuance.
     pub fn with_cert_issuer(mut self, issuer: CertIssuer, trust_bundle_pem: String) -> Self {
         self.cert_issuer = Some(issuer);
+        match crate::mesh::advert::AdvertVerifier::new(&trust_bundle_pem, &self.domain) {
+            Ok(verifier) => {
+                self.peers = Some(Arc::new(super::peers::PeerRegistry::new(verifier)));
+            }
+            Err(e) => tracing::error!(error = %e, "Peer adverts disabled: bad trust bundle"),
+        }
         self.trust_bundle_pem = Some(trust_bundle_pem);
         self
     }
@@ -362,6 +375,11 @@ impl FleetControl for FleetControlService {
                 let _ = self.state.send_to_agent(&node_id, msg).await;
             }
         }
+        // Current WireGuard peers, so the new agent can reach the mesh.
+        if let Some(peers) = &self.peers {
+            let msg = peer_update(peers.snapshot().await);
+            let _ = self.state.send_to_agent(&node_id, msg).await;
+        }
 
         // Process the first message
         self.process_message(&node_id, first_msg).await;
@@ -371,9 +389,26 @@ impl FleetControl for FleetControlService {
         let nid = node_id.clone();
         let issuer = self.cert_issuer.clone();
         let metrics = self.metrics.clone();
+        let peers = self.peers.clone();
+        let conn = self
+            .next_conn
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tokio::spawn(async move {
             loop {
                 match inbound.message().await {
+                    Ok(Some(AgentMessage {
+                        payload: Some(Payload::PeerAdvert(advert)),
+                    })) => {
+                        handle_peer_advert(
+                            &state,
+                            peers.as_deref(),
+                            svid_node_id.as_deref(),
+                            &nid,
+                            conn,
+                            advert,
+                        )
+                        .await;
+                    }
                     Ok(Some(msg)) => {
                         super::agent_msg::process_agent_message(
                             &state,
@@ -395,6 +430,12 @@ impl FleetControl for FleetControlService {
                 }
             }
             state.deregister_agent(&nid).await;
+            if let Some(peers) = &peers
+                && peers.remove(&nid, conn).await
+            {
+                tracing::info!(node_id = %nid, "WireGuard peer advert withdrawn");
+                broadcast_peers(&state, peers).await;
+            }
         });
 
         // Wrap rx in a stream of Result<ServerMessage, Status>
@@ -2261,6 +2302,50 @@ pub fn agent_node_id<'a>(spiffe_id: &'a str, domain: &str) -> Option<&'a str> {
         .strip_prefix(domain)?
         .strip_prefix("/agent/")?;
     (!node_id.is_empty() && !node_id.contains('/')).then_some(node_id)
+}
+
+fn peer_update(peers: Vec<crate::proto::WireguardPeer>) -> ServerMessage {
+    ServerMessage {
+        payload: Some(ServerPayload::Peers(crate::proto::PeerUpdate { peers })),
+    }
+}
+
+/// Send the full set of verified adverts to every connected agent.
+async fn broadcast_peers(state: &FleetState, peers: &super::peers::PeerRegistry) {
+    let snapshot = peers.snapshot().await;
+    for node in state.connected_nodes().await {
+        let _ = state
+            .send_to_agent(&node, peer_update(snapshot.clone()))
+            .await;
+    }
+}
+
+/// Verify and record an agent's WireGuard advert, then relay the new peer set.
+async fn handle_peer_advert(
+    state: &FleetState,
+    peers: Option<&super::peers::PeerRegistry>,
+    svid_node_id: Option<&str>,
+    node_id: &str,
+    conn: u64,
+    advert: crate::proto::WireguardPeer,
+) {
+    let Some(peers) = peers else {
+        tracing::warn!(node_id = %node_id, "Ignoring WireGuard peer advert: no trust bundle");
+        return;
+    };
+    let advert_node = advert.node_id.clone();
+    match peers.accept(svid_node_id, conn, advert).await {
+        Ok(()) => {
+            tracing::info!(node_id = %node_id, "WireGuard peer advert accepted");
+            broadcast_peers(state, peers).await;
+        }
+        Err(e) => tracing::warn!(
+            node_id = %node_id,
+            advert_node_id = %advert_node,
+            error = %e,
+            "Rejected WireGuard peer advert"
+        ),
+    }
 }
 
 /// Tag requests for the `Attest` RPC with [`AttestRoute`].

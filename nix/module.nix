@@ -171,6 +171,29 @@ in
         '';
       };
 
+      wireguard = {
+        endpoint = lib.mkOption {
+          type = lib.types.nullOr lib.types.str;
+          default = null;
+          example = "203.0.113.7:51820";
+          description = ''
+            Join the WireGuard mesh, reachable by other nodes at this
+            `ip:port`. The agent advertises its WireGuard key signed with its
+            node SVID, so it must have joined with a join token. `null`
+            leaves WireGuard untouched. Open the UDP port in the firewall.
+          '';
+        };
+
+        meshIndex = lib.mkOption {
+          type = lib.types.nullOr (lib.types.ints.between 1 65534);
+          default = null;
+          description = ''
+            Unique index of this node in the mesh; its mesh address is
+            `10.100.<index / 256>.<index % 256>`. Required with `endpoint`.
+          '';
+        };
+      };
+
       keepGenerations = lib.mkOption {
         type = lib.types.ints.unsigned;
         default = 10;
@@ -289,8 +312,20 @@ in
 
     # ── Agent-side: agent + workload-api + proxy ─────────────────────
     (lib.mkIf cfg.agent.enable {
+      assertions = [
+        {
+          assertion = (cfg.agent.wireguard.endpoint == null) == (cfg.agent.wireguard.meshIndex == null);
+          message = "services.ekafleet.agent.wireguard.endpoint and meshIndex must be set together.";
+        }
+      ];
+
       systemd.services.ekafleet-agent = {
         description = "ekafleet data plane agent";
+        # `ip` and `wg` set up the WireGuard mesh interface.
+        path = [
+          pkgs.iproute2
+          pkgs.wireguard-tools
+        ];
         wantedBy = [ "multi-user.target" ];
         after = [ "network-online.target" ];
         wants = [ "network-online.target" ];
@@ -299,13 +334,16 @@ in
           let
             caCertArg = lib.optionalString (cfg.agent.caCert != null) "--ca-cert ${cfg.agent.caCert}";
             tokenArg = lib.optionalString (cfg.agent.token != "") "--token ${cfg.agent.token}";
+            wgArg = lib.optionalString (
+              cfg.agent.wireguard.endpoint != null
+            ) "--wireguard-endpoint ${cfg.agent.wireguard.endpoint} --mesh-index ${toString cfg.agent.wireguard.meshIndex}";
           in
           {
             Type = "simple";
             Restart = "on-failure";
             RestartSec = 5;
 
-            ExecStart = "${cfg.agent.package}/bin/ekafleet agent --join ${cfg.agent.serverAddr} --data-dir ${cfg.agent.dataDir} --gossip-listen ${cfg.agent.gossipListen} ${tokenArg} ${caCertArg}";
+            ExecStart = "${cfg.agent.package}/bin/ekafleet agent --join ${cfg.agent.serverAddr} --data-dir ${cfg.agent.dataDir} --gossip-listen ${cfg.agent.gossipListen} ${tokenArg} ${caCertArg} ${wgArg}";
 
             # The agent requires root for systemd unit management,
             # WireGuard, nftables, and systemd-nspawn containers.

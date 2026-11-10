@@ -106,6 +106,10 @@ pub(super) async fn process_agent_message(
             );
             state.complete_request(&cid, resp).await;
         }
+        Some(Payload::PeerAdvert(_)) => {
+            // Handled in `stream_control`, which knows the stream's SVID.
+            tracing::warn!(node_id = %node_id, "Peer advert outside a control stream ignored");
+        }
         None => {}
     }
 }

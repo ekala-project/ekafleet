@@ -167,8 +167,19 @@ pub struct AgentConfig {
     /// UDP address for gossip; `None` disables it. Gossip starts once the
     /// server sends the cluster key.
     pub gossip_listen: Option<std::net::SocketAddr>,
+    /// Join the WireGuard mesh; `None` leaves WireGuard untouched.
+    pub wireguard: Option<WireguardConfig>,
     pub data_dir: PathBuf,
     pub ca_cert_pem: Option<String>,
+}
+
+/// WireGuard mesh settings for this agent.
+#[derive(Debug, Clone, Copy)]
+pub struct WireguardConfig {
+    /// Address other nodes use to reach this node's WireGuard port.
+    pub endpoint: std::net::SocketAddr,
+    /// Unique index that determines this node's mesh address.
+    pub mesh_index: u16,
 }
 
 /// Tracks local desired state as received from server.

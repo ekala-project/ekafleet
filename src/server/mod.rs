@@ -8,6 +8,7 @@ pub mod events;
 pub mod federation;
 pub mod namespace;
 pub mod nix;
+pub mod peers;
 pub mod policy;
 pub mod quota;
 pub mod rbac;

@@ -118,6 +118,10 @@ message AgentMessage {
     Nack nack = 6;
     NodeAttestationResponse attest_response = 7;
     AgentCommandResponse command_response = 8;
+    // This node's signed WireGuard advertisement. Accepted only on an
+    // mTLS stream whose SVID names `node_id`; the server verifies it and
+    // relays it to the other agents in `PeerUpdate`.
+    WireguardPeer peer_advert = 9;
   }
 }
 
@@ -580,6 +584,8 @@ message CertificateResponse {
   string service_name = 4;  // Which service/identity this certificate is for.
 }
 
+// The complete set of verified peer adverts. Receivers replace their peer
+// set with it (peers missing from it are removed).
 message PeerUpdate {
   repeated WireguardPeer peers = 1;
 }
@@ -589,13 +595,17 @@ message WireguardPeer {
   string public_key = 2;
   string endpoint = 3;
   string allowed_ip = 4;
-  // ASN.1/DER ECDSA-P256 signature over the canonical advertisement bytes
-  // (node_id || public_key || endpoint || allowed_ip), produced with the
-  // advertising node's SVID private key. Empty if unsigned (legacy/dev).
+  // ASN.1/DER ECDSA-P256 signature, made with the advertising node's SVID
+  // private key, over "ekafleet-wireguard-advert-v1" followed by
+  // length-prefixed node_id, public_key, endpoint, allowed_ip and then
+  // issued_at (u64 big-endian). Unsigned adverts are rejected.
   bytes signature = 5;
-  // PEM of the advertising node's SVID certificate, used to verify `signature`
-  // and to bind `public_key` to the node's SPIFFE identity.
+  // PEM of the advertising node's SVID leaf followed by its intermediates.
+  // It must chain to the fleet CA and name spiffe://<domain>/agent/<node_id>.
   string signing_cert_pem = 6;
+  // Unix milliseconds when the advert was signed. Must increase per node, so
+  // an older advert cannot replace a newer one.
+  uint64 issued_at = 7;
 }
 
 message PolicyUpdate {

@@ -4,7 +4,8 @@
 # it as an agent with a one-time join token. Covers token creation over the
 # API, join-token attestation, mTLS with the issued node SVID, a stable node ID
 # across restarts, token replay rejection, SWIM gossip between the two
-# machines, and HTTP API access across machines.
+# machines, SVID-signed WireGuard peer distribution with traffic over the
+# mesh, and HTTP API access across machines.
 pkgs.testers.nixosTest {
   name = "ekafleet-server-agent";
 
@@ -23,20 +24,31 @@ pkgs.testers.nixosTest {
         7400
         7402
       ];
-      networking.firewall.allowedUDPPorts = [ 7401 ];
+      networking.firewall.allowedUDPPorts = [
+        7401
+        51820
+      ];
 
-      environment.systemPackages = [ pkgs.jq ];
+      environment.systemPackages = [
+        pkgs.ekaos-fleet
+        pkgs.jq
+        pkgs.wireguard-tools
+      ];
     };
 
   nodes.client =
     { ... }:
     {
       nixpkgs.overlays = [ (import ../overlay.nix) ];
-      networking.firewall.allowedUDPPorts = [ 7401 ];
+      networking.firewall.allowedUDPPorts = [
+        7401
+        51820
+      ];
       environment.systemPackages = [
         pkgs.ekaos-fleet
         pkgs.jq
         pkgs.openssl
+        pkgs.wireguard-tools
       ];
     };
 
@@ -71,6 +83,8 @@ pkgs.testers.nixosTest {
     ca_pem = server.succeed("cat /var/lib/ekafleet/ca-cert.pem")
     client.succeed(f"mkdir -p /etc/ekafleet && cat > /etc/ekafleet/ca.pem <<'EOF'\n{ca_pem}EOF")
     server_ip = client.succeed("getent ahostsv4 server | head -n1 | cut -d' ' -f1").strip()
+    # Resolve each machine from the other: a host's own name may map to 127.0.0.2.
+    client_ip = server.succeed("getent ahostsv4 client | head -n1 | cut -d' ' -f1").strip()
     CLI = f"EKAFLEET_TOKEN=cluster-token ekafleet --ca-cert /etc/ekafleet/ca.pem --server {server_ip}:7400"
 
     # Without the admin token, the server refuses to create a join token.
@@ -163,6 +177,50 @@ pkgs.testers.nixosTest {
         f"curl -sf {AUTH} "
         "-o /dev/null -w '%{http_code}' "
         "http://server:7402/metrics | grep -q '200'"
+    )
+
+    # WireGuard mesh: a second agent runs on the server machine. Each agent
+    # advertises its WireGuard key signed with its node SVID; the server
+    # verifies and relays the adverts, and each agent verifies them again
+    # before installing the peer.
+    SERVER_CLI = (
+        "EKAFLEET_TOKEN=cluster-token ekafleet --ca-cert /var/lib/ekafleet/ca-cert.pem "
+        "--server 127.0.0.1:7400"
+    )
+    mesh_token = server.succeed(f"{SERVER_CLI} token create --node-id mesh-1").strip()
+    server.succeed(
+        f"systemd-run --unit=ekafleet-mesh-agent -E PATH=/run/current-system/sw/bin "
+        f"-E EKAFLEET_JOIN_TOKEN={mesh_token} "
+        "ekafleet agent --join 127.0.0.1:7400 --ca-cert /var/lib/ekafleet/ca-cert.pem "
+        "--data-dir /var/lib/ekafleet-mesh-agent --node-id mesh-1 --gossip-listen off "
+        f"--wireguard-endpoint {server_ip}:51820 --mesh-index 1"
+    )
+    client.succeed("systemctl stop ekafleet-rejoin")
+    client.succeed(
+        f"systemd-run --unit=ekafleet-mesh -E PATH=/run/current-system/sw/bin {AGENT} "
+        f"--wireguard-endpoint {client_ip}:51820 --mesh-index 2"
+    )
+
+    server.wait_until_succeeds(
+        "journalctl -u ekafleet-server | grep -q 'WireGuard peer advert accepted node_id=mesh-1'",
+        timeout=60,
+    )
+    server.wait_until_succeeds(
+        f"journalctl -u ekafleet-server | grep -q 'WireGuard peer advert accepted node_id={node_id}'",
+        timeout=60,
+    )
+    client_key = client.succeed("wg show wg-fleet public-key").strip()
+    server_key = server.succeed("wg show wg-fleet public-key").strip()
+    server.wait_until_succeeds(f"wg show wg-fleet peers | grep -qF '{client_key}'", timeout=60)
+    client.wait_until_succeeds(f"wg show wg-fleet peers | grep -qF '{server_key}'", timeout=60)
+    # Traffic flows over the mesh addresses.
+    client.wait_until_succeeds("ping -c1 -W2 10.100.0.1", timeout=60)
+    server.succeed("ping -c1 -W2 10.100.0.2")
+
+    # When an agent leaves, its peer is withdrawn from the others.
+    server.succeed("systemctl stop ekafleet-mesh-agent")
+    client.wait_until_succeeds(
+        f"! wg show wg-fleet peers | grep -qF '{server_key}'", timeout=60
     )
   '';
 }
