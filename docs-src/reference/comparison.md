@@ -58,7 +58,7 @@ ekafleet is a single binary that consolidates capabilities from 10+ separate too
 |---------|----------|------------|-------|-------|
 | Rolling updates | **Yes** | **Yes** | **Yes** | maxParallel batch sizing |
 | Canary deployments | **Yes** | *Partial* (manual) | **Yes** | Auto-promote when healthy |
-| Blue-green deployments | **Yes** | *Partial* (via Argo) | **Yes** | Deploy all, then switch traffic |
+| Blue-green deployments | *Partial* | *Partial* (via Argo) | **Yes** | All-or-nothing in-place cutover: deploy to every node, health-gate, roll all back on failure. No parallel blue/green instances or traffic switch yet |
 | Health-gated progression | **Yes** | **Yes** (readiness) | **Yes** | minHealthyTime + healthyDeadline |
 | Auto-revert on failure | **Yes** | **Yes** (rollback) | **Yes** | Automatic rollback to previous version |
 | Progress deadline | **Yes** | **Yes** | No | Overall deployment timeout |
@@ -113,7 +113,7 @@ ekafleet is a single binary that consolidates capabilities from 10+ separate too
 | External service registration | **Yes** | **Yes** (ExternalName) | **Yes** | Non-fleet services in DNS catalog |
 | Distributed tracing | **Yes** | No (needs Istio) | **Yes** (via Envoy) | W3C Trace Context propagation |
 | mTLS enforcement | **Yes** | No (needs Istio) | **Yes** | SPIFFE ID-based caller authorization |
-| Gossip-based discovery | **Yes** | No | **Yes** (Serf) | SWIM protocol for agent-to-agent |
+| Gossip-based discovery | *Partial* | No | **Yes** (Serf) | SWIM + catalog implemented in `src/gossip/` but not yet started by server or agent |
 | Multi-region federation | **Yes** | *Partial* (Federation v2) | **Yes** (WAN) | Cross-cluster service discovery |
 
 ## Security & Identity
@@ -124,7 +124,7 @@ ekafleet is a single binary that consolidates capabilities from 10+ separate too
 | Audit logging | **Yes** | **Yes** | **Yes** | Structured control-plane action trail |
 | SPIFFE X.509-SVIDs | **Yes** | No (needs SPIRE) | No (needs SPIRE) | Native SPIFFE identity for every workload |
 | SPIFFE Workload API | **Yes** | No (needs SPIRE) | No (needs SPIRE) | Standard UDS-based API for SVID delivery |
-| Node attestation | **Yes** | **Yes** (kubelet) | **Yes** (Consul) | Join token attestation (one-time use) |
+| Node attestation | *Partial* | **Yes** (kubelet) | **Yes** (Consul) | One-time join tokens (persisted, replay-audited, rate-limited); agent join flow not yet wired; no TPM/cloud instance attestation |
 | mTLS everywhere | **Yes** | No (needs Istio) | **Yes** (Connect) | Agent-server and service-to-service |
 | Identity contracts | **Yes** | No (needs NetworkPolicy) | **Yes** (Intentions) | allowedCallers/allowedTargets per service |
 | Trust domain federation | **Yes** | No (needs SPIRE) | No (needs SPIRE) | Cross-cluster SPIFFE trust |
@@ -195,7 +195,7 @@ ekafleet is a single binary that consolidates capabilities from 10+ separate too
 | Feature | ekafleet | Kubernetes | Nomad + Consul | Notes |
 |---------|----------|------------|----------------|-------|
 | Consensus (server HA) | *Planned* | **Yes** (etcd/Raft) | **Yes** (Raft) | Single-node with durable state; multi-node Raft planned |
-| Gossip protocol | **Yes** (SWIM) | No | **Yes** (Serf/SWIM) | Failure detection, catalog propagation |
+| Gossip protocol | *Partial* (SWIM) | No | **Yes** (Serf/SWIM) | HMAC-authenticated SWIM implemented; not yet started at runtime |
 | Leader election | *Planned* | **Yes** (etcd) | **Yes** (Raft) | `--peers` parsed, not yet wired |
 | Graceful degradation | **Yes** | **Yes** | **Yes** | Agents continue when server unreachable |
 | State snapshots | **Yes** | **Yes** (etcd backup) | **Yes** (snapshot) | Raft snapshot/restore |
@@ -229,7 +229,7 @@ ekafleet is a single binary that consolidates capabilities from 10+ separate too
 | Binary size | ~5 MB (static musl) | ~100 MB+ (control plane) | ~100 MB | Single binary, no dependencies |
 | Runtime dependencies | None | Container runtime, etcd | None | No JVM, no interpreters |
 | OS deployment | **Yes** (Nix closures) | No | No | Full system activation (switch/boot/test) |
-| Reconciliation model | Continuous (30s) | Continuous | Evaluation-based | Terraform-inspired eval→plan→apply loop |
+| Reconciliation model | Periodic (30s) + event-triggered | Continuous | Evaluation-based | Terraform-inspired eval→plan→apply loop; runs while `apply --follow` is active; node eviction, agent disconnect, and service failure trigger an immediate pass |
 | Package management | Nix store | Container images | Artifacts | Reproducible builds via Nix |
 
 ---

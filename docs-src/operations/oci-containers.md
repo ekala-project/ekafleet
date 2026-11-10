@@ -172,7 +172,7 @@ Supported key types:
 
 Signature verification is a gate in the pull pipeline -- if verification fails, no layers are downloaded and the service is not started.
 
-Keyless verification (Sigstore Fulcio/Rekor) is not yet supported.
+Keyless verification (Sigstore Fulcio certificate chain, with optional Rekor inclusion) is also supported as an alternative to a static public key.
 
 ## Rollback Retention
 
@@ -192,7 +192,7 @@ Containers run with a hardened security profile:
 
 - **No bridge networking** -- containers use host networking only. Private container networks are not supported.
 - **No rootless containers** -- systemd-nspawn runs as root. Workload isolation relies on cgroup v2 resource controls, capability dropping, seccomp filtering, and namespace separation.
-- **No keyless signature verification** -- cosign static key verification is supported, but Sigstore keyless (Fulcio/Rekor) and Notation (CNCF Notary v2) are not yet implemented.
+- **No Notation signatures** -- cosign static-key and Sigstore keyless (Fulcio/Rekor) verification are supported, but Notation (CNCF Notary v2) is not yet implemented.
 
 ## Nix-Built Container Images
 

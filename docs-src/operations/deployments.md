@@ -41,7 +41,9 @@ update = {
 
 ### Blue-Green
 
-Deploys all new instances simultaneously. Once all are healthy, traffic switches from old to new.
+Deploys the new version to every target node at once and waits for all instances to become healthy. If any node is unreachable or fails the health gate, every node that received the new version is rolled back to the previous one, so the fleet is never left half-updated.
+
+The update is currently performed in place: the previous (blue) instances are replaced rather than kept running alongside green, and there is no separate traffic-switch step.
 
 ```nix
 update = {

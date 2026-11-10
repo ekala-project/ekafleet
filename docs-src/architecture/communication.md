@@ -131,6 +131,8 @@ Port 7401. Used for:
 
 The gossip layer works independently of the server, providing continued service discovery even during server outages.
 
+> **Status:** the SWIM implementation (`src/gossip/`, HMAC-SHA256 authenticated with a shared cluster key) is not yet started by the server or agent.
+
 ## HTTP API
 
 Port 7402. Public endpoints:
