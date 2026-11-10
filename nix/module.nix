@@ -249,6 +249,10 @@ in
             RestrictRealtime = true;
             ReadWritePaths = [ cfg.server.dataDir ];
             RuntimeDirectory = "ekafleet";
+            # /run/ekafleet is shared with ekafleet-ca-signer, whose socket
+            # lives there. Without this, stopping or restarting the server
+            # deletes the directory and the signer's socket with it.
+            RuntimeDirectoryPreserve = true;
           };
 
         environment = {
