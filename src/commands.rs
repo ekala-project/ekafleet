@@ -217,6 +217,7 @@ pub async fn cmd_agent(
     data_dir: PathBuf,
     ca_cert: Option<PathBuf>,
     gossip_listen: String,
+    wireguard: Option<(std::net::SocketAddr, u16)>,
 ) -> anyhow::Result<()> {
     let ca_cert_pem = match ca_cert {
         Some(path) => Some(std::fs::read_to_string(&path)?),
@@ -229,6 +230,10 @@ pub async fn cmd_agent(
         join_token,
         node_id,
         gossip_listen: parse_gossip_listen(&gossip_listen)?,
+        wireguard: wireguard.map(|(endpoint, mesh_index)| agent::WireguardConfig {
+            endpoint,
+            mesh_index,
+        }),
         data_dir,
         ca_cert_pem,
     };

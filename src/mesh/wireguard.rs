@@ -56,7 +56,9 @@ impl WireguardManager {
         self.private_key =
             Zeroizing::new(String::from_utf8_lossy(&output.stdout).trim().to_string());
 
-        // Create interface
+        // Create interface, replacing one left behind by a previous run (it
+        // holds the old private key).
+        let _ = run_cmd("ip", &["link", "del", &self.interface]).await;
         run_cmd("ip", &["link", "add", &self.interface, "type", "wireguard"]).await?;
 
         // Set private key via stdin (avoid exposing key in process args)

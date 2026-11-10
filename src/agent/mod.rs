@@ -17,7 +17,7 @@ pub mod join;
 mod types;
 
 pub(crate) use helpers::now_epoch;
-pub use types::{AgentConfig, NodeIdentity};
+pub use types::{AgentConfig, NodeIdentity, WireguardConfig};
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -146,8 +146,39 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
     )));
     let health_checker = HealthChecker::new();
     let dns_resolver = Arc::new(DnsResolver::new("fleet.internal", vec![]));
-    let wg_manager = WireguardManager::new("wg-fleet", 51820);
-    let peer_manager = Arc::new(RwLock::new(PeerManager::new(wg_manager, "fleet.internal")));
+    let wg_port = config.wireguard.map_or(51820, |wg| wg.endpoint.port());
+    let wg_manager = WireguardManager::new("wg-fleet", wg_port);
+    let (advert_verifier, svid) = {
+        let ni = node_identity.read().await;
+        let svid = match (&ni.cert_pem, &ni.key_pem, &ni.spiffe_id) {
+            (Some(cert), Some(key), Some(id)) if use_mtls => Some((
+                cert.clone(),
+                key.clone(),
+                spiffe_trust_domain(id).to_string(),
+            )),
+            _ => None,
+        };
+        // Peers are verified against the locally pinned CA certificate, not
+        // the bundle the server pushes, so the server cannot vouch for keys.
+        let verifier = match (&config.ca_cert_pem, &svid) {
+            (Some(ca), Some((_, _, domain))) => {
+                match crate::mesh::advert::AdvertVerifier::new(ca, domain) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Cannot verify WireGuard peers");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        (verifier, svid)
+    };
+    let peer_manager = Arc::new(RwLock::new(PeerManager::new(
+        wg_manager,
+        node_id.as_str(),
+        advert_verifier,
+    )));
     let policy_enforcer = Arc::new(PolicyEnforcer::new());
     let netns_manager = Arc::new(netns::NamespaceNetworkManager::new());
 
@@ -169,6 +200,34 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
         })),
     })
     .await?;
+
+    // Join the WireGuard mesh: bring up the interface and advertise its key,
+    // signed with the node SVID.
+    if let Some(wg) = config.wireguard {
+        match &svid {
+            None => tracing::warn!(
+                "WireGuard mesh needs a node SVID (join with --join-token); not enabling it"
+            ),
+            Some((cert_pem, key_pem, _)) => {
+                let advert = {
+                    let mut pm = peer_manager.write().await;
+                    pm.enable(wg.mesh_index)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("failed to set up WireGuard: {e}"))?;
+                    signed_advert(&node_id, pm.wireguard(), wg.endpoint, cert_pem, key_pem).await?
+                };
+                tracing::info!(
+                    mesh_ip = %advert.allowed_ip,
+                    endpoint = %advert.endpoint,
+                    "Advertising signed WireGuard peer"
+                );
+                tx.send(AgentMessage {
+                    payload: Some(Payload::PeerAdvert(advert)),
+                })
+                .await?;
+            }
+        }
+    }
 
     // Open bidirectional stream
     let response = client.stream_control(ReceiverStream::new(rx)).await?;
@@ -406,6 +465,40 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// The trust domain of a SPIFFE ID (`spiffe://<domain>/...`).
+fn spiffe_trust_domain(spiffe_id: &str) -> &str {
+    let rest = spiffe_id.strip_prefix("spiffe://").unwrap_or(spiffe_id);
+    rest.split('/').next().unwrap_or(rest)
+}
+
+/// Build this node's WireGuard advert and sign it with the node SVID.
+async fn signed_advert(
+    node_id: &str,
+    wg: &WireguardManager,
+    endpoint: std::net::SocketAddr,
+    svid_cert_pem: &str,
+    svid_key_pem: &str,
+) -> anyhow::Result<crate::proto::WireguardPeer> {
+    let public_key = wg
+        .public_key()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to read WireGuard public key: {e}"))?;
+    let issued_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis() as u64;
+    let mut advert = crate::proto::WireguardPeer {
+        node_id: node_id.to_string(),
+        public_key,
+        endpoint: endpoint.to_string(),
+        allowed_ip: format!("{}/32", wg.mesh_ip()),
+        issued_at,
+        ..Default::default()
+    };
+    let key_der = crate::mesh::advert::pkcs8_der_from_pem(svid_key_pem)?;
+    crate::mesh::advert::sign_advert(&mut advert, svid_cert_pem, &key_der)?;
+    Ok(advert)
 }
 
 /// Connect to the server at `server_addr`.

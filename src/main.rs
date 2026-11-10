@@ -175,6 +175,17 @@ enum Command {
         /// Gossip starts once the server sends the cluster key.
         #[arg(long, default_value = "0.0.0.0:7401")]
         gossip_listen: String,
+
+        /// Join the WireGuard mesh, reachable by other nodes at this
+        /// `ip:port` (the port is also the local WireGuard listen port).
+        /// Requires a node SVID and `--mesh-index`.
+        #[arg(long, requires = "mesh_index")]
+        wireguard_endpoint: Option<std::net::SocketAddr>,
+
+        /// This node's index in the mesh (1-65534); its mesh address is
+        /// 10.100.<index / 256>.<index % 256>. Must be unique in the fleet.
+        #[arg(long, requires = "wireguard_endpoint", value_parser = clap::value_parser!(u16).range(1..65535))]
+        mesh_index: Option<u16>,
     },
 
     /// Show desired-vs-actual diff
@@ -895,6 +906,8 @@ async fn main() -> anyhow::Result<()> {
             data_dir,
             ca_cert,
             gossip_listen,
+            wireguard_endpoint,
+            mesh_index,
         } => {
             commands::cmd_agent(
                 join,
@@ -904,6 +917,7 @@ async fn main() -> anyhow::Result<()> {
                 data_dir,
                 ca_cert,
                 gossip_listen,
+                wireguard_endpoint.zip(mesh_index),
             )
             .await?
         }
