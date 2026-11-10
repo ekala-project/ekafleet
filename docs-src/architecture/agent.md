@@ -22,9 +22,9 @@ Start with `ekafleet agent --join <server>:7400 --join-token <TOKEN> --ca-cert <
 
 ## Connection Lifecycle
 
-1. Agent validates server address and generates a persistent node ID (`<data-dir>/node-id`)
+1. Agent validates server address and loads or creates its persistent node ID (`<data-dir>/node-id`; `--node-id` on first start, otherwise a UUID)
 2. Loads persisted node SVID if available (from previous attestation)
-3. If no node SVID and `--join-token` provided: calls `Attest` RPC to bootstrap SPIFFE identity
+3. If there is no valid node SVID for this node ID and `--join-token` is provided: calls `Attest` over server-authenticated TLS to obtain one, and persists it
 4. Opens a mTLS gRPC connection using node SVID as client certificate (or falls back to bearer token with `--token`)
 5. Sends initial heartbeat to identify itself
 6. Receives trust bundle (CA certificate) and fleet encryption key from server

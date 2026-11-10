@@ -68,6 +68,9 @@ service FleetControl {
   // Fail a stuck deployment (triggers rollback).
   rpc FailDeployment(FailDeploymentRequest) returns (FailDeploymentResponse);
 
+  // Register a one-time join token that a new agent presents to Attest.
+  rpc CreateJoinToken(CreateJoinTokenRequest) returns (CreateJoinTokenResponse);
+
   // Create an ACL token.
   rpc CreateACLToken(CreateACLTokenRequest) returns (CreateACLTokenResponse);
 
@@ -599,7 +602,11 @@ message NetworkPolicy {
 message NodeAttestationRequest {
   string attestation_type = 1;  // "join_token", "nix_store_path", "tpm"
   bytes attestation_data = 2;   // Type-specific payload (e.g., the join token)
-  bytes csr = 3;                // PKCS#10 CSR for the node SVID
+  bytes csr = 3;                // Reserved: PKCS#10 CSR for the node SVID (not yet used)
+  // The agent's stable node ID (persisted in `<data-dir>/node-id`). It becomes
+  // the SPIFFE ID path `spiffe://<domain>/agent/<node_id>`. A token bound to a
+  // node ID only attests that ID.
+  string node_id = 4;
 }
 
 // Server-initiated challenge (e.g., TPM nonce) sent during attestation.
@@ -620,6 +627,8 @@ message NodeAttestationResult {
   bytes trust_bundle = 4;       // CA trust bundle PEM
   string error_message = 5;
   string trust_domain = 6;      // Trust domain for SPIFFE IDs
+  string node_id = 7;           // Node ID bound into the issued SVID
+  uint64 expires_at = 8;        // Node SVID expiry (unix seconds)
 }
 
 // Fleet encryption key distributed to agents over mTLS channel.
@@ -936,6 +945,21 @@ message FailDeploymentRequest {
 message FailDeploymentResponse {
   bool success = 1;
   string message = 2;
+}
+
+// --- Join Tokens ---
+
+message CreateJoinTokenRequest {
+  // Optional node ID to bind the token to. When set, only an agent presenting
+  // this node ID can consume the token. Empty means unbound.
+  string node_id = 1;
+}
+
+message CreateJoinTokenResponse {
+  string token = 1;
+  // Unix time after which the server discards the unused token.
+  uint64 expires_at = 2;
+  string node_id = 3;
 }
 
 // --- ACL Token Management ---

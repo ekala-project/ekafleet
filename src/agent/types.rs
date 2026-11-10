@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 /// Persisted to disk and used for mTLS with the server.
 pub struct NodeIdentity {
     pub cert_pem: Option<String>,
-    pub key_pem: Option<String>,
+    pub key_pem: Option<zeroize::Zeroizing<String>>,
     pub spiffe_id: Option<String>,
     pub expires_at: u64,
     data_dir: PathBuf,
@@ -36,10 +36,12 @@ impl NodeIdentity {
                 // Extract SPIFFE ID from cert SAN
                 let spiffe_id =
                     crate::proxy::mtls::SpiffeAuthorizer::extract_spiffe_id_from_pem(&cert);
-                tracing::info!(spiffe_id = ?spiffe_id, "Loaded persisted node SVID");
+                let expires_at = cert_not_after(&cert).unwrap_or(0);
+                tracing::info!(spiffe_id = ?spiffe_id, expires_at, "Loaded persisted node SVID");
                 self.cert_pem = Some(cert);
-                self.key_pem = Some(key);
+                self.key_pem = Some(zeroize::Zeroizing::new(key));
                 self.spiffe_id = spiffe_id;
+                self.expires_at = expires_at;
                 true
             }
             _ => false,
@@ -47,21 +49,17 @@ impl NodeIdentity {
     }
 
     /// Persist node SVID to disk with restrictive permissions.
+    ///
+    /// The key file is created with mode 0600 before any key material is
+    /// written, so the key is never readable by other users, even briefly.
     pub(super) async fn save(&self) -> Result<(), std::io::Error> {
         if let (Some(cert), Some(key)) = (&self.cert_pem, &self.key_pem) {
             let cert_path = self.data_dir.join("node-svid.pem");
             let key_path = self.data_dir.join("node-svid-key.pem");
 
             tokio::fs::create_dir_all(&self.data_dir).await?;
+            write_private(&key_path, key.as_bytes()).await?;
             tokio::fs::write(&cert_path, cert).await?;
-            tokio::fs::write(&key_path, key).await?;
-
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let perms = std::fs::Permissions::from_mode(0o400);
-                tokio::fs::set_permissions(&key_path, perms).await?;
-            }
 
             tracing::info!(
                 spiffe_id = ?self.spiffe_id,
@@ -75,7 +73,7 @@ impl NodeIdentity {
     pub(super) async fn install(
         &mut self,
         cert_pem: String,
-        key_pem: String,
+        key_pem: zeroize::Zeroizing<String>,
         spiffe_id: String,
         expires_at: u64,
     ) -> Result<(), std::io::Error> {
@@ -86,10 +84,50 @@ impl NodeIdentity {
         self.save().await
     }
 
-    /// Check if the node SVID exists and is valid.
+    /// Check if the node SVID exists and has not expired.
     pub fn has_valid_svid(&self) -> bool {
-        self.cert_pem.is_some() && self.key_pem.is_some()
+        self.cert_pem.is_some() && self.key_pem.is_some() && self.expires_at > now_epoch()
     }
+
+    /// Whether the SVID names `spiffe://<any domain>/agent/<node_id>`.
+    pub fn is_for_node(&self, node_id: &str) -> bool {
+        self.spiffe_id
+            .as_deref()
+            .and_then(|id| id.strip_prefix("spiffe://"))
+            .and_then(|rest| rest.split_once('/'))
+            .is_some_and(|(_, path)| path.strip_prefix("agent/") == Some(node_id))
+    }
+}
+
+/// Read the `notAfter` time (unix seconds) of the first certificate in `pem`.
+pub(super) fn cert_not_after(pem: &str) -> Option<u64> {
+    let mut reader = std::io::BufReader::new(pem.as_bytes());
+    let der = rustls_pemfile::certs(&mut reader).next()?.ok()?;
+    let (_, cert) = x509_parser::parse_x509_certificate(&der).ok()?;
+    u64::try_from(cert.validity().not_after.timestamp()).ok()
+}
+
+/// Write `data` to `path`, creating or truncating it with mode 0600.
+async fn write_private(path: &Path, data: &[u8]) -> Result<(), std::io::Error> {
+    use tokio::io::AsyncWriteExt;
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(path).await?;
+    // An existing file keeps its old mode, so tighten it explicitly too.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .await?;
+    }
+    file.write_all(data).await?;
+    file.sync_all().await
+}
+
+fn now_epoch() -> u64 {
+    super::helpers::now_epoch()
 }
 
 /// Holds keypairs for pending certificate requests.
@@ -123,6 +161,9 @@ pub struct AgentConfig {
     pub token: String,
     /// One-time join token for SPIFFE node attestation (replaces token).
     pub join_token: Option<String>,
+    /// Node ID to use on first start. Ignored if `<data_dir>/node-id` already
+    /// holds the same ID; an error if it holds a different one.
+    pub node_id: Option<String>,
     pub data_dir: PathBuf,
     pub ca_cert_pem: Option<String>,
 }
@@ -132,4 +173,69 @@ pub struct AgentConfig {
 pub(super) struct LocalState {
     pub(super) desired_services: HashMap<String, crate::proto::ServiceSpec>,
     pub(super) system_path: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn identity(spiffe_id: &str) -> NodeIdentity {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ni = NodeIdentity::new(dir.path());
+        ni.spiffe_id = Some(spiffe_id.to_string());
+        ni
+    }
+
+    #[test]
+    fn is_for_node_matches_agent_path_only() {
+        assert!(identity("spiffe://fleet.internal/agent/web-1").is_for_node("web-1"));
+        assert!(!identity("spiffe://fleet.internal/agent/web-1").is_for_node("web-2"));
+        assert!(!identity("spiffe://fleet.internal/server/web-1").is_for_node("web-1"));
+        assert!(!identity("spiffe://fleet.internal/agent/web-1/x").is_for_node("web-1"));
+    }
+
+    #[tokio::test]
+    async fn installed_svid_round_trips_with_private_key_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["n".into()]).unwrap();
+        params.subject_alt_names.push(rcgen::SanType::URI(
+            "spiffe://fleet.internal/agent/n".try_into().unwrap(),
+        ));
+        let cert = params.self_signed(&key_pair).unwrap();
+        let expires_at = cert_not_after(&cert.pem()).unwrap();
+        assert!(expires_at > now_epoch());
+
+        let mut ni = NodeIdentity::new(dir.path());
+        ni.install(
+            cert.pem(),
+            zeroize::Zeroizing::new(key_pair.serialize_pem()),
+            "spiffe://fleet.internal/agent/n".into(),
+            expires_at,
+        )
+        .await
+        .unwrap();
+        let mode = std::fs::metadata(dir.path().join("node-svid-key.pem"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        let mut loaded = NodeIdentity::new(dir.path());
+        assert!(loaded.load().await);
+        assert!(loaded.has_valid_svid());
+        assert!(loaded.is_for_node("n"));
+        assert_eq!(loaded.expires_at, expires_at);
+    }
+
+    #[test]
+    fn expired_svid_is_not_valid() {
+        let mut ni = identity("spiffe://fleet.internal/agent/n");
+        ni.cert_pem = Some(String::new());
+        ni.key_pem = Some(zeroize::Zeroizing::new(String::new()));
+        ni.expires_at = 1;
+        assert!(!ni.has_valid_svid());
+    }
 }

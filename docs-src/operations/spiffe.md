@@ -165,29 +165,39 @@ Agents bootstrap their identity using SPIFFE-style node attestation, replacing s
 
 ### Join Token Attestation
 
-The simplest attestation method. An admin generates a one-time join token, and the agent presents it during bootstrap:
+The simplest attestation method. An admin asks the server for a one-time join token, and the agent presents it during bootstrap:
 
 ```bash
-# Admin generates a one-time token on the server
-ekafleet token create --type agent
+# Admin creates a token on the server (needs an admin bearer token).
+# --node-id binds the token to one node ID (optional).
+EKAFLEET_TOKEN=$ADMIN_TOKEN ekafleet --server 10.0.0.1:7400 --ca-cert ca.pem \
+  token create --node-id web-1
 # Output: a0b1c2d3e4f5...
 
 # Agent uses the token to bootstrap (one-time use)
-ekafleet agent --join server:7400 --join-token a0b1c2d3e4f5... --ca-cert /path/to/ca.pem
+ekafleet agent --join 10.0.0.1:7400 --join-token a0b1c2d3e4f5... \
+  --ca-cert /path/to/ca.pem --node-id web-1
 ```
 
+The token is generated and registered by the server and expires after one hour. The agent's node ID is `--node-id` if given, otherwise a UUID generated on first start; either way it is persisted in `<data-dir>/node-id` and never changes.
+
 After successful attestation:
-1. The token is consumed and deleted (cannot be replayed)
-2. The agent receives a node SVID (`spiffe://<domain>/agent/<node-id>`)
-3. The node SVID is persisted to disk
-4. All subsequent connections use mTLS with the node SVID
+1. The token is consumed (cannot be replayed, including after a server restart)
+2. The agent receives a node SVID (`spiffe://<domain>/agent/<node-id>`); the server generates the key pair, so the SPIFFE ID never comes from the agent
+3. The node SVID is persisted to disk (key mode 0600)
+4. All subsequent connections use mTLS with the node SVID; the join token is not needed again
+5. The server only accepts heartbeats from that connection for the node ID named in the SVID
+
+A token bound with `--node-id` only attests that node. An unbound token cannot attest a node ID that has already attested, so a leaked token cannot take over an existing node's identity.
+
+Node SVIDs are not renewed yet: they expire with the CA's default leaf TTL (one hour). To re-attest a node, create a token bound to its node ID.
 
 ### Attestation Flow
 
 ```text
-Admin:     ekafleet token create --type agent  ->  prints "abc123..."
-Agent:     boots, calls Attest RPC with join token + CSR
-Server:    validates token (one-time use), deletes it
+Admin:     ekafleet token create  ->  CreateJoinToken RPC  ->  prints "abc123..."
+Agent:     boots, calls Attest RPC (TLS, no client cert) with join token + node ID
+Server:    validates token (one-time use, binding, no takeover), consumes it
 Server:    issues node SVID signed by fleet CA
 Agent:     receives node SVID, persists to disk
 Agent:     connects via mTLS using node SVID (no bearer token needed)

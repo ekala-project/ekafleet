@@ -1,6 +1,6 @@
 //! CLI integration tests for the ekafleet binary.
 //!
-//! Tests all subcommands: argument parsing, help output, token generation,
+//! Tests all subcommands: argument parsing, help output, join token creation,
 //! and error handling for missing/invalid arguments.
 
 use assert_cmd::Command;
@@ -43,43 +43,32 @@ fn invalid_subcommand() {
 // ─── Token subcommand ───────────────────────────────────────────────
 
 #[test]
-fn token_create_outputs_hex_token() {
-    let output = ekafleet().args(["token", "create"]).assert().success();
-
-    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
-    let token = stdout.trim();
-
-    // Must be 64 hex characters (256 bits)
-    assert_eq!(token.len(), 64, "token must be 64 hex chars");
-    assert!(
-        token.chars().all(|c| c.is_ascii_hexdigit()),
-        "token must be hex: {token}"
-    );
+fn token_create_requires_a_server() {
+    // Join tokens are only valid once the server has registered them, so the
+    // CLI must not print a token it could not register.
+    ekafleet()
+        .args(["token", "create", "--server", "127.0.0.1:1"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty());
 }
 
 #[test]
-fn token_create_generates_unique_tokens() {
-    let get_token = || {
-        let output = ekafleet().args(["token", "create"]).output().unwrap();
-        String::from_utf8(output.stdout).unwrap().trim().to_string()
-    };
-
-    let t1 = get_token();
-    let t2 = get_token();
-    let t3 = get_token();
-
-    assert_ne!(t1, t2, "tokens must be unique");
-    assert_ne!(t2, t3, "tokens must be unique");
-    assert_ne!(t1, t3, "tokens must be unique");
-}
-
-#[test]
-fn token_create_with_type_flag() {
+fn token_create_rejects_non_agent_type() {
     ekafleet()
         .args(["token", "create", "--type", "server"])
         .assert()
+        .failure()
+        .stderr(predicate::str::contains("only `agent` join tokens"));
+}
+
+#[test]
+fn token_create_accepts_node_id() {
+    ekafleet()
+        .args(["token", "create", "--help"])
+        .assert()
         .success()
-        .stdout(predicate::str::is_match("[0-9a-f]{64}").unwrap());
+        .stdout(predicate::str::contains("--node-id"));
 }
 
 #[test]
@@ -88,7 +77,7 @@ fn token_help() {
         .args(["token", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Generate join token"));
+        .stdout(predicate::str::contains("one-time join token"));
 }
 
 // ─── Server subcommand ──────────────────────────────────────────────

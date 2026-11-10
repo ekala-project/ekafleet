@@ -47,6 +47,7 @@ validation checks.
 | Secret Storage | `src/secrets/` | AES-256-GCM encryption, per-agent HKDF key derivation, AAD binding |
 | Auth & RBAC | `src/server/api.rs`, `src/server/rbac.rs` | mTLS SPIFFE ID extraction, bearer tokens, namespace-scoped RBAC |
 | Seal Module | `src/server/seal.rs` | PBKDF2+AES-256-GCM envelope encryption for key material at rest |
+| Node Attestation | `src/attestation/join_token.rs`, `src/agent/join.rs`, `attest` in `src/server/api.rs` | One-time join tokens, node-ID binding, no takeover of attested IDs; `Attest` is the only RPC admitted without credentials; node SVID identity chosen by the server |
 | Workload Attestation | `src/spiffe/workload_attestor.rs` | Cgroup-only attestation (no env var fallback), PID→service mapping |
 | Raft Storage | `src/raft/storage.rs` | AES-256-GCM encrypted log + snapshots, restore-on-boot |
 | WireGuard Keys | `src/mesh/wireguard.rs` | Private key handling (stdin, never argv), `Zeroizing<String>` |
@@ -105,7 +106,8 @@ src/
 │   ├── health.rs        # Liveness/readiness/startup probes (HTTP, TCP, exec)
 │   ├── activation.rs    # NixOS system closure activation, generation pruning
 │   ├── types.rs         # Agent-side state types (LocalState, NodeIdentity)
-│   ├── helpers.rs       # SVID installation helpers
+│   ├── helpers.rs       # SVID installation helpers, persistent node ID
+│   ├── join.rs          # Join-token attestation (Attest RPC → node SVID)
 │   ├── netns.rs         # Per-namespace network isolation (netns, bridge, veth, VXLAN overlay)
 │   ├── template.rs      # Config file template rendering
 │   ├── exec.rs          # Remote command execution in service cgroups
