@@ -34,8 +34,9 @@ pkgs.testers.nixosTest {
     # Help output
     machine.succeed("ekafleet --help | grep -q 'Unified fleet management'")
 
-    # Token generation produces 64 hex characters
-    token = machine.succeed("ekafleet token create").strip()
+    # Join tokens are created by, and registered with, the server
+    CLI = "EKAFLEET_TOKEN=cli-test-token ekafleet --ca-cert /var/lib/ekafleet/ca-cert.pem --server 127.0.0.1:7400"
+    token = machine.succeed(f"{CLI} token create").strip()
     assert len(token) == 64, f"Expected 64 hex chars, got {len(token)}: '{token}'"
 
     # Shell completions (write to file first to avoid broken pipe panic in clap_complete)
@@ -75,11 +76,11 @@ pkgs.testers.nixosTest {
 
     # --- ACL token lifecycle via CLI ---
 
-    # Create a viewer token via the CLI
-    cli_token = machine.succeed(
-        "ekafleet token create --type server"
-    ).strip()
-    assert len(cli_token) == 64, f"Expected 64 hex chars, got {len(cli_token)}"
+    # Only agent join tokens exist; other types are refused rather than
+    # printing a token the server never registered.
+    machine.fail(f"{CLI} token create --type server")
+    bound = machine.succeed(f"{CLI} token create --node-id web-1").strip()
+    assert len(bound) == 64, f"Expected 64 hex chars, got {len(bound)}"
 
     # --- Additional REST endpoints ---
 

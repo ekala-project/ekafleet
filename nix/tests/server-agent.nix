@@ -1,13 +1,9 @@
 { pkgs, lib }:
 
-# Two-node test: verify that the server can start, the HTTP API is reachable
-# from a second machine, and the gRPC port accepts TLS connections.
-#
-# Note: Full agent→server gRPC streaming requires mTLS client certificates
-# or disabling client cert verification. The server's TLS config currently
-# requires client certs, so bearer-token-only agents cannot complete the
-# TLS handshake. This test validates network reachability and HTTP API
-# access across machines instead.
+# Two-node test: the server runs from the NixOS module; a second machine joins
+# it as an agent with a one-time join token. Covers token creation over the
+# API, join-token attestation, mTLS with the issued node SVID, a stable node ID
+# across restarts, token replay rejection, and HTTP API access across machines.
 pkgs.testers.nixosTest {
   name = "ekafleet-server-agent";
 
@@ -37,6 +33,7 @@ pkgs.testers.nixosTest {
       environment.systemPackages = [
         pkgs.ekaos-fleet
         pkgs.jq
+        pkgs.openssl
       ];
     };
 
@@ -60,11 +57,63 @@ pkgs.testers.nixosTest {
 
     # Verify the client can use the ekafleet CLI (binary runs on remote machine)
     client.succeed("ekafleet --help | grep -q 'Unified fleet management'")
-    client.succeed("ekafleet token create | grep -qE '^[0-9a-f]{64}$'")
 
     # Verify gRPC port is reachable from client (TLS handshake starts)
     server.wait_for_open_port(7400)
     client.succeed("nc -z server 7400")
+
+    # ── Join-token attestation ──
+
+    # The client trusts the fleet CA out of band (copied from the server).
+    ca_pem = server.succeed("cat /var/lib/ekafleet/ca-cert.pem")
+    client.succeed(f"mkdir -p /etc/ekafleet && cat > /etc/ekafleet/ca.pem <<'EOF'\n{ca_pem}EOF")
+    server_ip = client.succeed("getent ahostsv4 server | head -n1 | cut -d' ' -f1").strip()
+    CLI = f"EKAFLEET_TOKEN=cluster-token ekafleet --ca-cert /etc/ekafleet/ca.pem --server {server_ip}:7400"
+
+    # Without the admin token, the server refuses to create a join token.
+    client.fail(f"ekafleet --ca-cert /etc/ekafleet/ca.pem --server {server_ip}:7400 token create")
+
+    # The admin creates a join token over the API; it is registered server-side.
+    join_token = client.succeed(f"{CLI} token create").strip()
+    assert len(join_token) == 64, f"Expected 64 hex chars, got {len(join_token)}"
+
+    AGENT = (
+        f"ekafleet agent --join {server_ip}:7400 --ca-cert /etc/ekafleet/ca.pem "
+        "--data-dir /var/lib/ekafleet-agent"
+    )
+    client.succeed(
+        f"systemd-run --unit=ekafleet-join -E EKAFLEET_JOIN_TOKEN={join_token} {AGENT}"
+    )
+    client.wait_until_succeeds("test -s /var/lib/ekafleet-agent/node-svid.pem", timeout=60)
+    node_id = client.succeed("cat /var/lib/ekafleet-agent/node-id").strip()
+    client.succeed(
+        "openssl x509 -noout -ext subjectAltName -in /var/lib/ekafleet-agent/node-svid.pem "
+        f"| grep -q 'URI:spiffe://fleet.internal/agent/{node_id}'"
+    )
+    assert client.succeed("stat -c %a /var/lib/ekafleet-agent/node-svid-key.pem").strip() == "600"
+    server.wait_until_succeeds(
+        f"journalctl -u ekafleet-server | grep -q 'Agent connected node_id={node_id}.*mtls=true'",
+        timeout=60,
+    )
+
+    # Restart without the join token: same node ID, same SVID, still mTLS.
+    client.succeed("systemctl stop ekafleet-join")
+    svid_before = client.succeed("sha256sum /var/lib/ekafleet-agent/node-svid.pem")
+    client.succeed(f"systemd-run --unit=ekafleet-rejoin {AGENT}")
+    client.wait_until_succeeds("journalctl -u ekafleet-rejoin | grep -q 'Node SVID loaded from disk'", timeout=60)
+    assert client.succeed("cat /var/lib/ekafleet-agent/node-id").strip() == node_id
+    assert client.succeed("sha256sum /var/lib/ekafleet-agent/node-svid.pem") == svid_before
+    server.wait_until_succeeds(
+        f"[ $(journalctl -u ekafleet-server | grep -c 'Agent connected node_id={node_id}.*mtls=true') -ge 2 ]",
+        timeout=60,
+    )
+
+    # The consumed token cannot attest another node.
+    out = client.fail(
+        f"EKAFLEET_JOIN_TOKEN={join_token} ekafleet agent --join {server_ip}:7400 "
+        "--ca-cert /etc/ekafleet/ca.pem --data-dir /var/lib/ekafleet-agent-2 2>&1"
+    )
+    assert "already consumed" in out, out
 
     # Verify the KV store works cross-machine
     AUTH = "-H 'Authorization: Bearer cluster-token'"

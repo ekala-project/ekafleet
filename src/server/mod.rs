@@ -402,8 +402,10 @@ async fn housekeeping_loop(deps: HousekeepingDeps, shutdown: CancellationToken) 
 
         tick_count += 1;
 
-        // 1. Expire join tokens older than 1 hour
-        join_tokens.expire_old(3600).await;
+        // 1. Expire unused join tokens
+        join_tokens
+            .expire_old(crate::attestation::join_token::JOIN_TOKEN_TTL_SECS)
+            .await;
 
         // 2. Evict nodes with no heartbeat for 5 minutes
         let evicted = fleet_state.evict_dead_nodes(300).await;

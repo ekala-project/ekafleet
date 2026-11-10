@@ -113,15 +113,6 @@ pub fn exec_ssh(target: &str) -> std::io::Error {
     std::process::Command::new("ssh").arg(target).exec()
 }
 
-/// Generate a cryptographically random token (64 hex chars = 256 bits).
-pub fn generate_token() -> String {
-    use ring::rand::{SecureRandom, SystemRandom};
-    let rng = SystemRandom::new();
-    let mut bytes = [0u8; 32];
-    rng.fill(&mut bytes).expect("system RNG failure");
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 pub async fn cmd_dev(data_dir: PathBuf, http_listen: String, listen: String) -> anyhow::Result<()> {
     tracing::info!(
         data_dir = %data_dir.display(),
@@ -218,6 +209,7 @@ pub async fn cmd_agent(
     join: String,
     token: String,
     join_token: Option<String>,
+    node_id: Option<String>,
     data_dir: PathBuf,
     ca_cert: Option<PathBuf>,
 ) -> anyhow::Result<()> {
@@ -230,6 +222,7 @@ pub async fn cmd_agent(
         server_addr: join,
         token,
         join_token,
+        node_id,
         data_dir,
         ca_cert_pem,
     };
@@ -535,10 +528,34 @@ pub async fn cmd_scale(service: String, count: u32, server: String) -> anyhow::R
     Ok(())
 }
 
-pub async fn cmd_token_create(type_str: String) -> anyhow::Result<()> {
-    tracing::info!(token_type = %type_str, "Creating token");
-    let token = generate_token();
-    println!("{token}");
+/// Register a one-time join token with the server and print it.
+///
+/// The token is generated server-side and only becomes valid once the server
+/// has stored it, so this needs a connection and a token with `ManageTokens`.
+pub async fn cmd_token_create(
+    type_str: String,
+    node_id: Option<String>,
+    server: String,
+) -> anyhow::Result<()> {
+    if type_str != "agent" {
+        anyhow::bail!(
+            "unsupported join token type '{type_str}': only `agent` join tokens exist \
+             (servers do not join through attestation)"
+        );
+    }
+    let mut client = connect_server(&server).await?;
+    let resp = client
+        .create_join_token(ekafleet::proto::CreateJoinTokenRequest {
+            node_id: node_id.unwrap_or_default(),
+        })
+        .await?
+        .into_inner();
+    tracing::info!(
+        bound_node_id = %resp.node_id,
+        expires_at = resp.expires_at,
+        "Join token registered"
+    );
+    println!("{}", resp.token);
     Ok(())
 }
 

@@ -29,15 +29,20 @@ Server mode embeds all agent capabilities and can run workloads directly.
 # Install
 nix profile install .#ekafleet
 
-# Start server (with custom trust domain)
-ekafleet server --data-dir /var/lib/ekafleet --domain fleet.internal
+# Start server (with custom trust domain); --token is the initial admin token
+ekafleet server --data-dir /var/lib/ekafleet --domain fleet.internal --token $ADMIN_TOKEN
 
-# Join an agent via SPIFFE node attestation (one-time join token)
-TOKEN=$(ekafleet token create --type=agent)
-ekafleet agent --join server:7400 --join-token $TOKEN --ca-cert /path/to/ca.pem
+# Create a one-time join token on the server (registered server-side; 1h TTL)
+JOIN_TOKEN=$(EKAFLEET_TOKEN=$ADMIN_TOKEN ekafleet --server 10.0.0.1:7400 \
+  --ca-cert /var/lib/ekafleet/ca-cert.pem token create)
+
+# Join an agent via SPIFFE node attestation: it presents the token to Attest,
+# receives a node SVID for spiffe://<domain>/agent/<node-id> and uses mTLS
+# from then on. The token is consumed and cannot be replayed.
+ekafleet agent --join 10.0.0.1:7400 --join-token $JOIN_TOKEN --ca-cert /path/to/ca.pem
 
 # Or join with legacy bearer token auth
-ekafleet agent --join server:7400 --token $TOKEN
+ekafleet agent --join 10.0.0.1:7400 --token $ADMIN_TOKEN
 
 # Deploy
 ekafleet apply --config ./fleet.nix

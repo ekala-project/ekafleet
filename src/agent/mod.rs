@@ -12,6 +12,7 @@ pub mod template;
 
 mod handlers;
 mod helpers;
+pub mod join;
 mod types;
 
 pub(crate) use helpers::now_epoch;
@@ -52,63 +53,55 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
         "Starting ekafleet agent"
     );
 
-    let node_id = get_node_id(&config.data_dir)?;
+    let node_id = get_node_id(&config.data_dir, config.node_id.as_deref())?;
     tracing::info!(node_id = %node_id, "Agent identity established");
 
-    // Load or prepare node SVID for mTLS
+    // Load or obtain the node SVID used for mTLS.
     let node_identity = Arc::new(RwLock::new(NodeIdentity::new(&config.data_dir)));
     {
         let mut ni = node_identity.write().await;
         if ni.load().await {
-            tracing::info!("Node SVID loaded from disk");
-        } else {
-            tracing::info!("No persisted node SVID — will use bearer token auth");
+            tracing::info!(spiffe_id = ?ni.spiffe_id, "Node SVID loaded from disk");
+        }
+        let usable = ni.has_valid_svid() && ni.is_for_node(&node_id);
+        if !usable && let Some(join_token) = &config.join_token {
+            let ca_pem = config.ca_cert_pem.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("--join-token requires --ca-cert to authenticate the server")
+            })?;
+            tracing::info!("Attesting with join token");
+            let channel = connect_channel(&config.server_addr, Some(ca_pem), None).await?;
+            let attested = join::attest_with_join_token(channel, join_token, &node_id).await?;
+            ni.install(
+                attested.cert_pem,
+                attested.key_pem,
+                attested.spiffe_id.clone(),
+                attested.expires_at,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to persist node SVID: {e}"))?;
+            tracing::info!(spiffe_id = %attested.spiffe_id, "Node attested; SVID persisted");
+        } else if !usable {
+            tracing::info!("No valid node SVID — will use bearer token auth");
         }
     }
 
     // Determine authentication mode: mTLS (node SVID) or bearer token
     let ni = node_identity.read().await;
-    let use_mtls = ni.has_valid_svid();
-    let node_cert_pem = ni.cert_pem.clone();
-    let node_key_pem = ni.key_pem.clone();
+    let use_mtls = ni.has_valid_svid() && ni.is_for_node(&node_id);
+    let identity = match (&ni.cert_pem, &ni.key_pem) {
+        (Some(cert), Some(key)) if use_mtls => {
+            tracing::info!("Using node SVID for mTLS authentication");
+            Some(tonic::transport::Identity::from_pem(
+                cert.as_bytes(),
+                key.as_bytes(),
+            ))
+        }
+        _ => None,
+    };
     drop(ni);
 
-    let channel = if let Some(ca_pem) = &config.ca_cert_pem {
-        let endpoint = format!("https://{}", config.server_addr);
-        let ca_cert = tonic::transport::Certificate::from_pem(ca_pem);
-        let mut tls_config = tonic::transport::ClientTlsConfig::new().ca_certificate(ca_cert);
-
-        // When connecting by IP address, override TLS hostname verification.
-        // The CA cert already validates the server's identity chain.
-        if config.server_addr.starts_with(|c: char| c.is_ascii_digit()) {
-            tls_config = tls_config.domain_name("ekafleet");
-        }
-
-        // Use node SVID for mTLS if available
-        if use_mtls && let (Some(cert), Some(key)) = (&node_cert_pem, &node_key_pem) {
-            tracing::info!("Using node SVID for mTLS authentication");
-            let identity = tonic::transport::Identity::from_pem(cert.as_bytes(), key.as_bytes());
-            tls_config = tls_config.identity(identity);
-        }
-
-        tonic::transport::Endpoint::from_shared(endpoint)?
-            .tls_config(tls_config)?
-            .http2_keep_alive_interval(Duration::from_secs(20))
-            .keep_alive_timeout(Duration::from_secs(10))
-            .tcp_keepalive(Some(Duration::from_secs(60)))
-            .connect()
-            .await?
-    } else {
-        // Plaintext fallback (development only)
-        tracing::warn!("Connecting without TLS — use --ca-cert in production");
-        let endpoint = format!("http://{}", config.server_addr);
-        tonic::transport::Endpoint::from_shared(endpoint)?
-            .http2_keep_alive_interval(Duration::from_secs(20))
-            .keep_alive_timeout(Duration::from_secs(10))
-            .tcp_keepalive(Some(Duration::from_secs(60)))
-            .connect()
-            .await?
-    };
+    let channel =
+        connect_channel(&config.server_addr, config.ca_cert_pem.as_deref(), identity).await?;
 
     // Attach authentication metadata to all outgoing requests.
     //
@@ -116,14 +109,14 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
     // client certificate itself — the server derives identity from the verified
     // peer cert, so no metadata marker is sent (and any such marker would be
     // stripped server-side). Without an SVID we fall back to bearer token auth,
-    // which is also how an agent bootstraps using its one-time join token.
+    // (join tokens are presented to Attest above, never as bearer tokens).
     let token: tonic::metadata::MetadataValue<_> = format!("Bearer {}", config.token).parse()?;
     let mtls_flag = use_mtls;
     #[allow(clippy::result_large_err)]
     let mut client =
         FleetControlClient::with_interceptor(channel, move |mut req: tonic::Request<()>| {
             if !mtls_flag {
-                // Legacy bearer token / join-token bootstrap auth.
+                // Legacy bearer token auth.
                 req.metadata_mut().insert("authorization", token.clone());
             }
             Ok(req)
@@ -399,4 +392,40 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Connect to the server at `server_addr`.
+///
+/// With `ca_pem`, the server is verified against the fleet CA and `identity`,
+/// if given, is presented as the mTLS client certificate. Without it the
+/// connection is plaintext (development only).
+async fn connect_channel(
+    server_addr: &str,
+    ca_pem: Option<&str>,
+    identity: Option<tonic::transport::Identity>,
+) -> anyhow::Result<tonic::transport::Channel> {
+    let endpoint = if let Some(ca_pem) = ca_pem {
+        let ca_cert = tonic::transport::Certificate::from_pem(ca_pem);
+        let mut tls_config = tonic::transport::ClientTlsConfig::new().ca_certificate(ca_cert);
+
+        // When connecting by IP address, override TLS hostname verification.
+        // The CA cert already validates the server's identity chain.
+        if server_addr.starts_with(|c: char| c.is_ascii_digit()) {
+            tls_config = tls_config.domain_name("ekafleet");
+        }
+        if let Some(identity) = identity {
+            tls_config = tls_config.identity(identity);
+        }
+        tonic::transport::Endpoint::from_shared(format!("https://{server_addr}"))?
+            .tls_config(tls_config)?
+    } else {
+        tracing::warn!("Connecting without TLS — use --ca-cert in production");
+        tonic::transport::Endpoint::from_shared(format!("http://{server_addr}"))?
+    };
+    Ok(endpoint
+        .http2_keep_alive_interval(Duration::from_secs(20))
+        .keep_alive_timeout(Duration::from_secs(10))
+        .tcp_keepalive(Some(Duration::from_secs(60)))
+        .connect()
+        .await?)
 }
