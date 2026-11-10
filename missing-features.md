@@ -27,7 +27,7 @@ Status legend: **Done** = implemented, wired into the runtime, and tested ·
 | P1.3 Node attestation is TOFU | **Partial** | Store hardened; the join-token flow is not wired end to end; no TPM or instance binding |
 | P1.4 WireGuard keys / gossip | **Partial** | Signed-advert verification exists; nothing signs or sends adverts; gossip uses a shared HMAC key and is not started |
 | P1.5 Non-NixOS support | **Partial** | Example + `nix profile` fallback; no VM/container test |
-| P1.6 Generation retention | Done | `GenerationRetention` + module options (one bug: combining both bounds fails) |
+| P1.6 Generation retention | Done | `GenerationRetention` + module options; both bounds can be combined |
 | P2.1 Promote/fail RPCs | Done | Pending-canary registry, real promote/fail |
 | P2.2 Blue-green | **Partial** | All-or-nothing in-place cutover; no parallel blue/green or traffic switch |
 | P2.3 Migration failure handling | **Partial** | Partial-failure semantics done; no destination health gate |
@@ -203,28 +203,33 @@ match `spiffe://<domain>/agent/<node_id>`. `PeerManager::apply_update`
 userland (Nix + systemd, no NixOS module), as originally asked. The `todo.md` item
 is marked done on the strength of the example alone.
 
-### P1.6 Old system generations accumulate unbounded — **Done** (one bug)
+### ~~P1.6 Old system generations accumulate unbounded~~ (Done)
 
 **Exists** (commit e16375d), in `src/agent/activation.rs`:
-- `GenerationRetention` (line 71) defaults to keeping the last 10 generations.
+- `GenerationRetention` defaults to keeping the last 10 generations.
 - `GenerationRetention::from_env` reads `EKAFLEET_KEEP_GENERATIONS` /
   `EKAFLEET_KEEP_GENERATIONS_DAYS`.
-- `activate_system` calls `prune_generations` (line 240) after a successful
-  activation. A pruning failure is non-fatal.
-- `nix profile wipe-history --older-than` is the fallback when `nix-env` is absent.
+- `activate_system` calls `prune_generations` after a successful activation. A
+  pruning failure is non-fatal.
+- `prune_generations` lists the `system-N-link` generations itself
+  (`list_generations`), selects the ones outside *every* configured bound
+  (`generations_to_delete`), and passes them to `nix-env --delete-generations`
+  as explicit numbers. Combining both bounds works: a generation is removed only
+  if it is outside the last-N window *and* older than the age cutoff, as the
+  `keepGenerationsDays` option documents. (Previously both selectors were passed
+  together, `nix-env` rejected them with `invalid generation number '10d'`, and
+  pruning silently did nothing.) The current generation is never deleted.
+- `nix profile wipe-history --older-than` is the fallback when `nix-env` is
+  absent, used only for an age-only policy.
 
 Wiring: `src/agent/handlers.rs:60`. NixOS module options
 `services.ekafleet.agent.keepGenerations` / `keepGenerationsDays`
-(`nix/module.nix:156,166`). Unit tests are in `activation.rs`.
+(`nix/module.nix:156,166`). Unit tests are in `activation.rs`, including the
+argument construction and the combined-bound selection.
 
 **Remaining**:
-- When both bounds are set, `prune_generations` passes two selectors
-  (`--delete-generations 10d +10`). `nix-env` only accepts `Nd` or `+N` as a
-  *single* argument and fails with `invalid generation number '10d'` (reproduced
-  locally). Pruning then silently does nothing beyond a warning. Either apply the
-  bounds in two invocations or document that they are mutually exclusive.
-- On flakes-only hosts, count-based pruning is skipped. Only the age bound is
-  expressible there.
+- On flakes-only hosts (no `nix-env`), a policy with a count bound is skipped
+  with a warning, because `nix profile wipe-history` cannot express it.
 - There is no VM test of pruning.
 
 ---
@@ -429,5 +434,5 @@ Follow-ups:
 4. **P1.3 / P1.4**: wire join-token attestation and signed peer distribution end
    to end, then add hardware/instance attestation and identity-bound or encrypted
    gossip.
-5. Remaining Partial P1/P2 items (P1.6 dual-bound bug, P2.2 true blue-green, P2.7
+5. Remaining Partial P1/P2 items (P2.2 true blue-green, P2.7
    default to `evalFleet`, P2.8/P2.9 UX), then tests for each.
