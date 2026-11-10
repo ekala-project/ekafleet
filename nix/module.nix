@@ -48,6 +48,15 @@ in
         description = "HTTP API listen address.";
       };
 
+      gossipListen = lib.mkOption {
+        type = lib.types.str;
+        default = "0.0.0.0:7401";
+        description = ''
+          UDP address for SWIM gossip (HMAC-authenticated membership and
+          failure detection). Set to `"off"` to disable gossip.
+        '';
+      };
+
       domain = lib.mkOption {
         type = lib.types.str;
         default = "fleet.internal";
@@ -153,6 +162,15 @@ in
         description = "Listen address for the service mesh proxy.";
       };
 
+      gossipListen = lib.mkOption {
+        type = lib.types.str;
+        default = "0.0.0.0:7401";
+        description = ''
+          UDP address for SWIM gossip (HMAC-authenticated membership and
+          failure detection). Set to `"off"` to disable gossip.
+        '';
+      };
+
       keepGenerations = lib.mkOption {
         type = lib.types.ints.unsigned;
         default = 10;
@@ -234,7 +252,7 @@ in
             Restart = "on-failure";
             RestartSec = 5;
 
-            ExecStart = "${cfg.server.package}/bin/ekafleet server --data-dir ${cfg.server.dataDir} --token ${cfg.server.token} --listen ${cfg.server.grpcListen} --http-listen ${cfg.server.httpListen} --domain ${cfg.server.domain} --ca-socket ${cfg.server.caSocketPath} ${peersArg}";
+            ExecStart = "${cfg.server.package}/bin/ekafleet server --data-dir ${cfg.server.dataDir} --token ${cfg.server.token} --listen ${cfg.server.grpcListen} --http-listen ${cfg.server.httpListen} --domain ${cfg.server.domain} --ca-socket ${cfg.server.caSocketPath} --gossip-listen ${cfg.server.gossipListen} ${peersArg}";
 
             # The control plane does not hold the CA key (that's in ca-signer).
             DynamicUser = true;
@@ -287,7 +305,7 @@ in
             Restart = "on-failure";
             RestartSec = 5;
 
-            ExecStart = "${cfg.agent.package}/bin/ekafleet agent --join ${cfg.agent.serverAddr} --data-dir ${cfg.agent.dataDir} ${tokenArg} ${caCertArg}";
+            ExecStart = "${cfg.agent.package}/bin/ekafleet agent --join ${cfg.agent.serverAddr} --data-dir ${cfg.agent.dataDir} --gossip-listen ${cfg.agent.gossipListen} ${tokenArg} ${caCertArg}";
 
             # The agent requires root for systemd unit management,
             # WireGuard, nftables, and systemd-nspawn containers.

@@ -25,7 +25,7 @@ Status legend: **Done** = implemented, wired into the runtime, and tested ·
 | P1.1 Event-driven reconcile | **Partial** | Trigger exists, but the loop only runs during `apply --follow` |
 | P1.2 Workload attestation env var | Done | Cgroup-only attestation |
 | P1.3 Node attestation is TOFU | **Partial** | Join-token flow wired end to end (create → Attest → node SVID → mTLS); no node SVID renewal; no TPM or instance binding |
-| P1.4 WireGuard keys / gossip | **Partial** | Signed-advert verification exists; nothing signs or sends adverts; gossip uses a shared HMAC key and is not started |
+| P1.4 WireGuard keys / gossip | **Partial** | Gossip runs on server and agents (HMAC key from the fleet key, handed out over mTLS); nothing signs or sends WireGuard adverts yet |
 | P1.5 Non-NixOS support | **Partial** | Example + `nix profile` fallback; no VM/container test |
 | P1.6 Generation retention | Done | `GenerationRetention` + module options (one bug: combining both bounds fails) |
 | P2.1 Promote/fail RPCs | Done | Pending-canary registry, real promote/fail |
@@ -190,14 +190,19 @@ match `spiffe://<domain>/agent/<node_id>`. `PeerManager::apply_update`
   or unsigned.
 - The agent constructs `PeerManager` with a hardcoded `"fleet.internal"` trust
   domain (`src/agent/mod.rs:155`) instead of the fleet's domain.
-- Gossip (`src/gossip/swim.rs`) authenticates with a single shared HMAC-SHA256
-  cluster key (`SwimMembership::new`). It is not encrypted and not bound to node
-  SVIDs. Neither `SwimMembership` nor `ServiceCatalog` is constructed outside
-  `src/gossip/`, so gossip does not run in the server or agent today.
-- Remaining work: server-side peer distribution over the mTLS control channel,
-  agent-side signing with its SVID, and gossip transport encryption with per-node
-  identity (or drop gossip in favour of the control channel). Then add a
-  multi-node VM test.
+- Gossip runs: the server starts SWIM on UDP `--gossip-listen` (default
+  `0.0.0.0:7401`). It derives the HMAC-SHA256 cluster key from the fleet key with
+  HKDF (`gossip::derive_cluster_key`) and sends it, with the alive member list, to
+  each agent over the authenticated control stream (`ServerMessage::GossipConfig`).
+  The agent starts SWIM on the first config and swaps the key on rotation. Messages
+  carry a timestamp (30s window) and node ID under the HMAC, so stale replays and
+  tampering are dropped. `server-agent.nix` checks a two-VM gossip join.
+- Gossip is still authenticated only by a shared key, not encrypted and not bound
+  to node SVIDs. Any holder of the key (every connected agent) can claim any
+  node ID in gossip. Gossip membership is therefore advisory and must not be used
+  for authorization or peer keys. `ServiceCatalog` is still not wired in.
+- Remaining work: server-side peer distribution over the mTLS control channel and
+  agent-side signing with its SVID; optionally, per-node gossip identity.
 
 ### P1.5 Non-NixOS-with-Nix support is claimed but does not exist — **Partial**
 

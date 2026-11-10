@@ -3,7 +3,8 @@
 # Two-node test: the server runs from the NixOS module; a second machine joins
 # it as an agent with a one-time join token. Covers token creation over the
 # API, join-token attestation, mTLS with the issued node SVID, a stable node ID
-# across restarts, token replay rejection, and HTTP API access across machines.
+# across restarts, token replay rejection, SWIM gossip between the two
+# machines, and HTTP API access across machines.
 pkgs.testers.nixosTest {
   name = "ekafleet-server-agent";
 
@@ -22,6 +23,7 @@ pkgs.testers.nixosTest {
         7400
         7402
       ];
+      networking.firewall.allowedUDPPorts = [ 7401 ];
 
       environment.systemPackages = [ pkgs.jq ];
     };
@@ -30,6 +32,7 @@ pkgs.testers.nixosTest {
     { ... }:
     {
       nixpkgs.overlays = [ (import ../overlay.nix) ];
+      networking.firewall.allowedUDPPorts = [ 7401 ];
       environment.systemPackages = [
         pkgs.ekaos-fleet
         pkgs.jq
@@ -93,6 +96,15 @@ pkgs.testers.nixosTest {
     assert client.succeed("stat -c %a /var/lib/ekafleet-agent/node-svid-key.pem").strip() == "600"
     server.wait_until_succeeds(
         f"journalctl -u ekafleet-server | grep -q 'Agent connected node_id={node_id}.*mtls=true'",
+        timeout=60,
+    )
+
+    # The server hands the agent the gossip key over the control stream; the
+    # agent starts SWIM, and the server admits it once its HMAC-signed pings
+    # arrive.
+    client.wait_until_succeeds("journalctl -u ekafleet-join | grep -q 'Gossip started'", timeout=60)
+    server.wait_until_succeeds(
+        f"journalctl -u ekafleet-server | grep -q 'Gossip member joined node_id={node_id}'",
         timeout=60,
     )
 

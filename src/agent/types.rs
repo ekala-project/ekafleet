@@ -164,6 +164,9 @@ pub struct AgentConfig {
     /// Node ID to use on first start. Ignored if `<data_dir>/node-id` already
     /// holds the same ID; an error if it holds a different one.
     pub node_id: Option<String>,
+    /// UDP address for gossip; `None` disables it. Gossip starts once the
+    /// server sends the cluster key.
+    pub gossip_listen: Option<std::net::SocketAddr>,
     pub data_dir: PathBuf,
     pub ca_cert_pem: Option<String>,
 }

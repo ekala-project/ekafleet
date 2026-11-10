@@ -129,6 +129,8 @@ pub async fn cmd_dev(data_dir: PathBuf, http_listen: String, listen: String) -> 
         peers: Vec::new(),
         grpc_listen: listen,
         http_listen,
+        // Dev mode is a single local process: nothing to gossip with.
+        gossip_listen: None,
         token: dev_token.to_string(),
         domain: "dev.local".to_string(),
         ca_socket: None,
@@ -183,6 +185,7 @@ pub async fn cmd_server(
     peers: Option<String>,
     listen: String,
     http_listen: String,
+    gossip_listen: String,
     token: String,
     domain: String,
     ca_socket: Option<PathBuf>,
@@ -196,6 +199,7 @@ pub async fn cmd_server(
         peers: peer_list,
         grpc_listen: listen,
         http_listen,
+        gossip_listen: parse_gossip_listen(&gossip_listen)?,
         token,
         domain,
         ca_socket,
@@ -212,6 +216,7 @@ pub async fn cmd_agent(
     node_id: Option<String>,
     data_dir: PathBuf,
     ca_cert: Option<PathBuf>,
+    gossip_listen: String,
 ) -> anyhow::Result<()> {
     let ca_cert_pem = match ca_cert {
         Some(path) => Some(std::fs::read_to_string(&path)?),
@@ -223,12 +228,25 @@ pub async fn cmd_agent(
         token,
         join_token,
         node_id,
+        gossip_listen: parse_gossip_listen(&gossip_listen)?,
         data_dir,
         ca_cert_pem,
     };
 
     agent::run(config).await?;
     Ok(())
+}
+
+/// Parse a `--gossip-listen` value: a UDP socket address, or `off`/empty to
+/// disable gossip.
+fn parse_gossip_listen(value: &str) -> anyhow::Result<Option<std::net::SocketAddr>> {
+    match value.trim() {
+        "" | "off" | "none" => Ok(None),
+        addr => addr
+            .parse()
+            .map(Some)
+            .map_err(|e| anyhow::anyhow!("invalid --gossip-listen '{addr}': {e}")),
+    }
 }
 
 pub async fn cmd_plan(config: PathBuf, server: String) -> anyhow::Result<()> {

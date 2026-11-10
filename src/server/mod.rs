@@ -39,6 +39,8 @@ pub struct ServerConfig {
     pub peers: Vec<String>,
     pub grpc_listen: String,
     pub http_listen: String,
+    /// UDP address for gossip; `None` disables it.
+    pub gossip_listen: Option<std::net::SocketAddr>,
     pub token: String,
     /// Trust domain for SPIFFE identities (e.g., "fleet.internal").
     pub domain: String,
@@ -222,6 +224,28 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     // Create a cancellation token for graceful shutdown
     let shutdown = CancellationToken::new();
 
+    // Gossip (SWIM): the server is the seed every agent pings first. The
+    // cluster key is derived from the fleet key and sent to agents over the
+    // authenticated control stream.
+    let gossip = match config.gossip_listen {
+        Some(addr) => {
+            let node_id = format!("server-{server_id}");
+            let key = crate::gossip::derive_cluster_key(&fleet_key);
+            let swim = crate::gossip::swim::SwimMembership::new(&node_id, addr, &key);
+            let bound = swim.start(shutdown.child_token()).await?;
+            tracing::info!(addr = %bound, node_id = %node_id, "Gossip started");
+            Some(api::ServerGossip {
+                swim,
+                node_id,
+                port: bound.port(),
+            })
+        }
+        None => {
+            tracing::info!("Gossip disabled");
+            None
+        }
+    };
+
     // Start gRPC and HTTP servers concurrently
     let grpc_config = api::GrpcServerConfig {
         addr: grpc_addr,
@@ -236,6 +260,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         instance_tracker: instance_tracker.clone(),
         event_store: event_store.clone(),
         data_dir: config.data_dir.clone(),
+        gossip,
     };
 
     let grpc_shutdown = shutdown.clone();

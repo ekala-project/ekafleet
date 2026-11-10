@@ -1,7 +1,30 @@
+//! SWIM-style membership and failure detection over UDP.
+//!
+//! Every probe interval each node pings every member it knows that is not
+//! dead. A member that answers (ack) or pings us is alive. One that stays
+//! silent past the suspect timeout is suspected, and past the dead timeout it is
+//! declared dead. A ping from an unknown node adds it, so a node joins by
+//! pinging any seed and is then learned by everyone it pings.
+//!
+//! # Wire format
+//!
+//! ```text
+//! type (1) || timestamp_ms (8, big-endian) || node_id (UTF-8) || HMAC-SHA256 tag (32)
+//! ```
+//!
+//! The tag covers everything before it, keyed with the cluster key. Messages
+//! with a bad tag, a timestamp outside [`MAX_CLOCK_SKEW`], an invalid node ID,
+//! or our own node ID are dropped before they touch membership state.
+//!
+//! The cluster key is shared by every member, so it authenticates *membership
+//! in the fleet*, not *which* member sent a message: any key holder can claim
+//! any node ID. Membership here is advisory (failure detection); nothing
+//! security-relevant, such as WireGuard peer keys, is taken from gossip.
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ring::hmac;
 use tokio::net::UdpSocket;
@@ -9,23 +32,68 @@ use tokio::sync::RwLock;
 
 use crate::gossip::catalog::ServiceCatalog;
 
+/// Default UDP port for gossip.
+pub const DEFAULT_GOSSIP_PORT: u16 = 7401;
+
+/// Largest accepted difference between a message's timestamp and local time.
+pub const MAX_CLOCK_SKEW: Duration = Duration::from_secs(30);
+
 const HMAC_LEN: usize = 32; // SHA-256 HMAC tag length
+const HEADER_LEN: usize = 1 + 8;
+const MAX_DATAGRAM: usize = 1500;
+/// New members are not added beyond this many known members.
+const MAX_MEMBERS: usize = 4096;
+
+const MSG_PING: u8 = 0x01;
+const MSG_ACK: u8 = 0x02;
 
 /// SWIM-based membership protocol for failure detection.
-/// Detects node failures in 2-5 seconds via ping/ping-req/suspect cycle.
-/// All messages are authenticated with HMAC-SHA256 using a shared cluster key.
+///
+/// All messages are authenticated with HMAC-SHA256 under a shared cluster key
+/// (see the module docs for what that does and does not prove).
 #[derive(Clone)]
 pub struct SwimMembership {
     inner: Arc<RwLock<MembershipState>>,
-    hmac_key: Arc<hmac::Key>,
+    hmac_key: Arc<std::sync::RwLock<Arc<hmac::Key>>>,
+}
+
+/// Liveness of a gossip member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberStatus {
+    /// Answered within the suspect timeout.
+    Alive,
+    /// Silent for longer than the suspect timeout.
+    Suspect,
+    /// Silent for longer than the dead timeout; no longer probed.
+    Dead,
+}
+
+/// Probe and failure-detection timings.
+#[derive(Debug, Clone, Copy)]
+pub struct SwimTimings {
+    /// How often every live member is pinged.
+    pub probe_interval: Duration,
+    /// Silence after which an alive member becomes suspect.
+    pub suspect_timeout: Duration,
+    /// Silence after which a suspect member is declared dead.
+    pub dead_timeout: Duration,
+}
+
+impl Default for SwimTimings {
+    fn default() -> Self {
+        Self {
+            probe_interval: Duration::from_secs(1),
+            suspect_timeout: Duration::from_secs(3),
+            dead_timeout: Duration::from_secs(10),
+        }
+    }
 }
 
 struct MembershipState {
     node_id: String,
     bind_addr: SocketAddr,
     members: HashMap<String, MemberInfo>,
-    suspect_timeout: Duration,
-    dead_timeout: Duration,
+    timings: SwimTimings,
     catalog: Option<ServiceCatalog>,
 }
 
@@ -38,26 +106,38 @@ struct MemberInfo {
     incarnation: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MemberStatus {
-    Alive,
-    Suspect,
-    Dead,
+/// A decoded, authenticated message.
+#[derive(Debug, PartialEq, Eq)]
+struct Message {
+    kind: u8,
+    node_id: String,
 }
 
 impl SwimMembership {
+    /// Create a member that will listen on `bind_addr` with the default timings.
     pub fn new(node_id: &str, bind_addr: SocketAddr, cluster_key: &[u8; 32]) -> Self {
-        let hmac_key = hmac::Key::new(hmac::HMAC_SHA256, cluster_key);
+        Self::with_timings(node_id, bind_addr, cluster_key, SwimTimings::default())
+    }
+
+    /// Create a member with explicit probe and failure-detection timings.
+    pub fn with_timings(
+        node_id: &str,
+        bind_addr: SocketAddr,
+        cluster_key: &[u8; 32],
+        timings: SwimTimings,
+    ) -> Self {
         Self {
             inner: Arc::new(RwLock::new(MembershipState {
                 node_id: node_id.to_string(),
                 bind_addr,
                 members: HashMap::new(),
-                suspect_timeout: Duration::from_secs(3),
-                dead_timeout: Duration::from_secs(10),
+                timings,
                 catalog: None,
             })),
-            hmac_key: Arc::new(hmac_key),
+            hmac_key: Arc::new(std::sync::RwLock::new(Arc::new(hmac::Key::new(
+                hmac::HMAC_SHA256,
+                cluster_key,
+            )))),
         }
     }
 
@@ -67,109 +147,82 @@ impl SwimMembership {
         state.node_id.clone()
     }
 
+    /// Replace the cluster key (on fleet key rotation). Messages tagged with
+    /// the old key are dropped from then on.
+    pub fn set_key(&self, cluster_key: &[u8; 32]) {
+        let key = Arc::new(hmac::Key::new(hmac::HMAC_SHA256, cluster_key));
+        *self.hmac_key.write().unwrap_or_else(|e| e.into_inner()) = key;
+    }
+
     /// Attach a service catalog for gossip propagation.
-    /// The catalog snapshot will be included in gossip piggyback data
-    /// during the probe cycle.
+    ///
+    /// The catalog is not yet piggybacked on probe messages.
     pub async fn attach_catalog(&self, catalog: ServiceCatalog) {
         let mut state = self.inner.write().await;
         state.catalog = Some(catalog);
-        tracing::info!("Service catalog attached to SWIM membership for gossip propagation");
+        tracing::info!("Service catalog attached to SWIM membership");
     }
 
-    /// Sign a message payload with HMAC-SHA256.
-    /// Returns payload || hmac_tag (32 bytes).
-    #[cfg(test)]
-    fn sign(&self, payload: &[u8]) -> Vec<u8> {
-        let tag = hmac::sign(&self.hmac_key, payload);
-        let mut signed = Vec::with_capacity(payload.len() + HMAC_LEN);
-        signed.extend_from_slice(payload);
-        signed.extend_from_slice(tag.as_ref());
-        signed
-    }
-
-    /// Verify and strip HMAC tag from a received message.
-    /// Returns the payload if verification succeeds.
-    #[cfg(test)]
-    fn verify<'a>(&self, data: &'a [u8]) -> Option<&'a [u8]> {
-        if data.len() < HMAC_LEN {
-            return None;
-        }
-        let (payload, tag) = data.split_at(data.len() - HMAC_LEN);
-        hmac::verify(&self.hmac_key, payload, tag).ok()?;
-        Some(payload)
-    }
-
-    /// Start the SWIM protocol. Listens for UDP messages and runs
-    /// the probe cycle. Stops when the cancellation token is triggered.
+    /// Bind the UDP socket and start the receive loop and probe cycle.
+    ///
+    /// Returns the bound address (useful with port 0). Both tasks stop when
+    /// `shutdown` is cancelled.
     pub async fn start(
         &self,
         shutdown: tokio_util::sync::CancellationToken,
-    ) -> Result<(), std::io::Error> {
-        let state = self.inner.read().await;
-        let socket = UdpSocket::bind(state.bind_addr).await?;
-        let bind = state.bind_addr;
-        drop(state);
+    ) -> Result<SocketAddr, std::io::Error> {
+        let (bind_addr, probe_interval) = {
+            let state = self.inner.read().await;
+            (state.bind_addr, state.timings.probe_interval)
+        };
+        let socket = Arc::new(UdpSocket::bind(bind_addr).await?);
+        let local_addr = socket.local_addr()?;
+        tracing::info!(addr = %local_addr, "SWIM membership started (HMAC-authenticated)");
 
-        tracing::info!(addr = %bind, "SWIM membership started (HMAC-authenticated)");
-
-        let inner = self.inner.clone();
-
-        // Spawn receiver
-        let socket = Arc::new(socket);
-        let recv_inner = inner.clone();
-        let recv_key = self.hmac_key.clone();
+        let recv = self.clone();
         let recv_socket = socket.clone();
         let recv_shutdown = shutdown.child_token();
         tokio::spawn(async move {
-            let mut buf = [0u8; 1500];
+            let mut buf = [0u8; MAX_DATAGRAM];
             loop {
                 tokio::select! {
                     _ = recv_shutdown.cancelled() => break,
-                    result = recv_socket.recv_from(&mut buf) => {
-                        match result {
-                            Ok((len, src)) => {
-                                // Verify HMAC before processing
-                                let data = &buf[..len];
-                                if data.len() < HMAC_LEN {
-                                    tracing::warn!(src = %src, "SWIM message too short, dropping");
-                                    continue;
-                                }
-                                let (payload, tag) = data.split_at(data.len() - HMAC_LEN);
-                                if hmac::verify(&recv_key, payload, tag).is_err() {
-                                    tracing::warn!(src = %src, "SWIM HMAC verification failed, dropping");
-                                    continue;
-                                }
-                                handle_message(&recv_inner, payload, src, &recv_socket, &recv_key).await;
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "SWIM recv error");
-                            }
-                        }
-                    }
+                    result = recv_socket.recv_from(&mut buf) => match result {
+                        Ok((len, src)) => recv.handle_datagram(&buf[..len], src, &recv_socket).await,
+                        Err(e) => tracing::warn!(error = %e, "SWIM recv error"),
+                    },
                 }
             }
         });
 
-        // Spawn probe cycle
-        let probe_inner = inner.clone();
+        let probe = self.clone();
         let probe_shutdown = shutdown.child_token();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            let mut interval = tokio::time::interval(probe_interval);
             loop {
                 tokio::select! {
                     _ = probe_shutdown.cancelled() => break,
                     _ = interval.tick() => {}
                 }
-                probe_cycle(&probe_inner).await;
+                probe.probe_cycle(&socket).await;
             }
         });
 
-        Ok(())
+        Ok(local_addr)
     }
 
     /// Add a seed member to bootstrap the membership.
+    ///
+    /// A known member keeps its state; only its address is updated.
     pub async fn add_seed(&self, node_id: &str, addr: SocketAddr) {
         let mut state = self.inner.write().await;
+        if node_id == state.node_id {
+            return;
+        }
+        if let Some(member) = state.members.get_mut(node_id) {
+            member.addr = addr;
+            return;
+        }
         state.members.insert(
             node_id.to_string(),
             MemberInfo {
@@ -202,243 +255,357 @@ impl SwimMembership {
             .map(|(id, m)| (id.clone(), m.addr, m.status))
             .collect()
     }
-}
 
-/// Handle an incoming SWIM message (already HMAC-verified).
-async fn handle_message(
-    state: &Arc<RwLock<MembershipState>>,
-    data: &[u8],
-    src: SocketAddr,
-    socket: &UdpSocket,
-    hmac_key: &hmac::Key,
-) {
-    // Simple protocol: first byte is message type
-    // 0x01 = ping [node_id_bytes...], 0x02 = ack [node_id_bytes...], 0x03 = ping-req
-    if data.is_empty() {
-        return;
+    /// Status of one member, if known.
+    pub async fn member_status(&self, node_id: &str) -> Option<MemberStatus> {
+        let state = self.inner.read().await;
+        state.members.get(node_id).map(|m| m.status)
     }
 
-    match data[0] {
-        0x01 => {
-            // Ping — respond with ack including our node_id (signed with HMAC)
-            tracing::trace!(src = %src, "SWIM ping received");
-            let node_id = {
-                let s = state.read().await;
-                s.node_id.clone()
-            };
-            let mut ack_payload = vec![0x02u8];
-            ack_payload.extend_from_slice(node_id.as_bytes());
-            let tag = hmac::sign(hmac_key, &ack_payload);
-            let mut signed = Vec::with_capacity(ack_payload.len() + HMAC_LEN);
-            signed.extend_from_slice(&ack_payload);
-            signed.extend_from_slice(tag.as_ref());
-            if let Err(e) = socket.send_to(&signed, src).await {
+    fn key(&self) -> Arc<hmac::Key> {
+        self.hmac_key
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Encode and tag a message from this node.
+    fn encode(&self, kind: u8, node_id: &str) -> Vec<u8> {
+        encode_message(&self.key(), kind, node_id, unix_millis())
+    }
+
+    /// Verify and decode a datagram. `None` means drop it.
+    fn decode(&self, data: &[u8]) -> Option<Message> {
+        decode_message(&self.key(), data, unix_millis())
+    }
+
+    async fn handle_datagram(&self, data: &[u8], src: SocketAddr, socket: &UdpSocket) {
+        let Some(msg) = self.decode(data) else {
+            tracing::debug!(src = %src, "Dropping unauthenticated or stale SWIM message");
+            return;
+        };
+        let own_id = self.node_id().await;
+        if msg.node_id == own_id {
+            return;
+        }
+        self.mark_alive(&msg.node_id, src).await;
+        if msg.kind == MSG_PING {
+            let ack = self.encode(MSG_ACK, &own_id);
+            if let Err(e) = socket.send_to(&ack, src).await {
                 tracing::warn!(src = %src, error = %e, "Failed to send SWIM ack");
             }
         }
-        0x02 => {
-            // Ack — mark sender as alive, using embedded node_id if present.
-            // A member that was suspected/dead must increment its incarnation
-            // to refute suspicion (SWIM conflict resolution).
-            let sender_id = if data.len() > 1 {
-                std::str::from_utf8(&data[1..]).ok().map(|s| s.to_string())
-            } else {
-                None
-            };
-            let mut state = state.write().await;
-            if let Some(ref id) = sender_id {
-                if let Some(member) = state.members.get_mut(id) {
-                    if member.status != MemberStatus::Alive {
-                        // Member was suspected/dead — increment incarnation to
-                        // record that it has come back (refutation).
-                        member.incarnation += 1;
-                        tracing::info!(
-                            node_id = %id,
-                            incarnation = member.incarnation,
-                            "Member refuted suspicion, incarnation incremented"
-                        );
-                    }
-                    member.status = MemberStatus::Alive;
-                    member.last_seen = Instant::now();
-                    member.addr = src;
-                }
-            } else {
-                // Fallback: match by address for backwards compatibility
-                for member in state.members.values_mut() {
-                    if member.addr == src {
-                        if member.status != MemberStatus::Alive {
-                            member.incarnation += 1;
-                        }
-                        member.status = MemberStatus::Alive;
-                        member.last_seen = Instant::now();
-                        break;
-                    }
-                }
-            }
-        }
-        0x03 => {
-            // Ping-req — forward ping to target address encoded in data[1..7]
-            // Format: 0x03 || 4-byte IP || 2-byte port (big-endian)
-            tracing::trace!(src = %src, "SWIM ping-req received");
-            if data.len() >= 7 {
-                let ip = std::net::Ipv4Addr::new(data[1], data[2], data[3], data[4]);
-                let port = u16::from_be_bytes([data[5], data[6]]);
-                let target = SocketAddr::new(std::net::IpAddr::V4(ip), port);
+    }
 
-                let ping_payload = [0x01u8];
-                let tag = hmac::sign(hmac_key, &ping_payload);
-                let mut signed = Vec::with_capacity(1 + HMAC_LEN);
-                signed.extend_from_slice(&ping_payload);
-                signed.extend_from_slice(tag.as_ref());
-                if let Err(e) = socket.send_to(&signed, target).await {
-                    tracing::warn!(target = %target, error = %e, "Failed to forward SWIM ping");
-                }
+    /// Record that `node_id` was heard from at `src`.
+    async fn mark_alive(&self, node_id: &str, src: SocketAddr) {
+        let mut state = self.inner.write().await;
+        if let Some(member) = state.members.get_mut(node_id) {
+            if member.status != MemberStatus::Alive {
+                // A suspected or dead member that answers has come back;
+                // record it as a new incarnation (SWIM refutation).
+                member.incarnation += 1;
+                tracing::info!(
+                    node_id = %node_id,
+                    incarnation = member.incarnation,
+                    "Gossip member is alive again"
+                );
+            }
+            member.status = MemberStatus::Alive;
+            member.last_seen = Instant::now();
+            member.addr = src;
+        } else if state.members.len() < MAX_MEMBERS {
+            tracing::info!(node_id = %node_id, addr = %src, "Gossip member joined");
+            state.members.insert(
+                node_id.to_string(),
+                MemberInfo {
+                    node_id: node_id.to_string(),
+                    addr: src,
+                    status: MemberStatus::Alive,
+                    last_seen: Instant::now(),
+                    incarnation: 0,
+                },
+            );
+        } else {
+            tracing::warn!(node_id = %node_id, "Gossip member table full, ignoring new member");
+        }
+    }
+
+    /// Ping every live member, then apply suspect/dead transitions.
+    async fn probe_cycle(&self, socket: &UdpSocket) {
+        let (own_id, targets, timings) = {
+            let state = self.inner.read().await;
+            let targets: Vec<SocketAddr> = state
+                .members
+                .values()
+                .filter(|m| m.status != MemberStatus::Dead)
+                .map(|m| m.addr)
+                .collect();
+            (state.node_id.clone(), targets, state.timings)
+        };
+        let ping = self.encode(MSG_PING, &own_id);
+        for addr in targets {
+            if let Err(e) = socket.send_to(&ping, addr).await {
+                tracing::debug!(target = %addr, error = %e, "Failed to send SWIM ping");
             }
         }
-        _ => {
-            tracing::trace!(src = %src, type_byte = data[0], "Unknown SWIM message");
+
+        let mut state = self.inner.write().await;
+        for member in state.members.values_mut() {
+            let elapsed = member.last_seen.elapsed();
+            match member.status {
+                MemberStatus::Alive if elapsed > timings.suspect_timeout => {
+                    tracing::warn!(node_id = %member.node_id, elapsed = ?elapsed, "Gossip member suspected");
+                    member.status = MemberStatus::Suspect;
+                }
+                MemberStatus::Suspect if elapsed > timings.dead_timeout => {
+                    tracing::error!(node_id = %member.node_id, elapsed = ?elapsed, "Gossip member declared dead");
+                    member.status = MemberStatus::Dead;
+                }
+                _ => {}
+            }
         }
     }
 }
 
-/// Run one probe cycle: check for suspects and dead members.
-/// Snapshots member state under a read lock, then applies changes under a write lock
-/// to avoid holding the write lock during the entire iteration.
-async fn probe_cycle(state: &Arc<RwLock<MembershipState>>) {
-    // Snapshot under read lock
-    let transitions: Vec<(String, MemberStatus)> = {
-        let state = state.read().await;
-        let suspect_timeout = state.suspect_timeout;
-        let dead_timeout = state.dead_timeout;
+/// Encode `kind || timestamp_ms || node_id` and append its HMAC tag.
+fn encode_message(key: &hmac::Key, kind: u8, node_id: &str, now_ms: u64) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(HEADER_LEN + node_id.len() + HMAC_LEN);
+    msg.push(kind);
+    msg.extend_from_slice(&now_ms.to_be_bytes());
+    msg.extend_from_slice(node_id.as_bytes());
+    let tag = hmac::sign(key, &msg);
+    msg.extend_from_slice(tag.as_ref());
+    msg
+}
 
-        state
-            .members
-            .values()
-            .filter_map(|member| {
-                let elapsed = member.last_seen.elapsed();
-                match member.status {
-                    MemberStatus::Alive if elapsed > suspect_timeout => {
-                        tracing::warn!(
-                            node_id = %member.node_id,
-                            elapsed = ?elapsed,
-                            "Member suspected"
-                        );
-                        Some((member.node_id.clone(), MemberStatus::Suspect))
-                    }
-                    MemberStatus::Suspect if elapsed > dead_timeout => {
-                        tracing::error!(
-                            node_id = %member.node_id,
-                            elapsed = ?elapsed,
-                            "Member declared dead"
-                        );
-                        Some((member.node_id.clone(), MemberStatus::Dead))
-                    }
-                    _ => None,
-                }
-            })
-            .collect()
-    };
-
-    // Apply transitions under write lock only if there are changes
-    if !transitions.is_empty() {
-        let mut state = state.write().await;
-        for (node_id, new_status) in transitions {
-            if let Some(member) = state.members.get_mut(&node_id) {
-                member.status = new_status;
-            }
-        }
+/// Verify the tag, freshness and fields of a datagram.
+fn decode_message(key: &hmac::Key, data: &[u8], now_ms: u64) -> Option<Message> {
+    if data.len() < HEADER_LEN + HMAC_LEN {
+        return None;
     }
+    let (payload, tag) = data.split_at(data.len() - HMAC_LEN);
+    hmac::verify(key, payload, tag).ok()?;
+
+    let kind = payload[0];
+    if kind != MSG_PING && kind != MSG_ACK {
+        return None;
+    }
+    let sent_ms = u64::from_be_bytes(payload[1..HEADER_LEN].try_into().ok()?);
+    if sent_ms.abs_diff(now_ms) > MAX_CLOCK_SKEW.as_millis() as u64 {
+        return None;
+    }
+    let node_id = std::str::from_utf8(&payload[HEADER_LEN..]).ok()?;
+    crate::attestation::join_token::validate_node_id(node_id).ok()?;
+    Some(Message {
+        kind,
+        node_id: node_id.to_string(),
+    })
+}
+
+fn unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn cluster_key() -> [u8; 32] {
-        [0xDE; 32]
+    const NOW: u64 = 1_800_000_000_000;
+
+    fn key(byte: u8) -> hmac::Key {
+        hmac::Key::new(hmac::HMAC_SHA256, &[byte; 32])
     }
 
-    fn swim(node_id: &str) -> SwimMembership {
-        SwimMembership::new(node_id, "127.0.0.1:0".parse().unwrap(), &cluster_key())
+    fn fast() -> SwimTimings {
+        SwimTimings {
+            probe_interval: Duration::from_millis(50),
+            suspect_timeout: Duration::from_millis(300),
+            dead_timeout: Duration::from_millis(600),
+        }
+    }
+
+    fn local(node_id: &str, cluster_key: [u8; 32]) -> SwimMembership {
+        SwimMembership::with_timings(
+            node_id,
+            "127.0.0.1:0".parse().unwrap(),
+            &cluster_key,
+            fast(),
+        )
+    }
+
+    async fn wait_for(cond: impl AsyncFn() -> bool) -> bool {
+        for _ in 0..100 {
+            if cond().await {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
     }
 
     #[test]
-    fn sign_verify_roundtrip() {
-        let s = swim("node-1");
-        let payload = b"hello";
-
-        let signed = s.sign(payload);
-        let verified = s.verify(&signed);
-
-        assert!(verified.is_some());
-        assert_eq!(verified.unwrap(), payload);
-    }
-
-    #[test]
-    fn verify_rejects_wrong_key() {
-        let s1 = SwimMembership::new("n1", "127.0.0.1:0".parse().unwrap(), &[0xAA; 32]);
-        let s2 = SwimMembership::new("n2", "127.0.0.1:0".parse().unwrap(), &[0xBB; 32]);
-
-        let signed = s1.sign(b"payload");
-        let result = s2.verify(&signed);
-
-        assert!(
-            result.is_none(),
-            "different cluster key must fail verification"
+    fn encode_decode_roundtrip() {
+        let msg = encode_message(&key(1), MSG_PING, "node-1", NOW);
+        assert_eq!(
+            decode_message(&key(1), &msg, NOW),
+            Some(Message {
+                kind: MSG_PING,
+                node_id: "node-1".into()
+            })
         );
     }
 
     #[test]
-    fn verify_rejects_tampered_payload() {
-        let s = swim("node-1");
-        let mut signed = s.sign(b"original");
-
-        // Tamper with the payload (before the HMAC tag)
-        signed[0] ^= 0xFF;
-
-        let result = s.verify(&signed);
-        assert!(result.is_none(), "tampered payload must fail verification");
+    fn decode_rejects_wrong_key() {
+        let msg = encode_message(&key(1), MSG_PING, "node-1", NOW);
+        assert_eq!(decode_message(&key(2), &msg, NOW), None);
     }
 
     #[test]
-    fn verify_rejects_tampered_tag() {
-        let s = swim("node-1");
-        let mut signed = s.sign(b"payload");
-
-        // Tamper with the HMAC tag (last byte)
-        let last = signed.len() - 1;
-        signed[last] ^= 0xFF;
-
-        let result = s.verify(&signed);
-        assert!(result.is_none(), "tampered tag must fail verification");
+    fn decode_rejects_tampering() {
+        let msg = encode_message(&key(1), MSG_PING, "node-1", NOW);
+        for i in 0..msg.len() {
+            let mut tampered = msg.clone();
+            tampered[i] ^= 0x01;
+            assert_eq!(decode_message(&key(1), &tampered, NOW), None, "byte {i}");
+        }
     }
 
     #[test]
-    fn verify_rejects_truncated_message() {
-        let s = swim("node-1");
+    fn decode_rejects_stale_and_future_messages() {
+        let skew = MAX_CLOCK_SKEW.as_millis() as u64;
+        let old = encode_message(&key(1), MSG_PING, "n", NOW - skew - 1);
+        let future = encode_message(&key(1), MSG_PING, "n", NOW + skew + 1);
+        let edge = encode_message(&key(1), MSG_PING, "n", NOW - skew);
+        assert_eq!(decode_message(&key(1), &old, NOW), None);
+        assert_eq!(decode_message(&key(1), &future, NOW), None);
+        assert!(decode_message(&key(1), &edge, NOW).is_some());
+    }
 
-        // Too short to contain an HMAC tag
-        assert!(s.verify(&[0u8; HMAC_LEN - 1]).is_none());
-        assert!(s.verify(&[]).is_none());
+    #[test]
+    fn decode_rejects_truncated_unknown_and_invalid_ids() {
+        assert_eq!(decode_message(&key(1), &[], NOW), None);
+        assert_eq!(decode_message(&key(1), &[0u8; HMAC_LEN], NOW), None);
+        let unknown = encode_message(&key(1), 0x03, "n", NOW);
+        assert_eq!(decode_message(&key(1), &unknown, NOW), None);
+        let empty_id = encode_message(&key(1), MSG_PING, "", NOW);
+        assert_eq!(decode_message(&key(1), &empty_id, NOW), None);
+        let bad_id = encode_message(&key(1), MSG_PING, "../x", NOW);
+        assert_eq!(decode_message(&key(1), &bad_id, NOW), None);
     }
 
     #[tokio::test]
     async fn seed_members_start_alive() {
-        let s = swim("node-1");
+        let s = local("node-1", [0xDE; 32]);
         s.add_seed("node-2", "10.0.0.2:7401".parse().unwrap()).await;
+        s.add_seed("node-1", "10.0.0.1:7401".parse().unwrap()).await;
 
-        let alive = s.alive_members().await;
-        assert_eq!(alive.len(), 1);
-        assert_eq!(alive[0].0, "node-2");
+        let all = s.all_members().await;
+        assert_eq!(all.len(), 1, "a node never seeds itself");
+        assert_eq!(all[0].0, "node-2");
+        assert_eq!(all[0].2, MemberStatus::Alive);
     }
 
     #[tokio::test]
-    async fn all_members_includes_status() {
-        let s = swim("node-1");
-        s.add_seed("node-2", "10.0.0.2:7401".parse().unwrap()).await;
+    async fn members_discover_each_other_through_a_seed() {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let server = local("server-1", [7; 32]);
+        let a = local("node-a", [7; 32]);
+        let b = local("node-b", [7; 32]);
+        let server_addr = server.start(shutdown.clone()).await.unwrap();
+        a.start(shutdown.clone()).await.unwrap();
+        b.start(shutdown.clone()).await.unwrap();
+        a.add_seed("server-1", server_addr).await;
+        b.add_seed("server-1", server_addr).await;
 
-        let all = s.all_members().await;
-        assert_eq!(all.len(), 1);
-        assert_eq!(all[0].2, MemberStatus::Alive);
+        assert!(
+            wait_for(async || server.alive_members().await.len() == 2).await,
+            "the seed learns both members from their pings"
+        );
+        // A node told about another (as the server does in GossipConfig)
+        // reaches it directly and the other side learns it back.
+        let (_, b_addr) = server
+            .alive_members()
+            .await
+            .into_iter()
+            .find(|(id, _)| id == "node-b")
+            .unwrap();
+        a.add_seed("node-b", b_addr).await;
+        assert!(
+            wait_for(async || b.member_status("node-a").await == Some(MemberStatus::Alive)).await
+        );
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn wrong_key_member_is_never_admitted() {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let server = local("server-1", [7; 32]);
+        let intruder = local("intruder", [8; 32]);
+        let server_addr = server.start(shutdown.clone()).await.unwrap();
+        intruder.start(shutdown.clone()).await.unwrap();
+        intruder.add_seed("server-1", server_addr).await;
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(server.member_status("intruder").await, None);
+        // And the intruder never hears a valid ack, so it suspects the seed.
+        assert_ne!(
+            intruder.member_status("server-1").await,
+            Some(MemberStatus::Alive)
+        );
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn silent_member_is_suspected_then_dead_and_can_return() {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let a = local("node-a", [7; 32]);
+        let a_addr = a.start(shutdown.clone()).await.unwrap();
+
+        // A member nobody answers for.
+        a.add_seed("node-gone", "127.0.0.1:9".parse().unwrap())
+            .await;
+        assert!(
+            wait_for(async || a.member_status("node-gone").await == Some(MemberStatus::Dead)).await
+        );
+
+        // It comes back and pings: alive again.
+        let back = local("node-gone", [7; 32]);
+        let back_shutdown = tokio_util::sync::CancellationToken::new();
+        back.start(back_shutdown.clone()).await.unwrap();
+        back.add_seed("node-a", a_addr).await;
+        assert!(
+            wait_for(async || a.member_status("node-gone").await == Some(MemberStatus::Alive))
+                .await
+        );
+        back_shutdown.cancel();
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn rotated_key_drops_members_on_the_old_key() {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let a = local("node-a", [7; 32]);
+        let b = local("node-b", [7; 32]);
+        let a_addr = a.start(shutdown.clone()).await.unwrap();
+        b.start(shutdown.clone()).await.unwrap();
+        b.add_seed("node-a", a_addr).await;
+        assert!(
+            wait_for(async || a.member_status("node-b").await == Some(MemberStatus::Alive)).await
+        );
+
+        a.set_key(&[9; 32]);
+        assert!(
+            wait_for(async || a.member_status("node-b").await == Some(MemberStatus::Suspect)).await
+        );
+        b.set_key(&[9; 32]);
+        assert!(
+            wait_for(async || a.member_status("node-b").await == Some(MemberStatus::Alive)).await
+        );
+        shutdown.cancel();
     }
 }

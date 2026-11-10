@@ -10,6 +10,7 @@ pub mod storage;
 pub mod supervisor;
 pub mod template;
 
+pub mod gossip;
 mod handlers;
 mod helpers;
 pub mod join;
@@ -33,6 +34,7 @@ use crate::mesh::wireguard::WireguardManager;
 use crate::policy::nftables::PolicyEnforcer;
 use crate::proto::agent_message::Payload;
 use crate::proto::fleet_control_client::FleetControlClient;
+use crate::proto::server_message::Payload as ServerPayload;
 use crate::proto::{AgentMessage, CertificateRequest, HealthReport, Heartbeat, StatusReport};
 use crate::secrets::injector::SecretInjector;
 use crate::spiffe::workload_api::WorkloadManager;
@@ -42,7 +44,7 @@ use types::{LocalState, PendingKeyStore};
 
 pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
     // Validate server address format before connecting
-    config
+    let server_socket_addr = config
         .server_addr
         .parse::<std::net::SocketAddr>()
         .map_err(|e| anyhow::anyhow!("invalid server address '{}': {e}", config.server_addr))?;
@@ -174,6 +176,12 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
 
     // Create a cancellation token for graceful shutdown
     let shutdown = CancellationToken::new();
+    let gossip = gossip::AgentGossip::new(
+        &node_id,
+        config.gossip_listen,
+        server_socket_addr.ip(),
+        shutdown.child_token(),
+    );
 
     // Spawn SPIFFE Workload API socket listener
     let wapi_mgr = workload_mgr.clone();
@@ -362,7 +370,11 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
             result = inbound.message() => {
                 match result? {
                     Some(msg) => {
-                        if let Some(payload) = msg.payload {
+                        match msg.payload {
+                            Some(ServerPayload::Gossip(config)) => {
+                                gossip.apply_config(config).await;
+                            }
+                            Some(payload) => {
                             handlers::handle_server_message(
                                 payload,
                                 &supervisor,
@@ -379,6 +391,8 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
                                 &node_id,
                             )
                             .await;
+                            }
+                            None => {}
                         }
                     }
                     None => {

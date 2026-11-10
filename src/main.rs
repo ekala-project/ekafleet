@@ -134,6 +134,10 @@ enum Command {
         #[arg(long, default_value = "fleet.internal")]
         domain: String,
 
+        /// UDP address for gossip (SWIM membership); "off" disables gossip
+        #[arg(long, default_value = "0.0.0.0:7401")]
+        gossip_listen: String,
+
         /// Path to CA signer Unix socket (uses external ca-signer daemon instead of embedding CA)
         #[arg(long)]
         ca_socket: Option<PathBuf>,
@@ -166,6 +170,11 @@ enum Command {
         /// Path to CA certificate PEM for TLS verification
         #[arg(long)]
         ca_cert: Option<PathBuf>,
+
+        /// UDP address for gossip (SWIM membership); "off" disables gossip.
+        /// Gossip starts once the server sends the cluster key.
+        #[arg(long, default_value = "0.0.0.0:7401")]
+        gossip_listen: String,
     },
 
     /// Show desired-vs-actual diff
@@ -862,6 +871,7 @@ async fn main() -> anyhow::Result<()> {
             http_listen,
             token,
             domain,
+            gossip_listen,
             ca_socket,
         } => {
             commands::cmd_server(
@@ -869,6 +879,7 @@ async fn main() -> anyhow::Result<()> {
                 peers,
                 listen,
                 http_listen,
+                gossip_listen,
                 token,
                 domain,
                 ca_socket,
@@ -883,7 +894,19 @@ async fn main() -> anyhow::Result<()> {
             node_id,
             data_dir,
             ca_cert,
-        } => commands::cmd_agent(join, token, join_token, node_id, data_dir, ca_cert).await?,
+            gossip_listen,
+        } => {
+            commands::cmd_agent(
+                join,
+                token,
+                join_token,
+                node_id,
+                data_dir,
+                ca_cert,
+                gossip_listen,
+            )
+            .await?
+        }
 
         Command::Plan { config, server } => commands::cmd_plan(config, server).await?,
 

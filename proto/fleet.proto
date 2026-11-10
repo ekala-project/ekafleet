@@ -295,7 +295,27 @@ message ServerMessage {
     SystemRebuildCommand system_rebuild_command = 18;
     InspectServiceCommand inspect_service_command = 19;
     MigrateVolumeCommand migrate_volume_command = 20;
+    GossipConfig gossip = 21;
   }
+}
+
+// Gossip (SWIM) bootstrap, sent to an agent when it connects and again when
+// the fleet key (and with it the gossip key) is rotated.
+message GossipConfig {
+  // HMAC-SHA256 key for gossip messages, derived from the fleet key.
+  bytes cluster_key = 1;
+  // The server's own gossip node ID and UDP port; the agent reaches it at the
+  // host it joined plus this port.
+  string server_node_id = 2;
+  uint32 server_port = 3;
+  // Members the server currently sees alive, as seeds.
+  repeated GossipMember members = 4;
+}
+
+message GossipMember {
+  string node_id = 1;
+  // ip:port
+  string addr = 2;
 }
 
 // --- Server → Agent command messages ---

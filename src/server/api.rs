@@ -71,6 +71,8 @@ pub struct FleetControlService {
     pub(super) token_store: TokenStore,
     /// Append-only audit log recording which principal performed each action.
     pub(super) audit_log: super::audit::AuditLog,
+    /// Gossip membership, when enabled; agents get its key and seeds.
+    pub(super) gossip: Option<ServerGossip>,
 }
 
 impl FleetControlService {
@@ -106,7 +108,39 @@ impl FleetControlService {
             event_store,
             token_store,
             audit_log: super::audit::AuditLog::new(),
+            gossip: None,
         }
+    }
+
+    /// Enable gossip bootstrap: connecting agents receive a `GossipConfig`.
+    pub fn with_gossip(mut self, gossip: Option<ServerGossip>) -> Self {
+        self.gossip = gossip;
+        self
+    }
+
+    /// Build the `GossipConfig` for `node_id` under `fleet_key`, or `None`
+    /// when gossip is disabled. The connecting node is left out of the seeds.
+    async fn gossip_config(&self, fleet_key: &[u8], node_id: &str) -> Option<ServerMessage> {
+        let gossip = self.gossip.as_ref()?;
+        let members = gossip
+            .swim
+            .alive_members()
+            .await
+            .into_iter()
+            .filter(|(id, _)| id != node_id)
+            .map(|(id, addr)| crate::proto::GossipMember {
+                node_id: id,
+                addr: addr.to_string(),
+            })
+            .collect();
+        Some(ServerMessage {
+            payload: Some(ServerPayload::Gossip(crate::proto::GossipConfig {
+                cluster_key: crate::gossip::derive_cluster_key(fleet_key).to_vec(),
+                server_node_id: gossip.node_id.clone(),
+                server_port: gossip.port.into(),
+                members,
+            })),
+        })
     }
 
     /// Record an audit-log entry, attributing it to the principal that issued
@@ -323,6 +357,9 @@ impl FleetControl for FleetControlService {
                     })),
                 };
                 let _ = self.state.send_to_agent(&node_id, key_msg).await;
+            }
+            if let Some(msg) = self.gossip_config(&fk.key, &node_id).await {
+                let _ = self.state.send_to_agent(&node_id, msg).await;
             }
         }
 
@@ -1971,6 +2008,16 @@ impl FleetControl for FleetControlService {
             if self.state.send_to_agent(nid, key_msg).await {
                 notified += 1;
             }
+            if let Some(msg) = self.gossip_config(&new_key, nid).await {
+                let _ = self.state.send_to_agent(nid, msg).await;
+            }
+        }
+        // The server switches last so agents that got the new key are not
+        // dropped while others are still being notified.
+        if let Some(gossip) = &self.gossip {
+            gossip
+                .swim
+                .set_key(&crate::gossip::derive_cluster_key(&new_key));
         }
 
         tracing::info!(
@@ -2040,6 +2087,19 @@ pub struct GrpcServerConfig {
     pub instance_tracker: InstanceTracker,
     pub event_store: EventStore,
     pub data_dir: std::path::PathBuf,
+    /// The server's running gossip membership, if gossip is enabled.
+    pub gossip: Option<ServerGossip>,
+}
+
+/// The server's gossip membership and how agents reach it.
+#[derive(Clone)]
+pub struct ServerGossip {
+    /// Running SWIM membership.
+    pub swim: crate::gossip::swim::SwimMembership,
+    /// The server's gossip node ID (`server-<server-id>`).
+    pub node_id: String,
+    /// Bound UDP port; agents combine it with the host they joined.
+    pub port: u16,
 }
 
 /// Start the gRPC server with TLS and RBAC-based authentication.
@@ -2062,6 +2122,7 @@ pub async fn serve_grpc(
         instance_tracker,
         event_store,
         data_dir,
+        gossip,
     } = config;
 
     tracing::info!(%addr, domain = %domain, "gRPC server listening (TLS + RBAC + SPIFFE)");
@@ -2174,7 +2235,8 @@ pub async fn serve_grpc(
     )
     .with_cert_issuer(cert_issuer, trust_bundle_pem)
     .with_ca(ca)
-    .with_fleet_key(fleet_key);
+    .with_fleet_key(fleet_key)
+    .with_gossip(gossip);
 
     tonic::transport::Server::builder()
         .tls_config(tls_config)?
