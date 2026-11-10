@@ -76,12 +76,33 @@ pub(super) fn extract_cn_from_pem(pem: &str) -> Option<String> {
     Some(cn.to_string())
 }
 
-pub(super) fn get_node_id(data_dir: &Path) -> anyhow::Result<String> {
+/// Load this agent's stable node ID from `<data_dir>/node-id`, creating it on
+/// first start.
+///
+/// On first start the ID is `requested` if given, otherwise a random UUID.
+/// Once written, the ID never changes: it is the agent's SPIFFE identity
+/// (`spiffe://<domain>/agent/<node-id>`). Asking for a different ID than the
+/// persisted one is an error rather than a silent identity change.
+pub(super) fn get_node_id(data_dir: &Path, requested: Option<&str>) -> anyhow::Result<String> {
+    if let Some(id) = requested {
+        crate::attestation::join_token::validate_node_id(id)?;
+    }
     let id_path = data_dir.join("node-id");
     if id_path.exists() {
-        Ok(std::fs::read_to_string(&id_path)?.trim().to_string())
+        let id = std::fs::read_to_string(&id_path)?.trim().to_string();
+        if let Some(requested) = requested
+            && requested != id
+        {
+            anyhow::bail!(
+                "--node-id {requested} does not match the persisted node ID {id} in {}",
+                id_path.display()
+            );
+        }
+        Ok(id)
     } else {
-        let id = uuid::Uuid::new_v4().to_string();
+        let id = requested
+            .map(str::to_string)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         if let Some(parent) = id_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -142,5 +163,41 @@ pub(super) fn collect_resources() -> NodeResources {
         cpu_millicores,
         memory_mb,
         disk_mb,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_id_is_generated_once_and_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = get_node_id(dir.path(), None).unwrap();
+        assert!(uuid::Uuid::parse_str(&first).is_ok());
+        assert_eq!(get_node_id(dir.path(), None).unwrap(), first);
+        assert_eq!(get_node_id(dir.path(), Some(&first)).unwrap(), first);
+    }
+
+    #[test]
+    fn requested_node_id_is_used_on_first_start() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(get_node_id(dir.path(), Some("web-1")).unwrap(), "web-1");
+        assert_eq!(get_node_id(dir.path(), None).unwrap(), "web-1");
+    }
+
+    #[test]
+    fn requested_node_id_cannot_change_persisted_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        get_node_id(dir.path(), Some("web-1")).unwrap();
+        assert!(get_node_id(dir.path(), Some("web-2")).is_err());
+        assert_eq!(get_node_id(dir.path(), None).unwrap(), "web-1");
+    }
+
+    #[test]
+    fn invalid_requested_node_id_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(get_node_id(dir.path(), Some("../escape")).is_err());
+        assert!(!dir.path().join("node-id").exists());
     }
 }

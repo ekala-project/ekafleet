@@ -7,6 +7,11 @@ use tokio::sync::RwLock;
 
 use super::{AttestationError, AttestationResult};
 
+/// Lifetime of an unused join token. The server's housekeeping loop discards
+/// tokens older than this.
+pub const JOIN_TOKEN_TTL_SECS: u64 = 3600;
+/// Maximum length of a node ID. It becomes a SPIFFE ID path segment.
+const MAX_NODE_ID_LEN: usize = 128;
 /// Max failed consume attempts allowed within `RATE_LIMIT_WINDOW_SECS` before
 /// further attempts are rejected outright. Protects against brute-forcing the
 /// token namespace.
@@ -16,8 +21,9 @@ const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 
 /// Server-side store for one-time join tokens.
 ///
-/// Tokens are registered via `ekafleet token create --type agent` and consumed
-/// exactly once during node attestation. After successful attestation, the
+/// Tokens are registered via `ekafleet token create` (the `CreateJoinToken`
+/// RPC) or by the cloud scaling actuator, and consumed exactly once when an
+/// agent calls the `Attest` RPC. After successful attestation, the
 /// token is deleted and an audit record of the consumption is retained so the
 /// event survives a restart and cannot be silently replayed against a fresh
 /// (empty) in-memory store.
@@ -27,6 +33,11 @@ const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 /// node_id is rejected even if the token string is correct. This ties a token
 /// to an out-of-band identity (e.g. a cloud instance ID) so a leaked token is
 /// useless outside its intended host.
+///
+/// An *unbound* token can only mint a new identity: it is rejected for a
+/// node_id that has already been attested, so a leaked unbound token cannot be
+/// used to take over an existing node's SPIFFE ID. Re-attesting an existing
+/// node needs a token bound to that node_id.
 #[derive(Clone)]
 pub struct JoinTokenStore {
     inner: Arc<RwLock<State>>,
@@ -200,6 +211,22 @@ impl JoinTokenStore {
             ));
         };
 
+        // An unbound token may not claim an identity that was already
+        // attested. Only an operator-issued token bound to that node_id can.
+        if entry.bound_node_id.is_none() && state.consumed.values().any(|r| r.node_id == node_id) {
+            tracing::warn!(
+                node_id = %node_id,
+                "Unbound join token presented for an already-attested node_id"
+            );
+            state.failures.push(now);
+            drop(state);
+            self.persist().await;
+            return Err(AttestationError::Failed(
+                "node_id is already attested; re-attesting it needs a token bound to that node_id"
+                    .into(),
+            ));
+        }
+
         // Enforce node binding if present.
         if let Some(bound) = &entry.bound_node_id
             && bound != node_id
@@ -237,6 +264,28 @@ impl JoinTokenStore {
     }
 }
 
+/// Check that `node_id` is usable as a SPIFFE ID path segment.
+///
+/// Allows 1 to 128 ASCII letters, digits, `-`, `_` and `.`, and rejects `.`
+/// and `..`. Agent-generated UUIDs and typical host names pass.
+pub fn validate_node_id(node_id: &str) -> Result<(), AttestationError> {
+    let valid_chars = node_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if node_id.is_empty()
+        || node_id.len() > MAX_NODE_ID_LEN
+        || !valid_chars
+        || node_id == "."
+        || node_id == ".."
+    {
+        return Err(AttestationError::InvalidData(format!(
+            "invalid node_id {node_id:?}: expected 1-{MAX_NODE_ID_LEN} characters of \
+             [A-Za-z0-9._-]"
+        )));
+    }
+    Ok(())
+}
+
 fn now_epoch() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -260,6 +309,7 @@ pub async fn attest(
     if token.is_empty() {
         return Err(AttestationError::InvalidData("empty token".into()));
     }
+    validate_node_id(node_id)?;
 
     // Capture whether the token is bound before consuming (consume removes it).
     let was_bound = {
@@ -481,5 +531,60 @@ mod tests {
         let wrong = attest(&store2, b"bound-tok", "node-y").await;
         assert!(matches!(wrong, Err(AttestationError::Failed(_))));
         attest(&store2, b"bound-tok", "node-x").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unbound_token_cannot_take_over_attested_node() {
+        let store = JoinTokenStore::new();
+        store.register("first").await;
+        store.register("second").await;
+        attest(&store, b"first", "node-1").await.unwrap();
+
+        // A second unbound token must not mint another SVID for node-1.
+        let takeover = attest(&store, b"second", "node-1").await;
+        assert!(matches!(takeover, Err(AttestationError::Failed(_))));
+        assert_eq!(store.count().await, 1, "rejected token is not consumed");
+
+        // It still works for a fresh identity.
+        attest(&store, b"second", "node-2").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bound_token_can_reattest_existing_node() {
+        let store = JoinTokenStore::new();
+        store.register("first").await;
+        attest(&store, b"first", "node-1").await.unwrap();
+
+        // The operator explicitly issues a token for node-1 (e.g. lost SVID).
+        store
+            .register_bound("rebind", Some("node-1".to_string()))
+            .await;
+        attest(&store, b"rebind", "node-1").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_node_id_rejected_before_consuming() {
+        let store = JoinTokenStore::new();
+        store.register("tok").await;
+        for bad in ["", ".", "..", "a/b", "spiffe://x", &"n".repeat(129)] {
+            let result = attest(&store, b"tok", bad).await;
+            assert!(
+                matches!(result, Err(AttestationError::InvalidData(_))),
+                "{bad:?} must be rejected"
+            );
+        }
+        assert_eq!(store.count().await, 1);
+    }
+
+    #[test]
+    fn validate_node_id_accepts_uuids_and_hostnames() {
+        for ok in [
+            "0b6f2b0e-6a4e-4f5e-9d1a-1f0c2f3e4d5c",
+            "web-1",
+            "db_primary.eu-west",
+            &"n".repeat(128),
+        ] {
+            assert!(validate_node_id(ok).is_ok(), "{ok:?} must be accepted");
+        }
     }
 }

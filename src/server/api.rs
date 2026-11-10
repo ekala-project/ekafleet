@@ -21,19 +21,20 @@ use crate::proto::fleet_control_server::{FleetControl, FleetControlServer};
 use crate::proto::server_message::Payload as ServerPayload;
 use crate::proto::{
     AgentMessage, ApplyEvent, ApplyRequest, CreateAclTokenRequest, CreateAclTokenResponse,
-    DiffGenerationsRequest, DiffGenerationsResponse, DrainRequest, DrainResponse, EventsRequest,
-    EventsResponse, ExecRequest, ExecResponse, FailDeploymentRequest, FailDeploymentResponse,
-    FleetStatus, GetNodeRequest, InspectServiceRequest, InspectServiceResponse,
-    ListAclTokensRequest, ListAclTokensResponse, ListDeploymentsRequest, ListDeploymentsResponse,
-    ListGenerationsRequest, ListGenerationsResponse, ListNodesRequest, ListNodesResponse,
-    LogsChunk, LogsRequest, NodeAttestationRequest, NodeAttestationResult, NodeDetail,
-    OperationType, PlanRequest, PlanResponse, PlannedOperation, PromoteRequest, PromoteResponse,
-    RestoreRequest, RestoreResponse, RevokeAclTokenRequest, RevokeAclTokenResponse,
-    RollbackRequest, RollbackResponse, RotateFleetKeyRequest, RotateFleetKeyResponse, ScaleRequest,
-    ScaleResponse, ServerMessage, SnapshotRequest, SnapshotResponse, StatusRequest,
-    SwitchGenerationRequest, SwitchGenerationResponse, SystemGcRequest, SystemGcResponse,
-    SystemRebootRequest, SystemRebootResponse, SystemRebuildRequest, SystemRebuildResponse,
-    TopRequest, TopResponse, TrustBundleUpdate, UpdateNodeRequest, UpdateNodeResponse,
+    CreateJoinTokenRequest, CreateJoinTokenResponse, DiffGenerationsRequest,
+    DiffGenerationsResponse, DrainRequest, DrainResponse, EventsRequest, EventsResponse,
+    ExecRequest, ExecResponse, FailDeploymentRequest, FailDeploymentResponse, FleetStatus,
+    GetNodeRequest, InspectServiceRequest, InspectServiceResponse, ListAclTokensRequest,
+    ListAclTokensResponse, ListDeploymentsRequest, ListDeploymentsResponse, ListGenerationsRequest,
+    ListGenerationsResponse, ListNodesRequest, ListNodesResponse, LogsChunk, LogsRequest,
+    NodeAttestationRequest, NodeAttestationResult, NodeDetail, OperationType, PlanRequest,
+    PlanResponse, PlannedOperation, PromoteRequest, PromoteResponse, RestoreRequest,
+    RestoreResponse, RevokeAclTokenRequest, RevokeAclTokenResponse, RollbackRequest,
+    RollbackResponse, RotateFleetKeyRequest, RotateFleetKeyResponse, ScaleRequest, ScaleResponse,
+    ServerMessage, SnapshotRequest, SnapshotResponse, StatusRequest, SwitchGenerationRequest,
+    SwitchGenerationResponse, SystemGcRequest, SystemGcResponse, SystemRebootRequest,
+    SystemRebootResponse, SystemRebuildRequest, SystemRebuildResponse, TopRequest, TopResponse,
+    TrustBundleUpdate, UpdateNodeRequest, UpdateNodeResponse,
 };
 use crate::raft::state::FleetStateMachine;
 use crate::secrets::store::SecretStore;
@@ -135,6 +136,41 @@ impl FleetControlService {
             .await;
     }
 
+    /// Issue a node SVID for `node_id` (`spiffe://<domain>/agent/<node_id>`).
+    ///
+    /// The keypair is generated here and the CSR is built with the SPIFFE ID
+    /// the server chose, so the identity in the certificate never comes from
+    /// the requester. Returns the certificate PEM followed by the private key
+    /// PEM, and the expiry (unix seconds).
+    #[allow(clippy::result_large_err)] // tonic handlers return `Status` unboxed
+    pub(super) async fn issue_node_svid(&self, node_id: &str) -> Result<(Vec<u8>, u64), Status> {
+        let ca = self
+            .ca
+            .as_ref()
+            .ok_or_else(|| Status::internal("CA not configured for node SVID issuance"))?;
+        let node_csr = csr::generate_node_csr(&self.domain, node_id)
+            .map_err(|e| Status::internal(format!("node CSR generation: {e}")))?;
+        let (cert_pem, chain_pem, expires_at) = ca
+            .sign_csr(&node_csr.csr_der, &format!("agent/{node_id}"), None)
+            .await
+            .map_err(|e| Status::internal(format!("node SVID issuance: {e}")))?;
+        // Bundle leaf, issuing intermediate, then key (the server SVID format),
+        // so a peer anchored only on the root can build the chain.
+        let chain_pem = String::from_utf8_lossy(&chain_pem);
+        let intermediate = chain_pem
+            .split_inclusive("-----END CERTIFICATE-----")
+            .next()
+            .unwrap_or_default()
+            .trim();
+        let key_pem = zeroize::Zeroizing::new(node_csr.keypair.serialize_pem());
+        let mut node_cert = cert_pem;
+        node_cert.push(b'\n');
+        node_cert.extend_from_slice(intermediate.as_bytes());
+        node_cert.push(b'\n');
+        node_cert.extend_from_slice(key_pem.as_bytes());
+        Ok((node_cert, expires_at))
+    }
+
     /// Configure the service with a certificate issuer for SPIFFE SVID issuance.
     pub fn with_cert_issuer(mut self, issuer: CertIssuer, trust_bundle_pem: String) -> Self {
         self.cert_issuer = Some(issuer);
@@ -154,11 +190,20 @@ impl FleetControlService {
         let store = SecretStore::new(
             <&[u8; 32]>::try_from(key.as_slice()).expect("fleet key must be 32 bytes"),
         );
-        *self.fleet_key.blocking_write() = FleetKeyState {
+        // Builder methods run inside the async runtime, where `blocking_write`
+        // panics. Nothing else holds these locks during construction, so
+        // `try_write` always succeeds here.
+        *self
+            .fleet_key
+            .try_write()
+            .expect("fleet key lock is uncontended during construction") = FleetKeyState {
             key: key.clone(),
             version: 1,
         };
-        *self.secret_store.blocking_write() = store;
+        *self
+            .secret_store
+            .try_write()
+            .expect("secret store lock is uncontended during construction") = store;
         self
     }
 
@@ -182,6 +227,13 @@ impl FleetControl for FleetControlService {
             .remote_addr()
             .map(|a| a.to_string())
             .unwrap_or_else(|| "unknown".into());
+        // An agent authenticated by its node SVID may only speak for the node
+        // its SPIFFE ID names.
+        let svid_node_id = request
+            .extensions()
+            .get::<PeerIdentity>()
+            .and_then(|peer| agent_node_id(&peer.spiffe_id, &self.domain))
+            .map(str::to_string);
 
         let mut inbound = request.into_inner();
 
@@ -202,7 +254,21 @@ impl FleetControl for FleetControlService {
             }
         };
 
-        tracing::info!(node_id = %node_id, remote = %remote, "Agent connected");
+        if let Some(svid_node_id) = &svid_node_id
+            && *svid_node_id != node_id
+        {
+            tracing::warn!(
+                svid_node_id = %svid_node_id,
+                claimed_node_id = %node_id,
+                remote = %remote,
+                "Agent claimed a node ID that does not match its SVID"
+            );
+            return Err(Status::permission_denied(format!(
+                "node SVID is for '{svid_node_id}', not '{node_id}'"
+            )));
+        }
+
+        tracing::info!(node_id = %node_id, remote = %remote, mtls = svid_node_id.is_some(), "Agent connected");
 
         // Register agent and get outbound channel
         let pool_name = if pool.is_empty() {
@@ -683,103 +749,146 @@ impl FleetControl for FleetControlService {
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 
+    /// Attest a new node with a one-time join token and issue its node SVID.
+    ///
+    /// This RPC is reachable without a bearer token or client certificate (see
+    /// [`ATTEST_PATH`] in `serve_grpc`): the join token is the credential. The
+    /// agent supplies its stable node ID, which is bound into the SVID as
+    /// `spiffe://<domain>/agent/<node_id>`.
     async fn attest(
         &self,
         request: Request<NodeAttestationRequest>,
     ) -> Result<Response<NodeAttestationResult>, Status> {
-        require_permission(&request, Permission::Attest)?;
-        let req = request.into_inner();
+        let remote = request
+            .remote_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| "unknown".into());
+        let req = request.get_ref();
         tracing::info!(
             attestation_type = %req.attestation_type,
-            csr_len = req.csr.len(),
+            node_id = %req.node_id,
+            remote = %remote,
             "Node attestation request received"
         );
 
-        // Extract node_id from the CSR's CN (or generate one)
-        let node_id = if req.csr.len() > 1 && req.csr[0] == 0x30 {
-            // Try to extract from CSR DN
-            uuid::Uuid::new_v4().to_string()
-        } else {
-            uuid::Uuid::new_v4().to_string()
-        };
-
-        // Dispatch attestation based on type
         let attest_result = match req.attestation_type.as_str() {
             "join_token" => {
                 crate::attestation::join_token::attest(
                     &self.join_token_store,
                     &req.attestation_data,
-                    &node_id,
+                    &req.node_id,
                 )
                 .await
             }
-            other => {
+            other => Err(crate::attestation::AttestationError::UnknownType(
+                other.to_string(),
+            )),
+        };
+
+        let result = match attest_result {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::warn!(node_id = %req.node_id, remote = %remote, error = %e, "Node attestation failed");
+                self.audit(
+                    &request,
+                    super::audit::AuditAction::NodeAttest,
+                    &req.node_id,
+                    &format!("attestation from {remote} failed: {e}"),
+                    super::audit::AuditOutcome::Denied,
+                )
+                .await;
                 return Ok(Response::new(NodeAttestationResult {
                     success: false,
-                    error_message: format!("unknown attestation type: {other}"),
+                    error_message: e.to_string(),
                     ..Default::default()
                 }));
             }
         };
 
-        match attest_result {
-            Ok(result) => {
-                let ca = self
-                    .ca
-                    .as_ref()
-                    .ok_or_else(|| Status::internal("CA not configured for node SVID issuance"))?;
+        let (node_certificate, expires_at) = self.issue_node_svid(&result.node_id).await?;
+        let spiffe_id = format!("spiffe://{}/agent/{}", self.domain, result.node_id);
+        let trust_bundle = self
+            .trust_bundle_pem
+            .as_ref()
+            .map(|s| s.as_bytes().to_vec())
+            .unwrap_or_default();
 
-                // Generate a node CSR on behalf of the attested node and issue a node SVID
-                let spiffe_id = format!("spiffe://{}/agent/{}", self.domain, result.node_id);
+        tracing::info!(
+            node_id = %result.node_id,
+            spiffe_id = %spiffe_id,
+            selectors = ?result.selectors,
+            "Node attestation successful — SVID issued"
+        );
+        self.audit(
+            &request,
+            super::audit::AuditAction::NodeAttest,
+            &result.node_id,
+            &format!("attested from {remote} as {spiffe_id}"),
+            super::audit::AuditOutcome::Success,
+        )
+        .await;
 
-                let node_csr = csr::generate_node_csr(&self.domain, &result.node_id)
-                    .map_err(|e| Status::internal(format!("node CSR generation: {e}")))?;
+        Ok(Response::new(NodeAttestationResult {
+            success: true,
+            node_spiffe_id: spiffe_id,
+            node_certificate,
+            trust_bundle,
+            error_message: String::new(),
+            trust_domain: self.domain.clone(),
+            node_id: result.node_id,
+            expires_at,
+        }))
+    }
 
-                let (cert_pem, _chain_pem, _expires_at) = ca
-                    .sign_csr(
-                        &node_csr.csr_der,
-                        &format!("agent/{}", result.node_id),
-                        None,
-                    )
-                    .await
-                    .map_err(|e| Status::internal(format!("node SVID issuance: {e}")))?;
+    async fn create_join_token(
+        &self,
+        request: Request<CreateJoinTokenRequest>,
+    ) -> Result<Response<CreateJoinTokenResponse>, Status> {
+        require_permission(&request, Permission::ManageTokens)?;
+        let node_id = request.get_ref().node_id.clone();
+        let bound_node_id = if node_id.is_empty() {
+            None
+        } else {
+            crate::attestation::join_token::validate_node_id(&node_id)
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+            Some(node_id.clone())
+        };
 
-                // Combine cert with the locally generated key
-                let key_pem = node_csr.keypair.serialize_pem();
-                let mut node_cert = cert_pem;
-                node_cert.push(b'\n');
-                node_cert.extend_from_slice(key_pem.as_bytes());
+        use ring::rand::{SecureRandom, SystemRandom};
+        let mut bytes = zeroize::Zeroizing::new([0u8; 32]);
+        SystemRandom::new()
+            .fill(bytes.as_mut())
+            .map_err(|_| Status::internal("RNG failure"))?;
+        let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
 
-                let trust_bundle = self
-                    .trust_bundle_pem
-                    .as_ref()
-                    .map(|s| s.as_bytes().to_vec())
-                    .unwrap_or_default();
+        self.join_token_store
+            .register_bound(&token, bound_node_id)
+            .await;
+        let expires_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            + crate::attestation::join_token::JOIN_TOKEN_TTL_SECS;
 
-                tracing::info!(
-                    node_id = %result.node_id,
-                    spiffe_id = %spiffe_id,
-                    "Node attestation successful — SVID issued"
-                );
+        let detail = if node_id.is_empty() {
+            "create unbound join token".to_string()
+        } else {
+            format!("create join token bound to node {node_id}")
+        };
+        self.audit(
+            &request,
+            super::audit::AuditAction::TokenCreate,
+            &super::rbac::token_id(&token),
+            &detail,
+            super::audit::AuditOutcome::Success,
+        )
+        .await;
 
-                Ok(Response::new(NodeAttestationResult {
-                    success: true,
-                    node_spiffe_id: spiffe_id,
-                    node_certificate: node_cert,
-                    trust_bundle,
-                    error_message: String::new(),
-                    trust_domain: self.domain.clone(),
-                }))
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "Node attestation failed");
-                Ok(Response::new(NodeAttestationResult {
-                    success: false,
-                    error_message: e.to_string(),
-                    ..Default::default()
-                }))
-            }
-        }
+        Ok(Response::new(CreateJoinTokenResponse {
+            token,
+            expires_at,
+            node_id,
+        }))
     }
 
     async fn status(
@@ -1898,6 +2007,16 @@ impl FleetControlService {
     }
 }
 
+/// gRPC path of the `Attest` RPC, the only RPC callable without credentials.
+pub const ATTEST_PATH: &str = "/fleet.FleetControl/Attest";
+
+/// Request extension marking a call to [`ATTEST_PATH`].
+///
+/// Interceptors do not see the request URI, so `mark_attest_route` (a tower
+/// layer that does) records it here for the authentication interceptor.
+#[derive(Debug, Clone, Copy)]
+pub struct AttestRoute;
+
 /// TLS configuration for the gRPC server.
 pub struct TlsConfig {
     /// Server certificate PEM (leaf cert + private key)
@@ -1968,6 +2087,7 @@ pub async fn serve_grpc(
             .map(|v| super::rbac::RequestNamespace(v.to_string()))
             .unwrap_or_default();
         req.extensions_mut().insert(namespace);
+        let is_attest = req.extensions().get::<AttestRoute>().is_some();
 
         // Accept mTLS-authenticated requests. Authentication is established by
         // the presence of a client certificate that rustls has *already verified*
@@ -1992,6 +2112,12 @@ pub async fn serve_grpc(
             return Ok(req);
         }
 
+        // Attest is how an agent without credentials bootstraps: its join token
+        // (in the request body) is the credential, checked by the handler.
+        if is_attest {
+            return Ok(req);
+        }
+
         // RBAC bearer token authentication.
         // The token is validated against the TokenStore; role checks
         // happen at the RPC handler level via the role stored in metadata.
@@ -2002,10 +2128,15 @@ pub async fn serve_grpc(
         let raw_token = extract_bearer_token(auth_header)
             .ok_or_else(|| Status::unauthenticated("missing or invalid authorization header"))?;
 
-        // TokenStore::authenticate is async but interceptors are sync.
-        // We use blocking_read() for non-blocking access — the store is rarely written to.
+        // TokenStore::authenticate is async but interceptors are sync, and
+        // `blocking_read` panics on a runtime thread. The store is rarely
+        // written, so take the lock without waiting and only fall back to a
+        // blocking wait (moved off the async worker) when a writer holds it.
         let tokens = token_store.inner_ref();
-        let guard = tokens.blocking_read();
+        let guard = match tokens.try_read() {
+            Ok(guard) => guard,
+            Err(_) => tokio::task::block_in_place(|| tokens.blocking_read()),
+        };
         let (role, identity) =
             super::rbac::TokenStore::authenticate_sync_identity(&guard, raw_token)
                 .ok_or_else(|| Status::unauthenticated("invalid or expired token"))?;
@@ -2019,12 +2150,15 @@ pub async fn serve_grpc(
     };
 
     let identity = Identity::from_pem(&tls.cert_pem, &tls.cert_pem);
-    // Enable optional client certificate verification for mTLS.
-    // Agents with a node SVID present their client cert; legacy agents
-    // continue using bearer token auth.
+    // Optional client certificate verification for mTLS. Agents with a node
+    // SVID present their client cert. Clients without one (the CLI, legacy
+    // bearer-token agents, and agents calling Attest to get their first SVID)
+    // must still be able to complete the handshake, so a client cert is
+    // verified when presented but not required.
     let tls_config = ServerTlsConfig::new()
         .identity(identity)
-        .client_ca_root(Certificate::from_pem(&tls.ca_cert_pem));
+        .client_ca_root(Certificate::from_pem(&tls.ca_cert_pem))
+        .client_auth_optional(true);
 
     let addr_str = addr.to_string();
     let service = FleetControlService::new(
@@ -2047,9 +2181,32 @@ pub async fn serve_grpc(
         .http2_keepalive_interval(Some(Duration::from_secs(20)))
         .http2_keepalive_timeout(Some(Duration::from_secs(10)))
         .tcp_keepalive(Some(Duration::from_secs(60)))
+        .layer(tower::util::MapRequestLayer::new(mark_attest_route))
         .add_service(FleetControlServer::with_interceptor(service, interceptor))
         .serve_with_shutdown(addr, shutdown.cancelled())
         .await?;
 
     Ok(())
+}
+
+/// Extract `<node_id>` from `spiffe://<domain>/agent/<node_id>`.
+///
+/// Returns `None` for any other SPIFFE ID (other trust domain, `/server/...`,
+/// nested paths).
+pub fn agent_node_id<'a>(spiffe_id: &'a str, domain: &str) -> Option<&'a str> {
+    let node_id = spiffe_id
+        .strip_prefix("spiffe://")?
+        .strip_prefix(domain)?
+        .strip_prefix("/agent/")?;
+    (!node_id.is_empty() && !node_id.contains('/')).then_some(node_id)
+}
+
+/// Tag requests for the `Attest` RPC with [`AttestRoute`].
+fn mark_attest_route<B>(
+    mut req: tonic::codegen::http::Request<B>,
+) -> tonic::codegen::http::Request<B> {
+    if req.uri().path() == ATTEST_PATH {
+        req.extensions_mut().insert(AttestRoute);
+    }
+    req
 }

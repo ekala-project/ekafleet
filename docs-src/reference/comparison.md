@@ -124,7 +124,7 @@ ekafleet is a single binary that consolidates capabilities from 10+ separate too
 | Audit logging | **Yes** | **Yes** | **Yes** | Structured control-plane action trail |
 | SPIFFE X.509-SVIDs | **Yes** | No (needs SPIRE) | No (needs SPIRE) | Native SPIFFE identity for every workload |
 | SPIFFE Workload API | **Yes** | No (needs SPIRE) | No (needs SPIRE) | Standard UDS-based API for SVID delivery |
-| Node attestation | *Partial* | **Yes** (kubelet) | **Yes** (Consul) | One-time join tokens (persisted, replay-audited, rate-limited); agent join flow not yet wired; no TPM/cloud instance attestation |
+| Node attestation | *Partial* | **Yes** (kubelet) | **Yes** (Consul) | One-time join tokens (server-registered, persisted, replay-audited, rate-limited, optional node binding) with an end-to-end agent join; no node SVID renewal; no TPM/cloud instance attestation |
 | mTLS everywhere | **Yes** | No (needs Istio) | **Yes** (Connect) | Agent-server and service-to-service |
 | Identity contracts | **Yes** | No (needs NetworkPolicy) | **Yes** (Intentions) | allowedCallers/allowedTargets per service |
 | Trust domain federation | **Yes** | No (needs SPIRE) | No (needs SPIRE) | Cross-cluster SPIFFE trust |

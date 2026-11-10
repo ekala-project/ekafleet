@@ -24,7 +24,7 @@ Status legend: **Done** = implemented, wired into the runtime, and tested ·
 | P0.4 Multi-node Raft | **Open** | Single-node durable state only; `--peers` is logged and nothing else |
 | P1.1 Event-driven reconcile | **Partial** | Trigger exists, but the loop only runs during `apply --follow` |
 | P1.2 Workload attestation env var | Done | Cgroup-only attestation |
-| P1.3 Node attestation is TOFU | **Partial** | Store hardened; the join-token flow is not wired end to end; no TPM or instance binding |
+| P1.3 Node attestation is TOFU | **Partial** | Join-token flow wired end to end (create → Attest → node SVID → mTLS); no node SVID renewal; no TPM or instance binding |
 | P1.4 WireGuard keys / gossip | **Partial** | Signed-advert verification exists; nothing signs or sends adverts; gossip uses a shared HMAC key and is not started |
 | P1.5 Non-NixOS support | **Partial** | Example + `nix profile` fallback; no VM/container test |
 | P1.6 Generation retention | Done | `GenerationRetention` + module options (one bug: combining both bounds fails) |
@@ -145,21 +145,33 @@ in the same file.
 - Unit tests in the same file: replay, rate limit, binding mismatch, expiry, and
   persistence round-trip.
 
+**Wired end to end** (branch `jonringer/fix-join-tokens`):
+- `ekafleet token create [--node-id ID]` calls the new `CreateJoinToken` RPC
+  (needs `ManageTokens`), which generates the token server-side and registers it
+  (optionally bound to a node ID). Non-`agent` types are refused.
+- `Attest` is the one RPC the gRPC interceptor admits without a bearer token or
+  client cert (tagged by path in a tower layer); the join token in the body is the
+  credential. The server's TLS config makes client certs optional so credential-less
+  clients can complete the handshake.
+- The agent proposes its node ID (`--node-id`, or a UUID persisted in
+  `<data-dir>/node-id` on first start). `attest` validates it, enforces token
+  binding, and refuses an unbound token for a node ID that has already attested
+  (no identity takeover). The server generates the node key pair and SVID for
+  `spiffe://<domain>/agent/<node_id>`; the identity never comes from a CSR.
+- The agent (`src/agent/join.rs`) persists the SVID (key mode 0600) and uses it for
+  mTLS. `StreamControl` refuses heartbeats whose `node_id` differs from the SVID's.
+- Tests: `tests/join_token.rs` (real `serve_grpc`: flow, replay, binding, takeover,
+  wrong node, RBAC), unit tests in `join_token.rs`, `agent/helpers.rs`,
+  `agent/types.rs`, and the `server-agent` VM test (real join across two VMs,
+  restart keeps the node ID and SVID, replay refused).
+
 **Remaining**:
-- The store is not used end to end:
-  - `ekafleet token create` only prints a random token locally and never
-    registers it with the server (`cmd_token_create`, `src/commands.rs:538`).
-  - The only caller of `register` is the cloud scaling actuator
-    (`src/server/cloud/actuator.rs:403`).
-  - The agent never calls the `Attest` RPC. It accepts `--join-token`
-    (`AgentConfig.join_token`, `src/agent/types.rs:125`), but nothing reads it.
-- Binding cannot work as written. `attest` in `src/server/api.rs` (around line 698)
-  assigns a fresh random UUID as `node_id` for every request (both branches), so a
-  token bound to a node ID never matches. `register_bound` has no callers outside
-  tests.
+- Node SVIDs are not renewed. They use the CA default TTL (1h); after expiry the
+  agent can only reconnect with a new bound token (`token create --node-id <id>`).
+  The `NODE_CERT` certificate request type is still unhandled.
+- `--type server` join tokens do not exist (server SVIDs come from the CA directly).
 - There is no hardware or instance binding: no TPM, cloud instance-identity
   document, or host-key attestor.
-- There is no test of agent join through `Attest` (unit or VM).
 
 ### P1.4 WireGuard peer keys are not identity-bound; gossip is plaintext — **Partial**
 

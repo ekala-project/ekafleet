@@ -49,7 +49,6 @@ pkgs.testers.nixosTest {
     };
 
   testScript = ''
-    import json
 
     AUTH = "-H 'Authorization: Bearer lifecycle-token'"
     BASE = "http://server:7402"
@@ -202,12 +201,13 @@ pkgs.testers.nixosTest {
 
     # ── 10. ACL token lifecycle via CLI ──
 
-    token = server.succeed("ekafleet token create").strip()
+    TOKEN_CLI = "ekafleet --ca-cert /var/lib/ekafleet/ca-cert.pem --server 127.0.0.1:7400"
+    server.fail(f"{TOKEN_CLI} token create")  # needs an admin token
+    token = server.succeed(f"EKAFLEET_TOKEN=lifecycle-token {TOKEN_CLI} token create").strip()
     assert len(token) == 64 and all(c in "0123456789abcdef" for c in token), \
         f"Expected 64 hex chars, got {len(token)}: '{token}'"
 
-    server_token = server.succeed("ekafleet token create --type server").strip()
-    assert len(server_token) == 64, f"Server token wrong length: {len(server_token)}"
+    server.fail(f"EKAFLEET_TOKEN=lifecycle-token {TOKEN_CLI} token create --type server")
 
     # ── 11. Prometheus metrics ──
 
@@ -219,7 +219,9 @@ pkgs.testers.nixosTest {
     # ── 12. Dashboard UI ──
 
     server.succeed(
-        f"curl -sf {AUTH} {BASE}/ui/ | grep -qi 'ekafleet'"
+        # Download first: `grep -q` exits on the first match, and under
+        # pipefail curl's resulting write error (23) fails the step.
+        f"curl -sf {AUTH} {BASE}/ui/ -o /tmp/ui.html && grep -qi 'ekafleet' /tmp/ui.html"
     )
 
     # ── 13. Authentication enforcement ──

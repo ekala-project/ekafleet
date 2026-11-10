@@ -8,7 +8,7 @@ Quick reference for all ekafleet commands. All commands accept `--output json` f
 ekafleet dev                                    # Dev mode (server + agent, no TLS)
 ekafleet server --token $TOKEN --domain fleet.internal  # Production server
 ekafleet agent --join server:7400 --join-token $TOKEN    # Join agent to fleet
-ekafleet token create --type agent              # Generate join token
+ekafleet token create [--node-id ID]            # Create join token on the server
 ```
 
 ## Deploy
