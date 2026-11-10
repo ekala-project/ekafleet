@@ -3,211 +3,431 @@
 > Prioritized gap analysis for reaching Kubernetes/HashiCorp-grade orchestration
 > that is deeply Nix-native and SPIFFE-native, with optional OCI support.
 >
-> Every item below was verified against source at the cited `file:line`. Items are
-> ranked by severity. The previous edition of this file (24 "all done" features)
-> is preserved in git history — most of those landed, but the audit below found
-> deeper gaps in the *foundations* (consensus, identity trust, closure GC) that
-> the feature checklist did not cover.
+> Every item below was re-verified against source. Pointers use `file:line` or
+> `file` + symbol name. Line numbers drift, so the symbol is authoritative. Items
+> are ranked by severity. Earlier editions of this file are in git history.
 
 Severity legend: **P0** = blocks production / security hole · **P1** = ship-blocker
 for the stated goal · **P2** = correctness/UX gap · **P3** = polish.
+
+Status legend: **Done** = implemented, wired into the runtime, and tested ·
+**Partial** = real code exists, but part of the item is missing or not wired end to end ·
+**Open** = not implemented.
+
+## Status at a glance
+
+| Item | Status | One-line summary |
+|------|--------|------------------|
+| P0.1 gRPC auth bypass | Done | Peer-cert SPIFFE ID, header stripping, RBAC on every handler |
+| P0.2 Plaintext CA / fleet keys | Done | `seal.rs` envelope + `Zeroizing` |
+| P0.3 GC roots for closures | Done | Supervisor adds and removes indirect roots |
+| P0.4 Multi-node Raft | **Open** | Single-node durable state only; `--peers` is logged and nothing else |
+| P1.1 Event-driven reconcile | **Partial** | Trigger exists, but the loop only runs during `apply --follow` |
+| P1.2 Workload attestation env var | Done | Cgroup-only attestation |
+| P1.3 Node attestation is TOFU | **Partial** | Store hardened; the join-token flow is not wired end to end; no TPM or instance binding |
+| P1.4 WireGuard keys / gossip | **Partial** | Signed-advert verification exists; nothing signs or sends adverts; gossip uses a shared HMAC key and is not started |
+| P1.5 Non-NixOS support | **Partial** | Example + `nix profile` fallback; no VM/container test |
+| P1.6 Generation retention | Done | `GenerationRetention` + module options (one bug: combining both bounds fails) |
+| P2.1 Promote/fail RPCs | Done | Pending-canary registry, real promote/fail |
+| P2.2 Blue-green | **Partial** | All-or-nothing in-place cutover; no parallel blue/green or traffic switch |
+| P2.3 Migration failure handling | **Partial** | Partial-failure semantics done; no destination health gate |
+| P2.4 cgroup enforcement | Done | `to_cgroup_controls` → systemd directives |
+| P2.5 Agent re-adopts units | Done | `adopt_existing_units` at agent startup |
+| P2.6 Nix invocation flexibility | Done | `NixOptions` timeouts + `--option` passthrough + module options |
+| P2.7 fleet.nix module system | **Partial** | Typed module exists and is CI-checked; the CLI still evaluates raw `#fleet` |
+| P2.8 CLI context file | **Partial** | Contexts + `--namespace` done; no `context use/set`; nix stderr still untrimmed |
+| P2.9 REST TLS + pagination | **Partial** | Opt-in TLS + offset/limit; TLS not enforced or exposed in the module; no filtering |
+| P2.10 Intermediate CA | Done | 90-day intermediate signs all leaves |
+| P3 polish | Done | See list |
 
 ---
 
 ## P0 — Security & correctness show-stoppers
 
-### ~~P0.1 gRPC auth is bypassable via client-set metadata~~ (complete)
+### ~~P0.1 gRPC auth is bypassable via client-set metadata~~ (Done)
 
-Resolved. The gRPC interceptor now:
+The gRPC interceptor (`src/server/api.rs`, around line 1957):
 - Strips client-supplied `x-ekafleet-mtls` / `x-ekafleet-attest` headers at entry.
 - Derives mTLS identity from the rustls-verified peer certificate chain via
-  `req.peer_certs()`, extracting the SPIFFE ID from the leaf cert SAN URI.
-- Maps SPIFFE ID paths to roles: `/server/*` → Admin, `/agent/*` → Operator,
-  others → Viewer.
-- Every gRPC handler enforces RBAC via `require_permission()` before processing.
+  `req.peer_certs()` and extracts the SPIFFE ID from the leaf cert URI SAN.
+- Maps SPIFFE ID paths to roles (`src/server/rbac.rs`): `/server/*` → Admin,
+  `/agent/*` → Operator, others → Viewer.
+- Every gRPC handler calls `require_permission()` before doing any work.
 - Audit logs record the full SPIFFE URI for mTLS peers.
 
-### ~~P0.2 CA private key and fleet master key stored in plaintext~~ (complete)
+Tests: `tests/server_agent.rs` (`grpc_rejects_unauthenticated_client`,
+`grpc_rejects_wrong_token`), unit tests in `src/server/rbac.rs`.
 
-Resolved. At-rest sealing via `src/server/seal.rs` (PBKDF2-HMAC-SHA256 +
-AES-256-GCM envelope) encrypts CA keys and the fleet master key when
-`EKAFLEET_SEAL_PASSPHRASE` is set. In-memory key material (fleet key, CA key
-PEM strings) is wrapped in `zeroize::Zeroizing<T>` so it is cleared on drop,
-consistent with the WireGuard key handling.
+### ~~P0.2 CA private key and fleet master key stored in plaintext~~ (Done)
 
-### ~~P0.3 Deployed service closures are not GC-rooted~~ (complete)
+At-rest sealing in `src/server/seal.rs` (PBKDF2-HMAC-SHA256 + AES-256-GCM
+envelope) encrypts the root and intermediate CA keys and the fleet master key
+when `EKAFLEET_SEAL_PASSPHRASE` is set. In-memory key material is wrapped in
+`zeroize::Zeroizing<T>`.
 
-Implemented in `src/agent/supervisor.rs`. The supervisor creates indirect GC roots
-at `{data_dir}/gcroots/{service}` via `nix-store --add-root ... --realise` when a
-service is deployed (`add_gc_root`, line 402) and removes them on teardown
-(`remove_gc_root`, line 436). The `adopt_existing_units` path also recovers GC root
-symlinks for services that survive an agent restart.
+### ~~P0.3 Deployed service closures are not GC-rooted~~ (Done)
 
-### P0.4 No multi-node Raft consensus
-**Where**: `src/raft/mod.rs` (`state`, `storage`). `--peers` is parsed
-(`src/main.rs`) but not wired to a consensus protocol.
+`src/agent/supervisor.rs`: `add_gc_root` (line 414) creates indirect roots at
+`{data_dir}/gcroots/{service}` via `nix-store --add-root ... --realise`, and
+`remove_gc_root` (line 447) removes them on teardown. `adopt_existing_units`
+recovers state from those roots after an agent restart (see P2.5).
 
-There is no leader election, no log replication, no membership changes. The system
-is honestly scoped to single-node with durable state: `FleetStateMachine` is
-persisted via encrypted snapshots and log replay (AES-256-GCM, `raft/storage.rs`),
-and `restore_raft_state` (`src/server/mod.rs:321`) replays the latest snapshot +
-trailing log entries at boot. Two servers today would be two independent brains.
+### P0.4 No multi-node Raft consensus — **Open**
 
-**Resolved**: restore-on-startup is implemented — snapshots and log entries are
-replayed at boot via `restore_raft_state`, and periodic housekeeping takes snapshots
-and compacts the log.
+**Where**: `src/raft/` (`state.rs`, `storage.rs`; `mod.rs` only declares the two
+modules). `--peers` is parsed in `src/main.rs` and stored in `ServerConfig.peers`,
+but its only use is a log field (`src/server/mod.rs:53`).
+
+There is no leader election, log replication, or membership change, and the
+crate has no consensus dependency. The system is honestly scoped to single-node
+with durable state: `FleetStateMachine` is persisted as AES-256-GCM encrypted
+snapshots plus a log (`src/raft/storage.rs`), and `restore_raft_state`
+(`src/server/mod.rs:332`) replays the latest snapshot and trailing log entries at
+boot. Two servers today would be two independent brains.
+
+**Exists**: restore-on-boot; periodic snapshot + log compaction in the
+housekeeping task (`src/server/mod.rs`, around line 440); `ekafleet snapshot` /
+`restore`. The VM test `nix/tests/lifecycle.nix` only checks that the CA, the
+fleet key, and the API survive a server restart. It does not cover Raft state
+contents.
 
 **Remaining**: multi-node consensus (leader election, log replication across
-`--peers`). Candidate approach: integrate `openraft`, wrap `FleetStateMachine` as
-the state machine, use the existing encrypted storage as the log/snapshot store.
+`--peers`, membership changes, follower read/forward semantics), plus a 3-node VM
+test (this is also the `todo.md` "3 node ekaos HA" example). One candidate
+approach is to integrate `openraft`, wrap `FleetStateMachine` as the state
+machine, and use the existing encrypted storage as the log and snapshot store.
 
 ---
 
 ## P1 — Foundational gaps for the stated goal
 
-### P1.1 Reconciliation is timer/`apply`-driven, not event-driven
-**Where**: `src/server/api.rs:556-618` (30s watch loop), dead-node eviction at 300s
-(`src/server/state.rs`).
+### P1.1 Reconciliation is timer/`apply`-driven, not event-driven — **Partial**
 
-A node death does not trigger a reschedule; orphaned workloads wait up to the next
-30s tick (and only if `apply --watch` is running) after a 5-minute eviction delay.
-k8s/Nomad reconcile on events. Add a reconcile trigger channel fired on: agent
-disconnect, heartbeat timeout, service crash report, and config change.
+**Exists** (commit 13a8aba): `ReconcileTrigger` (`src/server/state.rs:18`, a
+coalescing `tokio::sync::Notify`) fires on:
+- agent disconnect (`deregister_agent`),
+- heartbeat-timeout eviction (`evict_dead_nodes`),
+- a service newly reporting `ServiceFailed` (`update_status`).
 
-### ~~P1.2 Workload attestation trusts a spoofable env var~~ (complete)
+The reconcile loop in `src/server/api.rs` (around line 594) `select!`s on the 30s
+tick or the trigger. Unit tests in `src/server/state.rs`:
+`eviction_fires_reconcile_trigger`, `newly_failed_service_fires_trigger`.
 
-Resolved. The env var fallback was removed from `src/spiffe/workload_attestor.rs`.
-Attestation is now cgroup-based only: the service name is derived from the process's
-systemd cgroup membership (`/proc/<pid>/cgroup`), which is set by the kernel and
-cannot be forged by the workload itself. The `EKAFLEET_SERVICE` env var is still
-*set* in service units (for the service's own use) but is never trusted as an
-identity source.
+**Remaining**:
+- The loop is only spawned inside the `Apply` handler when `req.watch` is set
+  (`src/server/api.rs:479`). With no open `apply --follow` stream, no
+  reconciliation happens at all, event-driven or periodic. Move it to a
+  server-owned background task started in `src/server/mod.rs`.
+  `reconciler::reconcile_loop` (`src/server/reconciler.rs:170`) exists for this
+  but has no callers, and it ignores the trigger.
+- Dead-node eviction is still hardcoded to 300s in the 60s housekeeping loop
+  (`src/server/mod.rs:409`). Make it configurable.
+- There is no trigger on config change (no watch on `fleet.nix` or the flake).
+- There is no integration or VM test that kills an agent and asserts a reschedule.
 
-### P1.3 Node attestation is pure TOFU
-**Where**: join token store is in-memory (`src/attestation/join_token.rs`), lost on
-restart, no machine binding, no rate limit, single generic selector.
+### ~~P1.2 Workload attestation trusts a spoofable env var~~ (Done)
 
-**Fix**: persist consumed-token audit; bind tokens to a cloud instance ID / TPM /
-host key; add attempt rate-limiting; include richer selectors in the attestation result.
+`src/spiffe/workload_attestor.rs` is cgroup-only. The service name comes from
+`/proc/<pid>/cgroup` (`attest_from_cgroup_content`). `EKAFLEET_SERVICE` is still
+set in units for the service's own use but is never trusted. There are unit tests
+in the same file.
 
-### P1.4 WireGuard peer keys are not identity-bound; gossip is plaintext
-**Where**: `src/mesh/wireguard.rs`, gossip in `src/gossip/`.
+### P1.3 Node attestation is pure TOFU — **Partial**
 
-Peer public keys are distributed via unencrypted SWIM gossip with no cryptographic
-proof of identity. A leaked/observed public key lets an attacker present as a peer,
-and discovery/topology is eavesdroppable.
+**Exists** (commit 14b8bf7), in `src/attestation/join_token.rs`:
+- Persistence: `JoinTokenStore::with_persistence` + `load()`, wired at
+  `src/server/mod.rs:217`. Both live tokens and a consumed-token audit trail are
+  persisted, so a replay after restart is rejected.
+- Rate limiting: 20 failures per 60s window (`RATE_LIMIT_MAX_FAILURES`, checked in
+  `consume`).
+- Optional node binding: `register_bound`.
+- Richer selectors: `attestation_type`, `join_token:bound`, `node_id`.
+- Unit tests in the same file: replay, rate limit, binding mismatch, expiry, and
+  persistence round-trip.
 
-**Fix**: sign peer key advertisements with the node SVID; distribute over the
-authenticated control channel or an encrypted gossip transport.
+**Remaining**:
+- The store is not used end to end:
+  - `ekafleet token create` only prints a random token locally and never
+    registers it with the server (`cmd_token_create`, `src/commands.rs:538`).
+  - The only caller of `register` is the cloud scaling actuator
+    (`src/server/cloud/actuator.rs:403`).
+  - The agent never calls the `Attest` RPC. It accepts `--join-token`
+    (`AgentConfig.join_token`, `src/agent/types.rs:125`), but nothing reads it.
+- Binding cannot work as written. `attest` in `src/server/api.rs` (around line 698)
+  assigns a fresh random UUID as `node_id` for every request (both branches), so a
+  token bound to a node ID never matches. `register_bound` has no callers outside
+  tests.
+- There is no hardware or instance binding: no TPM, cloud instance-identity
+  document, or host-key attestor.
+- There is no test of agent join through `Attest` (unit or VM).
 
-### P1.5 Non-NixOS-with-Nix support is claimed but does not exist
-**Where**: `todo.md` ("non nixos + nix example"), README/quickstart imply support.
+### P1.4 WireGuard peer keys are not identity-bound; gossip is plaintext — **Partial**
 
-No test, no example, the NixOS module is NixOS-only, and activation uses `nix-env`
-which is unavailable on flakes-only installs. Either build + test the standalone
-(Nix + systemd on a foreign distro) path, or remove the claim.
+**Exists** (commit 060a672): `src/mesh/advert.rs` provides `sign_advert` and
+`verify_advert`. An ECDSA P-256 signature from the node SVID covers
+`(node_id, public_key, endpoint, allowed_ip)`, and the cert's SPIFFE URI SAN must
+match `spiffe://<domain>/agent/<node_id>`. `PeerManager::apply_update`
+(`src/mesh/peers.rs:45`) drops unsigned or forged adverts. `WireguardPeer` carries
+`signature` / `signing_cert_pem` (`proto/fleet.proto`). Unit tests are in
+`advert.rs`: tampering, identity mismatch, wrong domain, and a foreign cert.
 
-**Fix**: standalone agent example on a non-NixOS host; `nix profile` fallback where
-`nix-env` is absent; a VM/container test covering it.
+**Remaining**:
+- Nothing calls `sign_advert` outside tests, and the server never builds a
+  `ServerPayload::Peers` message. The only handler is on the agent side
+  (`src/agent/handlers.rs:343`), so peer distribution is not wired at all, signed
+  or unsigned.
+- The agent constructs `PeerManager` with a hardcoded `"fleet.internal"` trust
+  domain (`src/agent/mod.rs:155`) instead of the fleet's domain.
+- Gossip (`src/gossip/swim.rs`) authenticates with a single shared HMAC-SHA256
+  cluster key (`SwimMembership::new`). It is not encrypted and not bound to node
+  SVIDs. Neither `SwimMembership` nor `ServiceCatalog` is constructed outside
+  `src/gossip/`, so gossip does not run in the server or agent today.
+- Remaining work: server-side peer distribution over the mTLS control channel,
+  agent-side signing with its SVID, and gossip transport encryption with per-node
+  identity (or drop gossip in favour of the control channel). Then add a
+  multi-node VM test.
 
-### P1.6 Old system generations accumulate unbounded
-**Where**: `src/agent/activation.rs` — each activation bumps the profile generation,
-none are trimmed. Long-lived fleets fill disk. Add a retention policy
-(`keep last N` / `older than D`) after successful activation, plus a module option.
+### P1.5 Non-NixOS-with-Nix support is claimed but does not exist — **Partial**
+
+**Exists** (commit db7eaa4):
+- `examples/standalone-nonnixos/` (README + `fleet.nix`) documents per-service
+  systemd supervision on a foreign distro with no NixOS module.
+- `set_system_profile` (`src/agent/activation.rs:364`) falls back to
+  `nix profile install --profile` when `nix-env` is absent.
+- Unit tests `run_profile_set_reports_missing_binary_as_notfound` and
+  `run_profile_set_reports_nonzero_exit_as_profile_failed`.
+- The example `fleet.nix` is schema-checked by `nix/tests/fleet-module.nix`, which
+  evaluates every `examples/*`.
+
+**Remaining**: there is no VM or container test that runs the agent on a non-NixOS
+userland (Nix + systemd, no NixOS module), as originally asked. The `todo.md` item
+is marked done on the strength of the example alone.
+
+### P1.6 Old system generations accumulate unbounded — **Done** (one bug)
+
+**Exists** (commit e16375d), in `src/agent/activation.rs`:
+- `GenerationRetention` (line 71) defaults to keeping the last 10 generations.
+- `GenerationRetention::from_env` reads `EKAFLEET_KEEP_GENERATIONS` /
+  `EKAFLEET_KEEP_GENERATIONS_DAYS`.
+- `activate_system` calls `prune_generations` (line 240) after a successful
+  activation. A pruning failure is non-fatal.
+- `nix profile wipe-history --older-than` is the fallback when `nix-env` is absent.
+
+Wiring: `src/agent/handlers.rs:60`. NixOS module options
+`services.ekafleet.agent.keepGenerations` / `keepGenerationsDays`
+(`nix/module.nix:156,166`). Unit tests are in `activation.rs`.
+
+**Remaining**:
+- When both bounds are set, `prune_generations` passes two selectors
+  (`--delete-generations 10d +10`). `nix-env` only accepts `Nd` or `+N` as a
+  *single* argument and fails with `invalid generation number '10d'` (reproduced
+  locally). Pruning then silently does nothing beyond a warning. Either apply the
+  bounds in two invocations or document that they are mutually exclusive.
+- On flakes-only hosts, count-based pruning is skipped. Only the age bound is
+  expressible there.
+- There is no VM test of pruning.
 
 ---
 
 ## P2 — Correctness & UX gaps
 
-### P2.1 `promote_deployment` / `fail_deployment` RPCs are stubs
-`src/server/api.rs:1459-1489` return success and do nothing. Canary auto-promote
-works in the deployer, but the manual promote/fail controls are non-functional.
+### ~~P2.1 `promote_deployment` / `fail_deployment` RPCs are stubs~~ (Done)
 
-### P2.2 Blue-green deployment incomplete
-Skeleton only in `src/server/deployer.rs`; rolling and canary are real.
+Implemented in commit 06ec91a:
+- When a canary is healthy and `autoPromote = false`, `execute_canary` records a
+  `PendingCanary` in `PendingCanaryStore` (`src/server/deployer.rs:44`), held on
+  `FleetState`.
+- `promote_deployment` (`src/server/api.rs:1557`) calls `deployer::promote_canary`
+  (`deployer.rs:472`). If promotion fails, the entry is re-registered so the
+  operator can retry or fail it.
+- `fail_deployment` (`api.rs:1612`) calls `deployer::fail_canary` (`deployer.rs:540`)
+  to roll the canary back.
+- CLI: `ekafleet deployment promote|fail <service>` (`src/main.rs`).
+- Unit tests in `deployer.rs`: `pending_store_insert_take_is_one_shot`, the
+  `promote_*` tests, and `fail_canary_does_not_panic_without_previous_path`.
 
-### P2.3 Reschedule volume-migration failure handling is thin
-**Corrected finding**: migrations *are* computed and executed for reschedules
-(`src/server/reconciler.rs:265-309, 382-406`) — the earlier "never runs" claim was
-wrong. Remaining gap: partial-failure semantics and health-gating of the destination
-before cutover need hardening and a test. (Creates/updates/destroys correctly carry
-no migrations.)
+Follow-ups:
+- Pending canaries are in memory only and are lost on server restart.
+- `fail` only acts on a canary awaiting promotion, although the CLI help says
+  "Fail a stuck deployment".
+- There is no RPC-level or VM test.
 
-### ~~P2.4 No cgroup resource enforcement~~ (complete)
+### P2.2 Blue-green deployment incomplete — **Partial**
 
-Resolved. The reconciler now calls `to_cgroup_controls()` when building
-`ServiceSpec` protos and sends full `DesiredState` messages (with cgroup controls,
-health checks, lifecycle hooks, volumes) to agents before the deployer sends
-lightweight `DeployCommand` triggers. The agent supervisor renders `CPUQuota`,
-`MemoryMax`, `CPUWeight`, `MemoryHigh`, `IOWeight`, `TasksMax`, and `OOMPolicy`
-into systemd unit directives.
+**Exists** (commit b6547d7): `execute_blue_green` (`src/server/deployer.rs:588`)
+sends the new version to every target node, gates on all instances becoming
+healthy (`wait_healthy`), and on an unreachable node or health timeout calls
+`abort_blue_green` (`deployer.rs:661`) to roll every node that received green back
+to the previous store path. Unit tests: `blue_green_empty_plan_is_noop`,
+`blue_green_unreachable_green_aborts_cutover`,
+`blue_green_unhealthy_green_aborts_cutover`.
 
-### P2.5 Agent does not re-adopt services on restart
-On agent restart, prior systemd units survive but supervisor state is lost; orphans
-persist until the next `DesiredState`. Reconcile against actually-running
-`ekafleet-*.service` units at startup.
+**Remaining**: this is an all-or-nothing *in-place* update, not true blue-green.
+- The agent does nothing strategy-specific with `DeployStrategy::BlueGreen`.
+  Green replaces blue on each node, so blue is not kept running alongside green.
+- There is no proxy or DNS traffic switch.
+- There is no post-cutover window to switch back while blue is still warm.
 
-### P2.6 Nix invocation is inflexible
-`src/server/nix.rs:10-16` hardcodes eval/build/copy timeouts (120/600/300s) with no
-override, and passes no `--option` (can't add substituters, trusted keys, or the IFD
-flag). Large or cache-dependent builds fail opaquely. Add configurable timeouts and
-an option passthrough (surface via the NixOS module too).
+Docs (`configuration.md`, `comparison.md`) describe "deploy all, then switch
+traffic".
 
-### P2.7 No fleet.nix module system
-Config is a raw attrset → JSON → serde (`src/config/`). Type errors surface late as
-serde failures, not as typed Nix option errors; there is no Nix-side schema, defaults,
-or `nix flake show` docs. A NixOS-style `lib.types` module would catch mistakes at
-eval time and self-document.
+### P2.3 Reschedule volume-migration failure handling is thin — **Partial**
 
-### P2.8 No CLI context/config file
-Every command needs `--server`/`--token`; there is no kubeconfig-equivalent context
-store. Namespaces exist in code but no `--namespace` flag is exposed. Raw `nix eval`
-stderr is dumped untrimmed to the CLI (`src/server/nix.rs:64`).
+Migrations are computed and executed for reschedules (`src/server/reconciler.rs`).
+Commit ef22738 added per-instance `MigrationResult` collection and
+`summarize_migration_failure` (`reconciler.rs:86`). A reschedule is all-or-nothing:
+if any instance fails, the service stays on its untouched source nodes, and
+destinations holding partial copies are logged. There are unit tests in
+`reconciler.rs`, e.g. `all_migrations_succeed_allows_reschedule`.
 
-### P2.9 REST/HTTP TLS and pagination
-Bearer tokens travel in plaintext unless a reverse proxy terminates TLS; list
-endpoints are unpaginated. Document/enforce TLS; add pagination + filtering.
+**Remaining**:
+- There is no health gate on the destination before cutover.
+- Orphaned partial copies are logged but not cleaned up.
+- There is no integration or VM test of a real rsync migration.
 
-### P2.10 No intermediate CA
-A 10-year root signs leaves directly (`src/ca/root.rs`). Introduce short-lived
-intermediates so root rotation and revocation are practical.
+### ~~P2.4 No cgroup resource enforcement~~ (Done)
+
+`ResourceConfig::to_cgroup_controls` (`src/config/mod.rs:539`) is called while
+building `ServiceSpec` (`src/server/reconciler.rs:528`). Full `DesiredState` is sent
+before `DeployCommand`. The supervisor renders `CPUQuota`, `MemoryMax`, `CPUWeight`,
+`MemoryHigh`, `IOWeight`, `TasksMax`, and `OOMPolicy` directives
+(`src/agent/supervisor.rs`, around line 599).
+
+### ~~P2.5 Agent does not re-adopt services on restart~~ (Done)
+
+`Supervisor::adopt_existing_units` (`src/agent/supervisor.rs:67`) is called at agent
+startup (`src/agent/mod.rs:140`). It scans the unit dir for `ekafleet-*.service`,
+recovers the version key from the GC root (falling back to `ExecStart`), and queries
+the live unit state. The next `DesiredState` can then tear down true orphans. Unit
+tests: `adopt_existing_units_recovers_state_from_gc_root`,
+`adopt_existing_units_falls_back_to_exec_start`,
+`adopt_existing_units_ignores_foreign_and_missing_dir`. There is no VM test that
+restarts the agent.
+
+### ~~P2.6 Nix invocation is inflexible~~ (Done)
+
+`NixOptions` (`src/server/nix.rs`) adds:
+- configurable eval/build/copy timeouts (`EKAFLEET_NIX_{EVAL,BUILD,COPY}_TIMEOUT`),
+- `--option name value` passthrough (`EKAFLEET_NIX_OPTIONS`), installed at server
+  start (`src/server/mod.rs:65`).
+
+The NixOS module exposes `services.ekafleet.server.nixEvalTimeout` /
+`nixBuildTimeout` / `nixCopyTimeout` / `nixOptions` (`nix/module.nix:63-90,256`).
+There are unit tests in `nix.rs`.
+
+### P2.7 No fleet.nix module system — **Partial**
+
+**Exists** (commit 05acfdd):
+- `nix/lib/fleet-module.nix` is a NixOS-style typed options module mirroring
+  `FleetConfig`, with `nix/lib/eval-fleet.nix` (`lib.evalModules`) as the eval
+  helper.
+- The flake exports `lib.fleetModule` / `lib.evalFleet` (`flake.nix:57`).
+- `nix/tests/fleet-module.nix` evaluates every example and asserts that unknown
+  fields and type mismatches are rejected.
+- Rust test `module_shaped_json_deserializes` (`src/config/mod.rs:1020`) keeps the
+  serde and Nix schemas in lockstep.
+
+**Remaining**:
+- The module is opt-in. `eval_fleet` (`src/server/nix.rs:137`) still runs
+  `nix eval --json <flake>#fleet` on the raw attrset, and no example routes its
+  config through `evalFleet`. A typo outside CI still surfaces as a serde error at
+  `plan`/`apply` time.
+- The book (`docs-src/reference/fleet-config.md`) does not document `evalFleet`.
+- There is no generated options reference.
+
+### P2.8 No CLI context/config file — **Partial**
+
+**Exists** (commit 8dbafa0):
+- `src/client_config.rs` adds a kubeconfig-style JSON file of named contexts
+  (`server`, `token`, `caCert`, `namespace`) with `currentContext`.
+- The file is found via `EKAFLEET_CONFIG`, `$XDG_CONFIG_HOME/ekafleet/config.json`,
+  or `~/.config/ekafleet/config.json`.
+- Precedence, lowest to highest: built-in defaults, then the file, then
+  `EKAFLEET_*` env vars, then the global flags `--context` / `--server` / `--token`
+  / `--namespace` / `--ca-cert` (`src/main.rs`).
+- `connect_server` (`src/commands.rs:51`) builds TLS from the context and injects
+  the bearer token and `x-ekafleet-namespace` metadata.
+- `ekafleet context show|list`. There are unit tests in `client_config.rs`.
+
+**Remaining**:
+- There is no `context use` / `set` / `delete`. The file must be hand-edited.
+- Raw `nix eval` / `build` / `copy` stderr is still returned untrimmed in
+  `NixError` (`src/server/nix.rs`, `EvalFailed(stderr.to_string())`).
+- Per-subcommand `--server` defaults still shadow the context unless left at the
+  default value. This is a workaround in `connect_server`.
+
+### P2.9 REST/HTTP TLS and pagination — **Partial**
+
+**Exists** (commit f4f7e97):
+- Opt-in HTTPS reusing the server SVID when `EKAFLEET_HTTP_TLS` is set
+  (`src/server/mod.rs:157`).
+- Shared `PageQuery` offset/limit pagination, capped at 1000
+  (`src/server/rest.rs:454`), on the services, capacity, cloud-instance, and
+  silence lists, plus `offset` on events and deployment history.
+
+**Remaining**:
+- TLS is off by default and not enforced.
+- `EKAFLEET_HTTP_TLS` is not exposed as a NixOS module option or documented in the
+  book.
+- There is no field filtering on list endpoints.
+- There are no REST pagination tests.
+
+### ~~P2.10 No intermediate CA~~ (Done)
+
+`RootCa::initialize_with_intermediate` (`src/ca/root.rs:80`) mints or loads a 90-day,
+path-length-0 intermediate that signs all leaves. It is re-minted at boot when it
+has fewer than 7 days of validity left. Its key is sealed at rest
+(`src/server/mod.rs:77-133`). Tests are in `src/ca/root_tests.rs`.
+
+Follow-ups:
+- `rotate_intermediate` (`root.rs:184`) is only called from tests, so a
+  long-running server does not rotate without a restart.
+- There is no revocation (CRL/OCSP).
 
 ---
 
-## P3 — Polish (complete)
+## P3 — Polish (Done)
 
 - [x] OCI: keyless (Fulcio/Rekor) signature verification; custom registry CA
   bundle; fleet-wide (not per-service) image signature policy; per-layer pull
-  timeouts. (Per-layer timeouts are covered by the per-request deadline applied
-  to every manifest/blob/token fetch in `RegistryClient::send_with_timeout`.)
+  timeouts. Per-layer timeouts come from the per-request deadline that
+  `RegistryClient::with_timeout` (`src/agent/oci/registry.rs`) applies to every
+  manifest, blob, and token fetch.
 - [x] CLI: flag-name consistency (`--follow` vs `--watch`); add `ekafleet
-  version`. (`apply` now uses `--follow` with `--watch` as a visible alias,
-  matching `logs`/`events`; `version` command already present.)
-- [x] Audit log records *which* token performed each action via the non-secret
-  `TokenIdentity` derived server-side from the verified bearer token.
+  version`. `apply` now uses `--follow`, with `--watch` as a visible alias, matching
+  `logs`/`events`.
+- [x] Audit log records *which* token performed each action, via the non-secret
+  `TokenIdentity` (`src/server/rbac.rs`) derived server-side from the verified
+  bearer token.
 - [x] `top` RPC populates service cpu/mem request fields from the
-  `service_request` join (`src/server/state.rs`).
+  `service_requests` map (`src/server/state.rs`).
 - [x] Constant-time comparison for bearer tokens: the ACL token store is keyed
-  by SHA-256 digest, so lookups compare fixed-length digest bytes and the
+  by SHA-256 digest, so lookups compare fixed-length digest bytes, and the
   persisted `tokens.json` no longer stores raw secrets.
 
 ---
 
 ## Corrections to prior/agent-reported findings (do not re-file)
 
-- **OCI parse panics** (`src/agent/oci/manifest.rs:233,267`) are inside
-  `#[cfg(test)]` — not a runtime crash. Ignore.
-- **"Volume migrations never execute"** — false; see P2.3. They run for reschedules.
-- **`Completions` / shell completion** — already implemented
-  (`src/main.rs:395`, `src/commands.rs:541`). Not a gap.
+- **OCI parse panics** (`src/agent/oci/manifest.rs`) are inside `#[cfg(test)]`
+  (from line 208), so they are not a runtime crash. Ignore.
+- **"Volume migrations never execute"** is false; see P2.3. They run for reschedules.
+- **`Completions` / shell completion** is already implemented (`Command::Completions`
+  in `src/main.rs`, `cmd_completions` in `src/commands.rs`). Not a gap.
+- **"P1.3/P1.5/P1.6/P2.1/P2.2/P2.5/P2.7/P2.8 are open"** (previous edition of this
+  file) was stale. See the per-item status above. Several are only Partial.
 
 ---
 
 ## Suggested sequencing
 
-1. ~~**P0.1** (auth bypass)~~ — **done**: SPIFFE ID extraction, RBAC enforcement.
-2. ~~**P0.2** (key sealing)~~ — **done**: seal module + Zeroizing wrappers.
-3. ~~**P0.3** (GC roots)~~ — **done**: supervisor creates/removes indirect roots.
-4. **P0.4** (multi-node consensus) — restore-on-boot done; Raft replication remains.
-5. **P1.1 / P1.2** (event reconcile, real attestation) — core orchestration + identity.
-6. Remaining P1, then P2, then P3.
+1. ~~**P0.1**, **P0.2**, **P0.3**~~: done.
+2. **P0.4** (multi-node consensus): restore-on-boot is done; Raft replication and a
+   3-node test remain.
+3. **P1.1**: run reconciliation as a server-owned task, not only under
+   `apply --follow`.
+4. **P1.3 / P1.4**: wire join-token attestation and signed peer distribution end
+   to end, then add hardware/instance attestation and identity-bound or encrypted
+   gossip.
+5. Remaining Partial P1/P2 items (P1.6 dual-bound bug, P2.2 true blue-green, P2.7
+   default to `evalFleet`, P2.8/P2.9 UX), then tests for each.
