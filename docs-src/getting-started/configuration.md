@@ -256,7 +256,7 @@ services.nightly-backup = {
 |----------|----------|
 | `rolling` | Replace instances in batches of `maxParallel`, health-gated |
 | `canary` | Deploy to one instance first, verify health, then roll out |
-| `blue-green` | Deploy all new instances, verify health, then switch traffic |
+| `blue-green` | Deploy to all instances at once, verify health, roll all back on failure |
 
 ## Constraint Operators
 
