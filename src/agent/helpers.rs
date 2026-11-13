@@ -31,6 +31,11 @@ pub(super) async fn install_received_svid(
 
     let cert_pem =
         String::from_utf8(response.certificate.clone()).map_err(|e| invalid(e.to_string()))?;
+    if !cert_certifies_key(&cert_pem, &keypair) {
+        return Err(invalid(format!(
+            "certificate for '{service_name}' does not match the pending CSR key"
+        )));
+    }
     let chain_pem =
         String::from_utf8(response.chain.clone()).map_err(|e| invalid(e.to_string()))?;
     let key_pem = zeroize::Zeroizing::new(keypair.serialize_pem());
@@ -44,6 +49,61 @@ pub(super) async fn install_received_svid(
     )
     .await?;
     Ok(())
+}
+
+/// Whether the first certificate in `cert_pem` certifies `keypair`'s public key.
+fn cert_certifies_key(cert_pem: &str, keypair: &rcgen::KeyPair) -> bool {
+    let mut reader = std::io::BufReader::new(cert_pem.as_bytes());
+    let Some(Ok(der)) = rustls_pemfile::certs(&mut reader).next() else {
+        return false;
+    };
+    let Ok((_, cert)) = x509_parser::parse_x509_certificate(&der) else {
+        return false;
+    };
+    cert.public_key().subject_public_key.data.as_ref() == keypair.public_key_raw()
+}
+
+/// Request an X.509-SVID for `service_name` unless a request is already in
+/// flight. The keypair is generated here and never leaves the agent; only the
+/// CSR is sent.
+pub(super) async fn request_service_svid(
+    mgr: &WorkloadManager,
+    pending_keys: &Arc<RwLock<PendingKeyStore>>,
+    tx: &tokio::sync::mpsc::Sender<crate::proto::AgentMessage>,
+    node_id: &str,
+    service_name: &str,
+) {
+    if pending_keys.read().await.in_flight(service_name) {
+        return;
+    }
+    let trust_domain = mgr
+        .trust_domain_str()
+        .await
+        .unwrap_or_else(|| "fleet.internal".to_string());
+    match crate::ca::csr::generate_service_csr(&trust_domain, service_name) {
+        Ok(csr_output) => {
+            pending_keys
+                .write()
+                .await
+                .store(service_name, csr_output.keypair);
+            tracing::info!(service = %service_name, "Requesting SVID for service");
+            let _ = tx
+                .send(crate::proto::AgentMessage {
+                    payload: Some(crate::proto::agent_message::Payload::CertRequest(
+                        crate::proto::CertificateRequest {
+                            node_id: node_id.to_string(),
+                            service_name: service_name.to_string(),
+                            csr: csr_output.csr_der,
+                            request_type: crate::proto::CertRequestType::ServiceCert as i32,
+                        },
+                    )),
+                })
+                .await;
+        }
+        Err(e) => {
+            tracing::error!(service = %service_name, error = %e, "CSR generation failed");
+        }
+    }
 }
 
 /// The short system hostname (everything before the first `.`), used as the

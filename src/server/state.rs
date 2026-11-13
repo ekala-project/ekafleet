@@ -46,6 +46,9 @@ pub struct FleetState {
     reconcile: ReconcileTrigger,
     /// Canary deployments that are healthy and awaiting manual promotion.
     pending_canaries: super::deployer::PendingCanaryStore,
+    /// Node → assigned service names, consulted by the certificate issuer.
+    /// Kept in sync with `FleetStateInner::assigned`.
+    service_assignments: crate::ca::issuer::ServiceAssignments,
 }
 
 struct FleetStateInner {
@@ -58,6 +61,10 @@ struct FleetStateInner {
     service_requests: HashMap<String, (u64, u64)>,
     /// Monotonic counter identifying agent control-stream connections.
     next_connection_id: u64,
+    /// The last full `DesiredState` assigned to each node, including nodes
+    /// that are currently disconnected. Replayed when a node (re)connects and
+    /// amended in place when a deployment updates a service's store path.
+    assigned: HashMap<String, crate::proto::DesiredState>,
 }
 
 struct NodeInfo {
@@ -100,10 +107,93 @@ impl FleetState {
                 pending_requests: HashMap::new(),
                 service_requests: HashMap::new(),
                 next_connection_id: 0,
+                assigned: HashMap::new(),
             })),
             reconcile: ReconcileTrigger::new(),
             pending_canaries: super::deployer::PendingCanaryStore::new(),
+            service_assignments: crate::ca::issuer::ServiceAssignments::new(),
         }
+    }
+
+    /// Shared node → service assignment table for the certificate issuer.
+    pub fn service_assignments(&self) -> crate::ca::issuer::ServiceAssignments {
+        self.service_assignments.clone()
+    }
+
+    /// Record `desired` as the complete set of services `node_id` should run
+    /// and push it to the node if it is connected. The agent treats every
+    /// `DesiredState` as authoritative, stopping anything not listed. Returns
+    /// whether the message was delivered (disconnected nodes receive it when
+    /// they reconnect).
+    pub async fn assign_desired_state(
+        &self,
+        node_id: &str,
+        desired: crate::proto::DesiredState,
+    ) -> bool {
+        let names = desired.services.iter().map(|s| s.name.clone()).collect();
+        self.service_assignments.set(node_id, names).await;
+        let tx = {
+            let mut state = self.inner.write().await;
+            state.assigned.insert(node_id.to_string(), desired.clone());
+            state.nodes.get(node_id).map(|n| n.tx.clone())
+        };
+        let msg = ServerMessage {
+            payload: Some(crate::proto::server_message::Payload::DesiredState(desired)),
+        };
+        match tx {
+            Some(tx) => tx.send(msg).await.is_ok(),
+            None => false,
+        }
+    }
+
+    /// The last `DesiredState` assigned to a node, if any.
+    pub async fn assigned_desired_state(
+        &self,
+        node_id: &str,
+    ) -> Option<crate::proto::DesiredState> {
+        self.inner.read().await.assigned.get(node_id).cloned()
+    }
+
+    /// Nodes that have ever been assigned a desired state.
+    pub async fn assigned_nodes(&self) -> Vec<String> {
+        self.inner.read().await.assigned.keys().cloned().collect()
+    }
+
+    /// The store path most recently deployed for `service_name` on `node_id`.
+    pub async fn assigned_store_path(&self, node_id: &str, service_name: &str) -> Option<String> {
+        let state = self.inner.read().await;
+        state
+            .assigned
+            .get(node_id)?
+            .services
+            .iter()
+            .find(|s| s.name == service_name)
+            .map(|s| s.store_path.clone())
+            .filter(|p| !p.is_empty())
+    }
+
+    /// Send a `DeployCommand` to a node, first recording the new store path in
+    /// the node's assigned desired state so a reconnecting agent is replayed
+    /// the deployed version rather than a stale one.
+    pub async fn send_deploy_command(
+        &self,
+        node_id: &str,
+        cmd: crate::proto::DeployCommand,
+    ) -> bool {
+        {
+            let mut state = self.inner.write().await;
+            if let Some(svc) = state
+                .assigned
+                .get_mut(node_id)
+                .and_then(|ds| ds.services.iter_mut().find(|s| s.name == cmd.service_name))
+            {
+                svc.store_path = cmd.store_path.clone();
+            }
+        }
+        let msg = ServerMessage {
+            payload: Some(crate::proto::server_message::Payload::Deploy(cmd)),
+        };
+        self.send_to_agent(node_id, msg).await
     }
 
     /// Handle to the registry of canary deployments awaiting manual promotion.
@@ -698,6 +788,86 @@ mod tests {
 
         state.deregister_agent("node-1", new_conn).await;
         assert!(state.connected_nodes().await.is_empty());
+    }
+
+    fn spec(name: &str) -> crate::proto::ServiceSpec {
+        crate::proto::ServiceSpec {
+            name: name.into(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn assigned_desired_state_tracks_assignments_and_deploys() {
+        let state = FleetState::new();
+        let assignments = state.service_assignments();
+        let mut rx = state
+            .register_agent("node-1", "127.0.0.1:1".into(), "default".into())
+            .await;
+
+        let delivered = state
+            .assign_desired_state(
+                "node-1",
+                crate::proto::DesiredState {
+                    services: vec![spec("web"), spec("api")],
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(delivered);
+        assert!(matches!(
+            rx.recv().await.unwrap().payload,
+            Some(ServerPayload::DesiredState(ds)) if ds.services.len() == 2
+        ));
+        assert!(assignments.is_assigned("node-1", "web").await);
+        assert!(!assignments.is_assigned("node-2", "web").await);
+
+        // Deploying records the store path for replay.
+        assert!(
+            state
+                .send_deploy_command(
+                    "node-1",
+                    crate::proto::DeployCommand {
+                        service_name: "web".into(),
+                        store_path: "/nix/store/abc-web".into(),
+                        ..Default::default()
+                    },
+                )
+                .await
+        );
+        assert_eq!(
+            state.assigned_store_path("node-1", "web").await.as_deref(),
+            Some("/nix/store/abc-web")
+        );
+
+        // A later assignment replaces the set entirely.
+        state
+            .assign_desired_state(
+                "node-1",
+                crate::proto::DesiredState {
+                    services: vec![spec("api")],
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(!assignments.is_assigned("node-1", "web").await);
+        assert!(assignments.is_assigned("node-1", "api").await);
+
+        // Disconnected nodes keep their assignment for replay on reconnect.
+        assert!(
+            !state
+                .assign_desired_state(
+                    "node-2",
+                    crate::proto::DesiredState {
+                        services: vec![spec("db")],
+                        ..Default::default()
+                    },
+                )
+                .await
+        );
+        let replay = state.assigned_desired_state("node-2").await.unwrap();
+        assert_eq!(replay.services[0].name, "db");
+        assert!(assignments.is_assigned("node-2", "db").await);
     }
 
     #[tokio::test]

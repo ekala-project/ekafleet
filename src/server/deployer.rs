@@ -10,8 +10,7 @@ use super::events::{DeployOutcome, EventStore};
 use super::scheduler::Placement;
 use super::state::FleetState;
 use crate::config::{DisruptionBudget, UpdateStrategy};
-use crate::proto::server_message::Payload;
-use crate::proto::{DeployCommand, DeployStrategy, ServerMessage};
+use crate::proto::{DeployCommand, DeployStrategy};
 
 /// A canary deployment that has been rolled out to its first instance, is
 /// healthy, and is waiting for an operator to promote (roll out to the rest)
@@ -258,17 +257,18 @@ async fn revert_deployed_nodes(
     );
 
     for placement in placements {
-        let msg = ServerMessage {
-            payload: Some(Payload::Deploy(DeployCommand {
-                deployment_id: deployment_id.to_string(),
-                service_name: service_name.to_string(),
-                store_path: previous_store_path.to_string(),
-                strategy: DeployStrategy::Rolling as i32,
-                container_image: String::new(),
-            })),
+        let cmd = DeployCommand {
+            deployment_id: deployment_id.to_string(),
+            service_name: service_name.to_string(),
+            store_path: previous_store_path.to_string(),
+            strategy: DeployStrategy::Rolling as i32,
+            container_image: String::new(),
         };
 
-        if !state.send_to_agent(&placement.machine_name, msg).await {
+        if !state
+            .send_deploy_command(&placement.machine_name, cmd)
+            .await
+        {
             tracing::error!(
                 deployment_id = %deployment_id,
                 node = %placement.machine_name,
@@ -320,17 +320,18 @@ async fn execute_rolling(
 
         // Send deploy command to each node in the batch
         for placement in *batch {
-            let msg = ServerMessage {
-                payload: Some(Payload::Deploy(DeployCommand {
-                    deployment_id: deployment_id.to_string(),
-                    service_name: plan.service_name.clone(),
-                    store_path: plan.store_path.clone(),
-                    strategy: DeployStrategy::Rolling as i32,
-                    container_image: String::new(),
-                })),
+            let cmd = DeployCommand {
+                deployment_id: deployment_id.to_string(),
+                service_name: plan.service_name.clone(),
+                store_path: plan.store_path.clone(),
+                strategy: DeployStrategy::Rolling as i32,
+                container_image: String::new(),
             };
 
-            if !state.send_to_agent(&placement.machine_name, msg).await {
+            if !state
+                .send_deploy_command(&placement.machine_name, cmd)
+                .await
+            {
                 if plan.auto_revert {
                     return Err(DeployError::Reverted(format!(
                         "failed to reach node {}",
@@ -378,17 +379,18 @@ async fn execute_canary(
         "Deploying canary"
     );
 
-    let msg = ServerMessage {
-        payload: Some(Payload::Deploy(DeployCommand {
-            deployment_id: deployment_id.to_string(),
-            service_name: plan.service_name.clone(),
-            store_path: plan.store_path.clone(),
-            strategy: DeployStrategy::Canary as i32,
-            container_image: String::new(),
-        })),
+    let cmd = DeployCommand {
+        deployment_id: deployment_id.to_string(),
+        service_name: plan.service_name.clone(),
+        store_path: plan.store_path.clone(),
+        strategy: DeployStrategy::Canary as i32,
+        container_image: String::new(),
     };
 
-    if !state.send_to_agent(&canary[0].machine_name, msg).await {
+    if !state
+        .send_deploy_command(&canary[0].machine_name, cmd)
+        .await
+    {
         return Err(DeployError::NodeFailed {
             node: canary[0].machine_name.clone(),
             reason: "unreachable".into(),
@@ -604,17 +606,18 @@ async fn execute_blue_green(
     // received the green version so we can unwind exactly those on abort.
     let mut deployed: Vec<&Placement> = Vec::with_capacity(plan.placements.len());
     for placement in &plan.placements {
-        let msg = ServerMessage {
-            payload: Some(Payload::Deploy(DeployCommand {
-                deployment_id: deployment_id.to_string(),
-                service_name: plan.service_name.clone(),
-                store_path: plan.store_path.clone(),
-                strategy: DeployStrategy::BlueGreen as i32,
-                container_image: String::new(),
-            })),
+        let cmd = DeployCommand {
+            deployment_id: deployment_id.to_string(),
+            service_name: plan.service_name.clone(),
+            store_path: plan.store_path.clone(),
+            strategy: DeployStrategy::BlueGreen as i32,
+            container_image: String::new(),
         };
 
-        if !state.send_to_agent(&placement.machine_name, msg).await {
+        if !state
+            .send_deploy_command(&placement.machine_name, cmd)
+            .await
+        {
             // A green node is unreachable: abort the cutover and roll back any
             // node that already received green so no traffic hits a partial set.
             abort_blue_green(state, deployment_id, plan, &deployed).await;
