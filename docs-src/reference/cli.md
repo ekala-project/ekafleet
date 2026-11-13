@@ -72,9 +72,9 @@ ekafleet ca-signer [OPTIONS]
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--data-dir` | `/var/lib/ekafleet` | Data directory for CA key and certificate |
+| `--data-dir` | `/var/lib/ekafleet-ca` | Data directory for CA key and certificate |
 | `--domain` | `fleet.internal` | SPIFFE trust domain |
-| `--socket` | `/run/ekafleet/ca.sock` | Unix socket path for signing requests |
+| `--socket` | `/run/ekafleet-ca/ca.sock` | Unix socket path for signing requests (mode 0660) |
 
 ### `ekafleet proxy`
 

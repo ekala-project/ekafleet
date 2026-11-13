@@ -81,7 +81,7 @@ enum Command {
     /// Standalone CA signing daemon (process-isolated, no network)
     CaSigner {
         /// Data directory for CA key and certificate
-        #[arg(long, default_value = "/var/lib/ekafleet")]
+        #[arg(long, default_value = "/var/lib/ekafleet-ca")]
         data_dir: PathBuf,
 
         /// SPIFFE trust domain for fleet identities
@@ -89,7 +89,7 @@ enum Command {
         domain: String,
 
         /// Unix socket path for signing requests
-        #[arg(long, default_value = "/run/ekafleet/ca.sock")]
+        #[arg(long, default_value = "/run/ekafleet-ca/ca.sock")]
         socket: PathBuf,
     },
 
