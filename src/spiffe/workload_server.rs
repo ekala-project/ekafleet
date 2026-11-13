@@ -36,13 +36,34 @@ impl WorkloadApiService {
         }
     }
 
-    /// Extract the caller's PID from request metadata.
-    fn extract_peer_pid<T>(request: &Request<T>) -> Option<u32> {
+    /// Extract the caller's PID from the kernel-provided Unix socket peer
+    /// credentials (`SO_PEERCRED`).
+    ///
+    /// The PID must come from the connection itself, never from request
+    /// metadata: a client controls its own headers and could otherwise claim
+    /// the PID of any other workload and be issued that workload's SVID.
+    fn caller_pid<T>(request: &Request<T>) -> Option<u32> {
         request
-            .metadata()
-            .get("x-ekafleet-peer-pid")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse().ok())
+            .extensions()
+            .get::<tonic::transport::server::UdsConnectInfo>()
+            .and_then(|info| info.peer_cred)
+            .and_then(|cred| cred.pid())
+            .and_then(|pid| u32::try_from(pid).ok())
+            .filter(|&pid| pid > 0)
+    }
+
+    /// Attest the calling workload: resolve its PID from the socket peer
+    /// credentials and map it to an ekafleet service via its cgroup.
+    #[allow(clippy::result_large_err)]
+    async fn attest_caller<T>(request: &Request<T>) -> Result<String, Status> {
+        let pid = Self::caller_pid(request).ok_or_else(|| {
+            Status::unauthenticated("unable to identify caller from socket peer credentials")
+        })?;
+        workload_attestor::attest_pid(pid).await.ok_or_else(|| {
+            Status::permission_denied(format!(
+                "PID {pid} does not belong to any ekafleet-managed service"
+            ))
+        })
     }
 }
 
@@ -56,21 +77,9 @@ impl SpiffeWorkloadApi for WorkloadApiService {
         &self,
         request: Request<X509svidRequest>,
     ) -> Result<Response<Self::FetchX509SVIDStream>, Status> {
-        // Identify the caller
-        let pid = Self::extract_peer_pid(&request)
-            .ok_or_else(|| Status::unauthenticated("unable to identify caller PID"))?;
+        let service_name = Self::attest_caller(&request).await?;
 
-        let service_name = workload_attestor::attest_pid(pid).await.ok_or_else(|| {
-            Status::permission_denied(format!(
-                "PID {pid} does not belong to any ekafleet-managed service"
-            ))
-        })?;
-
-        tracing::info!(
-            pid,
-            service = %service_name,
-            "Workload API: FetchX509SVID"
-        );
+        tracing::info!(service = %service_name, "Workload API: FetchX509SVID");
 
         let (tx, rx) = mpsc::channel(4);
         let mgr = self.workload_mgr.clone();
