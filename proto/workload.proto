@@ -1,58 +1,72 @@
 syntax = "proto3";
 
-package spiffe.workload;
-
-// SPIFFE Workload API — subset compatible with the official SPIFFE spec.
-// Served over a Unix domain socket at /run/ekafleet/workload-api.sock.
+// SPIFFE Workload API, wire-compatible with the upstream definition
+// (github.com/spiffe/go-spiffe/v2/proto/spiffe/workload/workload.proto).
 //
-// Workloads connect to this API using go-spiffe, rust-spiffe, or any
-// SPIFFE-compatible library with SPIFFE_ENDPOINT_SOCKET env var.
+// Deliberately declares no package: the upstream service is addressed as
+// `/SpiffeWorkloadAPI/<Method>`, and standard clients (go-spiffe,
+// rust-spiffe, java-spiffe, Envoy via SPIRE) depend on that exact path and on
+// these field numbers.
+//
+// Served by the agent at unix:///run/ekafleet/workload-api.sock. Callers must
+// send the `workload.spiffe.io: true` metadata header and are identified by
+// their Unix socket peer credentials (PID → systemd cgroup → service).
+
+import "google/protobuf/struct.proto";
+
 service SpiffeWorkloadAPI {
-  // Fetch X.509-SVIDs for this workload. The server identifies the caller
-  // via Unix socket peer credentials (PID → systemd unit → service name).
-  // Returns a stream that pushes new SVIDs on renewal.
+  // X.509-SVIDs for the calling workload. Streams a new response whenever an
+  // SVID is renewed or the trust bundle changes.
   rpc FetchX509SVID(X509SVIDRequest) returns (stream X509SVIDResponse);
 
-  // Fetch X.509 trust bundles for the trust domain.
-  // Returns a stream that pushes updates when the CA rotates.
+  // X.509 trust bundles, keyed by trust domain SPIFFE ID.
   rpc FetchX509Bundles(X509BundlesRequest) returns (stream X509BundlesResponse);
 
-  // Fetch a JWT-SVID for the workload (future).
+  // A JWT-SVID for the calling workload, for the requested audience.
   rpc FetchJWTSVID(JWTSVIDRequest) returns (JWTSVIDResponse);
 
-  // Validate a JWT-SVID (future).
-  rpc ValidateJWTSVID(ValidateJWTSVIDRequest) returns (ValidateJWTSVIDResponse);
-
-  // Fetch JWT trust bundles (future).
+  // JWT bundles (JWKS documents), keyed by trust domain SPIFFE ID.
   rpc FetchJWTBundles(JWTBundlesRequest) returns (stream JWTBundlesResponse);
+
+  // Validate a JWT-SVID against the trust domain's JWT bundle.
+  rpc ValidateJWTSVID(ValidateJWTSVIDRequest) returns (ValidateJWTSVIDResponse);
 }
 
 message X509SVIDRequest {}
 
 message X509SVIDResponse {
   repeated X509SVID svids = 1;
+  // ASN.1 DER encoded certificate revocation lists.
+  repeated bytes crl = 2;
+  // DER CA bundles of federated trust domains, keyed by trust domain ID.
+  map<string, bytes> federated_bundles = 3;
 }
 
 message X509SVID {
-  // The SPIFFE ID (e.g., spiffe://fleet.internal/service/my-app)
+  // e.g. spiffe://fleet.internal/service/web
   string spiffe_id = 1;
-  // X.509 certificate chain (leaf + intermediates), DER-encoded
+  // ASN.1 DER certificates, concatenated: the leaf first, then intermediates.
   bytes x509_svid = 2;
-  // Private key for the SVID, DER-encoded
+  // ASN.1 DER PKCS#8 private key for the leaf.
   bytes x509_svid_key = 3;
-  // Trust bundle for the trust domain, DER-encoded CA certs
+  // ASN.1 DER CA certificates of the SVID's trust domain, concatenated.
   bytes bundle = 4;
+  // Operator-defined hint to disambiguate multiple SVIDs.
+  string hint = 5;
 }
 
 message X509BundlesRequest {}
 
 message X509BundlesResponse {
-  // Map of trust domain → DER-encoded CA certificate bundle
-  map<string, bytes> bundles = 1;
+  repeated bytes crl = 1;
+  // ASN.1 DER CA certificates, concatenated, keyed by trust domain ID.
+  map<string, bytes> bundles = 2;
 }
 
 message JWTSVIDRequest {
+  // Required. At least one audience.
   repeated string audience = 1;
+  // Optional. When set, must be the calling workload's own SPIFFE ID.
   string spiffe_id = 2;
 }
 
@@ -62,25 +76,26 @@ message JWTSVIDResponse {
 
 message JWTSVID {
   string spiffe_id = 1;
-  string svid = 2;  // JWT token
-}
-
-message ValidateJWTSVIDRequest {
-  string audience = 1;
+  // Compact-serialized JWS.
   string svid = 2;
-}
-
-message ValidateJWTSVIDResponse {
-  string spiffe_id = 1;
-  JWTSVIDClaims claims = 2;
-}
-
-message JWTSVIDClaims {
-  map<string, string> claims = 1;
+  string hint = 3;
 }
 
 message JWTBundlesRequest {}
 
 message JWTBundlesResponse {
+  // JWKS documents (RFC 7517), keyed by trust domain ID.
   map<string, bytes> bundles = 1;
+}
+
+message ValidateJWTSVIDRequest {
+  // Required. The audience the token must have been issued for.
+  string audience = 1;
+  // Required. The compact-serialized JWT-SVID.
+  string svid = 2;
+}
+
+message ValidateJWTSVIDResponse {
+  string spiffe_id = 1;
+  google.protobuf.Struct claims = 2;
 }

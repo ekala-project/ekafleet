@@ -66,7 +66,7 @@ This layout is compatible with:
 
 ## SPIFFE Workload API
 
-ekafleet exposes the standard SPIFFE Workload API v2 over a Unix domain socket at `/run/ekafleet/workload-api.sock`. This allows workloads to use standard SPIFFE libraries without any ekafleet-specific code.
+The agent exposes the standard SPIFFE Workload API over a Unix domain socket at `/run/ekafleet/workload-api.sock`. It is wire-compatible with the upstream API definition (no proto package, DER-encoded certificates and PKCS#8 keys, bundles keyed by trust domain ID, mandatory `workload.spiffe.io: true` header), so workloads use standard SPIFFE libraries without any ekafleet-specific code.
 
 ### Supported RPCs
 
@@ -74,18 +74,19 @@ ekafleet exposes the standard SPIFFE Workload API v2 over a Unix domain socket a
 |-----|--------|
 | `FetchX509SVID` | Implemented (streaming) |
 | `FetchX509Bundles` | Implemented (streaming) |
-| `FetchJWTSVID` | Implemented |
-| `ValidateJWTSVID` | Implemented |
-| `FetchJWTBundles` | Implemented (streaming) |
+| `FetchJWTSVID` | Not yet supported (`Unimplemented`) |
+| `ValidateJWTSVID` | Not yet supported (`Unimplemented`) |
+| `FetchJWTBundles` | Not yet supported (`Unimplemented`) |
 
 ### Workload Attestation
 
 The Workload API identifies callers via Unix socket peer credentials:
 
-1. Extract the caller's PID from `SO_PEERCRED`
+1. Extract the caller's PID from `SO_PEERCRED` (never from request metadata)
 2. Map PID to systemd cgroup (`/proc/<pid>/cgroup`) to find `ekafleet-<name>.service`
-3. Fallback: check `EKAFLEET_SERVICE` env var in `/proc/<pid>/environ`
-4. Return the SVID for the identified service
+3. Return the SVID for the identified service; callers outside an ekafleet service cgroup are refused with `PermissionDenied`
+
+There is deliberately no environment-variable fallback: a process's environment is under its own control, its cgroup is not.
 
 This works identically for OCI container services because containers run inside the `ekafleet-<name>.service` cgroup via `systemd-nspawn --keep-unit`. The SPIFFE socket is bind-mounted into the container, and `SO_PEERCRED` reports the host-namespace PID.
 

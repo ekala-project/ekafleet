@@ -9,6 +9,15 @@ let
   cfg = config.services.ekafleet;
 in
 {
+  imports = [
+    (lib.mkRemovedOptionModule [
+      "services"
+      "ekafleet"
+      "agent"
+      "workloadApiSocketPath"
+    ] "The agent serves the SPIFFE Workload API itself at /run/ekafleet/workload-api.sock.")
+  ];
+
   options.services.ekafleet = {
     server = {
       enable = lib.mkEnableOption "ekafleet server (control plane)";
@@ -152,12 +161,6 @@ in
         description = "Path to CA certificate PEM for TLS verification.";
       };
 
-      workloadApiSocketPath = lib.mkOption {
-        type = lib.types.str;
-        default = "/run/ekafleet/workload-api.sock";
-        description = "Unix socket path for the Workload API.";
-      };
-
       proxyListen = lib.mkOption {
         type = lib.types.str;
         default = "0.0.0.0:8080";
@@ -280,7 +283,7 @@ in
       };
     })
 
-    # ── Agent-side: agent + workload-api + proxy ─────────────────────
+    # ── Agent-side: agent (incl. SPIFFE Workload API) + proxy ────────
     (lib.mkIf cfg.agent.enable {
       systemd.services.ekafleet-agent = {
         description = "ekafleet data plane agent";
@@ -301,11 +304,16 @@ in
             ExecStart = "${cfg.agent.package}/bin/ekafleet agent --join ${cfg.agent.serverAddr} --node-name ${lib.escapeShellArg cfg.agent.nodeName} --data-dir ${cfg.agent.dataDir} ${tokenArg} ${caCertArg}";
 
             # The agent requires root for systemd unit management,
-            # WireGuard, nftables, and systemd-nspawn containers.
-            # Security isolation is provided by the separate workload-api
-            # and proxy processes which run unprivileged.
+            # WireGuard, nftables, and systemd-nspawn containers. It also
+            # serves the SPIFFE Workload API (world-connectable socket in
+            # /run/ekafleet; every call is attested via SO_PEERCRED + cgroup).
+            # The proxy, which handles untrusted network traffic, runs
+            # unprivileged in its own unit.
             ProtectHome = true;
             PrivateTmp = true;
+            RuntimeDirectory = "ekafleet";
+            RuntimeDirectoryMode = "0755";
+            RuntimeDirectoryPreserve = "yes";
           };
 
         environment = {
@@ -315,37 +323,6 @@ in
         // lib.optionalAttrs (cfg.agent.keepGenerationsDays != null) {
           EKAFLEET_KEEP_GENERATIONS_DAYS = toString cfg.agent.keepGenerationsDays;
         };
-      };
-
-      systemd.services.ekafleet-workload-api = {
-        description = "ekafleet SPIFFE Workload API (process-isolated)";
-        wantedBy = [ "multi-user.target" ];
-        after = [ "ekafleet-agent.service" ];
-        wants = [ "ekafleet-agent.service" ];
-
-        serviceConfig = {
-          Type = "simple";
-          Restart = "on-failure";
-          RestartSec = 5;
-
-          ExecStart = "${cfg.agent.package}/bin/ekafleet workload-api --data-dir ${cfg.agent.dataDir} --trust-domain ${cfg.agent.domain} --socket ${cfg.agent.workloadApiSocketPath}";
-
-          # Unprivileged: only reads SVID files written by the agent
-          # and serves them over a Unix socket. No network, no root.
-          DynamicUser = true;
-          PrivateNetwork = true;
-          CapabilityBoundingSet = "";
-          NoNewPrivileges = true;
-          ProtectSystem = "strict";
-          ProtectHome = true;
-          PrivateTmp = true;
-          PrivateDevices = true;
-          RestrictNamespaces = true;
-          RestrictRealtime = true;
-          RuntimeDirectory = "ekafleet";
-        };
-
-        environment.RUST_LOG = "info";
       };
 
       systemd.services.ekafleet-proxy = {
