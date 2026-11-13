@@ -553,26 +553,40 @@ fn service_config_to_spec(name: &str, cfg: &config::ServiceConfig) -> crate::pro
     }
 }
 
-/// Collect the per-node `DesiredState` messages for all services that need to be
-/// deployed or updated, and send them to the relevant agents before the deployer
-/// sends lightweight `DeployCommand` triggers.
+/// Push every node its complete `DesiredState` — every service placed on
+/// it — before the deployer sends `DeployCommand` triggers.
+///
+/// Agents treat each `DesiredState` as authoritative and stop anything not
+/// listed, so every known node (connected, previously assigned, or newly
+/// placed) receives one, possibly empty. Services in `keep_previous` (blocked
+/// by policy or whose volume migration failed) are not re-placed: each node
+/// keeps whatever spec it was last assigned for them. Store paths carry over
+/// from the node's previous assignment; new placements get theirs from the
+/// deployer.
 async fn send_desired_state(
     desired: &FleetConfig,
     plan: &ReconcilePlan,
     state: &FleetState,
     raft_state: &FleetStateMachine,
+    keep_previous: &std::collections::HashSet<String>,
 ) {
-    // Group placements by machine name so each agent gets one DesiredState.
-    let mut per_node: HashMap<String, Vec<crate::proto::ServiceSpec>> = HashMap::new();
-    // Track which namespaces each node participates in.
-    let mut per_node_namespaces: HashMap<String, std::collections::HashSet<String>> =
-        HashMap::new();
+    let mut nodes: std::collections::BTreeSet<String> =
+        state.connected_nodes().await.into_iter().collect();
+    nodes.extend(state.assigned_nodes().await);
+
+    // Node → (service name → spec). Keyed by name so a service that appears
+    // in several ops (e.g. update + reschedule) is listed once per node.
+    let mut per_node: HashMap<
+        String,
+        std::collections::BTreeMap<String, crate::proto::ServiceSpec>,
+    > = HashMap::new();
 
     let all_ops = plan
         .creates
         .iter()
         .chain(plan.updates.iter())
-        .chain(plan.reschedules.iter());
+        .chain(plan.reschedules.iter())
+        .filter(|op| !keep_previous.contains(&op.service_name));
 
     for op in all_ops {
         let Some(cfg) = desired.services.get(&op.service_name) else {
@@ -591,17 +605,52 @@ async fn send_desired_state(
         }
 
         for placement in &op.placements {
+            let node = &placement.machine_name;
+            nodes.insert(node.clone());
+            let mut node_spec = spec.clone();
+            node_spec.store_path = state
+                .assigned_store_path(node, &op.service_name)
+                .await
+                .unwrap_or_default();
             per_node
-                .entry(placement.machine_name.clone())
+                .entry(node.clone())
                 .or_default()
-                .push(spec.clone());
+                .insert(op.service_name.clone(), node_spec);
+        }
+    }
 
-            // Track namespace participation for this node
-            if !cfg.namespace.is_empty() && cfg.namespace != "default" {
-                per_node_namespaces
-                    .entry(placement.machine_name.clone())
+    // Held-back services stay exactly as previously assigned.
+    let mut previous_system_paths: HashMap<String, String> = HashMap::new();
+    for node in &nodes {
+        let Some(previous) = state.assigned_desired_state(node).await else {
+            continue;
+        };
+        previous_system_paths.insert(node.clone(), previous.system_path.clone());
+        for spec in previous.services {
+            if keep_previous.contains(&spec.name) {
+                per_node
+                    .entry(node.clone())
                     .or_default()
-                    .insert(cfg.namespace.clone());
+                    .insert(spec.name.clone(), spec);
+            }
+        }
+    }
+
+    let per_node: HashMap<String, Vec<crate::proto::ServiceSpec>> = per_node
+        .into_iter()
+        .map(|(node, specs)| (node, specs.into_values().collect()))
+        .collect();
+
+    // Track which namespaces each node participates in.
+    let mut per_node_namespaces: HashMap<String, std::collections::HashSet<String>> =
+        HashMap::new();
+    for (node, specs) in &per_node {
+        for spec in specs {
+            if !spec.namespace.is_empty() && spec.namespace != "default" {
+                per_node_namespaces
+                    .entry(node.clone())
+                    .or_default()
+                    .insert(spec.namespace.clone());
             }
         }
     }
@@ -647,7 +696,8 @@ async fn send_desired_state(
         }
     }
 
-    for (node, services) in &per_node {
+    for node in &nodes {
+        let services = per_node.get(node).cloned().unwrap_or_default();
         // Build NamespaceNetworkConfig for namespaces this node participates in
         let namespace_networks = per_node_namespaces
             .get(node)
@@ -688,18 +738,17 @@ async fn send_desired_state(
             })
             .unwrap_or_default();
 
-        let msg = crate::proto::ServerMessage {
-            payload: Some(crate::proto::server_message::Payload::DesiredState(
-                crate::proto::DesiredState {
-                    correlation_id: String::new(),
-                    services: services.clone(),
-                    system_path: String::new(),
-                    namespace_networks,
-                },
-            )),
+        let desired_state = crate::proto::DesiredState {
+            correlation_id: String::new(),
+            services,
+            system_path: previous_system_paths.remove(node).unwrap_or_default(),
+            namespace_networks,
         };
-        if !state.send_to_agent(node, msg).await {
-            tracing::warn!(node = %node, "Failed to send DesiredState to agent");
+        if !state.assign_desired_state(node, desired_state).await {
+            tracing::warn!(
+                node = %node,
+                "Node not connected; DesiredState will be sent when it reconnects"
+            );
         }
     }
 
@@ -752,12 +801,6 @@ async fn apply_plan(
     raft_state: &FleetStateMachine,
     events: Option<&super::events::EventStore>,
 ) -> Result<(), deployer::DeployError> {
-    // Send full ServiceSpec (with cgroup controls, health checks, lifecycle
-    // hooks, etc.) to each affected agent before the deployer sends lightweight
-    // DeployCommand triggers. This ensures agents have the complete service
-    // definition — including resource limits — before starting workloads.
-    send_desired_state(desired, plan, state, raft_state).await;
-
     // Execute volume migrations for reschedules before deploying.
     // Migrations run first so data is available on the destination node
     // before the service starts there. Services whose migrations fail are
@@ -906,22 +949,38 @@ async fn apply_plan(
         }
     }
 
+    // Services that must not move this cycle: blocked by policy, or whose
+    // volume migration failed (they stay on their source nodes).
+    let keep_previous: std::collections::HashSet<String> = plan
+        .policy_blocked
+        .iter()
+        .map(|b| b.service_name.clone())
+        .chain(migration_failed_services.iter().cloned())
+        .collect();
+
+    // Send full ServiceSpec (with cgroup controls, health checks, lifecycle
+    // hooks, etc.) to every agent before the deployer sends lightweight
+    // DeployCommand triggers. This ensures agents have the complete service
+    // definition — including resource limits — before starting workloads,
+    // and stop services no longer assigned to them.
+    send_desired_state(desired, plan, state, raft_state, &keep_previous).await;
+
     // Compute deployment order
     let tiers = deployer::compute_deploy_order(&desired.services);
 
     for tier in &tiers {
         for service_name in tier {
             // Find ops for this service (creates, updates, and reschedules).
-            // Skip reschedules for services whose volume migrations failed.
+            // Held-back services (policy-blocked, failed migrations) are not
+            // deployed to their new placements at all.
+            if keep_previous.contains(service_name) {
+                continue;
+            }
             let ops: Vec<&ServiceOp> = plan
                 .creates
                 .iter()
                 .chain(plan.updates.iter())
-                .chain(
-                    plan.reschedules
-                        .iter()
-                        .filter(|op| !migration_failed_services.contains(&op.service_name)),
-                )
+                .chain(plan.reschedules.iter())
                 .filter(|op| &op.service_name == service_name)
                 .collect();
 
@@ -1338,5 +1397,154 @@ mod tests {
         let plan = compute_plan(&config, &["node-1".to_string()], &state, None, &raft).await;
         // The service should be blocked by the policy.
         assert!(plan.creates.is_empty(), "blocked-svc should not be created");
+    }
+
+    fn simple_service() -> ServiceConfig {
+        ServiceConfig {
+            command: Some("/bin/svc".into()),
+            container: None,
+            ports: HashMap::new(),
+            secrets: HashMap::new(),
+            identity: Default::default(),
+            resources: Default::default(),
+            scheduling: SchedulingConfig::default(),
+            environment: HashMap::new(),
+            templates: HashMap::new(),
+            lifecycle: Default::default(),
+            volumes: vec![],
+            sidecars: vec![],
+            namespace: String::new(),
+        }
+    }
+
+    fn op(service: &str, machine: &str) -> ServiceOp {
+        ServiceOp {
+            service_name: service.into(),
+            placements: vec![Placement {
+                service_name: service.into(),
+                instance_id: format!("{service}-0"),
+                machine_name: machine.into(),
+            }],
+            description: String::new(),
+            migrations: vec![],
+        }
+    }
+
+    fn empty_plan() -> ReconcilePlan {
+        ReconcilePlan {
+            creates: vec![],
+            updates: vec![],
+            destroys: vec![],
+            reschedules: vec![],
+            has_changes: true,
+            policy_blocked: vec![],
+        }
+    }
+
+    fn desired_services(
+        rx: &mut tokio::sync::mpsc::Receiver<crate::proto::ServerMessage>,
+    ) -> Vec<String> {
+        let msg = rx.try_recv().expect("node should receive a DesiredState");
+        match msg.payload {
+            Some(crate::proto::server_message::Payload::DesiredState(ds)) => {
+                let mut names: Vec<String> = ds.services.into_iter().map(|s| s.name).collect();
+                names.sort();
+                names
+            }
+            other => panic!("expected DesiredState, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn desired_state_is_full_per_node_set() {
+        let state = FleetState::new();
+        let assignments = state.service_assignments();
+        let mut rx1 = state
+            .register_agent("node-1", "127.0.0.1:1".into(), "default".into())
+            .await;
+        let mut rx2 = state
+            .register_agent("node-2", "127.0.0.1:2".into(), "default".into())
+            .await;
+
+        let mut config = empty_fleet_config();
+        config.services.insert("web".into(), simple_service());
+        config.services.insert("api".into(), simple_service());
+        let raft = FleetStateMachine::new();
+
+        // First pass: web on node-1 (created), api on node-2 (created).
+        let mut plan = empty_plan();
+        plan.creates = vec![op("web", "node-1"), op("api", "node-2")];
+        send_desired_state(
+            &config,
+            &plan,
+            &state,
+            &raft,
+            &std::collections::HashSet::new(),
+        )
+        .await;
+        assert_eq!(desired_services(&mut rx1), vec!["web"]);
+        assert_eq!(desired_services(&mut rx2), vec!["api"]);
+        assert!(assignments.is_assigned("node-1", "web").await);
+        assert!(!assignments.is_assigned("node-1", "api").await);
+        assert!(assignments.is_assigned("node-2", "api").await);
+
+        // Second pass: api destroyed, web unchanged. node-2 must receive an
+        // empty (authoritative) set so the agent stops api, and its SVID
+        // authorization must be revoked.
+        let mut plan = empty_plan();
+        plan.updates = vec![op("web", "node-1")];
+        plan.destroys = vec![op("api", "node-2")];
+        send_desired_state(
+            &config,
+            &plan,
+            &state,
+            &raft,
+            &std::collections::HashSet::new(),
+        )
+        .await;
+        assert_eq!(desired_services(&mut rx1), vec!["web"]);
+        assert!(desired_services(&mut rx2).is_empty());
+        assert!(!assignments.is_assigned("node-2", "api").await);
+        assert!(assignments.is_assigned("node-1", "web").await);
+    }
+
+    #[tokio::test]
+    async fn held_back_services_keep_previous_placement() {
+        let state = FleetState::new();
+        let assignments = state.service_assignments();
+        let mut rx1 = state
+            .register_agent("node-1", "127.0.0.1:1".into(), "default".into())
+            .await;
+        let mut rx2 = state
+            .register_agent("node-2", "127.0.0.1:2".into(), "default".into())
+            .await;
+
+        let mut config = empty_fleet_config();
+        config.services.insert("db".into(), simple_service());
+        let raft = FleetStateMachine::new();
+
+        let mut plan = empty_plan();
+        plan.creates = vec![op("db", "node-1")];
+        send_desired_state(
+            &config,
+            &plan,
+            &state,
+            &raft,
+            &std::collections::HashSet::new(),
+        )
+        .await;
+        assert_eq!(desired_services(&mut rx1), vec!["db"]);
+        assert!(desired_services(&mut rx2).is_empty());
+
+        // A reschedule to node-2 whose volume migration failed: db must stay
+        // on node-1 and must not be started on node-2.
+        let mut plan = empty_plan();
+        plan.reschedules = vec![op("db", "node-2")];
+        let keep: std::collections::HashSet<String> = ["db".to_string()].into();
+        send_desired_state(&config, &plan, &state, &raft, &keep).await;
+        assert_eq!(desired_services(&mut rx1), vec!["db"]);
+        assert!(desired_services(&mut rx2).is_empty());
+        assert!(assignments.is_assigned("node-1", "db").await);
+        assert!(!assignments.is_assigned("node-2", "db").await);
     }
 }

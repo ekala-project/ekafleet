@@ -9,14 +9,13 @@ use super::netns::NamespaceNetworkManager;
 use super::supervisor;
 use super::types::{LocalState, PendingKeyStore};
 use crate::agent::health::HealthChecker;
-use crate::ca::csr;
 use crate::dns::resolver::DnsResolver;
 use crate::mesh::peers::PeerManager;
 use crate::policy::nftables::PolicyEnforcer;
 use crate::proto::agent_command_response::Result as CmdResult;
 use crate::proto::agent_message::Payload;
 use crate::proto::server_message::Payload as ServerPayload;
-use crate::proto::{AgentCommandResponse, AgentMessage, CertificateRequest};
+use crate::proto::{AgentCommandResponse, AgentMessage};
 use crate::secrets::injector::SecretInjector;
 use crate::spiffe::workload_api::WorkloadManager;
 
@@ -194,37 +193,35 @@ pub(super) async fn handle_server_message(
                 tracing::warn!(error = %e, "Failed to GC namespace networks");
             }
 
-            // Request SPIFFE SVIDs for each assigned service
-            let trust_domain = workload_mgr
-                .trust_domain_str()
+            // Drop SVIDs and pending requests for services no longer assigned
+            // here (the server would refuse to renew them anyway), then
+            // request SVIDs for assigned services that lack a current one.
+            let assigned: std::collections::HashSet<&str> =
+                ds.services.iter().map(|s| s.name.as_str()).collect();
+            pending_keys
+                .write()
                 .await
-                .unwrap_or_else(|| "fleet.internal".to_string());
+                .retain(|name| assigned.contains(name));
+            for (name, _, _) in workload_mgr.active_services().await {
+                if !assigned.contains(name.as_str())
+                    && let Err(e) = workload_mgr.remove_svid(&name).await
+                {
+                    tracing::warn!(service = %name, error = %e, "Failed to remove stale SVID");
+                }
+            }
+            let renewals = workload_mgr.needs_renewal().await;
             for svc in &ds.services {
-                tracing::info!(service = %svc.name, "Requesting SVID for service");
-                match csr::generate_service_csr(&trust_domain, &svc.name) {
-                    Ok(csr_output) => {
-                        pending_keys
-                            .write()
-                            .await
-                            .store(&svc.name, csr_output.keypair);
-                        let _ = tx
-                            .send(AgentMessage {
-                                payload: Some(Payload::CertRequest(CertificateRequest {
-                                    node_id: node_id.to_string(),
-                                    service_name: svc.name.clone(),
-                                    csr: csr_output.csr_der,
-                                    request_type: crate::proto::CertRequestType::ServiceCert as i32,
-                                })),
-                            })
-                            .await;
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            service = %svc.name,
-                            error = %e,
-                            "CSR generation failed"
-                        );
-                    }
+                let has_current = workload_mgr.spiffe_id(&svc.name).await.is_some()
+                    && !renewals.contains(&svc.name);
+                if !has_current {
+                    super::helpers::request_service_svid(
+                        workload_mgr,
+                        pending_keys,
+                        tx,
+                        node_id,
+                        &svc.name,
+                    )
+                    .await;
                 }
             }
 
