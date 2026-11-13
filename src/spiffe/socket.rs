@@ -175,4 +175,72 @@ mod tests {
         shutdown.cancel();
         let _ = handle.await;
     }
+
+    /// Connect a Workload API client to a Unix socket path.
+    async fn uds_client(
+        path: PathBuf,
+    ) -> crate::workload_proto::spiffe_workload_api_client::SpiffeWorkloadApiClient<
+        tonic::transport::Channel,
+    > {
+        let channel = tonic::transport::Endpoint::from_static("http://[::]:50051")
+            .connect_with_connector(tower::service_fn(move |_: tonic::transport::Uri| {
+                let path = path.clone();
+                async move {
+                    Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(
+                        tokio::net::UnixStream::connect(path).await?,
+                    ))
+                }
+            }))
+            .await
+            .unwrap();
+        crate::workload_proto::spiffe_workload_api_client::SpiffeWorkloadApiClient::new(channel)
+    }
+
+    /// The caller PID must come from SO_PEERCRED, not from a client-supplied
+    /// header. A client claiming another process's PID via metadata must be
+    /// attested as itself (and here rejected, since the test process is not
+    /// an ekafleet-managed service).
+    #[tokio::test]
+    async fn caller_pid_comes_from_peer_credentials_not_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("wapi.sock");
+        let sock_str = sock_path.to_str().unwrap().to_string();
+
+        let mgr = Arc::new(WorkloadManager::new(dir.path(), "test.internal"));
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let handle = tokio::spawn(async move {
+            serve_workload_api(
+                mgr,
+                Some(&sock_str),
+                b"test-jwt-key-material-32bytes!!",
+                server_shutdown,
+            )
+            .await
+        });
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let mut client = uds_client(sock_path.clone()).await;
+        let mut req = tonic::Request::new(crate::workload_proto::X509svidRequest {});
+        // Attempt to impersonate PID 1 via the legacy (spoofable) header.
+        req.metadata_mut()
+            .insert("x-ekafleet-peer-pid", "1".parse().unwrap());
+        let err = client.fetch_x509svid(req).await.unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        let own_pid = std::process::id().to_string();
+        assert!(
+            err.message().contains(&format!("PID {own_pid} ")),
+            "server must attest the real peer PID ({own_pid}), got: {}",
+            err.message()
+        );
+
+        shutdown.cancel();
+        let _ = handle.await;
+    }
 }
