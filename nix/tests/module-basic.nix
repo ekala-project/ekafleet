@@ -12,6 +12,13 @@ pkgs.testers.nixosTest {
       services.ekafleet.server = {
         enable = true;
         token = "test-token-12345";
+        sealPassphraseFile = "/etc/ekafleet-seal";
+      };
+
+      # Root-only; the units receive it via LoadCredential.
+      environment.etc."ekafleet-seal" = {
+        text = "vm-test-seal-passphrase\n";
+        mode = "0400";
       };
 
       networking.firewall.allowedTCPPorts = [
@@ -51,15 +58,21 @@ pkgs.testers.nixosTest {
     # Verify gRPC port is listening
     machine.wait_for_open_port(7400)
 
-    # Verify data directory was created
-    machine.succeed("test -d /var/lib/ekafleet")
+    # CA material belongs to the CA signer alone; server state to the server.
+    machine.succeed("test -f /var/lib/ekafleet-ca/ca-key.pem")
+    machine.succeed("test -f /var/lib/ekafleet-ca/ca-cert.pem")
+    machine.succeed("stat -c '%U %a' /var/lib/ekafleet-ca | grep -qx 'ekafleet-ca 700'")
+    machine.succeed("stat -c '%U %a' /var/lib/ekafleet-ca/ca-key.pem | grep -qx 'ekafleet-ca 600'")
+    machine.succeed("test -f /var/lib/ekafleet-server/fleet-key")
+    machine.succeed("stat -c '%U %a' /var/lib/ekafleet-server | grep -qx 'ekafleet 700'")
 
-    # Verify CA key and cert were persisted
-    machine.succeed("test -f /var/lib/ekafleet/ca-key.pem")
-    machine.succeed("test -f /var/lib/ekafleet/ca-cert.pem")
+    # With a seal passphrase, no key is stored in plaintext.
+    machine.fail("grep -q 'PRIVATE KEY' /var/lib/ekafleet-ca/ca-key.pem")
+    machine.fail("grep -q 'PRIVATE KEY' /var/lib/ekafleet-ca/ca-intermediate-key.pem")
+    machine.fail("journalctl -u ekafleet-ca-signer -u ekafleet-server | grep -q UNSEALED")
 
-    # Verify fleet encryption key was generated
-    machine.succeed("test -f /var/lib/ekafleet/fleet-key")
+    # The CA socket is reachable by the server's group only.
+    machine.succeed("stat -c '%G %a' /run/ekafleet-ca/ca.sock | grep -qx 'ekafleet-ca 660'")
 
     # Verify the REST API status returns valid data
     machine.succeed(
@@ -72,10 +85,14 @@ pkgs.testers.nixosTest {
         f"curl -sf {AUTH} http://localhost:7402/v1/events"
     )
 
-    # Verify the service restarts cleanly
+    # Both services restart cleanly and the CA survives (sealed keys reload).
+    ca_before = machine.succeed("sha256sum /var/lib/ekafleet-ca/ca-cert.pem")
+    machine.succeed("systemctl restart ekafleet-ca-signer.service")
     machine.succeed("systemctl restart ekafleet-server.service")
     machine.wait_for_open_port(7402)
     result = machine.succeed("curl -sf http://localhost:7402/health")
     assert result.strip() == "ok", f"Expected 'ok' after restart, got '{result.strip()}'"
+    ca_after = machine.succeed("sha256sum /var/lib/ekafleet-ca/ca-cert.pem")
+    assert ca_before == ca_after, "CA root changed across a restart"
   '';
 }

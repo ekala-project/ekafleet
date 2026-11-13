@@ -31,12 +31,22 @@ Enable `services.ekafleet.server` to deploy the control plane. This creates two 
 |--------|------|---------|-------------|
 | `enable` | bool | `false` | Enable the control plane |
 | `token` | string | *(required)* | Authentication token |
-| `dataDir` | path | `/var/lib/ekafleet` | Data directory for persistent state |
+| `dataDir` | path | `/var/lib/ekafleet-server` | Control-plane state directory (must be under `/var/lib/`) |
+| `sealPassphraseFile` | null or string | `null` | Passphrase file that seals key material at rest, delivered to both units via `LoadCredential` (may be root-only) |
 | `peers` | list of string | `[]` | Peer server addresses for HA |
 | `grpcListen` | string | `0.0.0.0:7400` | gRPC listen address |
 | `httpListen` | string | `0.0.0.0:7402` | HTTP API listen address |
 | `domain` | string | `fleet.internal` | SPIFFE trust domain |
-| `caSocketPath` | string | `/run/ekafleet/ca.sock` | Unix socket for CA signer |
+| `caSocketPath` | string | `/run/ekafleet-ca/ca.sock` | Unix socket for CA signer (group `ekafleet-ca`, mode 0660) |
+
+The two server units run as separate static users with disjoint state:
+
+| Unit | User | State | Notes |
+|------|------|-------|-------|
+| `ekafleet-ca-signer` | `ekafleet-ca` | `/var/lib/ekafleet-ca` (0700) | Holds the CA keys; no network |
+| `ekafleet-server` | `ekafleet` (+ group `ekafleet-ca`) | `dataDir` (0700) | Reaches the CA only via `caSocketPath` |
+
+The agent runs as root and owns `/var/lib/ekafleet` and `/run/ekafleet`, so a combined server+agent node never shares key material between users.
 
 ## Agent Node
 
