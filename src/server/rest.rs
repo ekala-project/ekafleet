@@ -225,6 +225,7 @@ pub async fn serve_http(
     metrics: MetricsAggregator,
     alert_evaluator: AlertEvaluator,
     instance_tracker: Option<super::cloud::instance_tracker::InstanceTracker>,
+    jwt_bundle: String,
     tls: Option<HttpTlsConfig>,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<()> {
@@ -287,8 +288,23 @@ pub async fn serve_http(
             },
         ));
 
+    // The JWT bundle is public key material: relying parties outside the
+    // fleet fetch it to validate JWT-SVIDs, so it needs no authentication.
+    let jwks = Arc::new(jwt_bundle);
     let app = Router::new()
         .route("/health", get(health))
+        .route(
+            "/.well-known/jwks.json",
+            get(move || {
+                let jwks = jwks.clone();
+                async move {
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "application/jwk-set+json")],
+                        jwks.as_str().to_owned(),
+                    )
+                }
+            }),
+        )
         .merge(authenticated_routes);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;

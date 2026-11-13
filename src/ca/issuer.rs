@@ -118,6 +118,37 @@ impl CertIssuer {
 
         self.ca.sign_csr(csr_der, &subject, None).await
     }
+
+    /// Issue a JWT-SVID for `service_name` on behalf of the authenticated
+    /// node `node_id`, under the same rule as X.509-SVIDs: only for a
+    /// service currently assigned to that node.
+    pub async fn issue_jwt_svid(
+        &self,
+        node_id: &str,
+        service_name: &str,
+        audience: &[String],
+    ) -> Result<(String, u64), CaError> {
+        let subject = SvidSubject::Service(service_name.to_string());
+        subject.validate()?;
+        super::validate_jwt_audience(audience)?;
+        if !self.is_assigned(node_id, service_name).await {
+            tracing::warn!(
+                node_id = %node_id,
+                service = %service_name,
+                "JWT-SVID request denied: service not assigned to node"
+            );
+            return Err(CaError::AttestationFailed(format!(
+                "service '{service_name}' is not assigned to node '{node_id}'"
+            )));
+        }
+        tracing::info!(node_id = %node_id, service = %service_name, ?audience, "Issuing JWT-SVID");
+        self.ca.sign_jwt_svid(&subject, audience).await
+    }
+
+    /// The trust domain's JWT bundle (JWKS).
+    pub async fn jwt_bundle(&self) -> Result<String, CaError> {
+        self.ca.jwt_bundle().await
+    }
 }
 
 #[cfg(test)]
@@ -129,7 +160,8 @@ mod tests {
     async fn test_issuer() -> CertIssuer {
         let ca = RootCa::new("test.internal");
         ca.initialize(None, None).await.unwrap();
-        CertIssuer::new(Arc::new(DirectCaSigner::new(ca)))
+        let (jwt, _) = crate::ca::jwt::JwtSigner::generate().unwrap();
+        CertIssuer::new(Arc::new(DirectCaSigner::new(ca, jwt)))
     }
 
     fn csr(service: &str) -> Vec<u8> {
@@ -321,5 +353,51 @@ mod tests {
             cert_spiffe_id(&cert).as_deref(),
             Some("spiffe://test.internal/service/web")
         );
+    }
+
+    #[tokio::test]
+    async fn jwt_svid_only_for_assigned_service() {
+        let issuer = test_issuer().await;
+        issuer
+            .update_assignments("node-1", vec!["web".into()])
+            .await;
+        let aud = vec!["db".to_string()];
+
+        let (token, exp) = issuer.issue_jwt_svid("node-1", "web", &aud).await.unwrap();
+        let bundle = issuer.jwt_bundle().await.unwrap();
+        let v = crate::ca::jwt::verify_jwt_svid(&token, &bundle, "test.internal", "db").unwrap();
+        assert_eq!(v.spiffe_id, "spiffe://test.internal/service/web");
+        assert_eq!(v.claims["exp"].as_u64(), Some(exp));
+
+        assert!(matches!(
+            issuer.issue_jwt_svid("node-2", "web", &aud).await,
+            Err(CaError::AttestationFailed(_))
+        ));
+        assert!(matches!(
+            issuer.issue_jwt_svid("node-1", "api", &aud).await,
+            Err(CaError::AttestationFailed(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn jwt_svid_audience_is_validated() {
+        let issuer = test_issuer().await;
+        issuer
+            .update_assignments("node-1", vec!["web".into()])
+            .await;
+        for bad in [
+            vec![],
+            vec![String::new()],
+            vec!["has space".into()],
+            vec!["a".into(); 9],
+        ] {
+            assert!(
+                matches!(
+                    issuer.issue_jwt_svid("node-1", "web", &bad).await,
+                    Err(CaError::InvalidCsr(_))
+                ),
+                "{bad:?}"
+            );
+        }
     }
 }

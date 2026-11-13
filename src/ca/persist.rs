@@ -9,6 +9,7 @@ use std::path::Path;
 
 use zeroize::Zeroizing;
 
+use super::jwt::JwtSigner;
 use super::root::RootCa;
 use crate::server::seal;
 
@@ -16,6 +17,7 @@ const ROOT_KEY: &str = "ca-key.pem";
 const ROOT_CERT: &str = "ca-cert.pem";
 const INT_KEY: &str = "ca-intermediate-key.pem";
 const INT_CERT: &str = "ca-intermediate-cert.pem";
+const JWT_KEY: &str = "jwt-signing-key.pk8";
 
 /// Read a (possibly sealed) private key PEM and its certificate. Returns
 /// `None` when either file is absent.
@@ -85,6 +87,22 @@ pub async fn open_ca(data_dir: &Path, domain: &str) -> anyhow::Result<RootCa> {
     Ok(ca)
 }
 
+/// Load the JWT-SVID signing key from `data_dir`, generating and persisting
+/// (sealed, 0600) one on first boot. As with the CA keys, an existing key
+/// that cannot be read or unsealed is an error, never a reason to replace it.
+pub async fn open_jwt_signer(data_dir: &Path) -> anyhow::Result<JwtSigner> {
+    let path = data_dir.join(JWT_KEY);
+    if path.exists() {
+        let pkcs8 = seal::read_maybe_sealed(&path).await?;
+        return Ok(JwtSigner::from_pkcs8(&pkcs8)?);
+    }
+    let (signer, pkcs8) = JwtSigner::generate()?;
+    tokio::fs::create_dir_all(data_dir).await?;
+    seal::write_maybe_sealed(&path, &pkcs8, "JWT-SVID signing key").await?;
+    tracing::info!(kid = %signer.kid(), "JWT-SVID signing key generated and persisted");
+    Ok(signer)
+}
+
 /// Persist the CA's current intermediate when it differs from `stored_cert`
 /// (first boot, or rotation on expiry).
 pub async fn persist_intermediate_if_changed(
@@ -136,6 +154,26 @@ mod tests {
         let second = open_ca(dir.path(), "test.internal").await.unwrap();
         assert_eq!(second.root_certificate_pem().await.unwrap(), root);
         assert_eq!(second.intermediate_certificate_pem().await.unwrap(), int);
+    }
+
+    #[tokio::test]
+    async fn jwt_signer_is_persisted_and_reloaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = open_jwt_signer(dir.path()).await.unwrap();
+        let second = open_jwt_signer(dir.path()).await.unwrap();
+        assert_eq!(first.kid(), second.kid());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.path().join(JWT_KEY))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+
+        std::fs::write(dir.path().join(JWT_KEY), b"EKAFSEAL\x01garbage").unwrap();
+        assert!(open_jwt_signer(dir.path()).await.is_err());
     }
 
     #[tokio::test]

@@ -70,7 +70,8 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     } else {
         tracing::info!("Using in-process CA (embedded mode)");
         let root_ca = crate::ca::persist::open_ca(&config.data_dir, &config.domain).await?;
-        Arc::new(DirectCaSigner::new(root_ca))
+        let jwt = crate::ca::persist::open_jwt_signer(&config.data_dir).await?;
+        Arc::new(DirectCaSigner::new(root_ca, jwt))
     };
 
     // Generate or load server identity
@@ -107,6 +108,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     let cert_issuer = CertIssuer::with_assignments(ca.clone(), fleet_state.service_assignments());
 
     let trust_bundle_pem = ca.trust_bundle_pem().await?;
+    let jwt_bundle = ca.jwt_bundle().await?;
 
     // Generate or load fleet encryption key for secret distribution
     let fleet_key = get_or_create_fleet_key(&config.data_dir).await?;
@@ -165,6 +167,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         cert_issuer,
         ca,
         trust_bundle_pem,
+        jwt_bundle: jwt_bundle.clone(),
         domain: config.domain,
         fleet_key,
         join_token_store,
@@ -204,6 +207,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
             metrics,
             alert_evaluator,
             Some(instance_tracker),
+            jwt_bundle,
             http_tls,
             http_shutdown,
         ) => {
