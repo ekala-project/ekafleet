@@ -2,9 +2,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use tokio::io::AsyncWriteExt;
 use tokio::sync::{RwLock, watch};
 use zeroize::Zeroizing;
+
+use crate::fsutil::write_atomic as write_file_atomic;
 
 /// Manages SPIFFE workload identities on an agent node.
 ///
@@ -251,31 +252,6 @@ impl WorkloadManager {
             .map(|(name, svid)| (name.clone(), svid.spiffe_id.clone(), svid.expires_at))
             .collect()
     }
-}
-
-/// Replace `path` atomically with `contents`. The temporary file is created
-/// with `mode` already applied, so key material is never briefly readable
-/// under a wider default mode.
-async fn write_file_atomic(path: &Path, contents: &[u8], mode: u32) -> std::io::Result<()> {
-    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
-    tmp_name.push(".tmp");
-    let tmp = path.with_file_name(tmp_name);
-    match tokio::fs::remove_file(&tmp).await {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
-    let mut opts = tokio::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    opts.mode(mode);
-    #[cfg(not(unix))]
-    let _ = mode;
-    let mut file = opts.open(&tmp).await?;
-    file.write_all(contents).await?;
-    file.sync_all().await?;
-    drop(file);
-    tokio::fs::rename(&tmp, path).await
 }
 
 #[cfg(test)]
