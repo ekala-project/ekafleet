@@ -10,7 +10,7 @@ Use `--output json` with any command for structured JSON output suitable for scr
 
 ## Daemon Modes
 
-ekafleet is a single binary with multiple subcommands. In production, the NixOS module deploys the process-isolated topology (separate `ca-signer`, `server`, `agent`, `workload-api`, and `proxy` processes). For development and quick bootstrapping, convenience modes (`dev`, `server`, `agent`) embed everything in a single process.
+ekafleet is a single binary with multiple subcommands. In production, the NixOS module deploys the process-isolated topology (separate `ca-signer`, `server`, `agent`, and `proxy` processes). For development and quick bootstrapping, convenience modes (`dev`, `server`, `agent`) embed everything in a single process.
 
 ### `ekafleet dev`
 
@@ -75,20 +75,6 @@ ekafleet ca-signer [OPTIONS]
 | `--data-dir` | `/var/lib/ekafleet` | Data directory for CA key and certificate |
 | `--domain` | `fleet.internal` | SPIFFE trust domain |
 | `--socket` | `/run/ekafleet/ca.sock` | Unix socket path for signing requests |
-
-### `ekafleet workload-api`
-
-Standalone SPIFFE Workload API daemon. Reads SVIDs from disk (written by the agent) and serves them to workloads over a Unix socket. Runs unprivileged with no network access.
-
-```
-ekafleet workload-api [OPTIONS]
-```
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--data-dir` | `/var/lib/ekafleet` | Data directory containing `spiffe/` subdirectory |
-| `--trust-domain` | `fleet.internal` | SPIFFE trust domain |
-| `--socket` | `/run/ekafleet/workload-api.sock` | Unix socket path for the Workload API |
 
 ### `ekafleet proxy`
 

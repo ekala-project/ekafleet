@@ -6,18 +6,18 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-/// Find an available TCP port by binding to port 0.
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
+/// Bind an ephemeral localhost port and keep the listener, so parallel tests
+/// can never race for the same port between "find" and "bind".
+async fn bound_listener() -> (tokio::net::TcpListener, SocketAddr) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    (listener, addr)
 }
 
 /// Start the server in background, returning (grpc_addr, http_addr, ca_cert_pem, token).
 async fn start_server() -> (SocketAddr, SocketAddr, String, String) {
-    let grpc_port = free_port();
-    let http_port = free_port();
-    let grpc_addr: SocketAddr = format!("127.0.0.1:{grpc_port}").parse().unwrap();
-    let http_addr: SocketAddr = format!("127.0.0.1:{http_port}").parse().unwrap();
+    let (grpc_listener, grpc_addr) = bound_listener().await;
+    let (http_listener, http_addr) = bound_listener().await;
 
     let _dir = tempfile::tempdir().unwrap();
     let token = "integration-test-token".to_string();
@@ -91,7 +91,9 @@ async fn start_server() -> (SocketAddr, SocketAddr, String, String) {
             .tls_config(tls_config)
             .unwrap()
             .add_service(FleetControlServer::with_interceptor(service, interceptor))
-            .serve(grpc_addr)
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
+                grpc_listener,
+            ))
             .await
             .unwrap();
     });
@@ -127,8 +129,7 @@ async fn start_server() -> (SocketAddr, SocketAddr, String, String) {
             .route("/health", get(|| async { "ok" }))
             .merge(authenticated);
 
-        let listener = tokio::net::TcpListener::bind(http_addr).await.unwrap();
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(http_listener, app).await.unwrap();
     });
 
     // Wait for servers to bind
