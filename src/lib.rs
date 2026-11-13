@@ -6,6 +6,7 @@ pub mod attestation;
 pub mod ca;
 pub mod config;
 pub mod dns;
+pub mod fsutil;
 pub mod gossip;
 pub mod mesh;
 pub mod metrics;

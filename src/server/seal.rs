@@ -9,9 +9,11 @@
 //! ```
 //!
 //! The passphrase is taken from the `EKAFLEET_SEAL_PASSPHRASE` environment
-//! variable. When it is absent the caller may choose to fall back to plaintext
-//! persistence (with a warning) so that development and existing deployments
-//! keep working; production is expected to set the passphrase.
+//! variable, or read from the file named by `EKAFLEET_SEAL_PASSPHRASE_FILE`
+//! (e.g. a systemd credential, which keeps the secret out of the unit's
+//! environment block). When neither is set the caller may fall back to
+//! plaintext persistence (with a warning) so that development keeps working;
+//! production is expected to configure a passphrase.
 
 use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use ring::pbkdf2;
@@ -30,6 +32,9 @@ const DEFAULT_ITERATIONS: u32 = 600_000;
 
 /// Environment variable that supplies the sealing passphrase.
 pub const PASSPHRASE_ENV: &str = "EKAFLEET_SEAL_PASSPHRASE";
+
+/// Environment variable naming a file that holds the sealing passphrase.
+pub const PASSPHRASE_FILE_ENV: &str = "EKAFLEET_SEAL_PASSPHRASE_FILE";
 
 #[derive(Debug)]
 pub enum SealError {
@@ -53,11 +58,36 @@ impl std::fmt::Display for SealError {
 impl std::error::Error for SealError {}
 
 /// Read the sealing passphrase from the environment, if configured.
-pub fn passphrase_from_env() -> Option<Zeroizing<String>> {
-    match std::env::var(PASSPHRASE_ENV) {
-        Ok(p) if !p.is_empty() => Some(Zeroizing::new(p)),
-        _ => None,
+///
+/// A configured but unreadable or empty passphrase file is an error, never
+/// "no passphrase": silently falling back would write key material unsealed.
+pub fn passphrase_from_env() -> anyhow::Result<Option<Zeroizing<String>>> {
+    if let Ok(p) = std::env::var(PASSPHRASE_ENV)
+        && !p.is_empty()
+    {
+        return Ok(Some(Zeroizing::new(p)));
     }
+    let Some(path) = std::env::var_os(PASSPHRASE_FILE_ENV).filter(|p| !p.is_empty()) else {
+        return Ok(None);
+    };
+    passphrase_from_file(std::path::Path::new(&path)).map(Some)
+}
+
+/// Read a passphrase file, dropping one trailing newline.
+fn passphrase_from_file(path: &std::path::Path) -> anyhow::Result<Zeroizing<String>> {
+    let mut pass = Zeroizing::new(std::fs::read_to_string(path).map_err(|e| {
+        anyhow::anyhow!("cannot read seal passphrase file {}: {e}", path.display())
+    })?);
+    if pass.ends_with('\n') {
+        pass.pop();
+        if pass.ends_with('\r') {
+            pass.pop();
+        }
+    }
+    if pass.is_empty() {
+        anyhow::bail!("seal passphrase file {} is empty", path.display());
+    }
+    Ok(pass)
 }
 
 /// Returns true if the given bytes look like a sealed envelope.
@@ -144,35 +174,30 @@ pub fn unseal(sealed: &[u8], passphrase: &str) -> Result<Zeroizing<Vec<u8>>, Sea
 /// Persist `plaintext` to `path`, sealing it when a passphrase is configured.
 ///
 /// When no passphrase is set, writes plaintext and logs a warning so operators
-/// are aware the material is unprotected at rest. File permissions are set to
-/// `0o600` on Unix regardless.
+/// are aware the material is unprotected at rest. The file is replaced
+/// atomically and created with mode `0o600`, so it is never readable by other
+/// users, not even transiently.
 pub async fn write_maybe_sealed(
     path: &std::path::Path,
     plaintext: &[u8],
     what: &str,
 ) -> anyhow::Result<()> {
-    let bytes = match passphrase_from_env() {
-        Some(pass) => seal(plaintext, &pass).map_err(|e| anyhow::anyhow!("{e}"))?,
+    let bytes = match passphrase_from_env()? {
+        Some(pass) => Zeroizing::new(seal(plaintext, &pass).map_err(|e| anyhow::anyhow!("{e}"))?),
         None => {
             tracing::warn!(
                 what,
                 env = PASSPHRASE_ENV,
                 "{what} is being written UNSEALED (plaintext at rest). \
-                 Set {PASSPHRASE_ENV} to encrypt sensitive key material."
+                 Set {PASSPHRASE_ENV} or {PASSPHRASE_FILE_ENV} to encrypt sensitive key material."
             );
-            plaintext.to_vec()
+            Zeroizing::new(plaintext.to_vec())
         }
     };
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    tokio::fs::write(path, &bytes).await?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        tokio::fs::set_permissions(path, perms).await?;
-    }
+    crate::fsutil::write_atomic(path, &bytes, 0o600).await?;
     Ok(())
 }
 
@@ -184,9 +209,9 @@ pub async fn write_maybe_sealed(
 pub async fn read_maybe_sealed(path: &std::path::Path) -> anyhow::Result<Zeroizing<Vec<u8>>> {
     let data = tokio::fs::read(path).await?;
     if is_sealed(&data) {
-        let pass = passphrase_from_env().ok_or_else(|| {
+        let pass = passphrase_from_env()?.ok_or_else(|| {
             anyhow::anyhow!(
-                "{} is sealed but {PASSPHRASE_ENV} is not set",
+                "{} is sealed but neither {PASSPHRASE_ENV} nor {PASSPHRASE_FILE_ENV} is set",
                 path.display()
             )
         })?;
@@ -200,6 +225,25 @@ pub async fn read_maybe_sealed(path: &std::path::Path) -> anyhow::Result<Zeroizi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn passphrase_file_strips_one_trailing_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pass");
+        std::fs::write(&path, "s3cret\n").unwrap();
+        assert_eq!(passphrase_from_file(&path).unwrap().as_str(), "s3cret");
+        std::fs::write(&path, "s3cret \r\n").unwrap();
+        assert_eq!(passphrase_from_file(&path).unwrap().as_str(), "s3cret ");
+    }
+
+    #[test]
+    fn empty_or_missing_passphrase_file_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pass");
+        assert!(passphrase_from_file(&path).is_err());
+        std::fs::write(&path, "\n").unwrap();
+        assert!(passphrase_from_file(&path).is_err());
+    }
 
     #[test]
     fn seal_unseal_roundtrip() {

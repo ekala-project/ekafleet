@@ -1,6 +1,7 @@
 pub mod client;
 pub mod csr;
 pub mod issuer;
+pub mod persist;
 pub mod pki;
 pub mod root;
 pub mod signer;
