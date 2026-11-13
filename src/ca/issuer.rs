@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
-use super::CaSigner;
 use super::root::CaError;
+use super::{CaSigner, SvidSubject};
 
 /// Certificate issuance service.
 /// Validates CSRs, performs attestation, checks service assignment,
@@ -24,14 +24,34 @@ impl CertIssuer {
         }
     }
 
-    /// Update the service assignments for a node.
+    /// Replace the full set of services assigned to a node. Only assigned
+    /// services may obtain SVIDs through [`Self::process_request`].
     pub async fn update_assignments(&self, node_id: &str, services: Vec<String>) {
         let mut assignments = self.assignments.write().await;
         assignments.insert(node_id.to_string(), services);
     }
 
+    /// Forget all assignments for a node (e.g. when it leaves the fleet).
+    pub async fn remove_node(&self, node_id: &str) {
+        self.assignments.write().await.remove(node_id);
+    }
+
+    /// Whether `service_name` is currently assigned to `node_id`.
+    pub async fn is_assigned(&self, node_id: &str, service_name: &str) -> bool {
+        self.assignments
+            .read()
+            .await
+            .get(node_id)
+            .is_some_and(|services| services.iter().any(|s| s == service_name))
+    }
+
     /// Process a certificate request from an agent.
-    /// Validates that the requesting node is authorized for the requested service.
+    ///
+    /// `node_id` must be the *authenticated* identity of the requesting
+    /// agent (taken from its control stream), never a value the agent put in
+    /// the request. The request is honoured only when `service_name` is
+    /// currently assigned to that node, and only as a proper PKCS#10 CSR: the
+    /// CA never generates workload private keys.
     pub async fn process_request(
         &self,
         node_id: &str,
@@ -45,31 +65,13 @@ impl CertIssuer {
             "Processing certificate request"
         );
 
-        // Validate CSR is non-empty
         if csr_der.is_empty() {
             return Err(CaError::InvalidCsr("empty CSR".into()));
         }
+        let subject = SvidSubject::Service(service_name.to_string());
+        subject.validate()?;
 
-        // Validate service name is reasonable
-        if service_name.is_empty() || service_name.len() > 253 {
-            return Err(CaError::InvalidCsr("invalid service name length".into()));
-        }
-        if !service_name
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
-        {
-            return Err(CaError::InvalidCsr(
-                "service name contains invalid characters".into(),
-            ));
-        }
-
-        // Check that the service is actually assigned to this node
-        let assignments = self.assignments.read().await;
-        let authorized = assignments
-            .get(node_id)
-            .is_some_and(|services| services.contains(&service_name.to_string()));
-
-        if !authorized {
+        if !self.is_assigned(node_id, service_name).await {
             tracing::warn!(
                 node_id = %node_id,
                 service = %service_name,
@@ -80,19 +82,7 @@ impl CertIssuer {
             )));
         }
 
-        // Detect real PKCS#10 CSR vs legacy dummy CSR.
-        // A real CSR starts with ASN.1 SEQUENCE tag (0x30).
-        if csr_der.len() > 1 && csr_der[0] == 0x30 {
-            // Real CSR: sign it (private key stays with the requester)
-            self.ca.sign_csr(csr_der, service_name, None).await
-        } else {
-            // Legacy dummy CSR (e.g., [0x01]): generate keypair server-side
-            tracing::warn!(
-                service = %service_name,
-                "Legacy CSR detected — server generating keypair (deprecated)"
-            );
-            self.ca.issue_certificate(service_name, csr_der, None).await
-        }
+        self.ca.sign_csr(csr_der, &subject, None).await
     }
 }
 
@@ -108,6 +98,18 @@ mod tests {
         CertIssuer::new(Arc::new(DirectCaSigner::new(ca)))
     }
 
+    fn csr(service: &str) -> Vec<u8> {
+        crate::ca::csr::generate_service_csr("test.internal", service)
+            .unwrap()
+            .csr_der
+    }
+
+    fn cert_spiffe_id(cert_pem: &[u8]) -> Option<String> {
+        crate::proxy::mtls::SpiffeAuthorizer::extract_spiffe_id_from_pem(
+            std::str::from_utf8(cert_pem).unwrap(),
+        )
+    }
+
     #[tokio::test]
     async fn authorized_node_gets_certificate() {
         let issuer = test_issuer().await;
@@ -115,11 +117,21 @@ mod tests {
             .update_assignments("node-1", vec!["my-service".to_string()])
             .await;
 
-        let result = issuer
-            .process_request("node-1", "my-service", b"dummy-csr")
-            .await;
+        let (cert, _chain, _expires) = issuer
+            .process_request("node-1", "my-service", &csr("my-service"))
+            .await
+            .unwrap();
 
-        assert!(result.is_ok());
+        let cert_str = String::from_utf8(cert.clone()).unwrap();
+        assert!(cert_str.contains("BEGIN CERTIFICATE"));
+        assert!(
+            !cert_str.contains("PRIVATE KEY"),
+            "cert from CSR signing must not contain private key"
+        );
+        assert_eq!(
+            cert_spiffe_id(&cert).as_deref(),
+            Some("spiffe://test.internal/service/my-service")
+        );
     }
 
     #[tokio::test]
@@ -130,9 +142,23 @@ mod tests {
             .await;
 
         let result = issuer
-            .process_request("node-1", "other-service", b"dummy-csr")
+            .process_request("node-1", "other-service", &csr("other-service"))
             .await;
 
+        assert!(matches!(result, Err(CaError::AttestationFailed(_))));
+    }
+
+    #[tokio::test]
+    async fn service_assigned_elsewhere_denied() {
+        let issuer = test_issuer().await;
+        issuer
+            .update_assignments("node-1", vec!["db".to_string()])
+            .await;
+        issuer
+            .update_assignments("node-2", vec!["web".to_string()])
+            .await;
+
+        let result = issuer.process_request("node-2", "db", &csr("db")).await;
         assert!(matches!(result, Err(CaError::AttestationFailed(_))));
     }
 
@@ -142,7 +168,7 @@ mod tests {
         // No assignments registered for node-99
 
         let result = issuer
-            .process_request("node-99", "any-service", b"csr")
+            .process_request("node-99", "any-service", &csr("any-service"))
             .await;
 
         assert!(matches!(result, Err(CaError::AttestationFailed(_))));
@@ -161,23 +187,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_der_csr_rejected_without_server_keygen() {
+        let issuer = test_issuer().await;
+        issuer
+            .update_assignments("node-1", vec!["legacy-svc".to_string()])
+            .await;
+
+        // The removed legacy path used to mint a server-generated keypair
+        // for any non-DER "CSR" such as [0x01].
+        let result = issuer
+            .process_request("node-1", "legacy-svc", &[0x01])
+            .await;
+        assert!(matches!(result, Err(CaError::InvalidCsr(_))));
+    }
+
+    #[tokio::test]
     async fn invalid_service_name_rejected() {
         let issuer = test_issuer().await;
 
-        // Empty name
-        let result = issuer.process_request("node-1", "", b"csr").await;
-        assert!(matches!(result, Err(CaError::InvalidCsr(_))));
-
-        // Special characters
-        let result = issuer
-            .process_request("node-1", "svc;drop table", b"csr")
-            .await;
-        assert!(matches!(result, Err(CaError::InvalidCsr(_))));
-
-        // Too long
-        let long_name = "a".repeat(254);
-        let result = issuer.process_request("node-1", &long_name, b"csr").await;
-        assert!(matches!(result, Err(CaError::InvalidCsr(_))));
+        for name in [
+            "",
+            "svc;drop table",
+            "../server/x",
+            "-svc",
+            &"a".repeat(254),
+        ] {
+            issuer
+                .update_assignments("node-1", vec![name.to_string()])
+                .await;
+            let result = issuer.process_request("node-1", name, &csr("x")).await;
+            assert!(
+                matches!(result, Err(CaError::InvalidCsr(_))),
+                "name {name:?} must be rejected"
+            );
+        }
     }
 
     #[tokio::test]
@@ -189,60 +232,9 @@ mod tests {
             issuer
                 .update_assignments("node-1", vec![name.to_string()])
                 .await;
-            let result = issuer.process_request("node-1", name, b"csr").await;
+            let result = issuer.process_request("node-1", name, &csr(name)).await;
             assert!(result.is_ok(), "valid name '{name}' should be accepted");
         }
-    }
-
-    #[tokio::test]
-    async fn real_csr_uses_sign_csr_path() {
-        let issuer = test_issuer().await;
-        issuer
-            .update_assignments("node-1", vec!["csr-service".to_string()])
-            .await;
-
-        // Generate a real CSR
-        let csr_output =
-            crate::ca::csr::generate_service_csr("test.internal", "csr-service").unwrap();
-
-        let result = issuer
-            .process_request("node-1", "csr-service", &csr_output.csr_der)
-            .await;
-
-        assert!(result.is_ok(), "real CSR should be accepted");
-
-        // The returned cert should NOT contain a private key
-        let (cert, _chain, _expires) = result.unwrap();
-        let cert_str = String::from_utf8(cert).unwrap();
-        assert!(cert_str.contains("BEGIN CERTIFICATE"));
-        assert!(
-            !cert_str.contains("PRIVATE KEY"),
-            "cert from CSR signing must not contain private key"
-        );
-    }
-
-    #[tokio::test]
-    async fn legacy_dummy_csr_still_works() {
-        let issuer = test_issuer().await;
-        issuer
-            .update_assignments("node-1", vec!["legacy-svc".to_string()])
-            .await;
-
-        // Legacy dummy CSR (0x01)
-        let result = issuer
-            .process_request("node-1", "legacy-svc", &[0x01])
-            .await;
-
-        assert!(result.is_ok(), "legacy dummy CSR should still work");
-
-        // The returned cert SHOULD contain a private key (legacy combined format)
-        let (cert, _chain, _expires) = result.unwrap();
-        let cert_str = String::from_utf8(cert).unwrap();
-        assert!(cert_str.contains("BEGIN CERTIFICATE"));
-        assert!(
-            cert_str.contains("PRIVATE KEY"),
-            "legacy cert must contain private key"
-        );
     }
 
     #[tokio::test]
@@ -257,13 +249,43 @@ mod tests {
             .update_assignments("node-1", vec!["svc-b".to_string()])
             .await;
 
-        let result = issuer.process_request("node-1", "svc-a", b"csr").await;
+        let result = issuer
+            .process_request("node-1", "svc-a", &csr("svc-a"))
+            .await;
         assert!(
             matches!(result, Err(CaError::AttestationFailed(_))),
             "old assignment should no longer be valid"
         );
 
-        let result = issuer.process_request("node-1", "svc-b", b"csr").await;
+        let result = issuer
+            .process_request("node-1", "svc-b", &csr("svc-b"))
+            .await;
         assert!(result.is_ok(), "new assignment should be valid");
+
+        issuer.remove_node("node-1").await;
+        let result = issuer
+            .process_request("node-1", "svc-b", &csr("svc-b"))
+            .await;
+        assert!(matches!(result, Err(CaError::AttestationFailed(_))));
+    }
+
+    #[tokio::test]
+    async fn csr_requesting_other_identity_gets_assigned_identity() {
+        let issuer = test_issuer().await;
+        issuer
+            .update_assignments("node-1", vec!["web".to_string()])
+            .await;
+
+        // A CSR whose SAN claims a server identity must still yield a cert
+        // for the assigned service only.
+        let forged = crate::ca::csr::generate_node_csr("test.internal", "x").unwrap();
+        let (cert, _, _) = issuer
+            .process_request("node-1", "web", &forged.csr_der)
+            .await
+            .unwrap();
+        assert_eq!(
+            cert_spiffe_id(&cert).as_deref(),
+            Some("spiffe://test.internal/service/web")
+        );
     }
 }
