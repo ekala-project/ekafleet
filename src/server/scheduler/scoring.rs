@@ -11,6 +11,7 @@ use super::constraints::{evaluate_operator, get_attribute, passes_constraints, p
 use super::{Candidate, Preemption, ResourceRequirements};
 
 /// Compute a placement score for a candidate. Higher is better.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn compute_score(
     candidate: &Candidate,
     service_name: &str,

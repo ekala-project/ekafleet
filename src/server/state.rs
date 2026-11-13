@@ -518,6 +518,7 @@ impl FleetState {
     /// Inserts a oneshot channel keyed by `correlation_id`, sends the message
     /// to the agent, and awaits the response with a timeout. Returns an error
     /// status if the agent is unreachable or the response times out.
+    #[allow(clippy::result_large_err)]
     pub async fn send_command(
         &self,
         node_id: &str,
