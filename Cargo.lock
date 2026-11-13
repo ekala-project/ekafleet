@@ -616,6 +616,7 @@ dependencies = [
  "assert_cmd",
  "async-stream",
  "axum",
+ "base64",
  "clap",
  "clap_complete",
  "derive_more",

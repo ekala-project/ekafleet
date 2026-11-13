@@ -493,6 +493,11 @@ impl RootCa {
         Ok((leaf_pem.into_bytes(), chain_pem.into_bytes(), expires_at))
     }
 
+    /// The trust domain this CA issues identities in.
+    pub async fn domain(&self) -> String {
+        self.inner.read().await.domain.clone()
+    }
+
     /// Get the root CA certificate PEM (for trust anchors).
     pub async fn root_certificate_pem(&self) -> Option<String> {
         let state = self.inner.read().await;

@@ -50,6 +50,8 @@ pub struct FleetControlService {
     pub(super) cert_issuer: Option<CertIssuer>,
     pub(super) ca: Option<Arc<dyn CaSigner>>,
     pub(super) trust_bundle_pem: Option<String>,
+    /// The JWT bundle (JWKS) pushed to agents with the X.509 bundle.
+    pub(super) jwt_bundle: Option<String>,
     /// Trust domain for SPIFFE identities (e.g., "fleet.internal").
     pub(super) domain: String,
     /// Fleet encryption key state — supports runtime rotation.
@@ -90,6 +92,7 @@ impl FleetControlService {
             cert_issuer: None,
             ca: None,
             trust_bundle_pem: None,
+            jwt_bundle: None,
             domain: domain.to_string(),
             fleet_key: Arc::new(RwLock::new(FleetKeyState {
                 key: zeroize::Zeroizing::new(Vec::new()),
@@ -136,9 +139,15 @@ impl FleetControlService {
     }
 
     /// Configure the service with a certificate issuer for SPIFFE SVID issuance.
-    pub fn with_cert_issuer(mut self, issuer: CertIssuer, trust_bundle_pem: String) -> Self {
+    pub fn with_cert_issuer(
+        mut self,
+        issuer: CertIssuer,
+        trust_bundle_pem: String,
+        jwt_bundle: String,
+    ) -> Self {
         self.cert_issuer = Some(issuer);
         self.trust_bundle_pem = Some(trust_bundle_pem);
+        self.jwt_bundle = Some(jwt_bundle);
         self
     }
 
@@ -257,6 +266,12 @@ impl FleetControl for FleetControlService {
                 payload: Some(ServerPayload::TrustBundle(TrustBundleUpdate {
                     trust_domain: self.domain.clone(),
                     ca_certificate_pem: bundle_pem.as_bytes().to_vec(),
+                    jwt_bundle_jwks: self
+                        .jwt_bundle
+                        .as_deref()
+                        .unwrap_or_default()
+                        .as_bytes()
+                        .to_vec(),
                 })),
             };
             let _ = self.state.send_to_agent(&node_id, bundle_msg).await;
@@ -1970,6 +1985,7 @@ pub struct GrpcServerConfig {
     pub cert_issuer: CertIssuer,
     pub ca: Arc<dyn CaSigner>,
     pub trust_bundle_pem: String,
+    pub jwt_bundle: String,
     pub domain: String,
     pub fleet_key: zeroize::Zeroizing<Vec<u8>>,
     pub join_token_store: JoinTokenStore,
@@ -1992,6 +2008,7 @@ pub async fn serve_grpc(
         cert_issuer,
         ca,
         trust_bundle_pem,
+        jwt_bundle,
         domain,
         fleet_key,
         join_token_store,
@@ -2094,7 +2111,7 @@ pub async fn serve_grpc(
         service_token_store,
         data_dir,
     )
-    .with_cert_issuer(cert_issuer, trust_bundle_pem)
+    .with_cert_issuer(cert_issuer, trust_bundle_pem, jwt_bundle)
     .with_ca(ca)
     .with_fleet_key(fleet_key);
 

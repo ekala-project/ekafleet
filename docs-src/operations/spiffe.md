@@ -74,9 +74,9 @@ The agent exposes the standard SPIFFE Workload API over a Unix domain socket at 
 |-----|--------|
 | `FetchX509SVID` | Implemented (streaming) |
 | `FetchX509Bundles` | Implemented (streaming) |
-| `FetchJWTSVID` | Not yet supported (`Unimplemented`) |
-| `ValidateJWTSVID` | Not yet supported (`Unimplemented`) |
-| `FetchJWTBundles` | Not yet supported (`Unimplemented`) |
+| `FetchJWTSVID` | Implemented (signed by the server, cached by the agent) |
+| `ValidateJWTSVID` | Implemented (validated locally against the JWT bundle) |
+| `FetchJWTBundles` | Implemented (streaming) |
 
 ### Workload Attestation
 
@@ -125,26 +125,30 @@ let svids = client.fetch_x509_svid().await?;
 
 ## JWT-SVID
 
-In addition to X.509-SVIDs, ekafleet supports JWT-SVIDs for token-based authentication between services.
+In addition to X.509-SVIDs, ekafleet issues JWT-SVIDs for token-based authentication, e.g. towards HTTP APIs or cloud providers that accept OIDC-style tokens.
 
-### Fetching a JWT-SVID
+### Issuance
 
-```bash
-# Via the Workload API (programmatic)
-# The FetchJWTSVID RPC returns a signed JWT with the workload's SPIFFE ID
-```
+1. A workload calls `FetchJWTSVID` with one or more audiences. The agent attests it exactly as for X.509 (`SO_PEERCRED` → cgroup → service). If the request names a `spiffe_id`, it must be the caller's own.
+2. The agent forwards a `JwtSvidRequest` over its control stream. The server signs only for services currently assigned to that (mTLS-authenticated) node.
+3. The token is signed with **ES256** by the CA signer, which holds the signing key next to the X.509 CA keys (`jwt-signing-key.pk8`, sealed at rest like them).
+4. The agent caches each token per (service, audience set) and fetches a fresh one once half its lifetime has passed.
 
-JWT claims:
+Claims:
 - `sub` — SPIFFE ID (e.g., `spiffe://fleet.internal/service/my-app`)
-- `aud` — Requested audience(s)
-- `iat` — Issued at (Unix timestamp)
-- `exp` — Expiration (1 hour TTL)
+- `aud` — requested audience(s), 1–8 entries
+- `iat` — issued at (Unix timestamp)
+- `exp` — expiration (5 minute TTL; bearer tokens cannot be revoked)
 
-JWTs are signed with HMAC-SHA256 using the fleet signing key. Validation is performed via the `ValidateJWTSVID` RPC, which verifies the signature, expiration, and audience.
+The JOSE header carries `alg: ES256` and a `kid`, the RFC 7638 thumbprint of the signing key.
 
-### JWT Bundles
+### Validation and JWT Bundles
 
-The `FetchJWTBundles` RPC returns a JWKS (JSON Web Key Set) stream identifying the signing key. Clients use this to discover key material for local validation.
+The server pushes the trust domain's JWT bundle (a JWKS document) to every agent with the X.509 trust bundle.
+
+- `ValidateJWTSVID` verifies a token locally on the agent: ES256 only (`none`, HMAC and other algorithms are rejected), the `kid` must name a key in the bundle, and `exp`, `aud` and the trust domain of `sub` are checked. The response carries the token's claims.
+- `FetchJWTBundles` streams the JWKS keyed by trust domain ID.
+- Relying parties outside the fleet fetch the same document, unauthenticated, from the server's REST API at `/.well-known/jwks.json`.
 
 ### Filesystem Access
 

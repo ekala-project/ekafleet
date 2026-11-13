@@ -3,7 +3,9 @@ use crate::ca::issuer::CertIssuer;
 use crate::metrics::aggregator::MetricsAggregator;
 use crate::proto::agent_message::Payload;
 use crate::proto::server_message::Payload as ServerPayload;
-use crate::proto::{AgentMessage, CertificateResponse, ServerMessage};
+use crate::proto::{
+    AgentMessage, CertificateResponse, JwtSvidRequest, JwtSvidResponse, ServerMessage,
+};
 
 /// Note when a message's self-reported node id disagrees with the stream's
 /// authenticated node. The payload field is informational only and is never
@@ -17,6 +19,42 @@ fn check_claimed_node(node_id: &str, claimed: &str, kind: &str) {
             "Ignoring mismatched node_id in agent message"
         );
     }
+}
+
+/// Answer a JWT-SVID request from the authenticated node `node_id`. Always
+/// produces a response so the agent's waiting workload is never left hanging.
+async fn issue_jwt_svid(
+    node_id: &str,
+    req: &JwtSvidRequest,
+    cert_issuer: Option<&CertIssuer>,
+) -> JwtSvidResponse {
+    let mut response = JwtSvidResponse {
+        request_id: req.request_id.clone(),
+        ..Default::default()
+    };
+    let Some(issuer) = cert_issuer else {
+        response.error = "this server does not issue SVIDs".into();
+        return response;
+    };
+    match issuer
+        .issue_jwt_svid(node_id, &req.service_name, &req.audience)
+        .await
+    {
+        Ok((token, expires_at)) => {
+            response.token = token;
+            response.expires_at = expires_at;
+        }
+        Err(e) => {
+            tracing::warn!(
+                node_id = %node_id,
+                service = %req.service_name,
+                error = %e,
+                "JWT-SVID request denied"
+            );
+            response.error = e.to_string();
+        }
+    }
+    response
 }
 
 /// Handle one message from the control stream of `node_id`, the stream's
@@ -99,6 +137,17 @@ pub(super) async fn process_agent_message(
                 }
             }
         }
+        Some(Payload::JwtSvidRequest(req)) => {
+            let response = issue_jwt_svid(node_id, &req, cert_issuer).await;
+            state
+                .send_to_agent(
+                    node_id,
+                    ServerMessage {
+                        payload: Some(ServerPayload::JwtSvid(response)),
+                    },
+                )
+                .await;
+        }
         Some(Payload::Metrics(summary)) => {
             check_claimed_node(node_id, &summary.node_id, "metrics");
             tracing::debug!(
@@ -128,5 +177,55 @@ pub(super) async fn process_agent_message(
             state.complete_request(&cid, resp).await;
         }
         None => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ca::jwt::JwtSigner;
+    use crate::ca::root::RootCa;
+    use crate::ca::signer::DirectCaSigner;
+    use std::sync::Arc;
+
+    async fn issuer() -> CertIssuer {
+        let ca = RootCa::new("test.internal");
+        ca.initialize(None, None).await.unwrap();
+        let (jwt, _) = JwtSigner::generate().unwrap();
+        let issuer = CertIssuer::new(Arc::new(DirectCaSigner::new(ca, jwt)));
+        issuer
+            .update_assignments("node-1", vec!["web".into()])
+            .await;
+        issuer
+    }
+
+    fn request(service: &str) -> JwtSvidRequest {
+        JwtSvidRequest {
+            request_id: "r1".into(),
+            service_name: service.into(),
+            audience: vec!["db".into()],
+        }
+    }
+
+    #[tokio::test]
+    async fn jwt_svid_request_is_answered_with_token() {
+        let issuer = issuer().await;
+        let resp = issue_jwt_svid("node-1", &request("web"), Some(&issuer)).await;
+        assert_eq!(resp.request_id, "r1");
+        assert!(resp.error.is_empty(), "{}", resp.error);
+        let bundle = issuer.jwt_bundle().await.unwrap();
+        crate::ca::jwt::verify_jwt_svid(&resp.token, &bundle, "test.internal", "db").unwrap();
+    }
+
+    #[tokio::test]
+    async fn refused_jwt_svid_request_still_gets_a_response() {
+        let issuer = issuer().await;
+        let resp = issue_jwt_svid("node-2", &request("web"), Some(&issuer)).await;
+        assert_eq!(resp.request_id, "r1");
+        assert!(resp.token.is_empty());
+        assert!(resp.error.contains("not assigned"), "{}", resp.error);
+
+        let resp = issue_jwt_svid("node-1", &request("web"), None).await;
+        assert!(resp.token.is_empty() && !resp.error.is_empty());
     }
 }

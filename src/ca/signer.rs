@@ -10,6 +10,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
+use super::jwt::{JWT_SVID_TTL, JwtSigner};
 use super::root::{CaError, RootCa};
 use super::{CaSigner, SvidSubject};
 
@@ -34,6 +35,11 @@ enum Request {
         server_id: String,
     },
     TrustBundle,
+    SignJwtSvid {
+        subject: SvidSubject,
+        audience: Vec<String>,
+    },
+    JwtBundle,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -45,6 +51,13 @@ enum Response {
     },
     TrustBundle {
         pem: String,
+    },
+    JwtSvid {
+        token: String,
+        expires_at: u64,
+    },
+    JwtBundle {
+        jwks: String,
     },
     Error {
         message: String,
@@ -81,12 +94,28 @@ async fn recv_msg(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
 /// In-process CA signer. Used by `ekafleet server` and `ekafleet dev`.
 pub struct DirectCaSigner {
     ca: RootCa,
+    jwt: JwtSigner,
 }
 
 impl DirectCaSigner {
-    pub fn new(ca: RootCa) -> Self {
-        Self { ca }
+    pub fn new(ca: RootCa, jwt: JwtSigner) -> Self {
+        Self { ca, jwt }
     }
+}
+
+/// Sign a JWT-SVID for `subject` in `ca`'s trust domain. Shared by the
+/// in-process signer and the daemon so both validate identically.
+async fn sign_jwt(
+    ca: &RootCa,
+    jwt: &JwtSigner,
+    subject: &SvidSubject,
+    audience: &[String],
+) -> Result<(String, u64), CaError> {
+    subject.validate()?;
+    super::validate_jwt_audience(audience)?;
+    let spiffe_id = subject.spiffe_id(&ca.domain().await);
+    jwt.sign(&spiffe_id, audience, JWT_SVID_TTL)
+        .map_err(|e| CaError::Signing(e.to_string()))
 }
 
 #[tonic::async_trait]
@@ -109,6 +138,18 @@ impl CaSigner for DirectCaSigner {
             .root_certificate_pem()
             .await
             .ok_or(CaError::NotInitialized)
+    }
+
+    async fn sign_jwt_svid(
+        &self,
+        subject: &SvidSubject,
+        audience: &[String],
+    ) -> Result<(String, u64), CaError> {
+        sign_jwt(&self.ca, &self.jwt, subject, audience).await
+    }
+
+    async fn jwt_bundle(&self) -> Result<String, CaError> {
+        Ok(self.jwt.jwks())
     }
 }
 
@@ -193,6 +234,32 @@ impl CaSigner for RemoteCaSigner {
             _ => Err(CaError::Signing("unexpected response type".into())),
         }
     }
+
+    async fn sign_jwt_svid(
+        &self,
+        subject: &SvidSubject,
+        audience: &[String],
+    ) -> Result<(String, u64), CaError> {
+        let resp = self
+            .call(&Request::SignJwtSvid {
+                subject: subject.clone(),
+                audience: audience.to_vec(),
+            })
+            .await?;
+        match resp {
+            Response::JwtSvid { token, expires_at } => Ok((token, expires_at)),
+            Response::Error { message } => Err(CaError::Signing(message)),
+            _ => Err(CaError::Signing("unexpected response type".into())),
+        }
+    }
+
+    async fn jwt_bundle(&self) -> Result<String, CaError> {
+        match self.call(&Request::JwtBundle).await? {
+            Response::JwtBundle { jwks } => Ok(jwks),
+            Response::Error { message } => Err(CaError::Signing(message)),
+            _ => Err(CaError::Signing("unexpected response type".into())),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -219,7 +286,8 @@ pub async fn serve(config: CaSignerConfig) -> anyhow::Result<()> {
     );
 
     let ca = super::persist::open_ca(&config.data_dir, &config.domain).await?;
-    let ca = Arc::new(ca);
+    let jwt = super::persist::open_jwt_signer(&config.data_dir).await?;
+    let keys = Arc::new((ca, jwt));
 
     // Clean up stale socket
     let _ = tokio::fs::remove_file(&config.socket_path).await;
@@ -250,9 +318,10 @@ pub async fn serve(config: CaSignerConfig) -> anyhow::Result<()> {
             accept = listener.accept() => {
                 match accept {
                     Ok((stream, _addr)) => {
-                        let ca = ca.clone();
+                        let keys = keys.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_connection(stream, &ca).await {
+                            let (ca, jwt) = &*keys;
+                            if let Err(e) = handle_connection(stream, ca, jwt).await {
                                 tracing::warn!(error = %e, "CA signer connection error");
                             }
                         });
@@ -273,7 +342,11 @@ pub async fn serve(config: CaSignerConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn handle_connection(mut stream: tokio::net::UnixStream, ca: &RootCa) -> anyhow::Result<()> {
+async fn handle_connection(
+    mut stream: tokio::net::UnixStream,
+    ca: &RootCa,
+    jwt: &JwtSigner,
+) -> anyhow::Result<()> {
     let req_bytes = recv_msg(&mut stream).await?;
     let req: Request = serde_json::from_slice(&req_bytes)?;
 
@@ -308,9 +381,72 @@ async fn handle_connection(mut stream: tokio::net::UnixStream, ca: &RootCa) -> a
                 message: "CA not initialized".into(),
             },
         },
+        Request::SignJwtSvid { subject, audience } => {
+            match sign_jwt(ca, jwt, &subject, &audience).await {
+                Ok((token, expires_at)) => Response::JwtSvid { token, expires_at },
+                Err(e) => Response::Error {
+                    message: e.to_string(),
+                },
+            }
+        }
+        Request::JwtBundle => Response::JwtBundle { jwks: jwt.jwks() },
     };
 
     let resp_bytes = serde_json::to_vec(&resp)?;
     send_msg(&mut stream, &resp_bytes).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `RemoteCaSigner` talking to the daemon's connection handler over a
+    /// real Unix socket gives the same results as signing in-process.
+    #[tokio::test]
+    async fn remote_signer_round_trips_jwt_and_bundles() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("ca.sock");
+        let ca = RootCa::new("test.internal");
+        ca.initialize(None, None).await.unwrap();
+        let (jwt, _) = JwtSigner::generate().unwrap();
+        let keys = Arc::new((ca, jwt));
+
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server_keys = keys.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let keys = server_keys.clone();
+                tokio::spawn(async move {
+                    let (ca, jwt) = &*keys;
+                    let _ = handle_connection(stream, ca, jwt).await;
+                });
+            }
+        });
+
+        let remote = RemoteCaSigner::new(&socket);
+        let jwks = remote.jwt_bundle().await.unwrap();
+        assert_eq!(jwks, keys.1.jwks());
+
+        let subject = SvidSubject::Service("web".into());
+        let (token, _) = remote
+            .sign_jwt_svid(&subject, &["db".to_string()])
+            .await
+            .unwrap();
+        let v = crate::ca::jwt::verify_jwt_svid(&token, &jwks, "test.internal", "db").unwrap();
+        assert_eq!(v.spiffe_id, "spiffe://test.internal/service/web");
+
+        // Validation happens in the daemon too.
+        assert!(remote.sign_jwt_svid(&subject, &[]).await.is_err());
+        let bad = SvidSubject::Service("../server/x".into());
+        assert!(
+            remote
+                .sign_jwt_svid(&bad, &["db".to_string()])
+                .await
+                .is_err()
+        );
+
+        let root = remote.trust_bundle_pem().await.unwrap();
+        assert_eq!(Some(root), keys.0.root_certificate_pem().await);
+    }
 }

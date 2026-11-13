@@ -115,7 +115,19 @@ message AgentMessage {
     Nack nack = 6;
     NodeAttestationResponse attest_response = 7;
     AgentCommandResponse command_response = 8;
+    JwtSvidRequest jwt_svid_request = 9;
   }
+}
+
+// A JWT-SVID for a service on this node, on behalf of a workload the agent
+// has attested. The server signs only for services assigned to the
+// authenticated node and always answers with a JwtSvidResponse.
+message JwtSvidRequest {
+  // Echoed in the response.
+  string request_id = 1;
+  string service_name = 2;
+  // 1-8 audiences.
+  repeated string audience = 3;
 }
 
 // Envelope for all agent responses to server-initiated commands.
@@ -292,7 +304,17 @@ message ServerMessage {
     SystemRebuildCommand system_rebuild_command = 18;
     InspectServiceCommand inspect_service_command = 19;
     MigrateVolumeCommand migrate_volume_command = 20;
+    JwtSvidResponse jwt_svid = 21;
   }
+}
+
+message JwtSvidResponse {
+  string request_id = 1;
+  // Compact-serialized JWS; empty on error.
+  string token = 2;
+  uint64 expires_at = 3;
+  // Non-empty when the request was refused or failed.
+  string error = 4;
 }
 
 // --- Server → Agent command messages ---
@@ -357,6 +379,8 @@ message MigrateVolumeCommand {
 message TrustBundleUpdate {
   string trust_domain = 1;
   bytes ca_certificate_pem = 2;
+  // The trust domain's JWT bundle (JWKS, RFC 7517) for JWT-SVID validation.
+  bytes jwt_bundle_jwks = 3;
 }
 
 message DesiredState {

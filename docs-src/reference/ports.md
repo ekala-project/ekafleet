@@ -16,8 +16,8 @@
 
 | Path | Protocol | Used By | Purpose |
 |------|----------|---------|---------|
-| `/run/ekafleet-ca/ca.sock` | Length-prefixed JSON (UDS) | Server | CA signer ↔ control plane (SignCSR, GetBundle, IssueServerSVID) |
-| `/run/ekafleet/workload-api.sock` | gRPC (UDS) | Agent | SPIFFE Workload API (FetchX509SVID, FetchX509Bundles) |
+| `/run/ekafleet-ca/ca.sock` | Length-prefixed JSON (UDS) | Server | CA signer ↔ control plane (SignCSR, TrustBundle, IssueServerSVID, SignJwtSvid, JwtBundle) |
+| `/run/ekafleet/workload-api.sock` | gRPC (UDS) | Agent | SPIFFE Workload API (X.509 and JWT SVIDs and bundles) |
 
 ## Firewall Requirements
 
