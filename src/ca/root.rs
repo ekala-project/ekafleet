@@ -318,20 +318,24 @@ impl RootCa {
         Ok((leaf_pem.into_bytes(), chain_pem.into_bytes(), expires_at))
     }
 
-    /// Sign a PKCS#10 Certificate Signing Request.
+    /// Sign a PKCS#10 Certificate Signing Request for `subject`.
     ///
-    /// The CSR's signature is validated (proving the requester holds the private key),
-    /// then a certificate is issued using the public key from the CSR. The private key
-    /// never leaves the requester — only the public key is embedded in the certificate.
+    /// The CSR's signature is validated (proving the requester holds the
+    /// private key) and its public key is certified. Nothing else from the CSR
+    /// is honoured: the SPIFFE URI SAN, subject, key usages, extended key
+    /// usages, and CA basic constraints are all set by the CA from `subject`.
+    /// Copying requested SANs would let any requester mint an arbitrary
+    /// identity (e.g. `spiffe://<domain>/server/x`, which maps to Admin).
     ///
     /// Returns (cert_pem, chain_pem, expires_at_epoch). Unlike `issue_certificate`,
     /// the returned cert_pem does NOT contain the private key.
     pub async fn sign_csr(
         &self,
         csr_der: &[u8],
-        service_name: &str,
+        subject: &crate::ca::SvidSubject,
         store_path: Option<&str>,
     ) -> Result<(Vec<u8>, Vec<u8>, u64), CaError> {
+        subject.validate()?;
         let state = self.inner.read().await;
         let issuer = state.intermediate_issuer()?;
 
@@ -347,25 +351,47 @@ impl RootCa {
         let mut csr_params = CertificateSigningRequestParams::from_der(&csr_der_typed)
             .map_err(|e| CaError::InvalidCsr(format!("failed to parse CSR: {e}")))?;
 
-        // Override TTL and serial on the CSR's params
+        let spiffe_uri = subject.spiffe_id(&state.domain);
         let expires_at = unix_now() + state.default_ttl.as_secs();
 
-        // Set validity period on the CSR params
-        csr_params.params.not_after = time::OffsetDateTime::now_utc()
+        // Replace every requested attribute with CA-chosen values; only the
+        // CSR's public key survives.
+        let dns_names = match subject {
+            crate::ca::SvidSubject::Service(name) => vec![name.clone()],
+            crate::ca::SvidSubject::Agent(_) => Vec::new(),
+        };
+        let mut params = CertificateParams::new(dns_names)
+            .map_err(|e| CaError::Signing(format!("leaf cert params: {e}")))?;
+        params
+            .distinguished_name
+            .push(DnType::CommonName, subject.common_name());
+        params
+            .distinguished_name
+            .push(DnType::OrganizationName, "ekafleet");
+        params.subject_alt_names.push(SanType::URI(
+            spiffe_uri
+                .clone()
+                .try_into()
+                .map_err(|e| CaError::Signing(format!("invalid SPIFFE URI: {e}")))?,
+        ));
+        params.is_ca = IsCa::ExplicitNoCa;
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![
+            ExtendedKeyUsagePurpose::ServerAuth,
+            ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        params.not_after = time::OffsetDateTime::now_utc()
             + time::Duration::seconds(state.default_ttl.as_secs() as i64);
+        params.serial_number = Some(generate_serial()?);
+        csr_params.params = params;
 
-        let serial = generate_serial()?;
-        csr_params.params.serial_number = Some(serial);
-
-        // Sign the CSR with the intermediate CA key — the cert uses the CSR's
-        // public key.
+        // Sign with the intermediate CA key — the cert uses the CSR's public key.
         let signed_cert = csr_params
             .signed_by(&issuer.cert, issuer.keypair)
             .map_err(|e| CaError::Signing(format!("sign CSR: {e}")))?;
 
-        let spiffe_uri = format!("spiffe://{}/service/{}", state.domain, service_name);
         tracing::info!(
-            service = %service_name,
+            subject = %subject.spiffe_path(),
             spiffe = %spiffe_uri,
             ttl = ?state.default_ttl,
             "Certificate issued from CSR"

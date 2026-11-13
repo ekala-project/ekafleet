@@ -738,7 +738,7 @@ impl FleetControl for FleetControlService {
                 let (cert_pem, _chain_pem, _expires_at) = ca
                     .sign_csr(
                         &node_csr.csr_der,
-                        &format!("agent/{}", result.node_id),
+                        &crate::ca::SvidSubject::Agent(result.node_id.clone()),
                         None,
                     )
                     .await

@@ -9,71 +9,42 @@ use crate::spiffe::workload_api::WorkloadManager;
 
 /// Install an SVID received from the server's CertificateResponse.
 ///
-/// If a pending keypair exists for this service (proper CSR flow), the cert
-/// is paired with the local private key. Otherwise falls back to the legacy
-/// combined cert+key format.
+/// The certificate is paired with the private key this agent generated for
+/// the matching CSR. A certificate with no pending keypair is rejected: the
+/// server never generates workload keys, so an unsolicited response is either
+/// stale (already installed) or not ours.
 pub(super) async fn install_received_svid(
     mgr: &WorkloadManager,
     pending_keys: &Arc<RwLock<PendingKeyStore>>,
     response: &crate::proto::CertificateResponse,
 ) -> Result<(), std::io::Error> {
-    // Determine service name: prefer the explicit field, fall back to CN extraction
-    let service_name = if !response.service_name.is_empty() {
-        response.service_name.clone()
-    } else {
-        let cert_pem = String::from_utf8(response.certificate.clone())
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        extract_cn_from_pem(&cert_pem).unwrap_or_else(|| "unknown".to_string())
-    };
-
-    // Check if we have a pending keypair for this service (proper CSR flow)
-    let local_keypair = pending_keys.write().await.take(&service_name);
-
-    if let Some(keypair) = local_keypair {
-        // Proper CSR flow: pair server-signed cert with our local private key
-        let cert_pem = String::from_utf8(response.certificate.clone())
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let chain_pem = String::from_utf8(response.chain.clone())
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let key_pem = keypair.serialize_pem();
-
-        mgr.install_svid_split(
-            &service_name,
-            &cert_pem,
-            &key_pem,
-            &chain_pem,
-            response.expires_at,
-        )
-        .await?;
-    } else {
-        // Legacy flow: cert+key combined from server
-        mgr.install_svid(
-            &service_name,
-            &response.certificate,
-            &response.chain,
-            response.expires_at,
-        )
-        .await?;
+    let invalid = |msg: String| std::io::Error::new(std::io::ErrorKind::InvalidData, msg);
+    if response.service_name.is_empty() {
+        return Err(invalid("certificate response has no service name".into()));
     }
+    let service_name = &response.service_name;
 
+    let keypair = pending_keys
+        .write()
+        .await
+        .take(service_name)
+        .ok_or_else(|| invalid(format!("no pending CSR for service '{service_name}'")))?;
+
+    let cert_pem =
+        String::from_utf8(response.certificate.clone()).map_err(|e| invalid(e.to_string()))?;
+    let chain_pem =
+        String::from_utf8(response.chain.clone()).map_err(|e| invalid(e.to_string()))?;
+    let key_pem = zeroize::Zeroizing::new(keypair.serialize_pem());
+
+    mgr.install_svid_split(
+        service_name,
+        &cert_pem,
+        &key_pem,
+        &chain_pem,
+        response.expires_at,
+    )
+    .await?;
     Ok(())
-}
-
-/// Extract the Common Name (CN) from a PEM certificate by parsing the DER.
-pub(super) fn extract_cn_from_pem(pem: &str) -> Option<String> {
-    let cert_start = pem.find("-----BEGIN CERTIFICATE-----")?;
-    let cert_end = pem.find("-----END CERTIFICATE-----")? + "-----END CERTIFICATE-----".len();
-    let cert_pem = &pem[cert_start..cert_end];
-
-    let mut reader = std::io::BufReader::new(cert_pem.as_bytes());
-    let certs = rustls_pemfile::certs(&mut reader)
-        .collect::<Result<Vec<_>, _>>()
-        .ok()?;
-    let der = certs.first()?;
-
-    let (_, cert) = x509_parser::parse_x509_certificate(der).ok()?;
-    let cn = cert.subject().iter_common_name().next()?.as_str().ok()?;
-    Some(cn.to_string())
 }
 
 pub(super) fn get_node_id(data_dir: &Path) -> anyhow::Result<String> {
