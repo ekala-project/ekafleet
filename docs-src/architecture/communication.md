@@ -139,6 +139,7 @@ The gossip layer works independently of the server, providing continued service 
 Port 7402. Public endpoints:
 
 - `GET /health` — Server health check (unauthenticated)
+- `GET /.well-known/jwks.json` — JWT-SVID bundle (JWKS) for external relying parties (unauthenticated)
 
 Authenticated endpoints (require `Authorization: Bearer <token>` header):
 

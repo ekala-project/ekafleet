@@ -1,6 +1,7 @@
 pub mod client;
 pub mod csr;
 pub mod issuer;
+pub mod jwt;
 pub mod persist;
 pub mod pki;
 pub mod root;
@@ -122,4 +123,32 @@ pub trait CaSigner: Send + Sync + 'static {
 
     /// Get the root CA certificate PEM (trust bundle).
     async fn trust_bundle_pem(&self) -> Result<String, CaError>;
+
+    /// Sign a JWT-SVID (ES256, [`jwt::JWT_SVID_TTL`]) for `subject` and
+    /// `audience`. Returns (compact JWS, expires_at). As with
+    /// [`Self::sign_csr`], the caller must have authorized the requester.
+    async fn sign_jwt_svid(
+        &self,
+        subject: &SvidSubject,
+        audience: &[String],
+    ) -> Result<(String, u64), CaError>;
+
+    /// The trust domain's JWT bundle (a JWKS document).
+    async fn jwt_bundle(&self) -> Result<String, CaError>;
+}
+
+/// Validate a JWT-SVID audience list: 1–8 entries of 1–256 printable,
+/// non-whitespace ASCII characters.
+pub fn validate_jwt_audience(audience: &[String]) -> Result<(), CaError> {
+    if audience.is_empty() || audience.len() > 8 {
+        return Err(CaError::InvalidCsr("a JWT-SVID needs 1-8 audiences".into()));
+    }
+    for aud in audience {
+        if aud.is_empty() || aud.len() > 256 || !aud.chars().all(|c| c.is_ascii_graphic()) {
+            return Err(CaError::InvalidCsr(format!(
+                "invalid JWT-SVID audience '{aud}'"
+            )));
+        }
+    }
+    Ok(())
 }

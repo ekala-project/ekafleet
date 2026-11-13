@@ -6,6 +6,7 @@ use tokio::sync::{RwLock, watch};
 use zeroize::Zeroizing;
 
 use crate::fsutil::write_atomic as write_file_atomic;
+use crate::spiffe::jwt_broker::JwtSvidBroker;
 
 /// Manages SPIFFE workload identities on an agent node.
 ///
@@ -28,6 +29,8 @@ pub struct WorkloadManager {
     /// Bumped on every change to SVIDs or bundles; Workload API streams
     /// subscribe to push updates.
     changes: watch::Sender<u64>,
+    /// Obtains JWT-SVIDs from the server over the control stream.
+    jwt_broker: Arc<JwtSvidBroker>,
 }
 
 struct WorkloadState {
@@ -35,6 +38,8 @@ struct WorkloadState {
     trust_domain: String,
     /// CA trust bundle PEM
     trust_bundle_pem: Option<String>,
+    /// JWT bundle (JWKS) for validating JWT-SVIDs
+    jwt_bundle: Option<String>,
     /// service_name → issued SVID
     svids: HashMap<String, Svid>,
 }
@@ -70,9 +75,11 @@ impl WorkloadManager {
             inner: Arc::new(RwLock::new(WorkloadState {
                 trust_domain: trust_domain.to_string(),
                 trust_bundle_pem: None,
+                jwt_bundle: None,
                 svids: HashMap::new(),
             })),
             changes: watch::channel(0).0,
+            jwt_broker: Arc::new(JwtSvidBroker::new()),
         }
     }
 
@@ -127,6 +134,29 @@ impl WorkloadManager {
 
         tracing::info!("SPIFFE trust bundle updated");
         Ok(())
+    }
+
+    /// Replace the trust domain's JWT bundle (JWKS). Notifies streams only
+    /// when it actually changed.
+    pub async fn set_jwt_bundle(&self, jwks: &str) {
+        let mut state = self.inner.write().await;
+        if state.jwt_bundle.as_deref() == Some(jwks) {
+            return;
+        }
+        state.jwt_bundle = Some(jwks.to_string());
+        drop(state);
+        self.notify();
+        tracing::info!("SPIFFE JWT bundle updated");
+    }
+
+    /// The current JWT bundle (JWKS), once received from the server.
+    pub async fn jwt_bundle(&self) -> Option<String> {
+        self.inner.read().await.jwt_bundle.clone()
+    }
+
+    /// The broker that obtains JWT-SVIDs from the server.
+    pub fn jwt_broker(&self) -> &Arc<JwtSvidBroker> {
+        &self.jwt_broker
     }
 
     /// Get the current trust bundle PEM.

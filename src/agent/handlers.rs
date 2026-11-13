@@ -209,6 +209,11 @@ pub(super) async fn handle_server_message(
                     tracing::warn!(service = %name, error = %e, "Failed to remove stale SVID");
                 }
             }
+            let assigned_names: Vec<String> = ds.services.iter().map(|s| s.name.clone()).collect();
+            workload_mgr
+                .jwt_broker()
+                .retain_services(&assigned_names)
+                .await;
             let renewals = workload_mgr.needs_renewal().await;
             for svc in &ds.services {
                 let has_current = workload_mgr.spiffe_id(&svc.name).await.is_some()
@@ -336,6 +341,15 @@ pub(super) async fn handle_server_message(
             if let Err(e) = workload_mgr.set_trust_bundle(&pem).await {
                 tracing::error!(error = %e, "Failed to install trust bundle");
             }
+            if !bundle.jwt_bundle_jwks.is_empty() {
+                match std::str::from_utf8(&bundle.jwt_bundle_jwks) {
+                    Ok(jwks) => workload_mgr.set_jwt_bundle(jwks).await,
+                    Err(_) => tracing::error!("JWT bundle is not valid UTF-8"),
+                }
+            }
+        }
+        ServerPayload::JwtSvid(response) => {
+            workload_mgr.jwt_broker().complete(response).await;
         }
         ServerPayload::Peers(update) => {
             tracing::info!(peers = update.peers.len(), "Received peer update");

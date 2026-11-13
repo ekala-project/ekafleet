@@ -5,13 +5,14 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
+use crate::spiffe::jwt_broker::JwtBrokerError;
 use crate::spiffe::workload_api::WorkloadManager;
 use crate::spiffe::workload_attestor;
 use crate::workload_proto::spiffe_workload_api_server::SpiffeWorkloadApi;
 use crate::workload_proto::{
-    JwtBundlesRequest, JwtBundlesResponse, JwtsvidRequest, JwtsvidResponse, ValidateJwtsvidRequest,
-    ValidateJwtsvidResponse, X509BundlesRequest, X509BundlesResponse, X509svid, X509svidRequest,
-    X509svidResponse,
+    JwtBundlesRequest, JwtBundlesResponse, Jwtsvid, JwtsvidRequest, JwtsvidResponse,
+    ValidateJwtsvidRequest, ValidateJwtsvidResponse, X509BundlesRequest, X509BundlesResponse,
+    X509svid, X509svidRequest, X509svidResponse,
 };
 
 /// Metadata header every Workload API call must carry (SPIFFE Workload API
@@ -151,6 +152,67 @@ async fn x509_bundles_response(
     }))
 }
 
+async fn jwt_bundles_response(mgr: &WorkloadManager) -> Result<Option<JwtBundlesResponse>, String> {
+    let Some(jwks) = mgr.jwt_bundle().await else {
+        return Ok(None);
+    };
+    let domain = mgr.trust_domain_str().await.unwrap_or_default();
+    Ok(Some(JwtBundlesResponse {
+        bundles: [(trust_domain_id(&domain), jwks.into_bytes())].into(),
+    }))
+}
+
+/// Convert JSON to a protobuf `Value` (for `ValidateJWTSVIDResponse.claims`).
+fn json_to_prost(value: serde_json::Value) -> prost_types::Value {
+    use prost_types::value::Kind;
+    let kind = match value {
+        serde_json::Value::Null => Kind::NullValue(0),
+        serde_json::Value::Bool(b) => Kind::BoolValue(b),
+        serde_json::Value::Number(n) => Kind::NumberValue(n.as_f64().unwrap_or_default()),
+        serde_json::Value::String(s) => Kind::StringValue(s),
+        serde_json::Value::Array(list) => Kind::ListValue(prost_types::ListValue {
+            values: list.into_iter().map(json_to_prost).collect(),
+        }),
+        serde_json::Value::Object(map) => Kind::StructValue(json_object_to_struct(map)),
+    };
+    prost_types::Value { kind: Some(kind) }
+}
+
+fn json_object_to_struct(map: serde_json::Map<String, serde_json::Value>) -> prost_types::Struct {
+    prost_types::Struct {
+        fields: map
+            .into_iter()
+            .map(|(k, v)| (k, json_to_prost(v)))
+            .collect(),
+    }
+}
+
+/// Validate a JWT-SVID against the local JWT bundle (`ValidateJWTSVID`).
+#[allow(clippy::result_large_err)]
+async fn validate_jwt_svid(
+    mgr: &WorkloadManager,
+    audience: &str,
+    token: &str,
+) -> Result<ValidateJwtsvidResponse, Status> {
+    if audience.is_empty() {
+        return Err(Status::invalid_argument("audience must be specified"));
+    }
+    if token.is_empty() {
+        return Err(Status::invalid_argument("svid must be specified"));
+    }
+    let bundle = mgr
+        .jwt_bundle()
+        .await
+        .ok_or_else(|| Status::unavailable("no JWT bundle received from the server yet"))?;
+    let domain = mgr.trust_domain_str().await.unwrap_or_default();
+    let verified = crate::ca::jwt::verify_jwt_svid(token, &bundle, &domain, audience)
+        .map_err(|e| Status::invalid_argument(e.to_string()))?;
+    Ok(ValidateJwtsvidResponse {
+        spiffe_id: verified.spiffe_id,
+        claims: Some(json_object_to_struct(verified.claims)),
+    })
+}
+
 type WorkloadStream<T> = Pin<Box<ReceiverStream<Result<T, Status>>>>;
 
 /// Stream `build()` to the client: once as soon as it yields a value, then
@@ -230,8 +292,42 @@ impl SpiffeWorkloadApi for WorkloadApiService {
         &self,
         request: Request<JwtsvidRequest>,
     ) -> Result<Response<JwtsvidResponse>, Status> {
-        Self::attest_caller(&request).await?;
-        Err(Status::unimplemented("JWT-SVIDs are not supported"))
+        let service_name = Self::attest_caller(&request).await?;
+        let req = request.into_inner();
+        if req.audience.is_empty() {
+            return Err(Status::invalid_argument("audience must be specified"));
+        }
+        let domain = self
+            .workload_mgr
+            .trust_domain_str()
+            .await
+            .unwrap_or_default();
+        let spiffe_id = crate::ca::SvidSubject::Service(service_name.clone()).spiffe_id(&domain);
+        // A workload may only ask for its own identity.
+        if !req.spiffe_id.is_empty() && req.spiffe_id != spiffe_id {
+            return Err(Status::permission_denied(format!(
+                "caller is {spiffe_id}, not {}",
+                req.spiffe_id
+            )));
+        }
+        tracing::info!(service = %service_name, audience = ?req.audience, "Workload API: FetchJWTSVID");
+
+        let token = self
+            .workload_mgr
+            .jwt_broker()
+            .fetch(&service_name, &req.audience)
+            .await
+            .map_err(|e| match e {
+                JwtBrokerError::Refused(msg) => Status::permission_denied(msg),
+                other => Status::unavailable(other.to_string()),
+            })?;
+        Ok(Response::new(JwtsvidResponse {
+            svids: vec![Jwtsvid {
+                spiffe_id,
+                svid: token,
+                hint: String::new(),
+            }],
+        }))
     }
 
     async fn validate_jwtsvid(
@@ -239,7 +335,10 @@ impl SpiffeWorkloadApi for WorkloadApiService {
         request: Request<ValidateJwtsvidRequest>,
     ) -> Result<Response<ValidateJwtsvidResponse>, Status> {
         Self::attest_caller(&request).await?;
-        Err(Status::unimplemented("JWT-SVIDs are not supported"))
+        let req = request.into_inner();
+        validate_jwt_svid(&self.workload_mgr, &req.audience, &req.svid)
+            .await
+            .map(Response::new)
     }
 
     type FetchJWTBundlesStream = WorkloadStream<JwtBundlesResponse>;
@@ -249,7 +348,10 @@ impl SpiffeWorkloadApi for WorkloadApiService {
         request: Request<JwtBundlesRequest>,
     ) -> Result<Response<Self::FetchJWTBundlesStream>, Status> {
         Self::attest_caller(&request).await?;
-        Err(Status::unimplemented("JWT-SVIDs are not supported"))
+        let stream = spawn_change_stream(self.workload_mgr.clone(), |mgr| async move {
+            jwt_bundles_response(&mgr).await
+        });
+        Ok(Response::new(stream))
     }
 }
 
@@ -324,5 +426,52 @@ mod tests {
         let resp = x509_bundles_response(&mgr).await.unwrap().unwrap();
         let bundle = resp.bundles.get("spiffe://test.internal").unwrap();
         x509_parser::parse_x509_certificate(bundle).unwrap();
+    }
+
+    #[tokio::test]
+    async fn jwt_bundle_and_validation_use_the_pushed_jwks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = WorkloadManager::new(dir.path(), "test.internal");
+        let (signer, _) = crate::ca::jwt::JwtSigner::generate().unwrap();
+        let (token, _) = signer
+            .sign(
+                "spiffe://test.internal/service/web",
+                &["db".to_string()],
+                crate::ca::jwt::JWT_SVID_TTL,
+            )
+            .unwrap();
+
+        assert!(jwt_bundles_response(&mgr).await.unwrap().is_none());
+        assert_eq!(
+            validate_jwt_svid(&mgr, "db", &token)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unavailable
+        );
+
+        mgr.set_jwt_bundle(&signer.jwks()).await;
+        let bundles = jwt_bundles_response(&mgr).await.unwrap().unwrap();
+        assert_eq!(
+            bundles.bundles["spiffe://test.internal"],
+            signer.jwks().into_bytes()
+        );
+
+        let resp = validate_jwt_svid(&mgr, "db", &token).await.unwrap();
+        assert_eq!(resp.spiffe_id, "spiffe://test.internal/service/web");
+        let claims = resp.claims.unwrap();
+        assert_eq!(
+            claims.fields["sub"].kind,
+            Some(prost_types::value::Kind::StringValue(
+                "spiffe://test.internal/service/web".into()
+            ))
+        );
+
+        for (aud, tok) in [("other", token.as_str()), ("", token.as_str()), ("db", "")] {
+            assert_eq!(
+                validate_jwt_svid(&mgr, aud, tok).await.unwrap_err().code(),
+                tonic::Code::InvalidArgument
+            );
+        }
     }
 }

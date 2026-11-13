@@ -85,6 +85,7 @@ The server exposes JSON REST endpoints alongside the gRPC API:
 | Endpoint | Description |
 |----------|-------------|
 | `GET /health` | Health check (unauthenticated) |
+| `GET /.well-known/jwks.json` | JWT-SVID bundle (JWKS, unauthenticated) |
 | `GET /metrics` | Prometheus metrics |
 | `GET /v1/status` | Fleet health overview (nodes, services, pools) |
 | `GET /v1/services` | Service placement listing with instance details |

@@ -41,6 +41,14 @@ pkgs.testers.nixosTest {
     result = machine.succeed("curl -sf http://localhost:7402/health")
     assert result.strip() == "ok", f"Expected 'ok', got '{result.strip()}'"
 
+    # The JWT bundle comes from the CA signer and is public.
+    import json
+    jwks = json.loads(machine.succeed("curl -sf http://localhost:7402/.well-known/jwks.json"))
+    key = jwks["keys"][0]
+    assert key["kty"] == "EC" and key["alg"] == "ES256" and key["use"] == "jwt-svid", key
+    assert "d" not in key, "private key material in the JWKS"
+    machine.succeed("test -f /var/lib/ekafleet-ca/jwt-signing-key.pk8")
+
     # Verify /metrics returns 401 without auth
     machine.succeed(
         "curl -s -o /dev/null -w '%{http_code}' http://localhost:7402/metrics | grep -q '401'"

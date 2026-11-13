@@ -194,6 +194,9 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
     })
     .await?;
 
+    // JWT-SVID requests from the Workload API go out on this connection.
+    workload_mgr.jwt_broker().set_sender(tx.clone()).await;
+
     // Open bidirectional stream
     let response = client.stream_control(ReceiverStream::new(rx)).await?;
     let mut inbound = response.into_inner();
