@@ -19,7 +19,7 @@ async fn start_server() -> (SocketAddr, SocketAddr, String, String) {
     let (grpc_listener, grpc_addr) = bound_listener().await;
     let (http_listener, http_addr) = bound_listener().await;
 
-    let _dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let token = "integration-test-token".to_string();
 
     use ekafleet::proto::fleet_control_server::FleetControlServer;
@@ -64,8 +64,12 @@ async fn start_server() -> (SocketAddr, SocketAddr, String, String) {
         "127.0.0.1:7400",
         event_store,
         token_store,
-        std::path::PathBuf::from("/tmp/ekafleet-test"),
-    );
+        // The server outlives this function; leak the directory for the test.
+        dir.keep(),
+    )
+    // Exercise the production builder inside the runtime (it once blocked on
+    // a tokio lock here and panicked).
+    .with_fleet_key(zeroize::Zeroizing::new(vec![7u8; 32]));
 
     let expected_token = format!("Bearer {token}");
     #[allow(clippy::result_large_err)]
