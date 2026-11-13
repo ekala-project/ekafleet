@@ -176,7 +176,11 @@ async fn sign_csr_produces_valid_cert() {
 
     // Sign the CSR
     let (cert_pem, chain_pem, expires_at) = ca
-        .sign_csr(&csr_output.csr_der, "csr-svc", None)
+        .sign_csr(
+            &csr_output.csr_der,
+            &crate::ca::SvidSubject::Service("csr-svc".into()),
+            None,
+        )
         .await
         .unwrap();
 
@@ -224,11 +228,120 @@ async fn issue_server_svid_has_spiffe_uri() {
 async fn sign_csr_rejects_invalid_csr() {
     let ca = initialized_ca().await;
 
-    let result = ca.sign_csr(b"not-a-real-csr", "svc", None).await;
+    let result = ca
+        .sign_csr(
+            b"not-a-real-csr",
+            &crate::ca::SvidSubject::Service("svc".into()),
+            None,
+        )
+        .await;
     assert!(
         matches!(result, Err(CaError::InvalidCsr(_))),
         "invalid CSR must be rejected"
     );
+}
+
+/// Build a CSR whose requested attributes try to escalate: a server SPIFFE
+/// SAN, an extra DNS name, and CA-only key usages.
+fn forged_csr() -> Vec<u8> {
+    let keypair = rcgen::KeyPair::generate().unwrap();
+    let mut params = rcgen::CertificateParams::new(vec!["evil.example".to_string()]).unwrap();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "ekafleet-server-evil");
+    params.subject_alt_names.push(rcgen::SanType::URI(
+        "spiffe://test.internal/server/evil".try_into().unwrap(),
+    ));
+    params.key_usages = vec![
+        rcgen::KeyUsagePurpose::KeyCertSign,
+        rcgen::KeyUsagePurpose::CrlSign,
+    ];
+    params.serialize_request(&keypair).unwrap().der().to_vec()
+}
+
+#[tokio::test]
+async fn sign_csr_ignores_requested_identity() {
+    let ca = initialized_ca().await;
+    let csr = forged_csr();
+
+    for (subject, expected) in [
+        (
+            crate::ca::SvidSubject::Service("web".into()),
+            "spiffe://test.internal/service/web",
+        ),
+        (
+            crate::ca::SvidSubject::Agent("node-1".into()),
+            "spiffe://test.internal/agent/node-1",
+        ),
+    ] {
+        let (cert_pem, _, _) = ca.sign_csr(&csr, &subject, None).await.unwrap();
+        let der = pem_to_der(std::str::from_utf8(&cert_pem).unwrap()).unwrap();
+        let (_, cert) = x509_parser::parse_x509_certificate(&der).unwrap();
+
+        let uris: Vec<String> = cert
+            .subject_alternative_name()
+            .unwrap()
+            .unwrap()
+            .value
+            .general_names
+            .iter()
+            .filter_map(|n| match n {
+                x509_parser::extensions::GeneralName::URI(u) => Some(u.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            uris,
+            vec![expected.to_string()],
+            "SAN must come from subject"
+        );
+
+        let dns: Vec<String> = cert
+            .subject_alternative_name()
+            .unwrap()
+            .unwrap()
+            .value
+            .general_names
+            .iter()
+            .filter_map(|n| match n {
+                x509_parser::extensions::GeneralName::DNSName(d) => Some(d.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert!(!dns.contains(&"evil.example".to_string()));
+
+        let cn = cert
+            .subject()
+            .iter_common_name()
+            .next()
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(cn, subject.common_name());
+
+        let ku = cert.key_usage().unwrap().unwrap().value;
+        assert!(ku.digital_signature());
+        assert!(!ku.key_cert_sign(), "leaf must not be able to sign certs");
+        assert!(!ku.crl_sign());
+        let bc = cert.basic_constraints().unwrap().unwrap().value;
+        assert!(!bc.ca, "leaf must not be a CA");
+    }
+}
+
+#[tokio::test]
+async fn sign_csr_rejects_path_escaping_subject() {
+    let ca = initialized_ca().await;
+    let csr = forged_csr();
+    for name in ["../server/evil", "a/b", "", ".hidden"] {
+        let result = ca
+            .sign_csr(&csr, &crate::ca::SvidSubject::Agent(name.into()), None)
+            .await;
+        assert!(
+            matches!(result, Err(CaError::InvalidCsr(_))),
+            "subject name {name:?} must be rejected"
+        );
+    }
 }
 
 /// Extract the first PEM certificate block from a bundle.

@@ -10,8 +10,8 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
-use super::CaSigner;
 use super::root::{CaError, RootCa};
+use super::{CaSigner, SvidSubject};
 
 // --- Wire protocol ---
 //
@@ -27,12 +27,7 @@ use super::root::{CaError, RootCa};
 enum Request {
     SignCsr {
         csr_der: Vec<u8>,
-        service_name: String,
-        store_path: Option<String>,
-    },
-    IssueCertificate {
-        service_name: String,
-        csr_der: Vec<u8>,
+        subject: SvidSubject,
         store_path: Option<String>,
     },
     IssueServerSvid {
@@ -99,21 +94,10 @@ impl CaSigner for DirectCaSigner {
     async fn sign_csr(
         &self,
         csr_der: &[u8],
-        service_name: &str,
+        subject: &SvidSubject,
         store_path: Option<&str>,
     ) -> Result<(Vec<u8>, Vec<u8>, u64), CaError> {
-        self.ca.sign_csr(csr_der, service_name, store_path).await
-    }
-
-    async fn issue_certificate(
-        &self,
-        service_name: &str,
-        csr_der: &[u8],
-        store_path: Option<&str>,
-    ) -> Result<(Vec<u8>, Vec<u8>, u64), CaError> {
-        self.ca
-            .issue_certificate(service_name, csr_der, store_path)
-            .await
+        self.ca.sign_csr(csr_der, subject, store_path).await
     }
 
     async fn issue_server_svid(&self, server_id: &str) -> Result<(Vec<u8>, Vec<u8>, u64), CaError> {
@@ -179,29 +163,13 @@ impl CaSigner for RemoteCaSigner {
     async fn sign_csr(
         &self,
         csr_der: &[u8],
-        service_name: &str,
+        subject: &SvidSubject,
         store_path: Option<&str>,
     ) -> Result<(Vec<u8>, Vec<u8>, u64), CaError> {
         let resp = self
             .call(&Request::SignCsr {
                 csr_der: csr_der.to_vec(),
-                service_name: service_name.to_string(),
-                store_path: store_path.map(String::from),
-            })
-            .await?;
-        Self::into_cert_result(resp)
-    }
-
-    async fn issue_certificate(
-        &self,
-        service_name: &str,
-        csr_der: &[u8],
-        store_path: Option<&str>,
-    ) -> Result<(Vec<u8>, Vec<u8>, u64), CaError> {
-        let resp = self
-            .call(&Request::IssueCertificate {
-                service_name: service_name.to_string(),
-                csr_der: csr_der.to_vec(),
+                subject: subject.clone(),
                 store_path: store_path.map(String::from),
             })
             .await?;
@@ -383,29 +351,9 @@ async fn handle_connection(mut stream: tokio::net::UnixStream, ca: &RootCa) -> a
     let resp = match req {
         Request::SignCsr {
             csr_der,
-            service_name,
+            subject,
             store_path,
-        } => match ca
-            .sign_csr(&csr_der, &service_name, store_path.as_deref())
-            .await
-        {
-            Ok((cert_pem, chain_pem, expires_at)) => Response::CertResult {
-                cert_pem,
-                chain_pem,
-                expires_at,
-            },
-            Err(e) => Response::Error {
-                message: e.to_string(),
-            },
-        },
-        Request::IssueCertificate {
-            service_name,
-            csr_der,
-            store_path,
-        } => match ca
-            .issue_certificate(&service_name, &csr_der, store_path.as_deref())
-            .await
-        {
+        } => match ca.sign_csr(&csr_der, &subject, store_path.as_deref()).await {
             Ok((cert_pem, chain_pem, expires_at)) => Response::CertResult {
                 cert_pem,
                 chain_pem,
