@@ -178,6 +178,21 @@ impl FleetControl for FleetControlService {
         request: Request<Streaming<AgentMessage>>,
     ) -> Result<Response<Self::StreamControlStream>, Status> {
         require_permission(&request, Permission::AgentConnect)?;
+        // An mTLS session's node identity is the node SVID's SPIFFE ID; any
+        // node_id the agent puts in its messages is only checked against it.
+        let authenticated_node = match request.extensions().get::<PeerIdentity>() {
+            Some(peer) => Some(
+                peer.agent_name(&self.domain)
+                    .ok_or_else(|| {
+                        Status::permission_denied(format!(
+                            "{} is not an agent identity",
+                            peer.spiffe_id
+                        ))
+                    })?
+                    .to_string(),
+            ),
+            None => None,
+        };
         let remote = request
             .remote_addr()
             .map(|a| a.to_string())
@@ -192,7 +207,7 @@ impl FleetControl for FleetControlService {
             .map_err(|e| Status::internal(format!("stream error: {e}")))?
             .ok_or_else(|| Status::invalid_argument("no initial message"))?;
 
-        let (node_id, pool) = match &first_msg.payload {
+        let (claimed_node_id, pool) = match &first_msg.payload {
             Some(Payload::Heartbeat(hb)) => (hb.node_id.clone(), hb.pool.clone()),
             Some(Payload::Status(sr)) => (sr.node_id.clone(), String::new()),
             _ => {
@@ -201,8 +216,14 @@ impl FleetControl for FleetControlService {
                 ));
             }
         };
+        let node_id = resolve_stream_node_id(authenticated_node.as_deref(), &claimed_node_id)?;
 
-        tracing::info!(node_id = %node_id, remote = %remote, "Agent connected");
+        tracing::info!(
+            node_id = %node_id,
+            remote = %remote,
+            mtls = authenticated_node.is_some(),
+            "Agent connected"
+        );
 
         // Register agent and get outbound channel
         let pool_name = if pool.is_empty() {
@@ -210,9 +231,9 @@ impl FleetControl for FleetControlService {
         } else {
             pool
         };
-        let rx = self
+        let (connection_id, rx) = self
             .state
-            .register_agent(&node_id, remote.clone(), pool_name)
+            .register_agent_connection(&node_id, remote.clone(), pool_name)
             .await;
 
         // Correlate agent IP with a tracked cloud instance.
@@ -291,7 +312,7 @@ impl FleetControl for FleetControlService {
                     }
                 }
             }
-            state.deregister_agent(&nid).await;
+            state.deregister_agent(&nid, connection_id).await;
         });
 
         // Wrap rx in a stream of Result<ServerMessage, Status>
@@ -1898,6 +1919,30 @@ impl FleetControlService {
     }
 }
 
+/// Decide which node a control stream speaks for.
+///
+/// With an mTLS node SVID the node is the one named by the certificate, and a
+/// different self-asserted `node_id` is refused. Without one (bearer-token
+/// sessions in dev mode) the agent's claimed name is used after validation.
+#[allow(clippy::result_large_err)]
+fn resolve_stream_node_id(authenticated: Option<&str>, claimed: &str) -> Result<String, Status> {
+    match authenticated {
+        Some(name) => {
+            if !claimed.is_empty() && claimed != name {
+                return Err(Status::permission_denied(format!(
+                    "node SVID identifies '{name}' but the agent claimed to be '{claimed}'"
+                )));
+            }
+            Ok(name.to_string())
+        }
+        None => {
+            crate::ca::validate_identity_name(claimed)
+                .map_err(|e| Status::invalid_argument(format!("invalid node name: {e}")))?;
+            Ok(claimed.to_string())
+        }
+    }
+}
+
 /// TLS configuration for the gRPC server.
 pub struct TlsConfig {
     /// Server certificate PEM (leaf cert + private key)
@@ -1948,6 +1993,7 @@ pub async fn serve_grpc(
     tracing::info!(%addr, domain = %domain, "gRPC server listening (TLS + RBAC + SPIFFE)");
 
     let service_token_store = token_store.clone();
+    let interceptor_domain = domain.clone();
     #[allow(clippy::result_large_err)]
     let interceptor = move |mut req: Request<()>| -> Result<Request<()>, Status> {
         // Strip any client-supplied authentication markers. These are internal
@@ -1976,16 +2022,20 @@ pub async fn serve_grpc(
         // so this cannot be forged by setting a header.
         //
         // Extract the SPIFFE ID from the leaf certificate's SAN URI and derive
-        // a role from the path structure (/server/* → Admin, /agent/* → Operator).
+        // a role from the path structure (/server/* → Admin, /agent/* → Agent).
+        // Any other CA-verified identity (e.g. a workload's service SVID) is
+        // refused outright rather than granted a fallback role.
         if let Some(certs) = req.peer_certs()
             && let Some(leaf) = certs.first()
         {
-            let peer = crate::proxy::mtls::SpiffeAuthorizer::extract_spiffe_id_from_der(leaf)
-                .map(PeerIdentity::from_spiffe_id)
-                .unwrap_or_else(|| {
-                    // Cert is CA-verified but has no SPIFFE SAN — treat as Viewer.
-                    PeerIdentity::from_spiffe_id("spiffe://unknown/unidentified".to_string())
-                });
+            let spiffe_id = crate::proxy::mtls::SpiffeAuthorizer::extract_spiffe_id_from_der(leaf)
+                .ok_or_else(|| Status::permission_denied("client certificate has no SPIFFE ID"))?;
+            let peer = PeerIdentity::from_spiffe_id(&interceptor_domain, spiffe_id.clone())
+                .ok_or_else(|| {
+                    Status::permission_denied(format!(
+                        "SPIFFE ID {spiffe_id} is not authorized for the control plane"
+                    ))
+                })?;
             let role = peer.role;
             req.extensions_mut().insert(role);
             req.extensions_mut().insert(peer);
@@ -2052,4 +2102,26 @@ pub async fn serve_grpc(
         .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_stream_node_id;
+
+    #[test]
+    fn mtls_identity_wins_over_claim() {
+        assert_eq!(resolve_stream_node_id(Some("n1"), "n1").unwrap(), "n1");
+        assert_eq!(resolve_stream_node_id(Some("n1"), "").unwrap(), "n1");
+        let err = resolve_stream_node_id(Some("n1"), "n2").unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn bearer_claim_must_be_valid_name() {
+        assert_eq!(resolve_stream_node_id(None, "web-1").unwrap(), "web-1");
+        for bad in ["", "../server/x", "a/b", "-x"] {
+            let err = resolve_stream_node_id(None, bad).unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument, "{bad:?}");
+        }
+    }
 }
