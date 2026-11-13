@@ -6,43 +6,77 @@ use tokio::sync::RwLock;
 use super::root::CaError;
 use super::{CaSigner, SvidSubject};
 
+/// Which services each node is currently assigned (node name → service
+/// names). Shared between the scheduler side, which publishes each node's full
+/// assignment whenever it pushes desired state, and [`CertIssuer`], which only
+/// signs service SVIDs for assigned services.
+#[derive(Clone, Default)]
+pub struct ServiceAssignments {
+    inner: Arc<RwLock<HashMap<String, Vec<String>>>>,
+}
+
+impl ServiceAssignments {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Replace the full set of services assigned to a node.
+    pub async fn set(&self, node_id: &str, services: Vec<String>) {
+        self.inner
+            .write()
+            .await
+            .insert(node_id.to_string(), services);
+    }
+
+    /// Forget all assignments for a node.
+    pub async fn remove(&self, node_id: &str) {
+        self.inner.write().await.remove(node_id);
+    }
+
+    /// Whether `service_name` is currently assigned to `node_id`.
+    pub async fn is_assigned(&self, node_id: &str, service_name: &str) -> bool {
+        self.inner
+            .read()
+            .await
+            .get(node_id)
+            .is_some_and(|services| services.iter().any(|s| s == service_name))
+    }
+}
+
 /// Certificate issuance service.
-/// Validates CSRs, performs attestation, checks service assignment,
-/// and delegates to a `CaSigner` implementation for signing.
+/// Validates CSRs, checks service assignment, and delegates to a `CaSigner`
+/// implementation for signing.
 #[derive(Clone)]
 pub struct CertIssuer {
     ca: Arc<dyn CaSigner>,
-    /// node_id → list of service names assigned to that node
-    assignments: Arc<RwLock<HashMap<String, Vec<String>>>>,
+    assignments: ServiceAssignments,
 }
 
 impl CertIssuer {
     pub fn new(ca: Arc<dyn CaSigner>) -> Self {
-        Self {
-            ca,
-            assignments: Arc::new(RwLock::new(HashMap::new())),
-        }
+        Self::with_assignments(ca, ServiceAssignments::new())
+    }
+
+    /// Create an issuer that authorizes requests against a shared
+    /// assignment table (normally `FleetState::service_assignments`).
+    pub fn with_assignments(ca: Arc<dyn CaSigner>, assignments: ServiceAssignments) -> Self {
+        Self { ca, assignments }
     }
 
     /// Replace the full set of services assigned to a node. Only assigned
     /// services may obtain SVIDs through [`Self::process_request`].
     pub async fn update_assignments(&self, node_id: &str, services: Vec<String>) {
-        let mut assignments = self.assignments.write().await;
-        assignments.insert(node_id.to_string(), services);
+        self.assignments.set(node_id, services).await;
     }
 
     /// Forget all assignments for a node (e.g. when it leaves the fleet).
     pub async fn remove_node(&self, node_id: &str) {
-        self.assignments.write().await.remove(node_id);
+        self.assignments.remove(node_id).await;
     }
 
     /// Whether `service_name` is currently assigned to `node_id`.
     pub async fn is_assigned(&self, node_id: &str, service_name: &str) -> bool {
-        self.assignments
-            .read()
-            .await
-            .get(node_id)
-            .is_some_and(|services| services.iter().any(|s| s == service_name))
+        self.assignments.is_assigned(node_id, service_name).await
     }
 
     /// Process a certificate request from an agent.

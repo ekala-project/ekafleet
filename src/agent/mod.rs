@@ -26,14 +26,13 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::health::HealthChecker;
-use crate::ca::csr;
 use crate::dns::resolver::DnsResolver;
 use crate::mesh::peers::PeerManager;
 use crate::mesh::wireguard::WireguardManager;
 use crate::policy::nftables::PolicyEnforcer;
 use crate::proto::agent_message::Payload;
 use crate::proto::fleet_control_client::FleetControlClient;
-use crate::proto::{AgentMessage, CertificateRequest, HealthReport, Heartbeat, StatusReport};
+use crate::proto::{AgentMessage, HealthReport, Heartbeat, StatusReport};
 use crate::secrets::injector::SecretInjector;
 use crate::spiffe::workload_api::WorkloadManager;
 
@@ -316,37 +315,14 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
             }
             let renewals = renewal_mgr.needs_renewal().await;
             for service_name in renewals {
-                tracing::info!(service = %service_name, "Requesting SVID renewal");
-                // Get current trust domain for CSR generation
-                let trust_domain = renewal_mgr
-                    .trust_domain_str()
-                    .await
-                    .unwrap_or_else(|| "fleet.internal".to_string());
-                match csr::generate_service_csr(&trust_domain, &service_name) {
-                    Ok(csr_output) => {
-                        renewal_keys
-                            .write()
-                            .await
-                            .store(&service_name, csr_output.keypair);
-                        let _ = renewal_tx
-                            .send(AgentMessage {
-                                payload: Some(Payload::CertRequest(CertificateRequest {
-                                    node_id: renewal_node_id.to_string(),
-                                    service_name,
-                                    csr: csr_output.csr_der,
-                                    request_type: crate::proto::CertRequestType::ServiceCert as i32,
-                                })),
-                            })
-                            .await;
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            service = %service_name,
-                            error = %e,
-                            "CSR generation failed"
-                        );
-                    }
-                }
+                helpers::request_service_svid(
+                    &renewal_mgr,
+                    &renewal_keys,
+                    &renewal_tx,
+                    &renewal_node_id,
+                    &service_name,
+                )
+                .await;
             }
         }
     });

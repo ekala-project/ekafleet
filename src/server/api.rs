@@ -281,6 +281,16 @@ impl FleetControl for FleetControlService {
             }
         }
 
+        // Replay the node's assigned desired state so a reconnecting agent
+        // converges immediately instead of waiting for the next reconcile.
+        // Sent after the trust bundle, which the agent needs to request SVIDs.
+        if let Some(desired) = self.state.assigned_desired_state(&node_id).await {
+            let msg = ServerMessage {
+                payload: Some(ServerPayload::DesiredState(desired)),
+            };
+            let _ = self.state.send_to_agent(&node_id, msg).await;
+        }
+
         // Process the first message
         self.process_message(&node_id, first_msg).await;
 

@@ -97,8 +97,12 @@ impl NodeIdentity {
 /// When the signed certificate arrives, the keypair is retrieved and
 /// paired with the certificate.
 pub(super) struct PendingKeyStore {
-    keys: HashMap<String, rcgen::KeyPair>,
+    keys: HashMap<String, (rcgen::KeyPair, std::time::Instant)>,
 }
+
+/// How long a certificate request is considered in flight. The server sends
+/// no response when it denies a request, so after this the agent may retry.
+pub(super) const CSR_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl PendingKeyStore {
     pub(super) fn new() -> Self {
@@ -108,11 +112,27 @@ impl PendingKeyStore {
     }
 
     pub(super) fn store(&mut self, service_name: &str, keypair: rcgen::KeyPair) {
-        self.keys.insert(service_name.to_string(), keypair);
+        self.keys.insert(
+            service_name.to_string(),
+            (keypair, std::time::Instant::now()),
+        );
     }
 
     pub(super) fn take(&mut self, service_name: &str) -> Option<rcgen::KeyPair> {
-        self.keys.remove(service_name)
+        self.keys.remove(service_name).map(|(kp, _)| kp)
+    }
+
+    /// Whether a request for `service_name` was sent recently enough that a
+    /// response may still arrive.
+    pub(super) fn in_flight(&self, service_name: &str) -> bool {
+        self.keys
+            .get(service_name)
+            .is_some_and(|(_, at)| at.elapsed() < CSR_RETRY_AFTER)
+    }
+
+    /// Drop pending requests for services not in `keep`.
+    pub(super) fn retain(&mut self, keep: impl Fn(&str) -> bool) {
+        self.keys.retain(|name, _| keep(name));
     }
 }
 

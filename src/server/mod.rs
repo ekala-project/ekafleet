@@ -166,15 +166,17 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         None
     };
 
-    // Initialize certificate issuer for SPIFFE SVID issuance
-    let cert_issuer = CertIssuer::new(ca.clone());
+    let fleet_state = FleetState::new();
+
+    // Initialize certificate issuer for SPIFFE SVID issuance. It authorizes
+    // service SVIDs against the per-node assignments the reconciler publishes.
+    let cert_issuer = CertIssuer::with_assignments(ca.clone(), fleet_state.service_assignments());
 
     let trust_bundle_pem = ca.trust_bundle_pem().await?;
 
     // Generate or load fleet encryption key for secret distribution
     let fleet_key = get_or_create_fleet_key(&config.data_dir).await?;
 
-    let fleet_state = FleetState::new();
     let event_store = events::EventStore::new();
     let metrics = crate::metrics::aggregator::MetricsAggregator::new();
     let alert_evaluator = crate::metrics::alerting::AlertEvaluator::new();
