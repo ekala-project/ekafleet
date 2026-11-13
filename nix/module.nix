@@ -35,8 +35,26 @@ in
 
       dataDir = lib.mkOption {
         type = lib.types.path;
-        default = "/var/lib/ekafleet";
-        description = "Data directory for persistent state.";
+        default = "/var/lib/ekafleet-server";
+        description = ''
+          Data directory for control-plane state. Must be under `/var/lib/`
+          (it is the unit's systemd StateDirectory). Kept separate from the
+          agent's `/var/lib/ekafleet` so a combined server+agent node never
+          shares key material between the two users.
+        '';
+      };
+
+      sealPassphraseFile = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "/run/keys/ekafleet-seal";
+        description = ''
+          File holding the passphrase that seals key material at rest (CA
+          keys in the CA signer; fleet key and Raft keys in the server).
+          Passed to both units with systemd `LoadCredential`, so it may be
+          readable by root only. When `null`, keys are written unsealed and
+          a warning is logged.
+        '';
       };
 
       peers = lib.mkOption {
@@ -65,8 +83,11 @@ in
 
       caSocketPath = lib.mkOption {
         type = lib.types.str;
-        default = "/run/ekafleet/ca.sock";
-        description = "Unix socket path for the CA signer.";
+        default = "/run/ekafleet-ca/ca.sock";
+        description = ''
+          Unix socket of the CA signer. Only members of the `ekafleet-ca`
+          group (the server user) can connect.
+        '';
       };
 
       nixEvalTimeout = lib.mkOption {
@@ -192,96 +213,146 @@ in
 
   config = lib.mkMerge [
     # ── Server-side: ca-signer + server ──────────────────────────────
-    (lib.mkIf cfg.server.enable {
-      systemd.services.ekafleet-ca-signer = {
-        description = "ekafleet CA signer (process-isolated)";
-        wantedBy = [ "multi-user.target" ];
-        after = [ "local-fs.target" ];
-
-        serviceConfig = {
-          Type = "simple";
-          Restart = "on-failure";
-          RestartSec = 5;
-
-          ExecStart = "${cfg.server.package}/bin/ekafleet ca-signer --data-dir ${cfg.server.dataDir} --domain ${cfg.server.domain} --socket ${cfg.server.caSocketPath}";
-
-          # Maximum hardening: no network, no capabilities, restricted syscalls.
-          # This process holds the CA private key and nothing else.
-          DynamicUser = true;
-          StateDirectory = "ekafleet";
-          PrivateNetwork = true;
-          CapabilityBoundingSet = "";
-          MemoryDenyWriteExecute = true;
-          NoNewPrivileges = true;
-          ProtectSystem = "strict";
-          ProtectHome = true;
-          PrivateTmp = true;
-          PrivateDevices = true;
-          RestrictNamespaces = true;
-          RestrictRealtime = true;
-          IPAddressDeny = "any";
-          ReadWritePaths = [ cfg.server.dataDir ];
-          RuntimeDirectory = "ekafleet";
+    #
+    # Two static users with disjoint state:
+    #   ekafleet-ca  /var/lib/ekafleet-ca (CA keys), /run/ekafleet-ca/ca.sock
+    #   ekafleet     cfg.server.dataDir, connects to ca.sock via the
+    #                ekafleet-ca group
+    # The agent (root) owns /var/lib/ekafleet and /run/ekafleet.
+    (lib.mkIf cfg.server.enable (
+      let
+        sealCredential = lib.optionalAttrs (cfg.server.sealPassphraseFile != null) {
+          LoadCredential = [ "seal-passphrase:${cfg.server.sealPassphraseFile}" ];
         };
-
-        environment.RUST_LOG = "info";
-      };
-
-      systemd.services.ekafleet-server = {
-        description = "ekafleet control plane";
-        wantedBy = [ "multi-user.target" ];
-        after = [
-          "network-online.target"
-          "ekafleet-ca-signer.service"
-        ];
-        wants = [ "network-online.target" ];
-        requires = [ "ekafleet-ca-signer.service" ];
-
-        serviceConfig =
-          let
-            peersArg = lib.optionalString (
-              cfg.server.peers != [ ]
-            ) "--peers ${lib.concatStringsSep "," cfg.server.peers}";
-          in
+        sealEnv = lib.optionalAttrs (cfg.server.sealPassphraseFile != null) {
+          EKAFLEET_SEAL_PASSPHRASE_FILE = "%d/seal-passphrase";
+        };
+      in
+      {
+        assertions = [
           {
+            assertion = lib.hasPrefix "/var/lib/" cfg.server.dataDir;
+            message = "services.ekafleet.server.dataDir must be under /var/lib/ (got ${cfg.server.dataDir}).";
+          }
+        ];
+
+        users.users.ekafleet-ca = {
+          isSystemUser = true;
+          group = "ekafleet-ca";
+          description = "ekafleet CA signer";
+        };
+        users.groups.ekafleet-ca = { };
+
+        users.users.ekafleet = {
+          isSystemUser = true;
+          group = "ekafleet";
+          description = "ekafleet control plane";
+        };
+        users.groups.ekafleet = { };
+
+        systemd.services.ekafleet-ca-signer = {
+          description = "ekafleet CA signer (process-isolated)";
+          wantedBy = [ "multi-user.target" ];
+          after = [ "local-fs.target" ];
+
+          serviceConfig = {
             Type = "simple";
             Restart = "on-failure";
             RestartSec = 5;
 
-            ExecStart = "${cfg.server.package}/bin/ekafleet server --data-dir ${cfg.server.dataDir} --token ${cfg.server.token} --listen ${cfg.server.grpcListen} --http-listen ${cfg.server.httpListen} --domain ${cfg.server.domain} --ca-socket ${cfg.server.caSocketPath} ${peersArg}";
+            ExecStart = "${cfg.server.package}/bin/ekafleet ca-signer --data-dir /var/lib/ekafleet-ca --domain ${cfg.server.domain} --socket ${cfg.server.caSocketPath}";
+            # Only report started once the socket accepts connections, so the
+            # server (ordered after this unit) never races its creation.
+            ExecStartPost = "${pkgs.bash}/bin/bash -c 'for _ in $(seq 300); do [ -S ${cfg.server.caSocketPath} ] && exit 0; sleep 0.1; done; exit 1'";
 
-            # The control plane does not hold the CA key (that's in ca-signer).
-            DynamicUser = true;
-            StateDirectory = "ekafleet";
+            User = "ekafleet-ca";
+            Group = "ekafleet-ca";
+            StateDirectory = "ekafleet-ca";
+            StateDirectoryMode = "0700";
+            # The socket is 0660; the directory admits the group so the
+            # server (a member of ekafleet-ca) can reach it.
+            RuntimeDirectory = "ekafleet-ca";
+            RuntimeDirectoryMode = "0750";
+            UMask = "0077";
+
+            # Maximum hardening: no network, no capabilities, restricted syscalls.
+            # This process holds the CA private key and nothing else.
+            PrivateNetwork = true;
+            CapabilityBoundingSet = "";
+            MemoryDenyWriteExecute = true;
+            NoNewPrivileges = true;
             ProtectSystem = "strict";
             ProtectHome = true;
             PrivateTmp = true;
             PrivateDevices = true;
-            NoNewPrivileges = true;
-            MemoryDenyWriteExecute = true;
             RestrictNamespaces = true;
             RestrictRealtime = true;
-            ReadWritePaths = [ cfg.server.dataDir ];
-            RuntimeDirectory = "ekafleet";
-            # /run/ekafleet is shared with ekafleet-ca-signer, whose socket
-            # lives there. Without this, stopping or restarting the server
-            # deletes the directory and the signer's socket with it.
-            RuntimeDirectoryPreserve = true;
-          };
+            IPAddressDeny = "any";
+          }
+          // sealCredential;
 
-        environment = {
-          RUST_LOG = "info";
-          EKAFLEET_NIX_EVAL_TIMEOUT = toString cfg.server.nixEvalTimeout;
-          EKAFLEET_NIX_BUILD_TIMEOUT = toString cfg.server.nixBuildTimeout;
-          EKAFLEET_NIX_COPY_TIMEOUT = toString cfg.server.nixCopyTimeout;
-        }
-        // lib.optionalAttrs (cfg.server.nixOptions != { }) {
-          EKAFLEET_NIX_OPTIONS = lib.concatStringsSep ";" (
-            lib.mapAttrsToList (name: value: "${name}=${value}") cfg.server.nixOptions
-          );
+          environment = {
+            RUST_LOG = "info";
+          }
+          // sealEnv;
         };
-      };
-    })
+
+        systemd.services.ekafleet-server = {
+          description = "ekafleet control plane";
+          wantedBy = [ "multi-user.target" ];
+          after = [
+            "network-online.target"
+            "ekafleet-ca-signer.service"
+          ];
+          wants = [ "network-online.target" ];
+          requires = [ "ekafleet-ca-signer.service" ];
+
+          serviceConfig =
+            let
+              peersArg = lib.optionalString (
+                cfg.server.peers != [ ]
+              ) "--peers ${lib.concatStringsSep "," cfg.server.peers}";
+            in
+            {
+              Type = "simple";
+              Restart = "on-failure";
+              RestartSec = 5;
+
+              ExecStart = "${cfg.server.package}/bin/ekafleet server --data-dir ${cfg.server.dataDir} --token ${cfg.server.token} --listen ${cfg.server.grpcListen} --http-listen ${cfg.server.httpListen} --domain ${cfg.server.domain} --ca-socket ${cfg.server.caSocketPath} ${peersArg}";
+
+              # The control plane does not hold the CA key (that's in ca-signer).
+              User = "ekafleet";
+              Group = "ekafleet";
+              SupplementaryGroups = [ "ekafleet-ca" ];
+              StateDirectory = lib.removePrefix "/var/lib/" cfg.server.dataDir;
+              StateDirectoryMode = "0700";
+              UMask = "0077";
+              ProtectSystem = "strict";
+              ProtectHome = true;
+              PrivateTmp = true;
+              PrivateDevices = true;
+              NoNewPrivileges = true;
+              MemoryDenyWriteExecute = true;
+              RestrictNamespaces = true;
+              RestrictRealtime = true;
+            }
+            // sealCredential;
+
+          environment = {
+            RUST_LOG = "info";
+            EKAFLEET_NIX_EVAL_TIMEOUT = toString cfg.server.nixEvalTimeout;
+            EKAFLEET_NIX_BUILD_TIMEOUT = toString cfg.server.nixBuildTimeout;
+            EKAFLEET_NIX_COPY_TIMEOUT = toString cfg.server.nixCopyTimeout;
+          }
+          // sealEnv
+          // lib.optionalAttrs (cfg.server.nixOptions != { }) {
+            EKAFLEET_NIX_OPTIONS = lib.concatStringsSep ";" (
+              lib.mapAttrsToList (name: value: "${name}=${value}") cfg.server.nixOptions
+            );
+          };
+        };
+      }
+    ))
 
     # ── Agent-side: agent (incl. SPIFFE Workload API) + proxy ────────
     (lib.mkIf cfg.agent.enable {

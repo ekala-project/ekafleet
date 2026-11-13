@@ -46,7 +46,9 @@ Server state is stored in `--data-dir` (default: `/var/lib/ekafleet`):
     └── snapshots/          # Encrypted state machine snapshots
 ```
 
-¹ When `EKAFLEET_SEAL_PASSPHRASE` is set, key files are encrypted at rest using PBKDF2-HMAC-SHA256 + AES-256-GCM envelope encryption. Without it, they are stored as plaintext with a warning. In-memory copies of all key material are wrapped in `Zeroizing<T>` so they are cleared on drop.
+With an external `ca-signer`, the `ca-*.pem` files live in its own data directory (`/var/lib/ekafleet-ca` under the NixOS module) instead.
+
+¹ When `EKAFLEET_SEAL_PASSPHRASE` (or `EKAFLEET_SEAL_PASSPHRASE_FILE`, a file holding it) is set, key files are encrypted at rest using PBKDF2-HMAC-SHA256 + AES-256-GCM envelope encryption. Without it, they are stored as plaintext with a warning. In-memory copies of all key material are wrapped in `Zeroizing<T>` so they are cleared on drop.
 
 Log compaction happens automatically after snapshots to prevent unbounded growth.
 

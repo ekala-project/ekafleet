@@ -42,10 +42,10 @@ For process isolation, run the CA signer separately:
 
 ```bash
 # Terminal 1: CA signer (holds private key, no network)
-ekafleet ca-signer --data-dir /var/lib/ekafleet --domain fleet.internal
+ekafleet ca-signer --data-dir /var/lib/ekafleet-ca --domain fleet.internal
 
 # Terminal 2: Control plane (connects to CA via socket)
-ekafleet server --data-dir /var/lib/ekafleet --ca-socket /run/ekafleet/ca.sock
+ekafleet server --data-dir /var/lib/ekafleet-server --ca-socket /run/ekafleet-ca/ca.sock
 ```
 
 ## 2. Create a Join Token

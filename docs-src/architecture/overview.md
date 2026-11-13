@@ -9,7 +9,7 @@ ekafleet is a single binary with multiple subcommands. For development and quick
 ```text
 SERVER NODE:
   ekafleet-ca-signer.service     <- PrivateNetwork, no caps, owns CA key
-       | Unix socket (/run/ekafleet/ca.sock)
+       | Unix socket (/run/ekafleet-ca/ca.sock)
   ekafleet-server.service        <- Control plane (state machine, scheduler, API)
 
 AGENT NODE:

@@ -64,9 +64,9 @@ pkgs.testers.nixosTest {
     assert result.strip() == "ok", f"health: expected 'ok', got '{result.strip()}'"
 
     # Persistent state files created
-    server.succeed("test -f /var/lib/ekafleet/ca-key.pem")
-    server.succeed("test -f /var/lib/ekafleet/ca-cert.pem")
-    server.succeed("test -f /var/lib/ekafleet/fleet-key")
+    server.succeed("test -f /var/lib/ekafleet-ca/ca-key.pem")
+    server.succeed("test -f /var/lib/ekafleet-ca/ca-cert.pem")
+    server.succeed("test -f /var/lib/ekafleet-server/fleet-key")
 
     # CA signer is running as a prerequisite
     server.succeed("systemctl is-active ekafleet-ca-signer.service")
@@ -246,8 +246,8 @@ pkgs.testers.nixosTest {
     assert result.strip() == "ok", f"health after restart: expected 'ok', got '{result.strip()}'"
 
     # Persistent CA and fleet key survive restart
-    server.succeed("test -f /var/lib/ekafleet/ca-key.pem")
-    server.succeed("test -f /var/lib/ekafleet/fleet-key")
+    server.succeed("test -f /var/lib/ekafleet-ca/ca-key.pem")
+    server.succeed("test -f /var/lib/ekafleet-server/fleet-key")
 
     # Authenticated endpoints work after restart
     server.succeed(
