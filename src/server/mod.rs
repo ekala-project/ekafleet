@@ -30,7 +30,6 @@ use zeroize::Zeroizing;
 use crate::attestation::join_token::JoinTokenStore;
 use crate::ca::CaSigner;
 use crate::ca::issuer::CertIssuer;
-use crate::ca::root::RootCa;
 use crate::ca::signer::{DirectCaSigner, RemoteCaSigner};
 use crate::raft::state::FleetStateMachine;
 
@@ -70,72 +69,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         Arc::new(RemoteCaSigner::new(socket_path))
     } else {
         tracing::info!("Using in-process CA (embedded mode)");
-        let root_ca = RootCa::new(&config.domain);
-
-        let ca_key_path = config.data_dir.join("ca-key.pem");
-        let ca_cert_path = config.data_dir.join("ca-cert.pem");
-        let int_key_path = config.data_dir.join("ca-intermediate-key.pem");
-        let int_cert_path = config.data_dir.join("ca-intermediate-cert.pem");
-
-        let (stored_key, stored_cert) = match (
-            seal::read_maybe_sealed(&ca_key_path).await,
-            tokio::fs::read_to_string(&ca_cert_path).await,
-        ) {
-            (Ok(key), Ok(cert)) => (
-                Some(Zeroizing::new(String::from_utf8(key.to_vec())?)),
-                Some(cert),
-            ),
-            _ => (None, None),
-        };
-
-        let (stored_int_key, stored_int_cert) = match (
-            seal::read_maybe_sealed(&int_key_path).await,
-            tokio::fs::read_to_string(&int_cert_path).await,
-        ) {
-            (Ok(key), Ok(cert)) => (
-                Some(Zeroizing::new(String::from_utf8(key.to_vec())?)),
-                Some(cert),
-            ),
-            _ => (None, None),
-        };
-
-        root_ca
-            .initialize_with_intermediate(
-                stored_key.as_deref().map(|s| s.as_str()),
-                stored_cert.as_deref(),
-                stored_int_key.as_deref().map(|s| s.as_str()),
-                stored_int_cert.as_deref(),
-            )
-            .await?;
-
-        // Persist root CA key and cert if newly generated.
-        if stored_key.is_none()
-            && let (Some(key_pem), Some(cert_pem)) = (
-                root_ca.root_key_pem().await,
-                root_ca.root_certificate_pem().await,
-            )
-        {
-            tokio::fs::create_dir_all(&config.data_dir).await?;
-            seal::write_maybe_sealed(&ca_key_path, key_pem.as_bytes(), "CA private key").await?;
-            tokio::fs::write(&ca_cert_path, &cert_pem).await?;
-
-            tracing::info!("CA key and certificate persisted to disk");
-        }
-
-        // Persist the intermediate CA whenever the one held in memory differs
-        // from what is on disk (covers both first boot and rotation on expiry).
-        if let (Some(int_key), Some(int_cert)) = (
-            root_ca.intermediate_key_pem().await,
-            root_ca.intermediate_certificate_pem().await,
-        ) && stored_int_cert.as_deref() != Some(int_cert.as_str())
-        {
-            tokio::fs::create_dir_all(&config.data_dir).await?;
-            seal::write_maybe_sealed(&int_key_path, int_key.as_bytes(), "intermediate CA key")
-                .await?;
-            tokio::fs::write(&int_cert_path, &int_cert).await?;
-            tracing::info!("Intermediate CA key and certificate persisted to disk");
-        }
-
+        let root_ca = crate::ca::persist::open_ca(&config.data_dir, &config.domain).await?;
         Arc::new(DirectCaSigner::new(root_ca))
     };
 
