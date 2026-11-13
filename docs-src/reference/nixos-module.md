@@ -2,7 +2,7 @@
 
 ekafleet provides a NixOS module at `nix/module.nix` for declarative deployment on EkaOS and NixOS machines.
 
-The module always deploys the **process-isolated topology**: security-sensitive subsystems (CA signer, Workload API, proxy) run as separate systemd services with maximum hardening. There is no toggle for monolithic mode — the NixOS module is the production deployment path.
+The module always deploys the **process-isolated topology**: security-sensitive subsystems (CA signer, proxy) run as separate systemd services with maximum hardening. There is no toggle for monolithic mode — the NixOS module is the production deployment path.
 
 ## Server Node
 
@@ -40,10 +40,9 @@ Enable `services.ekafleet.server` to deploy the control plane. This creates two 
 
 ## Agent Node
 
-Enable `services.ekafleet.agent` to deploy the data plane. This creates three systemd services:
+Enable `services.ekafleet.agent` to deploy the data plane. This creates two systemd services:
 
-- **ekafleet-agent** — the data plane (systemd unit management, WireGuard, nftables, secrets), runs as root
-- **ekafleet-workload-api** — serves SPIFFE SVIDs to workloads, unprivileged with `PrivateNetwork=true`
+- **ekafleet-agent** — the data plane (systemd unit management, WireGuard, nftables, secrets), runs as root. It also serves the SPIFFE Workload API at `/run/ekafleet/workload-api.sock`; the socket is world-connectable and every call is attested from the caller's `SO_PEERCRED` PID and systemd cgroup.
 - **ekafleet-proxy** — service mesh proxy, unprivileged with only `CAP_NET_BIND_SERVICE`
 
 ```nix
@@ -69,7 +68,6 @@ Enable `services.ekafleet.agent` to deploy the data plane. This creates three sy
 | `dataDir` | path | `/var/lib/ekafleet` | Data directory for persistent state |
 | `domain` | string | `fleet.internal` | SPIFFE trust domain |
 | `caCert` | path or null | `null` | CA certificate PEM for TLS verification |
-| `workloadApiSocketPath` | string | `/run/ekafleet/workload-api.sock` | Workload API socket path |
 | `proxyListen` | string | `0.0.0.0:8080` | Proxy listen address |
 
 ## Combined Node (Server + Agent)
@@ -103,7 +101,6 @@ This creates all five systemd services on the same machine.
 | Service | User | Hardening |
 |---------|------|-----------|
 | `ekafleet-agent` | root | `ProtectHome`, `PrivateTmp` (needs root for systemd, WireGuard, nftables) |
-| `ekafleet-workload-api` | DynamicUser | `PrivateNetwork`, no capabilities, `ProtectSystem=strict` |
 | `ekafleet-proxy` | DynamicUser | `CAP_NET_BIND_SERVICE` only, `ProtectSystem=strict`, `NoNewPrivileges` |
 
 ## Integration with Flakes

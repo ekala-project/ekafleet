@@ -23,7 +23,9 @@ pub mod proto {
 
 pub mod workload_proto {
     #![allow(clippy::result_large_err)]
-    tonic::include_proto!("spiffe.workload");
+    // workload.proto declares no package (matching the upstream SPIFFE
+    // definition), so prost emits it as `_.rs`.
+    tonic::include_proto!("_");
 }
 
 pub mod agent;

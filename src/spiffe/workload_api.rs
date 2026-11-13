@@ -2,28 +2,31 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use tokio::sync::RwLock;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::{RwLock, watch};
+use zeroize::Zeroizing;
 
 /// Manages SPIFFE workload identities on an agent node.
 ///
 /// Each service gets an X.509-SVID (certificate + private key) and access
-/// to the trust bundle (CA certificate). These are written to a per-service
-/// directory and exposed via a well-known path structure that SPIFFE-aware
-/// workloads can consume directly.
+/// to the trust bundle (CA certificate). The agent serves them to workloads
+/// over the Workload API and also writes them to a per-service directory:
 ///
-/// Directory layout:
 /// ```text
 /// <data_dir>/spiffe/<service_name>/
 ///   svid.pem          — leaf certificate PEM
-///   svid-key.pem      — leaf private key PEM
+///   svid-key.pem      — leaf private key PEM (mode 0400)
 ///   bundle.pem        — CA trust bundle PEM
 /// ```
 ///
-/// The paths follow conventions compatible with Envoy SDS file-based config,
-/// application libraries (go-spiffe, rust-spiffe), and direct TLS consumers.
+/// Files are replaced atomically (write to a temporary file, then rename),
+/// so readers never observe a partially written certificate or key.
 pub struct WorkloadManager {
     data_dir: PathBuf,
     inner: Arc<RwLock<WorkloadState>>,
+    /// Bumped on every change to SVIDs or bundles; Workload API streams
+    /// subscribe to push updates.
+    changes: watch::Sender<u64>,
 }
 
 struct WorkloadState {
@@ -43,11 +46,20 @@ struct Svid {
     /// Leaf certificate PEM
     cert_pem: String,
     /// Leaf private key PEM
-    key_pem: String,
-    /// Certificate chain PEM (CA cert)
+    key_pem: Zeroizing<String>,
+    /// Certificate chain PEM (intermediate + root)
     chain_pem: String,
     /// Expiry as unix epoch seconds
     expires_at: u64,
+}
+
+/// A snapshot of one workload's X.509-SVID material.
+pub struct SvidMaterial {
+    pub spiffe_id: String,
+    pub cert_pem: String,
+    pub key_pem: Zeroizing<String>,
+    pub chain_pem: String,
+    pub expires_at: u64,
 }
 
 impl WorkloadManager {
@@ -59,7 +71,18 @@ impl WorkloadManager {
                 trust_bundle_pem: None,
                 svids: HashMap::new(),
             })),
+            changes: watch::channel(0).0,
         }
+    }
+
+    /// Subscribe to change notifications. The receiver is marked changed
+    /// whenever an SVID is installed or removed or a bundle is updated.
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+
+    fn notify(&self) {
+        self.changes.send_modify(|v| *v = v.wrapping_add(1));
     }
 
     /// Get the current trust domain string.
@@ -79,6 +102,8 @@ impl WorkloadManager {
                 "SPIFFE trust domain updated"
             );
             state.trust_domain = domain.to_string();
+            drop(state);
+            self.notify();
         }
     }
 
@@ -90,11 +115,14 @@ impl WorkloadManager {
 
         // Write bundle to every existing service's directory
         for service_name in state.svids.keys() {
-            let bundle_path = self.data_dir.join(service_name).join("bundle.pem");
-            if bundle_path.parent().is_some_and(|p| p.exists()) {
-                tokio::fs::write(&bundle_path, ca_cert_pem).await?;
+            let svc_dir = self.data_dir.join(service_name);
+            if svc_dir.exists() {
+                write_file_atomic(&svc_dir.join("bundle.pem"), ca_cert_pem.as_bytes(), 0o644)
+                    .await?;
             }
         }
+        drop(state);
+        self.notify();
 
         tracing::info!("SPIFFE trust bundle updated");
         Ok(())
@@ -106,109 +134,48 @@ impl WorkloadManager {
         state.trust_bundle_pem.clone()
     }
 
-    /// Install an X.509-SVID for a service from separate cert and key PEM.
+    /// Install an X.509-SVID for a service. The agent generated the keypair
+    /// itself (CSR flow); the private key never leaves the node.
     ///
-    /// This is the preferred method when the agent generates its own keypair
-    /// (proper CSR flow). The private key never leaves the agent.
-    ///
-    /// Writes files to `<data_dir>/spiffe/<service_name>/` with
-    /// restrictive permissions.
+    /// Writes files to `<data_dir>/spiffe/<service_name>/`, with the key
+    /// created at mode 0400.
     pub async fn install_svid_split(
         &self,
         service_name: &str,
-        cert_pem_str: &str,
-        key_pem_str: &str,
-        chain_pem_str: &str,
+        cert_pem: &str,
+        key_pem: &str,
+        chain_pem: &str,
         expires_at: u64,
     ) -> Result<PathBuf, std::io::Error> {
-        let cert_pem = cert_pem_str.to_string();
-        let key_pem = key_pem_str.to_string();
-        let chain = chain_pem_str.to_string();
-        self.write_svid(service_name, cert_pem, key_pem, chain, expires_at)
-            .await
-    }
+        crate::ca::validate_identity_name(service_name)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
-    /// Install an X.509-SVID for a service. The certificate material is
-    /// split from the combined cert+key PEM returned by the CA.
-    ///
-    /// This is the legacy method used when the server generates the keypair.
-    /// Prefer `install_svid_split` for the proper CSR flow.
-    ///
-    /// Writes files to `<data_dir>/spiffe/<service_name>/` with
-    /// restrictive permissions.
-    pub async fn install_svid(
-        &self,
-        service_name: &str,
-        cert_and_key_pem: &[u8],
-        chain_pem: &[u8],
-        expires_at: u64,
-    ) -> Result<PathBuf, std::io::Error> {
-        let combined = String::from_utf8(cert_and_key_pem.to_vec())
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let chain = String::from_utf8(chain_pem.to_vec())
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-        // Split the combined PEM into cert and key
-        let (cert_pem, key_pem) = split_cert_and_key(&combined)?;
-
-        self.write_svid(service_name, cert_pem, key_pem, chain, expires_at)
-            .await
-    }
-
-    /// Shared implementation for writing SVID material to disk and updating state.
-    async fn write_svid(
-        &self,
-        service_name: &str,
-        cert_pem: String,
-        key_pem: String,
-        chain: String,
-        expires_at: u64,
-    ) -> Result<PathBuf, std::io::Error> {
         let svc_dir = self.data_dir.join(service_name);
         tokio::fs::create_dir_all(&svc_dir).await?;
 
-        let cert_path = svc_dir.join("svid.pem");
-        let key_path = svc_dir.join("svid-key.pem");
-        let bundle_path = svc_dir.join("bundle.pem");
+        write_file_atomic(&svc_dir.join("svid.pem"), cert_pem.as_bytes(), 0o644).await?;
+        write_file_atomic(&svc_dir.join("svid-key.pem"), key_pem.as_bytes(), 0o400).await?;
 
-        // Write certificate
-        tokio::fs::write(&cert_path, &cert_pem).await?;
-
-        // Write private key with restrictive permissions
-        tokio::fs::write(&key_path, &key_pem).await?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o400);
-            tokio::fs::set_permissions(&key_path, perms).await?;
-        }
-
-        // Write trust bundle
-        let state = self.inner.read().await;
+        let mut state = self.inner.write().await;
         let bundle = state
             .trust_bundle_pem
             .clone()
-            .unwrap_or_else(|| chain.clone());
-        drop(state);
-        tokio::fs::write(&bundle_path, &bundle).await?;
+            .unwrap_or_else(|| chain_pem.to_string());
+        write_file_atomic(&svc_dir.join("bundle.pem"), bundle.as_bytes(), 0o644).await?;
 
-        // Store SVID in memory
-        let spiffe_id = {
-            let state = self.inner.read().await;
-            format!("spiffe://{}/service/{}", state.trust_domain, service_name)
-        };
-
-        let mut state = self.inner.write().await;
+        let spiffe_id = format!("spiffe://{}/service/{}", state.trust_domain, service_name);
         state.svids.insert(
             service_name.to_string(),
             Svid {
                 spiffe_id: spiffe_id.clone(),
-                cert_pem,
-                key_pem,
-                chain_pem: chain,
+                cert_pem: cert_pem.to_string(),
+                key_pem: Zeroizing::new(key_pem.to_string()),
+                chain_pem: chain_pem.to_string(),
                 expires_at,
             },
         );
+        drop(state);
+        self.notify();
 
         tracing::info!(
             service = %service_name,
@@ -227,16 +194,15 @@ impl WorkloadManager {
         state.svids.get(service_name).map(|s| s.spiffe_id.clone())
     }
 
-    /// Get the SVID cert PEM for a service (for programmatic access).
-    pub async fn get_svid(&self, service_name: &str) -> Option<(String, String, String, u64)> {
+    /// Get a snapshot of a service's SVID material.
+    pub async fn get_svid(&self, service_name: &str) -> Option<SvidMaterial> {
         let state = self.inner.read().await;
-        state.svids.get(service_name).map(|s| {
-            (
-                s.cert_pem.clone(),
-                s.key_pem.clone(),
-                s.chain_pem.clone(),
-                s.expires_at,
-            )
+        state.svids.get(service_name).map(|s| SvidMaterial {
+            spiffe_id: s.spiffe_id.clone(),
+            cert_pem: s.cert_pem.clone(),
+            key_pem: s.key_pem.clone(),
+            chain_pem: s.chain_pem.clone(),
+            expires_at: s.expires_at,
         })
     }
 
@@ -259,12 +225,14 @@ impl WorkloadManager {
 
     /// Remove SVID material for a service.
     pub async fn remove_svid(&self, service_name: &str) -> Result<(), std::io::Error> {
-        let svc_dir = self.data_dir.join(service_name);
-        if svc_dir.exists() {
-            tokio::fs::remove_dir_all(&svc_dir).await?;
-        }
         let mut state = self.inner.write().await;
         state.svids.remove(service_name);
+        let svc_dir = self.data_dir.join(service_name);
+        if crate::ca::validate_identity_name(service_name).is_ok() && svc_dir.exists() {
+            tokio::fs::remove_dir_all(&svc_dir).await?;
+        }
+        drop(state);
+        self.notify();
         tracing::info!(service = %service_name, "SVID removed");
         Ok(())
     }
@@ -283,189 +251,48 @@ impl WorkloadManager {
             .map(|(name, svid)| (name.clone(), svid.spiffe_id.clone(), svid.expires_at))
             .collect()
     }
-
-    /// Load SVIDs from disk into memory.
-    ///
-    /// Scans `<data_dir>/spiffe/<service>/` directories for `svid.pem`,
-    /// `svid-key.pem`, and `bundle.pem` files. Used by the standalone
-    /// `workload-api` process to pick up SVIDs written by the data-plane.
-    pub async fn load_from_disk(&self) -> Result<usize, std::io::Error> {
-        let mut loaded = 0;
-
-        let mut entries = match tokio::fs::read_dir(&self.data_dir).await {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-            Err(e) => return Err(e),
-        };
-
-        while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-
-            let service_name = match path.file_name().and_then(|n| n.to_str()) {
-                Some(name) => name.to_string(),
-                None => continue,
-            };
-
-            let cert_path = path.join("svid.pem");
-            let key_path = path.join("svid-key.pem");
-            let bundle_path = path.join("bundle.pem");
-
-            let (cert_pem, key_pem) = match (
-                tokio::fs::read_to_string(&cert_path).await,
-                tokio::fs::read_to_string(&key_path).await,
-            ) {
-                (Ok(c), Ok(k)) => (c, k),
-                _ => continue,
-            };
-
-            let chain_pem = tokio::fs::read_to_string(&bundle_path)
-                .await
-                .unwrap_or_default();
-
-            // Parse expiry from the certificate (approximate: use file mtime + 1h default)
-            let expires_at = {
-                let meta = tokio::fs::metadata(&cert_path).await?;
-                let mtime = meta
-                    .modified()
-                    .unwrap_or(std::time::SystemTime::now())
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                mtime + 3600 // default 1h TTL estimate
-            };
-
-            let spiffe_id = {
-                let state = self.inner.read().await;
-                format!("spiffe://{}/service/{}", state.trust_domain, service_name)
-            };
-
-            let mut state = self.inner.write().await;
-            state.svids.insert(
-                service_name.clone(),
-                Svid {
-                    spiffe_id,
-                    cert_pem,
-                    key_pem,
-                    chain_pem: chain_pem.clone(),
-                    expires_at,
-                },
-            );
-
-            // Also load trust bundle if we don't have one
-            if state.trust_bundle_pem.is_none() && !chain_pem.is_empty() {
-                state.trust_bundle_pem = Some(chain_pem);
-            }
-
-            loaded += 1;
-        }
-
-        if loaded > 0 {
-            tracing::info!(count = loaded, "Loaded SVIDs from disk");
-        }
-
-        Ok(loaded)
-    }
 }
 
-/// Split a combined PEM (certificate + private key) into separate parts.
-fn split_cert_and_key(combined: &str) -> Result<(String, String), std::io::Error> {
-    let cert_marker = "-----BEGIN CERTIFICATE-----";
-    let cert_end_marker = "-----END CERTIFICATE-----";
-    let key_markers = [
-        "-----BEGIN PRIVATE KEY-----",
-        "-----BEGIN EC PRIVATE KEY-----",
-        "-----BEGIN RSA PRIVATE KEY-----",
-    ];
-
-    // Extract certificate
-    let cert_start = combined.find(cert_marker).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "no certificate found in PEM",
-        )
-    })?;
-    let cert_end = combined[cert_start..]
-        .find(cert_end_marker)
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "no certificate end marker found",
-            )
-        })?
-        + cert_start
-        + cert_end_marker.len();
-    let cert_pem = combined[cert_start..cert_end].trim().to_string();
-
-    // Extract private key
-    let key_start = key_markers
-        .iter()
-        .filter_map(|marker| combined.find(marker))
-        .min()
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "no private key found in PEM",
-            )
-        })?;
-    let key_pem = combined[key_start..].trim().to_string();
-
-    Ok((cert_pem, key_pem))
+/// Replace `path` atomically with `contents`. The temporary file is created
+/// with `mode` already applied, so key material is never briefly readable
+/// under a wider default mode.
+async fn write_file_atomic(path: &Path, contents: &[u8], mode: u32) -> std::io::Result<()> {
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
+    match tokio::fs::remove_file(&tmp).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    opts.mode(mode);
+    #[cfg(not(unix))]
+    let _ = mode;
+    let mut file = opts.open(&tmp).await?;
+    file.write_all(contents).await?;
+    file.sync_all().await?;
+    drop(file);
+    tokio::fs::rename(&tmp, path).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn sample_cert_and_key() -> String {
-        // Minimal PEM structure for testing split logic
-        "-----BEGIN CERTIFICATE-----\n\
-         MIIB...\n\
-         -----END CERTIFICATE-----\n\
-         -----BEGIN PRIVATE KEY-----\n\
-         MIGHAgEA...\n\
-         -----END PRIVATE KEY-----\n"
-            .to_string()
-    }
-
-    #[test]
-    fn split_cert_and_key_works() {
-        let combined = sample_cert_and_key();
-        let (cert, key) = split_cert_and_key(&combined).unwrap();
-
-        assert!(cert.starts_with("-----BEGIN CERTIFICATE-----"));
-        assert!(cert.ends_with("-----END CERTIFICATE-----"));
-        assert!(key.starts_with("-----BEGIN PRIVATE KEY-----"));
-        assert!(key.ends_with("-----END PRIVATE KEY-----"));
-    }
-
-    #[test]
-    fn split_rejects_missing_cert() {
-        let result =
-            split_cert_and_key("-----BEGIN PRIVATE KEY-----\ndata\n-----END PRIVATE KEY-----");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn split_rejects_missing_key() {
-        let result =
-            split_cert_and_key("-----BEGIN CERTIFICATE-----\ndata\n-----END CERTIFICATE-----");
-        assert!(result.is_err());
-    }
+    const CERT: &str = "-----BEGIN CERTIFICATE-----\nCERT\n-----END CERTIFICATE-----\n";
+    const KEY: &str = "-----BEGIN PRIVATE KEY-----\nKEY\n-----END PRIVATE KEY-----\n";
+    const CHAIN: &str = "-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n";
 
     #[tokio::test]
     async fn install_and_retrieve_svid() {
         let dir = tempfile::tempdir().unwrap();
         let mgr = WorkloadManager::new(dir.path(), "test.internal");
 
-        let cert_and_key = b"-----BEGIN CERTIFICATE-----\nCERT\n-----END CERTIFICATE-----\n\
-                             -----BEGIN PRIVATE KEY-----\nKEY\n-----END PRIVATE KEY-----\n";
-        let chain = b"-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n";
-
         let svc_dir = mgr
-            .install_svid("my-svc", cert_and_key, chain, 9999999999)
+            .install_svid_split("my-svc", CERT, KEY, CHAIN, 9999999999)
             .await
             .unwrap();
 
@@ -477,6 +304,8 @@ mod tests {
         // SPIFFE ID should be set
         let id = mgr.spiffe_id("my-svc").await;
         assert_eq!(id.unwrap(), "spiffe://test.internal/service/my-svc");
+        let svid = mgr.get_svid("my-svc").await.unwrap();
+        assert_eq!(svid.key_pem.as_str(), KEY);
 
         // Key file should be read-only
         #[cfg(unix)]
@@ -490,15 +319,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn renewal_replaces_read_only_key_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = WorkloadManager::new(dir.path(), "test.internal");
+        mgr.install_svid_split("svc", CERT, KEY, CHAIN, 1)
+            .await
+            .unwrap();
+        let new_key = "-----BEGIN PRIVATE KEY-----\nNEW\n-----END PRIVATE KEY-----\n";
+        let svc_dir = mgr
+            .install_svid_split("svc", CERT, new_key, CHAIN, 2)
+            .await
+            .unwrap();
+        let on_disk = std::fs::read_to_string(svc_dir.join("svid-key.pem")).unwrap();
+        assert_eq!(on_disk, new_key);
+        assert!(!svc_dir.join("svid-key.pem.tmp").exists());
+    }
+
+    #[tokio::test]
+    async fn rejects_path_escaping_service_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = WorkloadManager::new(dir.path(), "test.internal");
+        let err = mgr
+            .install_svid_split("../escape", CERT, KEY, CHAIN, 1)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!dir.path().join("escape").exists());
+    }
+
+    #[tokio::test]
+    async fn changes_are_notified() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = WorkloadManager::new(dir.path(), "test.internal");
+        let mut rx = mgr.subscribe();
+        rx.mark_unchanged();
+
+        mgr.install_svid_split("svc", CERT, KEY, CHAIN, 1)
+            .await
+            .unwrap();
+        assert!(rx.has_changed().unwrap());
+        rx.mark_unchanged();
+
+        mgr.set_trust_bundle(CHAIN).await.unwrap();
+        assert!(rx.has_changed().unwrap());
+        rx.mark_unchanged();
+
+        mgr.remove_svid("svc").await.unwrap();
+        assert!(rx.has_changed().unwrap());
+    }
+
+    #[tokio::test]
     async fn trust_bundle_propagates_to_services() {
         let dir = tempfile::tempdir().unwrap();
         let mgr = WorkloadManager::new(dir.path(), "test.internal");
 
-        let cert_and_key = b"-----BEGIN CERTIFICATE-----\nC\n-----END CERTIFICATE-----\n\
-                             -----BEGIN PRIVATE KEY-----\nK\n-----END PRIVATE KEY-----\n";
-        let chain = b"-----BEGIN CERTIFICATE-----\nOLD_CA\n-----END CERTIFICATE-----\n";
-
-        mgr.install_svid("svc-a", cert_and_key, chain, 99999)
+        let old = "-----BEGIN CERTIFICATE-----\nOLD_CA\n-----END CERTIFICATE-----\n";
+        mgr.install_svid_split("svc-a", CERT, KEY, old, 99999)
             .await
             .unwrap();
 
@@ -518,12 +394,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mgr = WorkloadManager::new(dir.path(), "test.internal");
 
-        let cert_and_key = b"-----BEGIN CERTIFICATE-----\nC\n-----END CERTIFICATE-----\n\
-                             -----BEGIN PRIVATE KEY-----\nK\n-----END PRIVATE KEY-----\n";
-        let chain = b"-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n";
-
         let svc_dir = mgr
-            .install_svid("svc", cert_and_key, chain, 99999)
+            .install_svid_split("svc", CERT, KEY, CHAIN, 99999)
             .await
             .unwrap();
         assert!(svc_dir.exists());
@@ -538,21 +410,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mgr = WorkloadManager::new(dir.path(), "test.internal");
 
-        let cert_and_key = b"-----BEGIN CERTIFICATE-----\nC\n-----END CERTIFICATE-----\n\
-                             -----BEGIN PRIVATE KEY-----\nK\n-----END PRIVATE KEY-----\n";
-        let chain = b"-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n";
-
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
 
         // Expiring soon (within 5 min buffer)
-        mgr.install_svid("expiring", cert_and_key, chain, now + 60)
+        mgr.install_svid_split("expiring", CERT, KEY, CHAIN, now + 60)
             .await
             .unwrap();
         // Not expiring
-        mgr.install_svid("fresh", cert_and_key, chain, now + 7200)
+        mgr.install_svid_split("fresh", CERT, KEY, CHAIN, now + 7200)
             .await
             .unwrap();
 

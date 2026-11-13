@@ -1,6 +1,6 @@
 # Agent Mode
 
-Start with `ekafleet agent --join <server>:7400 --join-token <TOKEN> --ca-cert <CA>`. The agent runs the data plane on each fleet machine. In production, the NixOS module deploys the agent alongside two isolated companion processes: `ekafleet-workload-api` (serves SPIFFE SVIDs, unprivileged) and `ekafleet-proxy` (service mesh, unprivileged).
+Start with `ekafleet agent --join <server>:7400 --join-token <TOKEN> --ca-cert <CA>`. The agent runs the data plane on each fleet machine. In production, the NixOS module deploys the agent (which also serves the SPIFFE Workload API) alongside an isolated, unprivileged `ekafleet-proxy` process for the service mesh.
 
 ## Responsibilities
 
@@ -123,14 +123,13 @@ Each service gets identity material at:
 
 ## Process Isolation
 
-In production (via the NixOS module), the agent runs alongside two companion daemons:
+In production (via the NixOS module), the agent runs alongside one companion daemon:
 
 | Service | Purpose | Hardening |
 |---------|---------|-----------|
 | `ekafleet-agent` | Privileged data plane (systemd, WireGuard, nftables, secrets) | Root, `ProtectHome`, `PrivateTmp` |
-| `ekafleet-workload-api` | Serves SPIFFE SVIDs to workloads via Unix socket | `DynamicUser`, `PrivateNetwork`, no capabilities |
 | `ekafleet-proxy` | L7/L4 service mesh proxy | `DynamicUser`, only `CAP_NET_BIND_SERVICE` |
 
-The agent writes SVIDs to `<data_dir>/spiffe/<service>/` on disk. The standalone `workload-api` process polls this directory every 5 seconds and serves the material to workloads. This ensures that workload private keys are isolated from the privileged agent process (which handles remote exec, container management, and other root-level operations).
+The agent serves the SPIFFE Workload API in-process: it generates each workload's key, obtains the SVID from the server over the control stream, and hands it to the workload over `/run/ekafleet/workload-api.sock`. Every call is attested from the kernel-provided peer credentials, so only processes inside an `ekafleet-<name>.service` cgroup receive that service's identity.
 
-For development and quick bootstrapping, `ekafleet agent` embeds the Workload API and proxy in-process.
+For development and quick bootstrapping, `ekafleet agent` also embeds the proxy in-process.

@@ -13,9 +13,8 @@ SERVER NODE:
   ekafleet-server.service        <- Control plane (state machine, scheduler, API)
 
 AGENT NODE:
-  ekafleet-agent.service         <- Root, manages systemd/WG/nft/secrets
-       | writes SVID files to disk
-  ekafleet-workload-api.service  <- Unprivileged, serves SVIDs via Unix socket
+  ekafleet-agent.service         <- Root, manages systemd/WG/nft/secrets,
+                                    serves the SPIFFE Workload API (UDS)
   ekafleet-proxy.service         <- CAP_NET_BIND_SERVICE only, mesh traffic
 ```
 
@@ -29,12 +28,11 @@ AGENT NODE:
 
 ## Process Isolation Rationale
 
-Three subsystems are split into separate processes for security:
+Two subsystems are split into separate processes for security:
 
 | Component | Why Isolated | Hardening |
 |-----------|-------------|-----------|
 | **CA Signer** | CA private key must not share address space with HTTP parsers, webhook handlers, cloud API clients | `PrivateNetwork`, no capabilities, `MemoryDenyWriteExecute` |
-| **Workload API** | Workload private keys must not share address space with the remote exec handler or container supervisor | `PrivateNetwork`, `DynamicUser`, no capabilities |
 | **Proxy** | Untrusted network traffic parsing must not have root access or fleet key access | `DynamicUser`, only `CAP_NET_BIND_SERVICE` |
 
 Everything else stays in-process: the state machine, scheduler, and reconciler need tight coupling for consistency, the REST/gRPC APIs share state, and the heartbeat/health/renewal tasks are lightweight with no secrets.
@@ -81,7 +79,7 @@ Everything else stays in-process: the state machine, scheduler, and reconciler n
 | **gossip** | SWIM-based membership and service catalog propagation |
 | **certs** | CSR generation, certificate request/renewal from built-in CA |
 | **oci_images** | OCI registry client, content-addressable image store, layer unpacking, garbage collection |
-| **workload_api** | SPIFFE Workload API over Unix domain socket (isolated via `workload-api` process) |
+| **workload_api** | SPIFFE Workload API over Unix domain socket, served by the agent; callers attested via `SO_PEERCRED` + cgroup |
 | **proxy_l7/l4** | HTTP reverse proxy with circuit breaking, retries, rate limiting + L4 TCP proxy (isolated via `proxy` process) |
 
 ## Reconciliation Model

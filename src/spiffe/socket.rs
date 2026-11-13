@@ -18,7 +18,6 @@ pub const DEFAULT_SOCKET_PATH: &str = "/run/ekafleet/workload-api.sock";
 pub async fn serve_workload_api(
     workload_mgr: Arc<WorkloadManager>,
     socket_path: Option<&str>,
-    jwt_key_material: &[u8],
     shutdown: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<()> {
     let path = PathBuf::from(socket_path.unwrap_or(DEFAULT_SOCKET_PATH));
@@ -35,11 +34,14 @@ pub async fn serve_workload_api(
 
     let listener = UnixListener::bind(&path)?;
 
-    // Set socket permissions (owner + group can connect)
+    // Any local process may connect: workloads run under arbitrary (often
+    // dynamic) users. Access control is per call — every request is attested
+    // from the kernel-provided peer credentials, and processes outside an
+    // ekafleet service cgroup are refused.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o770);
+        let perms = std::fs::Permissions::from_mode(0o666);
         tokio::fs::set_permissions(&path, perms).await?;
     }
 
@@ -48,7 +50,7 @@ pub async fn serve_workload_api(
         "SPIFFE Workload API listening on Unix socket"
     );
 
-    let service = WorkloadApiService::new(workload_mgr, jwt_key_material);
+    let service = WorkloadApiService::new(workload_mgr);
     let uds_stream = UnixListenerStream::new(listener);
 
     tonic::transport::Server::builder()
@@ -58,72 +60,6 @@ pub async fn serve_workload_api(
 
     // Cleanup socket on shutdown
     cleanup_socket(&path).await;
-
-    Ok(())
-}
-
-/// Configuration for the standalone workload-api daemon.
-pub struct WorkloadApiConfig {
-    pub data_dir: PathBuf,
-    pub trust_domain: String,
-    pub socket_path: PathBuf,
-}
-
-/// Run the standalone SPIFFE Workload API daemon.
-///
-/// Loads existing SVIDs from `<data_dir>/spiffe/` on startup, then
-/// periodically re-scans to pick up new SVIDs written by the data-plane
-/// process. Serves the SPIFFE Workload API over a Unix socket.
-pub async fn run_standalone(config: WorkloadApiConfig) -> anyhow::Result<()> {
-    tracing::info!(
-        data_dir = %config.data_dir.display(),
-        socket = %config.socket_path.display(),
-        trust_domain = %config.trust_domain,
-        "Starting standalone Workload API daemon"
-    );
-
-    let mgr = Arc::new(WorkloadManager::new(&config.data_dir, &config.trust_domain));
-
-    // Load existing SVIDs from disk
-    let loaded = mgr.load_from_disk().await?;
-    tracing::info!(count = loaded, "Initial SVID load complete");
-
-    let shutdown = tokio_util::sync::CancellationToken::new();
-
-    // Spawn periodic disk scanner to pick up new SVIDs
-    let scan_mgr = mgr.clone();
-    let scan_shutdown = shutdown.child_token();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
-        loop {
-            tokio::select! {
-                _ = scan_shutdown.cancelled() => break,
-                _ = interval.tick() => {}
-            }
-            if let Err(e) = scan_mgr.load_from_disk().await {
-                tracing::warn!(error = %e, "Disk scan failed");
-            }
-        }
-    });
-
-    let socket_str = config.socket_path.to_string_lossy().to_string();
-    let api_shutdown = shutdown.clone();
-
-    // Run the Workload API server, cancel on Ctrl+C
-    tokio::select! {
-        result = serve_workload_api(
-            mgr,
-            Some(&socket_str),
-            b"ekafleet-default-jwt-signing-key",
-            api_shutdown,
-        ) => {
-            result?;
-        }
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("Workload API daemon shutting down");
-            shutdown.cancel();
-        }
-    }
 
     Ok(())
 }
@@ -155,15 +91,10 @@ mod tests {
         let test_shutdown = shutdown.clone();
 
         // Start the server in a background task
-        let handle = tokio::spawn(async move {
-            serve_workload_api(
-                mgr,
-                Some(&sock_str),
-                b"test-jwt-key-material-32bytes!!",
-                test_shutdown,
-            )
-            .await
-        });
+        let handle =
+            tokio::spawn(
+                async move { serve_workload_api(mgr, Some(&sock_str), test_shutdown).await },
+            );
 
         // Give it a moment to bind
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -196,6 +127,54 @@ mod tests {
         crate::workload_proto::spiffe_workload_api_client::SpiffeWorkloadApiClient::new(channel)
     }
 
+    /// Calls without the `workload.spiffe.io: true` header are refused before
+    /// attestation (SPIFFE Workload API spec).
+    #[tokio::test]
+    async fn security_header_is_required() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("wapi.sock");
+        let sock_str = sock_path.to_str().unwrap().to_string();
+
+        let mgr = Arc::new(WorkloadManager::new(dir.path(), "test.internal"));
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let handle =
+            tokio::spawn(
+                async move { serve_workload_api(mgr, Some(&sock_str), server_shutdown).await },
+            );
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let mut client = uds_client(sock_path.clone()).await;
+        let err = client
+            .fetch_x509svid(crate::workload_proto::X509svidRequest {})
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        let mut req = tonic::Request::new(crate::workload_proto::X509svidRequest {});
+        req.metadata_mut().insert(
+            crate::spiffe::workload_server::SECURITY_HEADER,
+            "false".parse().unwrap(),
+        );
+        let err = client.fetch_x509svid(req).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&sock_path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o666);
+        }
+
+        shutdown.cancel();
+        let _ = handle.await;
+    }
+
     /// The caller PID must come from SO_PEERCRED, not from a client-supplied
     /// header. A client claiming another process's PID via metadata must be
     /// attested as itself (and here rejected, since the test process is not
@@ -209,15 +188,10 @@ mod tests {
         let mgr = Arc::new(WorkloadManager::new(dir.path(), "test.internal"));
         let shutdown = tokio_util::sync::CancellationToken::new();
         let server_shutdown = shutdown.clone();
-        let handle = tokio::spawn(async move {
-            serve_workload_api(
-                mgr,
-                Some(&sock_str),
-                b"test-jwt-key-material-32bytes!!",
-                server_shutdown,
-            )
-            .await
-        });
+        let handle =
+            tokio::spawn(
+                async move { serve_workload_api(mgr, Some(&sock_str), server_shutdown).await },
+            );
         for _ in 0..50 {
             if sock_path.exists() {
                 break;
@@ -227,6 +201,10 @@ mod tests {
 
         let mut client = uds_client(sock_path.clone()).await;
         let mut req = tonic::Request::new(crate::workload_proto::X509svidRequest {});
+        req.metadata_mut().insert(
+            crate::spiffe::workload_server::SECURITY_HEADER,
+            "true".parse().unwrap(),
+        );
         // Attempt to impersonate PID 1 via the legacy (spoofable) header.
         req.metadata_mut()
             .insert("x-ekafleet-peer-pid", "1".parse().unwrap());

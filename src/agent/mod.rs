@@ -205,13 +205,8 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
     let wapi_mgr = workload_mgr.clone();
     let wapi_shutdown = shutdown.child_token();
     tokio::spawn(async move {
-        if let Err(e) = crate::spiffe::socket::serve_workload_api(
-            wapi_mgr,
-            None,
-            b"ekafleet-default-jwt-signing-key",
-            wapi_shutdown,
-        )
-        .await
+        if let Err(e) =
+            crate::spiffe::socket::serve_workload_api(wapi_mgr, None, wapi_shutdown).await
         {
             tracing::error!(error = %e, "Workload API socket failed");
         }

@@ -112,12 +112,15 @@ All RPCs enforce RBAC via `require_permission()`. The `Attest` RPC requires `Att
 
 ### SPIFFE Workload API (Unix Socket)
 
-Each agent also serves the standard SPIFFE Workload API v2 over a Unix domain socket at `/run/ekafleet/workload-api.sock`. This is a separate gRPC service that workloads connect to for fetching SVIDs and trust bundles.
+Each agent also serves the standard SPIFFE Workload API over a Unix domain socket at `/run/ekafleet/workload-api.sock`. It is wire-compatible with the upstream definition (`proto/workload.proto`), so go-spiffe, rust-spiffe and other standard clients work unmodified. Callers must send the `workload.spiffe.io: true` metadata header.
 
 ```protobuf
 service SpiffeWorkloadAPI {
   rpc FetchX509SVID(X509SVIDRequest) returns (stream X509SVIDResponse);
   rpc FetchX509Bundles(X509BundlesRequest) returns (stream X509BundlesResponse);
+  rpc FetchJWTSVID(JWTSVIDRequest) returns (JWTSVIDResponse);
+  rpc FetchJWTBundles(JWTBundlesRequest) returns (stream JWTBundlesResponse);
+  rpc ValidateJWTSVID(ValidateJWTSVIDRequest) returns (ValidateJWTSVIDResponse);
 }
 ```
 
