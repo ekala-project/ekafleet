@@ -117,6 +117,17 @@ in
         description = "Server address to join.";
       };
 
+      nodeName = lib.mkOption {
+        type = lib.types.str;
+        default = config.networking.hostName;
+        defaultText = lib.literalExpression "config.networking.hostName";
+        description = ''
+          This node's fleet name. Must match the node's `machines.<name>`
+          entry in the fleet config; it is the `<name>` in the node SVID
+          `spiffe://<domain>/agent/<name>`.
+        '';
+      };
+
       token = lib.mkOption {
         type = lib.types.str;
         default = "";
@@ -287,7 +298,7 @@ in
             Restart = "on-failure";
             RestartSec = 5;
 
-            ExecStart = "${cfg.agent.package}/bin/ekafleet agent --join ${cfg.agent.serverAddr} --data-dir ${cfg.agent.dataDir} ${tokenArg} ${caCertArg}";
+            ExecStart = "${cfg.agent.package}/bin/ekafleet agent --join ${cfg.agent.serverAddr} --node-name ${lib.escapeShellArg cfg.agent.nodeName} --data-dir ${cfg.agent.dataDir} ${tokenArg} ${caCertArg}";
 
             # The agent requires root for systemd unit management,
             # WireGuard, nftables, and systemd-nspawn containers.

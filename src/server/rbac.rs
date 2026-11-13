@@ -17,6 +17,10 @@ pub enum Role {
     Operator,
     /// Read-only: status, services, capacity, logs, drift.
     Viewer,
+    /// A fleet node's agent (mTLS node SVID). May only open its own control
+    /// stream; it cannot read fleet state or perform operator actions, so a
+    /// compromised node cannot act on the rest of the fleet.
+    Agent,
 }
 
 /// Marks how a request was authenticated. Stored in request extensions by the
@@ -33,29 +37,38 @@ pub struct PeerIdentity {
 }
 
 impl PeerIdentity {
-    /// Derive a `PeerIdentity` from a SPIFFE URI. The path determines the role:
-    /// - `/server/...` → Admin (peer server in an HA cluster)
-    /// - `/agent/...`  → Operator (data-plane agent)
-    /// - anything else → Viewer (unknown workload identity)
-    pub fn from_spiffe_id(spiffe_id: String) -> Self {
+    /// Derive a `PeerIdentity` from a verified peer certificate's SPIFFE URI.
+    /// Only identities in the server's own trust domain are accepted, and the
+    /// path determines the role:
+    /// - `/server/<id>` → Admin (peer server in an HA cluster)
+    /// - `/agent/<name>` → Agent (data-plane node; control stream only)
+    ///
+    /// Any other identity (workload SVIDs, foreign trust domains, malformed
+    /// IDs) returns `None` and must be refused.
+    pub fn from_spiffe_id(domain: &str, spiffe_id: String) -> Option<Self> {
         let path = spiffe_id
-            .find("//")
-            .and_then(|i| spiffe_id[i + 2..].find('/'))
-            .map(|i| {
-                let abs = spiffe_id.find("//").unwrap() + 2 + i;
-                &spiffe_id[abs..]
-            })
-            .unwrap_or("");
-
-        let role = if path.starts_with("/server/") {
+            .strip_prefix("spiffe://")
+            .and_then(|rest| rest.strip_prefix(domain))
+            .filter(|path| path.starts_with('/'))?;
+        let role = if crate::ca::agent_name_from_spiffe_id(domain, &spiffe_id).is_some() {
+            Role::Agent
+        } else if path
+            .strip_prefix("/server/")
+            .is_some_and(|id| crate::ca::validate_identity_name(id).is_ok())
+        {
             Role::Admin
-        } else if path.starts_with("/agent/") {
-            Role::Operator
         } else {
-            Role::Viewer
+            return None;
         };
+        Some(Self { spiffe_id, role })
+    }
 
-        Self { spiffe_id, role }
+    /// The node name when this peer is an agent of `domain`.
+    pub fn agent_name(&self, domain: &str) -> Option<&str> {
+        match self.role {
+            Role::Agent => crate::ca::agent_name_from_spiffe_id(domain, &self.spiffe_id),
+            _ => None,
+        }
     }
 
     /// Actor string for audit logging, e.g. `spiffe://fleet.internal/agent/node-1`.
@@ -168,6 +181,7 @@ impl Role {
                     | Permission::Attest
             ),
             Role::Viewer => matches!(permission, Permission::Read),
+            Role::Agent => matches!(permission, Permission::AgentConnect),
         }
     }
 }
@@ -593,28 +607,62 @@ mod tests {
 
     #[test]
     fn peer_identity_server_is_admin() {
-        let peer = PeerIdentity::from_spiffe_id("spiffe://fleet.internal/server/abc".to_string());
+        let peer = PeerIdentity::from_spiffe_id(
+            "fleet.internal",
+            "spiffe://fleet.internal/server/abc".into(),
+        )
+        .unwrap();
         assert_eq!(peer.role, Role::Admin);
         assert_eq!(peer.actor(), "spiffe://fleet.internal/server/abc");
+        assert_eq!(peer.agent_name("fleet.internal"), None);
     }
 
     #[test]
-    fn peer_identity_agent_is_operator() {
-        let peer = PeerIdentity::from_spiffe_id("spiffe://fleet.internal/agent/node-1".to_string());
-        assert_eq!(peer.role, Role::Operator);
+    fn peer_identity_agent_is_agent_role() {
+        let peer = PeerIdentity::from_spiffe_id(
+            "fleet.internal",
+            "spiffe://fleet.internal/agent/node-1".into(),
+        )
+        .unwrap();
+        assert_eq!(peer.role, Role::Agent);
+        assert_eq!(peer.agent_name("fleet.internal"), Some("node-1"));
     }
 
     #[test]
-    fn peer_identity_workload_is_viewer() {
-        let peer =
-            PeerIdentity::from_spiffe_id("spiffe://fleet.internal/workload/api-server".to_string());
-        assert_eq!(peer.role, Role::Viewer);
+    fn agent_role_can_only_connect() {
+        assert!(Role::Agent.has_permission(Permission::AgentConnect));
+        for perm in [
+            Permission::Read,
+            Permission::Deploy,
+            Permission::Scale,
+            Permission::Drain,
+            Permission::ManageTokens,
+            Permission::Attest,
+        ] {
+            assert!(!Role::Agent.has_permission(perm), "{perm:?}");
+        }
     }
 
     #[test]
-    fn peer_identity_unknown_is_viewer() {
-        let peer = PeerIdentity::from_spiffe_id("spiffe://unknown/unidentified".to_string());
-        assert_eq!(peer.role, Role::Viewer);
+    fn peer_identity_rejects_other_identities() {
+        for id in [
+            "spiffe://fleet.internal/service/api-server",
+            "spiffe://fleet.internal/workload/api-server",
+            "spiffe://unknown/unidentified",
+            "spiffe://other.domain/server/abc",
+            "spiffe://other.domain/agent/node-1",
+            "spiffe://fleet.internalx/server/abc",
+            "spiffe://fleet.internal/agent/a/b",
+            "spiffe://fleet.internal/server/",
+            "spiffe://fleet.internal/agent/",
+            "https://fleet.internal/server/abc",
+        ] {
+            assert_eq!(
+                PeerIdentity::from_spiffe_id("fleet.internal", id.into()),
+                None,
+                "{id} must not map to a role"
+            );
+        }
     }
 
     #[tokio::test]

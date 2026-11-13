@@ -218,6 +218,7 @@ pub async fn cmd_agent(
     join: String,
     token: String,
     join_token: Option<String>,
+    node_name: Option<String>,
     data_dir: PathBuf,
     ca_cert: Option<PathBuf>,
 ) -> anyhow::Result<()> {
@@ -225,11 +226,18 @@ pub async fn cmd_agent(
         Some(path) => Some(std::fs::read_to_string(&path)?),
         None => None,
     };
+    let node_name = match node_name {
+        Some(name) => name,
+        None => agent::system_hostname()?,
+    };
+    ekafleet::ca::validate_identity_name(&node_name)
+        .map_err(|e| anyhow::anyhow!("invalid node name: {e} (set --node-name)"))?;
 
     let config = agent::AgentConfig {
         server_addr: join,
         token,
         join_token,
+        node_name,
         data_dir,
         ca_cert_pem,
     };

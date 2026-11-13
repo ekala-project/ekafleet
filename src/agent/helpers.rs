@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
@@ -47,18 +46,27 @@ pub(super) async fn install_received_svid(
     Ok(())
 }
 
-pub(super) fn get_node_id(data_dir: &Path) -> anyhow::Result<String> {
-    let id_path = data_dir.join("node-id");
-    if id_path.exists() {
-        Ok(std::fs::read_to_string(&id_path)?.trim().to_string())
-    } else {
-        let id = uuid::Uuid::new_v4().to_string();
-        if let Some(parent) = id_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&id_path, &id)?;
-        Ok(id)
+/// The short system hostname (everything before the first `.`), used as the
+/// default node name.
+pub fn system_hostname() -> anyhow::Result<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: the buffer is valid for `buf.len()` bytes; gethostname writes a
+    // NUL-terminated name (possibly truncated) into it.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc != 0 {
+        return Err(anyhow::anyhow!(
+            "gethostname failed: {}",
+            std::io::Error::last_os_error()
+        ));
     }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let full = std::str::from_utf8(&buf[..end])
+        .map_err(|_| anyhow::anyhow!("system hostname is not valid UTF-8"))?;
+    let short = full.split('.').next().unwrap_or_default();
+    if short.is_empty() {
+        anyhow::bail!("system hostname is empty; set --node-name");
+    }
+    Ok(short.to_string())
 }
 
 pub(crate) fn now_epoch() -> u64 {

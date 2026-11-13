@@ -153,6 +153,11 @@ enum Command {
         #[arg(long)]
         join_token: Option<String>,
 
+        /// This node's name; must match its `machines.<name>` entry in the
+        /// fleet config. Defaults to the short system hostname.
+        #[arg(long, env = "EKAFLEET_NODE_NAME")]
+        node_name: Option<String>,
+
         /// Data directory for local state
         #[arg(long, default_value = "/var/lib/ekafleet")]
         data_dir: PathBuf,
@@ -867,9 +872,10 @@ async fn main() -> anyhow::Result<()> {
             join,
             token,
             join_token,
+            node_name,
             data_dir,
             ca_cert,
-        } => commands::cmd_agent(join, token, join_token, data_dir, ca_cert).await?,
+        } => commands::cmd_agent(join, token, join_token, node_name, data_dir, ca_cert).await?,
 
         Command::Plan { config, server } => commands::cmd_plan(config, server).await?,
 

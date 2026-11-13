@@ -56,9 +56,14 @@ struct FleetStateInner {
     /// `(cpu_millicores, memory_mb)`, refreshed from the desired state on each
     /// reconcile so the `top` RPC can report requested capacity per service.
     service_requests: HashMap<String, (u64, u64)>,
+    /// Monotonic counter identifying agent control-stream connections.
+    next_connection_id: u64,
 }
 
 struct NodeInfo {
+    /// Identifies the control stream this entry belongs to, so a stream that
+    /// ends after its node has reconnected cannot deregister the new session.
+    connection_id: u64,
     address: String,
     pool: String,
     total_resources: NodeResources,
@@ -94,6 +99,7 @@ impl FleetState {
                 nodes: HashMap::new(),
                 pending_requests: HashMap::new(),
                 service_requests: HashMap::new(),
+                next_connection_id: 0,
             })),
             reconcile: ReconcileTrigger::new(),
             pending_canaries: super::deployer::PendingCanaryStore::new(),
@@ -136,12 +142,35 @@ impl FleetState {
         address: String,
         pool: String,
     ) -> mpsc::Receiver<ServerMessage> {
+        self.register_agent_connection(node_id, address, pool)
+            .await
+            .1
+    }
+
+    /// Register a newly connected agent, replacing any previous session for
+    /// the same node (whose outbound channel is dropped, ending that stream).
+    /// Returns the connection id to pass to [`Self::deregister_agent`] and a
+    /// receiver for outbound messages. A node's cordon state survives
+    /// reconnects.
+    pub async fn register_agent_connection(
+        &self,
+        node_id: &str,
+        address: String,
+        pool: String,
+    ) -> (u64, mpsc::Receiver<ServerMessage>) {
         let (tx, rx) = mpsc::channel(64);
         let mut state = self.inner.write().await;
+        state.next_connection_id += 1;
+        let connection_id = state.next_connection_id;
+        let schedulable = state
+            .nodes
+            .get(node_id)
+            .is_none_or(|existing| existing.schedulable);
 
         state.nodes.insert(
             NodeId::new(node_id),
             NodeInfo {
+                connection_id,
                 address,
                 pool,
                 total_resources: NodeResources {
@@ -157,22 +186,31 @@ impl FleetState {
                 last_heartbeat: Instant::now(),
                 services: HashMap::new(),
                 tx,
-                schedulable: true,
+                schedulable,
                 mesh_ip: None,
             },
         );
 
-        tracing::info!(node_id, "Agent registered");
-        rx
+        tracing::info!(node_id, connection_id, "Agent registered");
+        (connection_id, rx)
     }
 
-    /// Remove an agent when it disconnects.
-    pub async fn deregister_agent(&self, node_id: &str) {
+    /// Remove an agent when its control stream (`connection_id`) ends. Does
+    /// nothing if the node has since reconnected on a newer stream.
+    pub async fn deregister_agent(&self, node_id: &str, connection_id: u64) {
         {
             let mut state = self.inner.write().await;
+            if state
+                .nodes
+                .get(node_id)
+                .is_none_or(|info| info.connection_id != connection_id)
+            {
+                tracing::debug!(node_id, connection_id, "Stale agent stream ended");
+                return;
+            }
             state.nodes.remove(node_id);
         }
-        tracing::info!(node_id, "Agent deregistered");
+        tracing::info!(node_id, connection_id, "Agent deregistered");
         // A disconnected node's services may need rescheduling — reconcile now
         // rather than waiting for the next periodic tick.
         self.reconcile.trigger();
@@ -635,6 +673,31 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(100), trigger.notified())
             .await
             .expect("pending trigger should wake an immediate waiter");
+    }
+
+    #[tokio::test]
+    async fn stale_stream_does_not_deregister_reconnected_node() {
+        let state = FleetState::new();
+        let (old_conn, mut old_rx) = state
+            .register_agent_connection("node-1", "10.0.0.1:1".into(), "default".into())
+            .await;
+        state.set_schedulable("node-1", false).await;
+
+        // The node reconnects before the old stream's task notices it ended.
+        let (new_conn, _new_rx) = state
+            .register_agent_connection("node-1", "10.0.0.1:2".into(), "default".into())
+            .await;
+        assert_ne!(old_conn, new_conn);
+        // The old session's outbound channel was dropped.
+        assert!(old_rx.recv().await.is_none());
+
+        state.deregister_agent("node-1", old_conn).await;
+        assert_eq!(state.connected_nodes().await, vec!["node-1".to_string()]);
+        // Cordon survives the reconnect.
+        assert!(!state.is_schedulable("node-1").await);
+
+        state.deregister_agent("node-1", new_conn).await;
+        assert!(state.connected_nodes().await.is_empty());
     }
 
     #[tokio::test]

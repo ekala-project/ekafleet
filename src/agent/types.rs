@@ -123,6 +123,9 @@ pub struct AgentConfig {
     pub token: String,
     /// One-time join token for SPIFFE node attestation (replaces token).
     pub join_token: Option<String>,
+    /// This node's name (= its `machines.<name>` key and the `<name>` in its
+    /// SPIFFE ID `spiffe://<domain>/agent/<name>`).
+    pub node_name: String,
     pub data_dir: PathBuf,
     pub ca_cert_pem: Option<String>,
 }

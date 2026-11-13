@@ -15,6 +15,7 @@ mod helpers;
 mod types;
 
 pub(crate) use helpers::now_epoch;
+pub use helpers::system_hostname;
 pub use types::{AgentConfig, NodeIdentity};
 
 use std::sync::Arc;
@@ -36,7 +37,7 @@ use crate::proto::{AgentMessage, CertificateRequest, HealthReport, Heartbeat, St
 use crate::secrets::injector::SecretInjector;
 use crate::spiffe::workload_api::WorkloadManager;
 
-use helpers::{collect_resources, get_node_id};
+use helpers::collect_resources;
 use types::{LocalState, PendingKeyStore};
 
 pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
@@ -52,7 +53,9 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
         "Starting ekafleet agent"
     );
 
-    let node_id = get_node_id(&config.data_dir)?;
+    crate::ca::validate_identity_name(&config.node_name)
+        .map_err(|e| anyhow::anyhow!("invalid node name: {e}"))?;
+    let node_id = config.node_name.clone();
     tracing::info!(node_id = %node_id, "Agent identity established");
 
     // Load or prepare node SVID for mTLS
@@ -60,6 +63,23 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
     {
         let mut ni = node_identity.write().await;
         if ni.load().await {
+            // A persisted SVID for a different name means the node was
+            // renamed (or the data dir copied); never present it under a
+            // name it does not certify.
+            let certified_path = ni
+                .spiffe_id
+                .as_deref()
+                .and_then(|id| id.strip_prefix("spiffe://"))
+                .and_then(|rest| rest.split_once('/'))
+                .map(|(_, path)| path.to_string());
+            if certified_path.as_deref() != Some(format!("agent/{node_id}").as_str()) {
+                anyhow::bail!(
+                    "persisted node SVID {} does not match node name '{node_id}'; \
+                     remove {}/node-svid*.pem and re-join with a join token",
+                    ni.spiffe_id.as_deref().unwrap_or("<no SPIFFE ID>"),
+                    config.data_dir.display()
+                );
+            }
             tracing::info!("Node SVID loaded from disk");
         } else {
             tracing::info!("No persisted node SVID — will use bearer token auth");
