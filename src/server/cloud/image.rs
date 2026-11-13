@@ -929,7 +929,7 @@ pub async fn cleanup_expired_images(
             .partition(|img| current_hash == Some(&img.store_path_hash));
 
         // Sort inactive by created_at descending (newest first)
-        inactive.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        inactive.sort_by_key(|img| std::cmp::Reverse(img.created_at));
 
         let retain_count = image_config.retain_count as usize;
         let max_age = image_config.max_age_seconds;

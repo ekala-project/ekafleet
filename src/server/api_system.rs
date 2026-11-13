@@ -1,3 +1,5 @@
+#![allow(clippy::result_large_err)]
+
 //! System operation handlers for FleetControlService.
 //!
 //! Handles: system_gc, system_reboot, system_rebuild, inspect_service,

@@ -15,12 +15,6 @@ use super::instance_tracker::InstanceTracker;
 /// Maximum number of instances to create per pool per evaluation cycle.
 const MAX_SCALE_UP_PER_CYCLE: u32 = 3;
 
-/// Bridges pool scaling decisions to cloud provider actions.
-///
-/// On each cycle the actuator:
-/// 1. Evaluates pool scaling policies via [`PoolScalingEngine`]
-/// 2. For scale-up: provisions new cloud VMs and registers join tokens
-/// 3. For scale-down: selects a victim, drains it, and terminates
 /// Default duration to wait after marking a node unschedulable before
 /// terminating. Gives the reconciler time to reschedule services off the node.
 /// Overridden by `drain_wait_seconds` in CloudProviderConfig.
@@ -32,6 +26,12 @@ const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(600);
 /// Base cooldown for the first failure (60 seconds).
 const BASE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Bridges pool scaling decisions to cloud provider actions.
+///
+/// On each cycle the actuator:
+/// 1. Evaluates pool scaling policies via [`PoolScalingEngine`]
+/// 2. For scale-up: provisions new cloud VMs and registers join tokens
+/// 3. For scale-down: selects a victim, drains it, and terminates
 pub struct ScalingActuator {
     pool_engine: PoolScalingEngine,
     providers: CloudProviderRegistry,
@@ -48,6 +48,7 @@ pub struct ScalingActuator {
 }
 
 impl ScalingActuator {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         pool_engine: PoolScalingEngine,
         providers: CloudProviderRegistry,

@@ -972,16 +972,12 @@ pub async fn cmd_top_nodes(server: String) -> anyhow::Result<()> {
             "NODE ID", "POOL", "CPU USED", "CPU TOTAL", "MEM USED", "MEM TOTAL"
         );
         for node in &result.nodes {
-            let cpu_pct = if node.cpu_total > 0 {
-                format!("{}%", node.cpu_used * 100 / node.cpu_total)
-            } else {
-                "-".to_string()
-            };
-            let mem_pct = if node.memory_total > 0 {
-                format!("{}%", node.memory_used * 100 / node.memory_total)
-            } else {
-                "-".to_string()
-            };
+            let cpu_pct = (node.cpu_used * 100)
+                .checked_div(node.cpu_total)
+                .map_or_else(|| "-".to_string(), |p| format!("{p}%"));
+            let mem_pct = (node.memory_used * 100)
+                .checked_div(node.memory_total)
+                .map_or_else(|| "-".to_string(), |p| format!("{p}%"));
             println!(
                 "{:<36}  {:<12}  {:>7}m({:>3})  {:>7}m  {:>6}MB({:>3})  {:>6}MB  {}",
                 node.node_id,
