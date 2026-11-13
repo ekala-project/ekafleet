@@ -149,16 +149,17 @@ impl FleetControlService {
     }
 
     /// Configure the fleet encryption key and secret store.
-    pub fn with_fleet_key(self, key: zeroize::Zeroizing<Vec<u8>>) -> Self {
+    ///
+    /// Called while building the service, before its state is shared, so the
+    /// locks are replaced rather than locked (this runs inside the runtime,
+    /// where blocking on a tokio lock would panic).
+    pub fn with_fleet_key(mut self, key: zeroize::Zeroizing<Vec<u8>>) -> Self {
         // Initialize the secret store with this key and set version 1
         let store = SecretStore::new(
             <&[u8; 32]>::try_from(key.as_slice()).expect("fleet key must be 32 bytes"),
         );
-        *self.fleet_key.blocking_write() = FleetKeyState {
-            key: key.clone(),
-            version: 1,
-        };
-        *self.secret_store.blocking_write() = store;
+        self.fleet_key = Arc::new(RwLock::new(FleetKeyState { key, version: 1 }));
+        self.secret_store = Arc::new(RwLock::new(store));
         self
     }
 
@@ -2062,14 +2063,9 @@ pub async fn serve_grpc(
         let raw_token = extract_bearer_token(auth_header)
             .ok_or_else(|| Status::unauthenticated("missing or invalid authorization header"))?;
 
-        // TokenStore::authenticate is async but interceptors are sync.
-        // We use blocking_read() for non-blocking access — the store is rarely written to.
-        let tokens = token_store.inner_ref();
-        let guard = tokens.blocking_read();
-        let (role, identity) =
-            super::rbac::TokenStore::authenticate_sync_identity(&guard, raw_token)
-                .ok_or_else(|| Status::unauthenticated("invalid or expired token"))?;
-        drop(guard);
+        let (role, identity) = token_store
+            .authenticate_identity(raw_token)
+            .ok_or_else(|| Status::unauthenticated("invalid or expired token"))?;
 
         // Stash the role in request extensions so RPC handlers can check permissions,
         // and the token identity so handlers can attribute audit-log entries.

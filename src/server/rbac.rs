@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// Role-based access control for the fleet API.
 /// Each token maps to a role that grants specific permissions.
@@ -264,8 +264,12 @@ impl TokenEntry {
 /// Token store that maps bearer tokens to roles with persistence.
 #[derive(Clone)]
 pub struct TokenStore {
+    // A std lock: the gRPC interceptor authenticates synchronously, and no
+    // guard is ever held across an await.
     tokens: Arc<RwLock<HashMap<String, TokenEntry>>>,
     persist_path: Option<PathBuf>,
+    // Serializes snapshot+write so the last write on disk is the newest state.
+    persist_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Default for TokenStore {
@@ -286,6 +290,7 @@ impl TokenStore {
         Self {
             tokens: Arc::new(RwLock::new(HashMap::new())),
             persist_path: None,
+            persist_lock: Arc::default(),
         }
     }
 
@@ -294,7 +299,16 @@ impl TokenStore {
         Self {
             tokens: Arc::new(RwLock::new(HashMap::new())),
             persist_path: Some(data_dir.join("tokens.json")),
+            persist_lock: Arc::default(),
         }
+    }
+
+    fn read_tokens(&self) -> RwLockReadGuard<'_, HashMap<String, TokenEntry>> {
+        self.tokens.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn write_tokens(&self) -> RwLockWriteGuard<'_, HashMap<String, TokenEntry>> {
+        self.tokens.write().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Load persisted tokens from disk. Expired tokens are discarded.
@@ -309,7 +323,7 @@ impl TokenStore {
         let data = tokio::fs::read_to_string(path).await?;
         let loaded: HashMap<String, TokenEntry> = serde_json::from_str(&data)?;
 
-        let mut tokens = self.tokens.write().await;
+        let mut tokens = self.write_tokens();
         let mut count = 0;
         for (token, entry) in loaded {
             if !entry.is_expired() {
@@ -326,10 +340,11 @@ impl TokenStore {
         let Some(path) = &self.persist_path else {
             return;
         };
-        let tokens = self.tokens.read().await;
-        match serde_json::to_string_pretty(&*tokens) {
+        let _persisting = self.persist_lock.lock().await;
+        let serialized = serde_json::to_string_pretty(&*self.read_tokens());
+        match serialized {
             Ok(data) => {
-                if let Err(e) = tokio::fs::write(path, data).await {
+                if let Err(e) = crate::fsutil::write_atomic(path, data.as_bytes(), 0o600).await {
                     tracing::warn!(error = %e, "Failed to persist tokens");
                 }
             }
@@ -376,35 +391,16 @@ impl TokenStore {
             expires_at: ttl_secs.map(|ttl| now + ttl),
             namespace,
         };
-        self.tokens.write().await.insert(token_key(token), entry);
+        self.write_tokens().insert(token_key(token), entry);
         tracing::info!(role = ?role, description = %description, "Token registered");
         self.persist().await;
     }
 
-    /// Get a reference to the inner token map for synchronous access (e.g., interceptors).
-    /// The interceptor must check expiration separately via `is_valid_sync`.
-    pub fn inner_ref(&self) -> &Arc<RwLock<HashMap<String, TokenEntry>>> {
-        &self.tokens
-    }
-
-    /// Synchronous token validation for use in interceptors.
-    /// Returns the role if the token exists and is not expired.
-    pub fn authenticate_sync(tokens: &HashMap<String, TokenEntry>, token: &str) -> Option<Role> {
-        let entry = tokens.get(&token_key(token))?;
-        if entry.is_expired() {
-            None
-        } else {
-            Some(entry.role)
-        }
-    }
-
-    /// Synchronous token authentication returning both the role and a stable,
-    /// non-secret identity for audit logging. Returns `None` for unknown or
-    /// expired tokens.
-    pub fn authenticate_sync_identity(
-        tokens: &HashMap<String, TokenEntry>,
-        token: &str,
-    ) -> Option<(Role, TokenIdentity)> {
+    /// Authenticate a bearer token, returning its role and a stable,
+    /// non-secret identity for audit logging. `None` for unknown or expired
+    /// tokens. Synchronous so the gRPC interceptor can call it.
+    pub fn authenticate_identity(&self, token: &str) -> Option<(Role, TokenIdentity)> {
+        let tokens = self.read_tokens();
         let entry = tokens.get(&token_key(token))?;
         if entry.is_expired() {
             return None;
@@ -419,19 +415,13 @@ impl TokenStore {
     }
 
     /// Look up the role for a bearer token.
-    pub async fn authenticate(&self, token: &str) -> Option<Role> {
-        let store = self.tokens.read().await;
-        Self::authenticate_sync(&store, token)
+    pub fn authenticate(&self, token: &str) -> Option<Role> {
+        self.authenticate_identity(token).map(|(role, _)| role)
     }
 
     /// Revoke a token.
     pub async fn revoke(&self, token: &str) -> bool {
-        let removed = self
-            .tokens
-            .write()
-            .await
-            .remove(&token_key(token))
-            .is_some();
+        let removed = self.write_tokens().remove(&token_key(token)).is_some();
         if removed {
             self.persist().await;
         }
@@ -440,8 +430,7 @@ impl TokenStore {
 
     /// List all tokens (returns description, role, and optional namespace).
     pub async fn list(&self) -> Vec<(String, Role, Option<String>)> {
-        let tokens = self.tokens.read().await;
-        tokens
+        self.read_tokens()
             .values()
             .filter(|e| !e.is_expired())
             .map(|e| (e.description.clone(), e.role, e.namespace.clone()))
@@ -498,9 +487,9 @@ mod tests {
             .register("viewer-tok", Role::Viewer, "dashboard")
             .await;
 
-        assert_eq!(store.authenticate("admin-tok").await, Some(Role::Admin));
-        assert_eq!(store.authenticate("viewer-tok").await, Some(Role::Viewer));
-        assert!(store.authenticate("unknown").await.is_none());
+        assert_eq!(store.authenticate("admin-tok"), Some(Role::Admin));
+        assert_eq!(store.authenticate("viewer-tok"), Some(Role::Viewer));
+        assert!(store.authenticate("unknown").is_none());
     }
 
     #[tokio::test]
@@ -508,7 +497,7 @@ mod tests {
         let store = TokenStore::new();
         store.register("tok", Role::Operator, "ci pipeline").await;
         assert!(store.revoke("tok").await);
-        assert!(store.authenticate("tok").await.is_none());
+        assert!(store.authenticate("tok").is_none());
         assert!(!store.revoke("tok").await);
     }
 
@@ -524,13 +513,9 @@ mod tests {
             expires_at: Some(now.saturating_sub(1)),
             namespace: None,
         };
-        store
-            .tokens
-            .write()
-            .await
-            .insert(token_key("expired-tok"), entry);
+        store.write_tokens().insert(token_key("expired-tok"), entry);
 
-        assert!(store.authenticate("expired-tok").await.is_none());
+        assert!(store.authenticate("expired-tok").is_none());
     }
 
     #[tokio::test]
@@ -540,7 +525,7 @@ mod tests {
             .register_with_ttl("ttl-tok", Role::Operator, "short-lived", Some(3600))
             .await;
 
-        assert_eq!(store.authenticate("ttl-tok").await, Some(Role::Operator));
+        assert_eq!(store.authenticate("ttl-tok"), Some(Role::Operator));
     }
 
     #[tokio::test]
@@ -554,17 +539,16 @@ mod tests {
         // Create a new store pointing to the same directory and load
         let store2 = TokenStore::with_persistence(dir.path());
         store2.load().await.unwrap();
-        assert_eq!(store2.authenticate("persist-tok").await, Some(Role::Admin));
+        assert_eq!(store2.authenticate("persist-tok"), Some(Role::Admin));
     }
 
     #[tokio::test]
-    async fn authenticate_sync_identity_returns_stable_id() {
+    async fn authenticate_identity_returns_stable_id() {
         let store = TokenStore::new();
         store.register("secret-tok", Role::Operator, "ci").await;
-        let guard = store.tokens.read().await;
-
-        let (role, id) =
-            TokenStore::authenticate_sync_identity(&guard, "secret-tok").expect("known token");
+        let (role, id) = store
+            .authenticate_identity("secret-tok")
+            .expect("known token");
         assert_eq!(role, Role::Operator);
         assert!(id.id.starts_with("token:"));
         // Id is derived from the token, never the token itself.
@@ -572,7 +556,7 @@ mod tests {
         assert_eq!(id.id, token_id("secret-tok"));
         assert_eq!(id.actor(), format!("{} (ci)", token_id("secret-tok")));
 
-        assert!(TokenStore::authenticate_sync_identity(&guard, "nope").is_none());
+        assert!(store.authenticate_identity("nope").is_none());
     }
 
     #[test]
@@ -588,7 +572,7 @@ mod tests {
         let store = TokenStore::new();
         store.register("secret-tok", Role::Admin, "ci").await;
 
-        let guard = store.tokens.read().await;
+        let guard = store.read_tokens();
         // The raw secret must never appear as a map key.
         assert!(!guard.contains_key("secret-tok"));
         // The digest key is present and is a 64-char lowercase hex SHA-256.
@@ -678,9 +662,7 @@ mod tests {
             )
             .await;
 
-        let guard = store.tokens.read().await;
-        let (role, identity) =
-            TokenStore::authenticate_sync_identity(&guard, "ns-tok").expect("known token");
+        let (role, identity) = store.authenticate_identity("ns-tok").expect("known token");
         assert_eq!(role, Role::Operator);
         assert_eq!(identity.namespace.as_deref(), Some("team-a"));
     }
@@ -690,9 +672,9 @@ mod tests {
         let store = TokenStore::new();
         store.register("global-tok", Role::Admin, "global").await;
 
-        let guard = store.tokens.read().await;
-        let (_, identity) =
-            TokenStore::authenticate_sync_identity(&guard, "global-tok").expect("known token");
+        let (_, identity) = store
+            .authenticate_identity("global-tok")
+            .expect("known token");
         assert!(identity.namespace.is_none());
     }
 }
