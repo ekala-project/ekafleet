@@ -10,7 +10,7 @@ use super::nix;
 use super::scheduler::{self, CurrentPlacements, Placement};
 use super::state::FleetState;
 use crate::config::{self, CapacityConfig, FleetConfig, MachineConfig};
-use crate::raft::state::{Command, FleetStateMachine, PlacementRecord};
+use crate::raft::state::{Command, FleetStateMachine, PlacementRecord, namespace_ip_holder};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReconcileError {
@@ -569,7 +569,7 @@ async fn send_desired_state(
     state: &FleetState,
     raft_state: &FleetStateMachine,
     keep_previous: &std::collections::HashSet<String>,
-) {
+) -> Result<(), crate::raft::RaftError> {
     let mut nodes: std::collections::BTreeSet<String> =
         state.connected_nodes().await.into_iter().collect();
     nodes.extend(state.assigned_nodes().await);
@@ -592,17 +592,8 @@ async fn send_desired_state(
         let Some(cfg) = desired.services.get(&op.service_name) else {
             continue;
         };
-        let mut spec = service_config_to_spec(&op.service_name, cfg);
-
-        // Populate server-assigned namespace IP from Raft state
-        if !cfg.namespace.is_empty()
-            && cfg.namespace != "default"
-            && let Some(ip) = raft_state
-                .namespace_ip_for_service(&cfg.namespace, &op.service_name)
-                .await
-        {
-            spec.namespace_ip = ip.to_string();
-        }
+        let spec = service_config_to_spec(&op.service_name, cfg);
+        let isolated = !crate::agent::netns::is_default_namespace(&cfg.namespace);
 
         for placement in &op.placements {
             let node = &placement.machine_name;
@@ -612,6 +603,22 @@ async fn send_desired_state(
                 .assigned_store_path(node, &op.service_name)
                 .await
                 .unwrap_or_default();
+            // Each replica gets its own address in the namespace network.
+            if isolated {
+                let holder = namespace_ip_holder(&op.service_name, node);
+                match raft_state
+                    .ensure_namespace_ip(&cfg.namespace, &holder)
+                    .await?
+                {
+                    Some(ip) => node_spec.namespace_ip = ip.to_string(),
+                    None => tracing::error!(
+                        service = %op.service_name,
+                        namespace = %cfg.namespace,
+                        node = %node,
+                        "Namespace address space exhausted; replica gets no namespace IP"
+                    ),
+                }
+            }
             per_node
                 .entry(node.clone())
                 .or_default()
@@ -640,6 +647,35 @@ async fn send_desired_state(
         .into_iter()
         .map(|(node, specs)| (node, specs.into_values().collect()))
         .collect();
+
+    // Free addresses of replicas no node runs any more (held-back specs
+    // keep theirs); namespaces left empty lose their subnet.
+    let live: std::collections::HashSet<(String, String)> = per_node
+        .iter()
+        .flat_map(|(node, specs)| {
+            specs
+                .iter()
+                .filter(|spec| !spec.namespace_ip.is_empty())
+                .map(move |spec| {
+                    (
+                        spec.namespace.clone(),
+                        namespace_ip_holder(&spec.name, node),
+                    )
+                })
+        })
+        .collect();
+    let released = raft_state.release_namespace_ips_except(&live).await?;
+    if released > 0 {
+        tracing::info!(released, "Released namespace IPs of removed replicas");
+    }
+    let mut subnets: HashMap<String, u8> = HashMap::new();
+    for (ns, _) in &live {
+        if !subnets.contains_key(ns)
+            && let Some(octet) = raft_state.namespace_subnet(ns).await
+        {
+            subnets.insert(ns.clone(), octet);
+        }
+    }
 
     // Track which namespaces each node participates in.
     let mut per_node_namespaces: HashMap<String, std::collections::HashSet<String>> =
@@ -704,8 +740,8 @@ async fn send_desired_state(
             .map(|namespaces| {
                 namespaces
                     .iter()
-                    .map(|ns| {
-                        let third_octet = namespace_subnet_octet(ns);
+                    .filter_map(|ns| {
+                        let third_octet = *subnets.get(ns)?;
 
                         // Populate remote_peers: other nodes in the same namespace
                         let remote_peers = ns_to_nodes
@@ -726,13 +762,13 @@ async fn send_desired_state(
                             })
                             .unwrap_or_default();
 
-                        crate::proto::NamespaceNetworkConfig {
+                        Some(crate::proto::NamespaceNetworkConfig {
                             namespace: ns.clone(),
                             subnet: format!("10.200.{third_octet}.0/24"),
                             gateway: format!("10.200.{third_octet}.1"),
                             vni: third_octet as u32,
                             remote_peers,
-                        }
+                        })
                     })
                     .collect()
             })
@@ -755,22 +791,32 @@ async fn send_desired_state(
     // Push namespace-scoped DNS records so services can resolve each other
     // across nodes within the same namespace.
     for (node, namespaces) in &per_node_namespaces {
-        let mut records = Vec::new();
+        // One A record per service listing every replica's address.
+        let mut replicas: std::collections::BTreeMap<(&str, &str), Vec<String>> =
+            std::collections::BTreeMap::new();
         for ns in namespaces {
-            if let Some(nodes) = ns_to_nodes.get(ns) {
-                for (_, svcs) in nodes {
-                    for svc in svcs {
-                        records.push(crate::proto::DnsRecord {
-                            name: svc.service_name.clone(),
-                            record_type: crate::proto::DnsRecordType::A as i32,
-                            values: vec![svc.ip.clone()],
-                            ttl: 30,
-                            namespace: ns.clone(),
-                        });
-                    }
+            for (_, svcs) in ns_to_nodes.get(ns).into_iter().flatten() {
+                for svc in svcs {
+                    replicas
+                        .entry((ns.as_str(), svc.service_name.as_str()))
+                        .or_default()
+                        .push(svc.ip.clone());
                 }
             }
         }
+        let records: Vec<crate::proto::DnsRecord> = replicas
+            .into_iter()
+            .map(|((ns, name), mut values)| {
+                values.sort();
+                crate::proto::DnsRecord {
+                    name: name.to_string(),
+                    record_type: crate::proto::DnsRecordType::A as i32,
+                    values,
+                    ttl: 30,
+                    namespace: ns.to_string(),
+                }
+            })
+            .collect();
         if !records.is_empty() {
             let dns_msg = crate::proto::ServerMessage {
                 payload: Some(crate::proto::server_message::Payload::Dns(
@@ -780,17 +826,7 @@ async fn send_desired_state(
             let _ = state.send_to_agent(node, dns_msg).await;
         }
     }
-}
-
-/// Derive a deterministic third octet (1-254) for a namespace's subnet.
-/// Uses a simple hash to map namespace name → octet, avoiding 0 and 255.
-fn namespace_subnet_octet(namespace: &str) -> u8 {
-    let mut hash: u64 = 0;
-    for b in namespace.bytes() {
-        hash = hash.wrapping_mul(31).wrapping_add(b as u64);
-    }
-    // Map to 1..=254 (avoiding 0 and 255)
-    ((hash % 254) + 1) as u8
+    Ok(())
 }
 
 /// Execute a reconciliation plan.
@@ -963,7 +999,7 @@ async fn apply_plan(
     // DeployCommand triggers. This ensures agents have the complete service
     // definition — including resource limits — before starting workloads,
     // and stop services no longer assigned to them.
-    send_desired_state(desired, plan, state, raft_state, &keep_previous).await;
+    send_desired_state(desired, plan, state, raft_state, &keep_previous).await?;
     record_undeploys(desired, raft_state).await?;
 
     // Compute deployment order
@@ -1541,7 +1577,8 @@ mod tests {
             &raft,
             &std::collections::HashSet::new(),
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(desired_services(&mut rx1), vec!["web"]);
         assert_eq!(desired_services(&mut rx2), vec!["api"]);
         assert!(assignments.is_assigned("node-1", "web").await);
@@ -1561,11 +1598,114 @@ mod tests {
             &raft,
             &std::collections::HashSet::new(),
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(desired_services(&mut rx1), vec!["web"]);
         assert!(desired_services(&mut rx2).is_empty());
         assert!(!assignments.is_assigned("node-2", "api").await);
         assert!(assignments.is_assigned("node-1", "web").await);
+    }
+
+    /// Every queued message for a node: (DesiredState, DnsUpdate records).
+    fn drain(
+        rx: &mut tokio::sync::mpsc::Receiver<crate::proto::ServerMessage>,
+    ) -> (crate::proto::DesiredState, Vec<crate::proto::DnsRecord>) {
+        let (mut desired, mut dns) = (None, Vec::new());
+        while let Ok(msg) = rx.try_recv() {
+            match msg.payload {
+                Some(crate::proto::server_message::Payload::DesiredState(ds)) => desired = Some(ds),
+                Some(crate::proto::server_message::Payload::Dns(update)) => {
+                    dns.extend(update.records)
+                }
+                _ => {}
+            }
+        }
+        (desired.expect("a DesiredState"), dns)
+    }
+
+    #[tokio::test]
+    async fn namespace_replicas_get_unique_ips_and_tenants_unique_subnets() {
+        let state = FleetState::new();
+        let mut rx1 = state
+            .register_agent("node-1", "127.0.0.1:1".into(), "default".into())
+            .await;
+        let mut rx2 = state
+            .register_agent("node-2", "127.0.0.1:2".into(), "default".into())
+            .await;
+        let mut config = empty_fleet_config();
+        let mut web = simple_service();
+        web.namespace = "acme".into();
+        let mut db = simple_service();
+        db.namespace = "globex".into();
+        config.services.insert("web".into(), web);
+        config.services.insert("db".into(), db);
+        let raft = FleetStateMachine::new();
+
+        let web_op = || {
+            let mut web = op("web", "node-1");
+            web.placements.push(Placement {
+                service_name: "web".into(),
+                instance_id: "web-1".into(),
+                machine_name: "node-2".into(),
+            });
+            web
+        };
+        let mut plan = empty_plan();
+        plan.creates = vec![web_op(), op("db", "node-1")];
+        let none = std::collections::HashSet::new();
+        send_desired_state(&config, &plan, &state, &raft, &none)
+            .await
+            .unwrap();
+
+        let (ds1, dns1) = drain(&mut rx1);
+        let (ds2, _) = drain(&mut rx2);
+        let ip = |ds: &crate::proto::DesiredState, name: &str| {
+            let spec = ds.services.iter().find(|s| s.name == name).unwrap();
+            spec.namespace_ip.parse::<std::net::Ipv4Addr>().unwrap()
+        };
+        let (web1, web2, db1) = (ip(&ds1, "web"), ip(&ds2, "web"), ip(&ds1, "db"));
+        assert_ne!(web1, web2, "replicas share one overlay segment");
+        assert_eq!(web1.octets()[2], web2.octets()[2]);
+        assert_ne!(web1.octets()[2], db1.octets()[2], "tenants share a subnet");
+
+        // Each node's network config uses the allocated subnet as VNI.
+        let acme = raft.namespace_subnet("acme").await.unwrap();
+        let net = ds2
+            .namespace_networks
+            .iter()
+            .find(|n| n.namespace == "acme")
+            .unwrap();
+        assert_eq!(net.subnet, format!("10.200.{acme}.0/24"));
+        assert_eq!(net.vni, acme as u32);
+        assert!(
+            !ds2.namespace_networks
+                .iter()
+                .any(|n| n.namespace == "globex")
+        );
+
+        // DNS lists both web replicas under one name.
+        let web_dns = dns1.iter().find(|r| r.name == "web").unwrap();
+        let mut expected = vec![web1.to_string(), web2.to_string()];
+        expected.sort();
+        assert_eq!(web_dns.values, expected);
+
+        // Same placement again keeps the same addresses.
+        send_desired_state(&config, &plan, &state, &raft, &none)
+            .await
+            .unwrap();
+        assert_eq!(ip(&drain(&mut rx2).0, "web"), web2);
+
+        // db leaves: its address and the globex subnet are released.
+        config.services.remove("db");
+        let mut plan = empty_plan();
+        plan.updates = vec![web_op()];
+        plan.destroys = vec![op("db", "node-1")];
+        send_desired_state(&config, &plan, &state, &raft, &none)
+            .await
+            .unwrap();
+        assert!(raft.namespace_ips("globex").await.is_empty());
+        assert_eq!(raft.namespace_subnet("globex").await, None);
+        assert_eq!(raft.namespace_ips("acme").await.len(), 2);
     }
 
     #[tokio::test]
@@ -1592,7 +1732,8 @@ mod tests {
             &raft,
             &std::collections::HashSet::new(),
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(desired_services(&mut rx1), vec!["db"]);
         assert!(desired_services(&mut rx2).is_empty());
 
@@ -1601,7 +1742,9 @@ mod tests {
         let mut plan = empty_plan();
         plan.reschedules = vec![op("db", "node-2")];
         let keep: std::collections::HashSet<String> = ["db".to_string()].into();
-        send_desired_state(&config, &plan, &state, &raft, &keep).await;
+        send_desired_state(&config, &plan, &state, &raft, &keep)
+            .await
+            .unwrap();
         assert_eq!(desired_services(&mut rx1), vec!["db"]);
         assert!(desired_services(&mut rx2).is_empty());
         assert!(assignments.is_assigned("node-1", "db").await);
