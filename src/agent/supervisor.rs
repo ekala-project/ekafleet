@@ -129,6 +129,11 @@ impl Supervisor {
     /// which case the next reconcile will restart the service to reassert its
     /// desired version.
     async fn recover_version_key(&self, name: &str, unit_path: &Path) -> Option<String> {
+        if let Ok(content) = tokio::fs::read_to_string(unit_path).await
+            && let Some(key) = version_key_from_unit(&content)
+        {
+            return Some(key);
+        }
         // Native services: the GC root points at the deployed store path, which
         // is exactly the version key.
         let gc_root = self.gcroot_dir.join(name);
@@ -261,35 +266,8 @@ impl Supervisor {
         spec: &ServiceSpec,
     ) -> Result<(), SupervisorError> {
         tokio::fs::create_dir_all(&self.unit_dir).await?;
-
-        let env_lines = build_env_lines(spec);
-        let extra_lines = build_extra_directives(spec);
-        let netns_line = build_netns_directive(spec);
-
-        let unit_content = format!(
-            r#"[Unit]
-Description=ekafleet managed: {name}
-After=network.target
-
-[Service]
-Type=simple
-ExecStart={command}
-Restart=on-failure
-RestartSec=5
-{netns}{extra}
-{env}
-
-[Install]
-WantedBy=multi-user.target
-"#,
-            name = spec.name,
-            command = spec.command,
-            netns = netns_line,
-            extra = extra_lines,
-            env = env_lines,
-        );
-
-        self.install_unit(unit_name, &unit_content).await
+        self.install_unit(unit_name, &native_unit_content(spec))
+            .await
     }
 
     /// Generate a systemd unit file that runs an OCI container via systemd-nspawn.
@@ -304,80 +282,8 @@ WantedBy=multi-user.target
         spec: &ServiceSpec,
     ) -> Result<(), SupervisorError> {
         tokio::fs::create_dir_all(&self.unit_dir).await?;
-
-        let machine_name = format!("ekafleet-{}", spec.name);
-        let bundle_path = format!("{OCI_STORE_DIR}/bundles/{}", spec.name);
-
-        // Build nspawn command with bind mounts
-        let spiffe_socket = crate::spiffe::socket::DEFAULT_SOCKET_PATH;
-        let secrets_dir = format!("/var/lib/ekafleet/secrets/{}", spec.name);
-
-        // Determine network namespace: non-default namespaces use their own
-        // netns for isolation; default namespace uses host networking.
-        let netns_path = if crate::agent::netns::is_default_namespace(&spec.namespace) {
-            "/proc/1/ns/net".to_string()
-        } else {
-            format!("/run/netns/ekafleet-{}", spec.namespace)
-        };
-
-        let mut nspawn_args = vec![
-            format!("--oci-bundle={bundle_path}"),
-            format!("--machine={machine_name}"),
-            format!("--network-namespace-path={netns_path}"),
-            // Bind-mount SPIFFE workload API socket
-            format!("--bind={spiffe_socket}"),
-            // Bind-mount secrets directory (read-only inside container)
-            format!("--bind-ro={secrets_dir}:/run/secrets"),
-            // Register with machined for machinectl access
-            "--register=yes".to_string(),
-            // Keep unit running (don't daemonize)
-            "--keep-unit".to_string(),
-        ];
-
-        // Add user-specified bind mounts from environment hints
-        for (key, value) in &spec.environment {
-            if key == "EKAFLEET_EXTRA_BINDS" {
-                for bind in value.split(',') {
-                    let bind = bind.trim();
-                    if !bind.is_empty() {
-                        nspawn_args.push(format!("--bind={bind}"));
-                    }
-                }
-            }
-        }
-
-        let nspawn_cmd = format!("systemd-nspawn {}", nspawn_args.join(" \\\n  "));
-
-        let env_lines = build_env_lines(spec);
-        let extra_lines = build_extra_directives(spec);
-
-        let unit_content = format!(
-            r#"[Unit]
-Description=ekafleet container: {name}
-After=network.target
-Wants=machines.target
-
-[Service]
-Type=simple
-ExecStart={nspawn_cmd}
-ExecStop=machinectl terminate {machine}
-Restart=on-failure
-RestartSec=5
-KillMode=mixed
-{extra}
-{env}
-
-[Install]
-WantedBy=multi-user.target
-"#,
-            name = spec.name,
-            nspawn_cmd = nspawn_cmd,
-            machine = machine_name,
-            extra = extra_lines,
-            env = env_lines,
-        );
-
-        self.install_unit(unit_name, &unit_content).await
+        self.install_unit(unit_name, &container_unit_content(spec))
+            .await
     }
 
     /// Write unit file to disk and symlink into systemd.
@@ -551,15 +457,178 @@ fn is_container_service(spec: &ServiceSpec) -> bool {
     !spec.container_image.is_empty()
 }
 
+/// The unit file of a native service.
+fn native_unit_content(spec: &ServiceSpec) -> String {
+    let env_lines = build_env_lines(spec);
+    let extra_lines = build_extra_directives(spec);
+    let netns_line = build_netns_directive(spec);
+    let binds: String = template_binds(spec)
+        .into_iter()
+        .map(|(source, dest)| format!("BindReadOnlyPaths={source}:{dest}\n"))
+        .collect();
+
+    let unit_content = format!(
+        r#"[Unit]
+Description=ekafleet managed: {name}
+After=network.target
+X-EkafleetVersion={version}
+
+[Service]
+Type=simple
+ExecStart={command}
+Restart=on-failure
+RestartSec=5
+{netns}{binds}{extra}
+{env}
+
+[Install]
+WantedBy=multi-user.target
+"#,
+        name = spec.name,
+        command = spec.command,
+        version = version_key_for(spec),
+        netns = netns_line,
+        extra = extra_lines,
+        env = env_lines,
+    );
+    unit_content
+}
+
+/// The unit file of a container service.
+fn container_unit_content(spec: &ServiceSpec) -> String {
+    let machine_name = format!("ekafleet-{}", spec.name);
+    let bundle_path = format!("{OCI_STORE_DIR}/bundles/{}", spec.name);
+
+    // Build nspawn command with bind mounts
+    let spiffe_socket = crate::spiffe::socket::DEFAULT_SOCKET_PATH;
+    let secrets_dir = format!("/var/lib/ekafleet/secrets/{}", spec.name);
+
+    // Determine network namespace: non-default namespaces use their own
+    // netns for isolation; default namespace uses host networking.
+    let netns_path = if crate::agent::netns::is_default_namespace(&spec.namespace) {
+        "/proc/1/ns/net".to_string()
+    } else {
+        format!("/run/netns/ekafleet-{}", spec.namespace)
+    };
+
+    let mut nspawn_args = vec![
+        format!("--oci-bundle={bundle_path}"),
+        format!("--machine={machine_name}"),
+        format!("--network-namespace-path={netns_path}"),
+        // Bind-mount SPIFFE workload API socket
+        format!("--bind={spiffe_socket}"),
+        // Bind-mount secrets directory (read-only inside container)
+        format!("--bind-ro={secrets_dir}:/run/secrets"),
+        // Register with machined for machinectl access
+        "--register=yes".to_string(),
+        // Keep unit running (don't daemonize)
+        "--keep-unit".to_string(),
+    ];
+
+    for (source, dest) in template_binds(spec) {
+        nspawn_args.push(format!("--bind-ro={source}:{dest}"));
+    }
+
+    // Add user-specified bind mounts from environment hints
+    for (key, value) in &spec.environment {
+        if key == "EKAFLEET_EXTRA_BINDS" {
+            for bind in value.split(',') {
+                let bind = bind.trim();
+                if !bind.is_empty() {
+                    nspawn_args.push(format!("--bind={bind}"));
+                }
+            }
+        }
+    }
+
+    let nspawn_cmd = format!("systemd-nspawn {}", nspawn_args.join(" \\\n  "));
+
+    let env_lines = build_env_lines(spec);
+    let extra_lines = build_extra_directives(spec);
+
+    let unit_content = format!(
+        r#"[Unit]
+Description=ekafleet container: {name}
+After=network.target
+Wants=machines.target
+X-EkafleetVersion={version}
+
+[Service]
+Type=simple
+ExecStart={nspawn_cmd}
+ExecStop=machinectl terminate {machine}
+Restart=on-failure
+RestartSec=5
+KillMode=mixed
+{extra}
+{env}
+
+[Install]
+WantedBy=multi-user.target
+"#,
+        name = spec.name,
+        nspawn_cmd = nspawn_cmd,
+        machine = machine_name,
+        version = version_key_for(spec),
+        extra = extra_lines,
+        env = env_lines,
+    );
+    unit_content
+}
+
 /// Compute the version key used to detect when a service needs restarting.
 /// For native services this is the Nix store path; for containers it's
-/// the image reference (which should include a digest for pinning).
+/// the image reference (which should include a digest for pinning), plus
+/// the set of template mounts.
 fn version_key_for(spec: &ServiceSpec) -> String {
-    if is_container_service(spec) {
+    let base = if is_container_service(spec) {
         spec.container_image.clone()
     } else {
         spec.store_path.clone()
+    };
+    // The set of template mounts is part of the unit; their content is
+    // not (changes are applied by the template manager).
+    let binds = template_binds(spec);
+    if binds.is_empty() {
+        base
+    } else {
+        let dests: Vec<&str> = binds.iter().map(|(_, dest)| dest.as_str()).collect();
+        format!("{base}#templates={}", dests.join(","))
     }
+}
+
+/// (rendered file, destination) of each valid template of `spec`.
+fn template_binds(spec: &ServiceSpec) -> Vec<(String, String)> {
+    use crate::agent::templates;
+    if crate::ca::validate_identity_name(&spec.name).is_err() {
+        return Vec::new();
+    }
+    let mut binds: Vec<(String, String)> = spec
+        .templates
+        .iter()
+        .filter(|t| templates::validate_dest(&t.dest_path).is_ok())
+        .map(|t| {
+            let source = templates::rendered_path(
+                Path::new(templates::TEMPLATES_DIR),
+                &spec.name,
+                &t.dest_path,
+            );
+            (source.display().to_string(), t.dest_path.clone())
+        })
+        .collect();
+    binds.sort_by(|a, b| a.1.cmp(&b.1));
+    binds.dedup_by(|a, b| a.1 == b.1);
+    binds
+}
+
+/// The version key recorded in a unit file this agent wrote.
+fn version_key_from_unit(content: &str) -> Option<String> {
+    content.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("X-EkafleetVersion=")
+            .map(str::to_string)
+            .filter(|v| !v.is_empty())
+    })
 }
 
 /// Extract the ekafleet service name from a unit file name, i.e. map
@@ -1088,6 +1157,55 @@ WantedBy=multi-user.target
 
         // Verify EKAFLEET_SERVICE is set
         assert!(content.contains("EKAFLEET_SERVICE=api"));
+    }
+
+    #[tokio::test]
+    async fn templates_are_bound_into_units_and_part_of_the_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let supervisor = Supervisor::new(dir.path());
+        let mut spec = native_spec("web", "/bin/web", "/nix/store/x");
+        let plain_key = version_key_for(&spec);
+        spec.templates = vec![
+            crate::proto::TemplateSpec {
+                dest_path: "/etc/web.conf".into(),
+                source: "x".into(),
+                ..Default::default()
+            },
+            crate::proto::TemplateSpec {
+                dest_path: "/etc/../shadow".into(),
+                source: "x".into(),
+                ..Default::default()
+            },
+        ];
+        let rendered = crate::agent::templates::rendered_path(
+            Path::new(crate::agent::templates::TEMPLATES_DIR),
+            "web",
+            "/etc/web.conf",
+        );
+        assert_eq!(
+            version_key_for(&spec),
+            format!("{plain_key}#templates=/etc/web.conf")
+        );
+
+        let content = native_unit_content(&spec);
+        let unit_path = dir.path().join("ekafleet-web.service");
+        std::fs::write(&unit_path, &content).unwrap();
+        assert!(content.contains(&format!(
+            "BindReadOnlyPaths={}:/etc/web.conf\n",
+            rendered.display()
+        )));
+        // Invalid destinations never reach the unit.
+        assert!(!content.contains("shadow"));
+        // A restarted agent recovers the full key, so it does not restart
+        // templated services needlessly.
+        assert_eq!(
+            supervisor.recover_version_key("web", &unit_path).await,
+            Some(version_key_for(&spec))
+        );
+
+        spec.container_image = "ghcr.io/org/web:1".into();
+        let content = container_unit_content(&spec);
+        assert!(content.contains(&format!("--bind-ro={}:/etc/web.conf", rendered.display())));
     }
 
     #[test]

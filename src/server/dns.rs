@@ -14,7 +14,8 @@
 //!   serving replica of a default-namespace (host-networked) service, plus
 //!   SRV records `<port> <node>.node` for its declared ports.
 //! - `<svc>.service` in namespace `ns`: the overlay addresses of serving
-//!   replicas, sent only to nodes that run something in `ns`.
+//!   replicas, plus SRV records `<port> <svc>.service`, sent only to nodes
+//!   that run something in `ns`.
 //!
 //! A replica is serving when its node reports it running and not unhealthy.
 
@@ -100,10 +101,12 @@ pub fn build_records(inputs: &DnsInputs) -> BTreeMap<String, Vec<DnsRecord>> {
         ));
     }
 
-    // Fleet-wide (host-networked) services: name → (mesh IPs, SRV values).
-    let mut hosted: BTreeMap<&str, (BTreeSet<String>, BTreeSet<String>)> = BTreeMap::new();
-    // Namespaced services: (namespace, name) → overlay IPs.
-    let mut namespaced: BTreeMap<(&str, &str), BTreeSet<String>> = BTreeMap::new();
+    // (addresses, SRV values) of a service.
+    type Addresses = (BTreeSet<String>, BTreeSet<String>);
+    // Fleet-wide (host-networked) services by name.
+    let mut hosted: BTreeMap<&str, Addresses> = BTreeMap::new();
+    // Namespaced services by (namespace, name).
+    let mut namespaced: BTreeMap<(&str, &str), Addresses> = BTreeMap::new();
     // Namespaces each node takes part in.
     let mut node_namespaces: HashMap<&str, BTreeSet<&str>> = HashMap::new();
 
@@ -127,7 +130,12 @@ pub fn build_records(inputs: &DnsInputs) -> BTreeMap<String, Vec<DnsRecord>> {
                     .entry((spec.namespace.as_str(), spec.name.as_str()))
                     .or_default();
                 if serving && !spec.namespace_ip.is_empty() {
-                    entry.insert(spec.namespace_ip.clone());
+                    entry.0.insert(spec.namespace_ip.clone());
+                    for port in spec.ports.iter().filter(|p| p.port != 0) {
+                        entry
+                            .1
+                            .insert(format!("{} {}.service", port.port, spec.name));
+                    }
                 }
             }
         }
@@ -159,7 +167,7 @@ pub fn build_records(inputs: &DnsInputs) -> BTreeMap<String, Vec<DnsRecord>> {
         .map(|node| {
             let mut records = fleet.clone();
             let member_of = node_namespaces.get(node);
-            for ((ns, name), ips) in &namespaced {
+            for ((ns, name), (ips, srv)) in &namespaced {
                 if !ips.is_empty() && member_of.is_some_and(|m| m.contains(ns)) {
                     records.push(record(
                         format!("{name}.service"),
@@ -167,6 +175,14 @@ pub fn build_records(inputs: &DnsInputs) -> BTreeMap<String, Vec<DnsRecord>> {
                         ips.iter().cloned().collect(),
                         ns,
                     ));
+                    if !srv.is_empty() {
+                        records.push(record(
+                            format!("{name}.service"),
+                            DnsRecordType::Srv,
+                            srv.iter().cloned().collect(),
+                            ns,
+                        ));
+                    }
                 }
             }
             (node.to_string(), records)
@@ -314,6 +330,11 @@ mod tests {
         let db = find(a, "db.service", DnsRecordType::A).unwrap();
         assert_eq!(db.namespace, "acme");
         assert_eq!(db.values, ["10.200.1.2"]);
+        let db_srv = find(a, "db.service", DnsRecordType::Srv).unwrap();
+        assert_eq!(
+            (db_srv.namespace.as_str(), &db_srv.values[..]),
+            ("acme", &["5432 db.service".to_string()][..])
+        );
         // Only members of the namespace learn its records.
         assert!(find(&records["b"], "db.service", DnsRecordType::A).is_some());
         assert!(find(&records["c"], "db.service", DnsRecordType::A).is_none());
