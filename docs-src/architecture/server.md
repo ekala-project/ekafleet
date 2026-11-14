@@ -27,7 +27,7 @@ The state machine stores:
 - The REST KV store (under an internal `user/` prefix)
 - DNS zone data
 - Cloud instance and cloud image tracking (cloud VM ID to fleet node ID mappings)
-- Namespace IP allocations
+- Namespace subnets and per-replica namespace IPs
 
 The `Restore` RPC installs an operator-supplied snapshot under a fresh log index and replaces the persisted state with it.
 

@@ -35,10 +35,16 @@ struct StateMachineInner {
     /// Cloud-provisioned machine instances tracked across the fleet.
     #[serde(default)]
     cloud_instances: HashMap<String, TrackedCloudInstance>,
-    /// Per-namespace IP allocations: namespace → (service_name → assigned IP).
-    /// Server-assigned so IPs are globally unique within a namespace across all nodes.
+    /// Per-namespace IP allocations: namespace → (holder → assigned IP),
+    /// where the holder is one replica (see [`namespace_ip_holder`]).
+    /// Server-assigned so IPs are unique within a namespace across all nodes.
     #[serde(default)]
     namespace_ips: HashMap<String, HashMap<String, Ipv4Addr>>,
+    /// Per-namespace subnets: namespace → third octet of `10.200.X.0/24`,
+    /// also used as the VXLAN VNI. Unique across namespaces so tenants never
+    /// share a subnet or an overlay segment.
+    #[serde(default)]
+    namespace_subnets: HashMap<String, u8>,
     /// Last applied log index
     last_applied: u64,
 }
@@ -166,15 +172,27 @@ pub enum Command {
     UntrackCloudInstance {
         instance_id: String,
     },
+    AllocateNamespaceSubnet {
+        namespace: String,
+        octet: u8,
+    },
     AllocateNamespaceIp {
         namespace: String,
-        service_name: String,
+        #[serde(alias = "service_name")]
+        holder: String,
         ip: Ipv4Addr,
     },
+    /// Releases the namespace subnet too once its last IP is released.
     ReleaseNamespaceIp {
         namespace: String,
-        service_name: String,
+        #[serde(alias = "service_name")]
+        holder: String,
     },
+}
+
+/// Allocation key for one replica of a service in a namespace network.
+pub fn namespace_ip_holder(service_name: &str, node: &str) -> String {
+    format!("{service_name}@{node}")
 }
 
 impl Default for FleetStateMachine {
@@ -253,6 +271,16 @@ impl FleetStateMachine {
     /// nothing is applied and the error is returned.
     pub async fn apply_next(&self, command: Command) -> Result<u64, RaftError> {
         let mut state = self.inner.write().await;
+        self.commit_locked(&mut state, command).await
+    }
+
+    /// Persist (when a log is attached) and apply `command` at the next
+    /// index while the caller holds the write lock.
+    async fn commit_locked(
+        &self,
+        state: &mut StateMachineInner,
+        command: Command,
+    ) -> Result<u64, RaftError> {
         let index = state.last_applied + 1;
         if let Some(log) = &self.log {
             log.append_log(&LogEntry {
@@ -262,7 +290,7 @@ impl FleetStateMachine {
             })
             .await?;
         }
-        Self::apply_locked(&mut state, index, command);
+        Self::apply_locked(state, index, command);
         Ok(index)
     }
 
@@ -397,26 +425,31 @@ impl FleetStateMachine {
             Command::UntrackCloudInstance { instance_id } => {
                 state.cloud_instances.remove(&instance_id);
             }
+            Command::AllocateNamespaceSubnet { namespace, octet } => {
+                state.namespace_subnets.insert(namespace, octet);
+            }
             Command::AllocateNamespaceIp {
                 namespace,
-                service_name,
+                holder,
                 ip,
             } => {
                 state
                     .namespace_ips
                     .entry(namespace)
                     .or_default()
-                    .insert(service_name, ip);
+                    .insert(holder, ip);
             }
-            Command::ReleaseNamespaceIp {
-                namespace,
-                service_name,
-            } => {
+            Command::ReleaseNamespaceIp { namespace, holder } => {
                 if let Some(ns_ips) = state.namespace_ips.get_mut(&namespace) {
-                    ns_ips.remove(&service_name);
-                    if ns_ips.is_empty() {
-                        state.namespace_ips.remove(&namespace);
-                    }
+                    ns_ips.remove(&holder);
+                }
+                if state
+                    .namespace_ips
+                    .get(&namespace)
+                    .is_none_or(HashMap::is_empty)
+                {
+                    state.namespace_ips.remove(&namespace);
+                    state.namespace_subnets.remove(&namespace);
                 }
             }
         }
@@ -545,48 +578,117 @@ impl FleetStateMachine {
             .unwrap_or_default()
     }
 
-    /// Get the assigned IP for a specific service in a namespace.
-    pub async fn namespace_ip_for_service(
-        &self,
-        namespace: &str,
-        service_name: &str,
-    ) -> Option<Ipv4Addr> {
+    /// The subnet octet assigned to a namespace, if any.
+    pub async fn namespace_subnet(&self, namespace: &str) -> Option<u8> {
+        self.inner
+            .read()
+            .await
+            .namespace_subnets
+            .get(namespace)
+            .copied()
+    }
+
+    /// The IP assigned to one replica (`holder`, see [`namespace_ip_holder`]).
+    pub async fn namespace_ip(&self, namespace: &str, holder: &str) -> Option<Ipv4Addr> {
         let state = self.inner.read().await;
         state
             .namespace_ips
             .get(namespace)
-            .and_then(|ips| ips.get(service_name).copied())
+            .and_then(|ips| ips.get(holder).copied())
     }
 
-    /// Allocate the next available IP in a namespace subnet.
-    /// Returns the allocated IP, or None if the subnet is exhausted.
-    pub async fn allocate_next_namespace_ip(
+    /// Return the IP of `holder` in `namespace`, allocating the namespace's
+    /// subnet and a free host address first if needed. Check and allocation
+    /// happen under one write lock, so concurrent callers never receive the
+    /// same address. `Ok(None)` means no subnet or host address is free.
+    pub async fn ensure_namespace_ip(
         &self,
         namespace: &str,
-        service_name: &str,
-        subnet_third_octet: u8,
-    ) -> Option<Ipv4Addr> {
-        let state = self.inner.read().await;
-        let existing = state.namespace_ips.get(namespace);
-
-        // Check if service already has an IP
-        if let Some(ips) = existing
-            && let Some(ip) = ips.get(service_name)
-        {
-            return Some(*ip);
-        }
-
-        // Find next available host part (start at .2, .1 is the gateway)
-        let used: Vec<u8> = existing
-            .map(|ips| ips.values().map(|ip| ip.octets()[3]).collect())
-            .unwrap_or_default();
-
-        for host in 2..=254 {
-            if !used.contains(&host) {
-                return Some(Ipv4Addr::new(10, 200, subnet_third_octet, host));
+        holder: &str,
+    ) -> Result<Option<Ipv4Addr>, RaftError> {
+        let mut state = self.inner.write().await;
+        let octet = match state.namespace_subnets.get(namespace) {
+            Some(octet) => *octet,
+            None => {
+                let used: std::collections::HashSet<u8> =
+                    state.namespace_subnets.values().copied().collect();
+                let Some(octet) = (1..=254).find(|o| !used.contains(o)) else {
+                    return Ok(None);
+                };
+                self.commit_locked(
+                    &mut state,
+                    Command::AllocateNamespaceSubnet {
+                        namespace: namespace.to_string(),
+                        octet,
+                    },
+                )
+                .await?;
+                octet
             }
+        };
+        let existing = state.namespace_ips.get(namespace);
+        if let Some(ip) = existing.and_then(|ips| ips.get(holder))
+            && ip.octets()[2] == octet
+        {
+            return Ok(Some(*ip));
         }
-        None // Subnet exhausted
+        // .1 is the gateway on every node's bridge.
+        let used: std::collections::HashSet<u8> = existing
+            .map(|ips| {
+                ips.iter()
+                    .filter(|(h, _)| h.as_str() != holder)
+                    .map(|(_, ip)| ip.octets()[3])
+                    .collect()
+            })
+            .unwrap_or_default();
+        let Some(host) = (2..=254).find(|h| !used.contains(h)) else {
+            return Ok(None);
+        };
+        let ip = Ipv4Addr::new(10, 200, octet, host);
+        self.commit_locked(
+            &mut state,
+            Command::AllocateNamespaceIp {
+                namespace: namespace.to_string(),
+                holder: holder.to_string(),
+                ip,
+            },
+        )
+        .await?;
+        Ok(Some(ip))
+    }
+
+    /// Release every namespace IP whose `(namespace, holder)` is not in
+    /// `live`; a namespace left without IPs loses its subnet. Returns how
+    /// many IPs were released.
+    pub async fn release_namespace_ips_except(
+        &self,
+        live: &std::collections::HashSet<(String, String)>,
+    ) -> Result<usize, RaftError> {
+        let mut state = self.inner.write().await;
+        let mut stale: Vec<(String, String)> = state
+            .namespace_ips
+            .iter()
+            .flat_map(|(ns, ips)| ips.keys().map(move |h| (ns.clone(), h.clone())))
+            .filter(|key| !live.contains(key))
+            .collect();
+        // Subnets allocated without any IP (address space exhausted).
+        stale.extend(
+            state
+                .namespace_subnets
+                .keys()
+                .filter(|ns| !state.namespace_ips.contains_key(*ns))
+                .map(|ns| (ns.clone(), String::new())),
+        );
+        stale.sort();
+        let released = stale.iter().filter(|(_, h)| !h.is_empty()).count();
+        for (namespace, holder) in stale {
+            self.commit_locked(
+                &mut state,
+                Command::ReleaseNamespaceIp { namespace, holder },
+            )
+            .await?;
+        }
+        Ok(released)
     }
 
     /// Set a runtime replica count override for a service.
@@ -628,6 +730,72 @@ impl FleetStateMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn namespace_allocations_are_unique_durable_and_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = || Arc::new(RaftStorage::new(dir.path(), &[7u8; 32]));
+        let first = storage();
+        first.initialize().await.unwrap();
+        let sm = FleetStateMachine::with_log(first);
+
+        let a1 = sm
+            .ensure_namespace_ip("a", "web@n1")
+            .await
+            .unwrap()
+            .unwrap();
+        let a2 = sm
+            .ensure_namespace_ip("a", "web@n2")
+            .await
+            .unwrap()
+            .unwrap();
+        let b1 = sm
+            .ensure_namespace_ip("b", "web@n1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(a1, Ipv4Addr::new(10, 200, 1, 2));
+        assert_eq!(a2, Ipv4Addr::new(10, 200, 1, 3));
+        assert_eq!(b1, Ipv4Addr::new(10, 200, 2, 2));
+        assert_eq!(
+            sm.ensure_namespace_ip("a", "web@n1").await.unwrap(),
+            Some(a1)
+        );
+
+        // Allocations survive a restart.
+        let restarted = FleetStateMachine::with_log(storage());
+        restarted.load().await.unwrap();
+        assert_eq!(restarted.namespace_ip("a", "web@n2").await, Some(a2));
+        assert_eq!(restarted.namespace_subnet("b").await, Some(2));
+
+        // Releasing everything in b frees its subnet for the next namespace.
+        let live = [("a".to_string(), "web@n1".to_string())].into();
+        assert_eq!(
+            restarted.release_namespace_ips_except(&live).await.unwrap(),
+            2
+        );
+        assert_eq!(restarted.namespace_subnet("b").await, None);
+        assert_eq!(restarted.namespace_ips("a").await.len(), 1);
+        let c = restarted.ensure_namespace_ip("c", "x@n1").await.unwrap();
+        assert_eq!(c, Some(Ipv4Addr::new(10, 200, 2, 2)));
+        // a's freed host address is reused.
+        let a3 = restarted.ensure_namespace_ip("a", "api@n1").await.unwrap();
+        assert_eq!(a3, Some(a2));
+    }
+
+    #[tokio::test]
+    async fn namespace_host_addresses_run_out() {
+        let sm = FleetStateMachine::new();
+        for i in 0..253 {
+            assert!(
+                sm.ensure_namespace_ip("a", &format!("s{i}@n"))
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert_eq!(sm.ensure_namespace_ip("a", "extra@n").await.unwrap(), None);
+    }
 
     #[tokio::test]
     async fn apply_next_indices_are_monotonic() {
