@@ -223,7 +223,7 @@ pkgs.testers.nixosTest {
     # ── 12. Dashboard UI ──
 
     server.succeed(
-        f"curl -sf {AUTH} {BASE}/ui/ | grep -qi 'ekafleet'"
+        f"curl -sf {AUTH} {BASE}/ui/ | grep -i 'ekafleet' >/dev/null"
     )
 
     # ── 13. Authentication enforcement ──
