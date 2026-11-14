@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::path::Path;
 use std::time::Duration;
 
 use super::cloud::instance_tracker::InstanceTracker;
@@ -111,42 +110,24 @@ fn summarize_migration_failure(results: &[MigrationResult]) -> Option<MigrationF
     })
 }
 
-/// Run a single reconciliation cycle: eval → refresh → plan → apply.
-pub async fn reconcile_once(
-    config_path: &Path,
+/// Run one reconciliation cycle toward `desired`: validate → plan → apply.
+pub async fn reconcile(
+    desired: &FleetConfig,
     state: &FleetState,
-    auto_approve: bool,
     instance_tracker: Option<&InstanceTracker>,
     raft_state: &FleetStateMachine,
+    events: Option<&super::events::EventStore>,
 ) -> Result<ReconcilePlan, ReconcileError> {
-    // 1. Evaluate: get desired state from Nix
-    tracing::info!(config = %config_path.display(), "Evaluating fleet configuration");
-    let desired = nix::eval_fleet(config_path).await?;
-
-    // 1b. Validate configuration consistency
-    if let Err(errors) = config::validate(&desired) {
+    if let Err(errors) = config::validate(desired) {
         return Err(ReconcileError::Validation(errors.join("; ")));
     }
-
-    // 2. Refresh: query current state from agents
     let current_nodes = state.connected_nodes().await;
-    tracing::info!(nodes = current_nodes.len(), "Current fleet state refreshed");
-
-    // 3. Plan: diff desired vs actual
-    let plan = compute_plan(
-        &desired,
-        &current_nodes,
-        state,
-        instance_tracker,
-        raft_state,
-    )
-    .await;
+    let plan = compute_plan(desired, &current_nodes, state, instance_tracker, raft_state).await;
 
     if !plan.has_changes {
-        tracing::info!("No changes detected");
+        tracing::debug!("No changes detected");
         return Ok(plan);
     }
-
     tracing::info!(
         creates = plan.creates.len(),
         updates = plan.updates.len(),
@@ -154,41 +135,8 @@ pub async fn reconcile_once(
         reschedules = plan.reschedules.len(),
         "Reconciliation plan computed"
     );
-
-    if !auto_approve {
-        // In non-auto mode, just return the plan for review
-        return Ok(plan);
-    }
-
-    // 4. Apply: execute deployment operations
-    apply_plan(&desired, &plan, state, raft_state, None).await?;
-
+    apply_plan(desired, &plan, state, raft_state, events).await?;
     Ok(plan)
-}
-
-/// Continuous reconciliation loop.
-pub async fn reconcile_loop(
-    config_path: &Path,
-    state: &FleetState,
-    interval: Duration,
-    instance_tracker: Option<&InstanceTracker>,
-    raft_state: &FleetStateMachine,
-) -> Result<(), ReconcileError> {
-    tracing::info!(
-        interval = ?interval,
-        "Starting continuous reconciliation"
-    );
-
-    let mut tick = tokio::time::interval(interval);
-    loop {
-        tick.tick().await;
-        match reconcile_once(config_path, state, true, instance_tracker, raft_state).await {
-            Ok(_) => {}
-            Err(e) => {
-                tracing::error!(error = %e, "Reconciliation cycle failed");
-            }
-        }
-    }
 }
 
 /// Compare desired state with actual state to produce operations.

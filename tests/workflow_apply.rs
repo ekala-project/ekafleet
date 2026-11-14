@@ -1,0 +1,456 @@
+//! Apply → reconcile → rollback against the real `ekafleet server` binary
+//! and a joined (simulated) agent:
+//!
+//! - `Apply` locks and evaluates a flake on the server, records a
+//!   configuration revision, and returns once it has been reconciled onto
+//!   the agent.
+//! - `Rollback` re-applies an earlier revision's configuration as a new
+//!   revision.
+//! - The server resumes reconciling the recorded revision after a crash,
+//!   with no client involved.
+//!
+//! Needs `nix` with flakes on `PATH` (the dev shell provides it).
+
+use std::net::SocketAddr;
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
+use std::time::Duration;
+
+use ekafleet::proto::agent_message::Payload;
+use ekafleet::proto::fleet_control_client::FleetControlClient;
+use ekafleet::proto::server_message::Payload as ServerPayload;
+use ekafleet::proto::{
+    AgentMessage, ApplyRequest, ApplyStatus, CreateAclTokenRequest, CreateJoinTokenRequest,
+    HealthReport, HealthStatus, Heartbeat, ListConfigRevisionsRequest, PlanRequest,
+    RollbackRequest, ServiceHealth,
+};
+use tokio::sync::mpsc;
+use tonic::transport::{Channel, Endpoint, Identity};
+
+const ADMIN_TOKEN: &str = "apply-admin-token";
+const NODE: &str = "web-1";
+
+fn free_addr() -> SocketAddr {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+}
+
+struct Server {
+    child: Child,
+    grpc: SocketAddr,
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Server {
+    fn crash(mut self) {
+        self.child.kill().unwrap();
+        self.child.wait().unwrap();
+    }
+}
+
+async fn start(dir: &Path) -> Server {
+    let token_file = dir.join("admin-token");
+    std::fs::write(&token_file, ADMIN_TOKEN).unwrap();
+    let grpc = free_addr();
+    let child = Command::new(assert_cmd::cargo::cargo_bin("ekafleet"))
+        .args(["server", "--data-dir"])
+        .arg(dir.join("data"))
+        .args(["--listen", &grpc.to_string()])
+        .args(["--http-listen", &free_addr().to_string()])
+        .arg("--token-file")
+        .arg(&token_file)
+        .env_remove("EKAFLEET_TOKEN")
+        .env_remove("EKAFLEET_SEAL_PASSPHRASE")
+        .env_remove("EKAFLEET_SEAL_PASSPHRASE_FILE")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let server = Server { child, grpc };
+    for _ in 0..300 {
+        if dir.join("data/ca-cert.pem").exists()
+            && tokio::net::TcpStream::connect(grpc).await.is_ok()
+        {
+            return server;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("server did not start");
+}
+
+fn ca_pem(dir: &Path) -> String {
+    std::fs::read_to_string(dir.join("data/ca-cert.pem")).unwrap()
+}
+
+async fn channel(server: &Server, dir: &Path, identity: Option<Identity>) -> Channel {
+    let mut tls = ekafleet::agent::bootstrap::tls_config(&server.grpc.to_string(), &ca_pem(dir));
+    if let Some(identity) = identity {
+        tls = tls.identity(identity);
+    }
+    Endpoint::from_shared(format!("https://{}", server.grpc))
+        .unwrap()
+        .tls_config(tls)
+        .unwrap()
+        .connect()
+        .await
+        .unwrap()
+}
+
+#[derive(Clone)]
+struct Bearer(tonic::metadata::MetadataValue<tonic::metadata::Ascii>);
+
+impl tonic::service::Interceptor for Bearer {
+    fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
+        req.metadata_mut().insert("authorization", self.0.clone());
+        Ok(req)
+    }
+}
+
+type Client = FleetControlClient<tonic::service::interceptor::InterceptedService<Channel, Bearer>>;
+
+async fn client(server: &Server, dir: &Path, token: &str) -> Client {
+    let header = format!("Bearer {token}").parse().unwrap();
+    FleetControlClient::with_interceptor(channel(server, dir, None).await, Bearer(header))
+}
+
+/// Write a flake whose `fleet` output runs `web` (with `command`) on one
+/// machine, `web-1`.
+fn write_fleet(flake: &Path, command: &str) {
+    std::fs::create_dir_all(flake).unwrap();
+    std::fs::write(
+        flake.join("flake.nix"),
+        "{ outputs = _: { fleet = builtins.fromJSON (builtins.readFile ./fleet.json); }; }\n",
+    )
+    .unwrap();
+    let fleet = serde_json::json!({
+        "name": "apply-test",
+        "domain": "apply.test",
+        "machines": {
+            NODE: { "targetHost": "127.0.0.1", "capacity": { "cpu": 4000, "memory": 4096 } }
+        },
+        "services": {
+            "web": {
+                "command": command,
+                "resources": { "cpu": { "request": 100 }, "memory": { "request": 64 } },
+                "scheduling": {
+                    "replicas": 1,
+                    "update": { "minHealthyTime": 0, "healthyDeadline": 30 }
+                }
+            }
+        }
+    });
+    std::fs::write(flake.join("fleet.json"), fleet.to_string()).unwrap();
+}
+
+/// Commit the flake so the server locks it to a git revision.
+fn commit(flake: &Path) {
+    for args in [
+        &["init", "-q"][..],
+        &["add", "."],
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "fleet",
+        ],
+    ] {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(flake)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    }
+}
+
+/// A joined agent that reports every service it is told to run as healthy
+/// and forwards the `web` command of each `DesiredState` it receives.
+struct Agent {
+    commands: mpsc::UnboundedReceiver<String>,
+}
+
+async fn join_agent(server: &Server, dir: &Path, agent_dir: &Path) -> Identity {
+    let token = client(server, dir, ADMIN_TOKEN)
+        .await
+        .create_join_token(CreateJoinTokenRequest {
+            node_name: NODE.into(),
+            ttl_secs: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .token;
+    let mut identity = ekafleet::agent::NodeIdentity::new(agent_dir);
+    ekafleet::agent::bootstrap::join(
+        &server.grpc.to_string(),
+        &ca_pem(dir),
+        NODE,
+        &token,
+        &mut identity,
+    )
+    .await
+    .unwrap();
+    Identity::from_pem(
+        identity.cert_pem.unwrap().as_bytes(),
+        identity.key_pem.unwrap().as_bytes(),
+    )
+}
+
+async fn connect_agent(server: &Server, dir: &Path, identity: Identity) -> Agent {
+    let (tx, rx) = mpsc::channel(16);
+    tx.send(AgentMessage {
+        payload: Some(Payload::Heartbeat(Heartbeat {
+            node_id: NODE.into(),
+            ..Default::default()
+        })),
+    })
+    .await
+    .unwrap();
+    let mut inbound = FleetControlClient::new(channel(server, dir, Some(identity)).await)
+        .stream_control(tokio_stream::wrappers::ReceiverStream::new(rx))
+        .await
+        .unwrap()
+        .into_inner();
+
+    let (commands_tx, commands) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut services: Vec<String> = Vec::new();
+        let mut tick = tokio::time::interval(Duration::from_millis(200));
+        loop {
+            tokio::select! {
+                msg = inbound.message() => {
+                    let Ok(Some(msg)) = msg else { return };
+                    if let Some(ServerPayload::DesiredState(ds)) = msg.payload {
+                        services = ds.services.iter().map(|s| s.name.clone()).collect();
+                        if let Some(web) = ds.services.iter().find(|s| s.name == "web") {
+                            let _ = commands_tx.send(web.command.clone());
+                        }
+                    }
+                }
+                _ = tick.tick() => {
+                    let report = AgentMessage {
+                        payload: Some(Payload::Health(HealthReport {
+                            node_id: NODE.into(),
+                            services: services
+                                .iter()
+                                .map(|name| ServiceHealth {
+                                    service_name: name.clone(),
+                                    instance_id: format!("{name}-0"),
+                                    status: HealthStatus::Healthy as i32,
+                                    readiness: HealthStatus::Healthy as i32,
+                                    message: String::new(),
+                                    checked_at: 0,
+                                })
+                                .collect(),
+                        })),
+                    };
+                    if tx.send(report).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+    Agent { commands }
+}
+
+impl Agent {
+    /// The next `web` command the server assigns that equals `want`.
+    async fn expect_command(&mut self, want: &str) {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while let Some(command) = self.commands.recv().await {
+                if command == want {
+                    return;
+                }
+            }
+            panic!("agent stream closed");
+        })
+        .await
+        .unwrap_or_else(|_| panic!("agent never received {want}"));
+    }
+}
+
+/// Run `Apply` to completion: (final status, final revision, messages).
+async fn apply(client: &mut Client, flake: &Path) -> (ApplyStatus, u64, Vec<String>) {
+    let mut stream = client
+        .apply(ApplyRequest {
+            flake_ref: flake.display().to_string(),
+            follow: false,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let (mut status, mut revision, mut messages) = (ApplyStatus::ApplyPending, 0, Vec::new());
+    while let Some(event) = tokio::time::timeout(Duration::from_secs(120), stream.message())
+        .await
+        .expect("apply stalled")
+        .unwrap()
+    {
+        status = ApplyStatus::try_from(event.status).unwrap();
+        revision = event.revision;
+        messages.push(event.message);
+    }
+    (status, revision, messages)
+}
+
+fn nix_available() -> bool {
+    let ok = Command::new("nix")
+        .args(["flake", "--help"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !ok {
+        eprintln!("skipping: nix with flakes is not available");
+    }
+    ok
+}
+
+#[tokio::test]
+async fn apply_rollback_and_resume_after_a_crash() {
+    if !nix_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let flake = dir.path().join("fleet");
+    let server = start(dir.path()).await;
+    let mut admin = client(&server, dir.path(), ADMIN_TOKEN).await;
+
+    // Nothing applied yet.
+    let err = admin
+        .rollback(RollbackRequest { to_revision: 0 })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+
+    let agent_dir = dir.path().join("agent");
+    let identity = join_agent(&server, dir.path(), &agent_dir).await;
+    let mut agent = connect_agent(&server, dir.path(), identity.clone()).await;
+
+    // Plan shows the create without recording anything.
+    write_fleet(&flake, "/bin/v1");
+    commit(&flake);
+    let plan = admin
+        .plan(PlanRequest {
+            flake_ref: flake.display().to_string(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(plan.has_changes);
+    assert_eq!(plan.operations[0].service_name, "web");
+
+    let (status, revision, messages) = apply(&mut admin, &flake).await;
+    assert_eq!(status, ApplyStatus::ApplySucceeded, "{messages:?}");
+    assert_eq!(revision, 1);
+    agent.expect_command("/bin/v1").await;
+
+    write_fleet(&flake, "/bin/v2");
+    let (status, revision, messages) = apply(&mut admin, &flake).await;
+    assert_eq!(status, ApplyStatus::ApplySucceeded, "{messages:?}");
+    assert_eq!(revision, 2);
+    agent.expect_command("/bin/v2").await;
+
+    // A broken flake fails at evaluation and records nothing.
+    std::fs::write(flake.join("fleet.json"), "{ not json").unwrap();
+    let (status, _, messages) = apply(&mut admin, &flake).await;
+    assert_eq!(status, ApplyStatus::ApplyFailed, "{messages:?}");
+
+    // Rollback re-applies revision 1 as revision 3.
+    let rollback = admin
+        .rollback(RollbackRequest { to_revision: 0 })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(rollback.success, "{}", rollback.message);
+    assert_eq!(rollback.revision, 3);
+    agent.expect_command("/bin/v1").await;
+
+    let revisions = admin
+        .list_config_revisions(ListConfigRevisionsRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+        .revisions;
+    let summary: Vec<_> = revisions
+        .iter()
+        .map(|r| (r.revision, r.rollback_of, r.current))
+        .collect();
+    assert_eq!(summary, [(1, 0, false), (2, 0, false), (3, 1, true)]);
+    // The recorded reference is locked to the commit that was evaluated.
+    assert!(
+        revisions[0].flake_ref.starts_with("git+file://")
+            && revisions[0].flake_ref.contains("rev=")
+            && revisions[0].flake_ref.ends_with("#fleet"),
+        "{}",
+        revisions[0].flake_ref
+    );
+    assert_eq!(revisions[0].applied_by, revisions[2].applied_by);
+
+    // After a crash the server picks the recorded revision back up and
+    // reconciles the agent on its own.
+    drop(agent);
+    server.crash();
+    let server = start(dir.path()).await;
+    let mut agent = connect_agent(&server, dir.path(), identity).await;
+    agent.expect_command("/bin/v1").await;
+    let revisions = client(&server, dir.path(), ADMIN_TOKEN)
+        .await
+        .list_config_revisions(ListConfigRevisionsRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+        .revisions;
+    assert_eq!(revisions.len(), 3);
+}
+
+#[tokio::test]
+async fn viewers_cannot_apply_or_roll_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = start(dir.path()).await;
+    let viewer = client(&server, dir.path(), ADMIN_TOKEN)
+        .await
+        .create_acl_token(CreateAclTokenRequest {
+            role: "viewer".into(),
+            description: "read-only".into(),
+            namespace: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .token;
+    let mut viewer = client(&server, dir.path(), &viewer).await;
+
+    let err = viewer
+        .apply(ApplyRequest {
+            flake_ref: "/nonexistent".into(),
+            follow: false,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    let err = viewer
+        .rollback(RollbackRequest { to_revision: 1 })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    // Reading history is allowed.
+    assert!(
+        viewer
+            .list_config_revisions(ListConfigRevisionsRequest {})
+            .await
+            .is_ok()
+    );
+}

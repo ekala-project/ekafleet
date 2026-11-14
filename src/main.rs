@@ -170,9 +170,9 @@ enum Command {
 
     /// Show desired-vs-actual diff
     Plan {
-        /// Path to fleet.nix configuration
-        #[arg(long, default_value = "fleet.nix")]
-        config: PathBuf,
+        /// Flake reference evaluated by the server (attribute defaults to `fleet`)
+        #[arg(long, visible_alias = "config", default_value = ".")]
+        flake: String,
 
         /// Server address to query
         #[arg(long, default_value = "127.0.0.1:7400")]
@@ -181,15 +181,17 @@ enum Command {
 
     /// Execute deployment plan
     Apply {
-        /// Path to fleet.nix configuration
-        #[arg(long, default_value = "fleet.nix")]
-        config: PathBuf,
+        /// Flake reference evaluated by the server (attribute defaults to
+        /// `fleet`). Local paths are made absolute; the server must be able
+        /// to read them.
+        #[arg(long, visible_alias = "config", default_value = ".")]
+        flake: String,
 
-        /// Skip confirmation prompt
+        /// Skip the plan and confirmation prompt
         #[arg(long)]
         auto_approve: bool,
 
-        /// Continuous reconciliation mode (alias: --watch)
+        /// Keep streaming the server's later reconciles (alias: --watch)
         #[arg(long, visible_alias = "watch")]
         follow: bool,
 
@@ -212,16 +214,17 @@ enum Command {
         server: String,
     },
 
-    /// Revert to previous generation
+    /// List applied configuration revisions
+    History {
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+
+    /// Re-apply an earlier configuration revision
     Rollback {
-        /// Machine to rollback (omit for all)
-        machine: Option<String>,
-
-        /// Rollback all machines
-        #[arg(long)]
-        all: bool,
-
-        /// Target generation number
+        /// Configuration revision to re-apply (default: the previous one;
+        /// see `ekafleet history`)
         #[arg(long)]
         to: Option<u64>,
 
@@ -903,25 +906,22 @@ async fn main() -> anyhow::Result<()> {
             .await?
         }
 
-        Command::Plan { config, server } => commands::cmd_plan(config, server).await?,
+        Command::Plan { flake, server } => commands::cmd_plan(flake, server).await?,
 
         Command::Apply {
-            config,
+            flake,
             auto_approve,
             follow,
             server,
-        } => commands::cmd_apply(config, auto_approve, follow, server).await?,
+        } => commands::cmd_apply(flake, auto_approve, follow, server).await?,
+
+        Command::History { server } => commands::cmd_history(server, &cli.output).await?,
 
         Command::Status { server } => commands::cmd_status(server, &cli.output).await?,
 
         Command::Drift { server } => commands::cmd_drift(server).await?,
 
-        Command::Rollback {
-            machine,
-            all,
-            to,
-            server,
-        } => commands::cmd_rollback(machine, all, to, server).await?,
+        Command::Rollback { to, server } => commands::cmd_rollback(to, server).await?,
 
         Command::Capacity { server } => commands::cmd_capacity(server).await?,
 

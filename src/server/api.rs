@@ -67,8 +67,6 @@ pub struct FleetControlService {
     /// Tracks cloud-provisioned machine instances for agent correlation
     /// and dynamic scheduling.
     pub(super) instance_tracker: InstanceTracker,
-    /// gRPC listen address for agent bootstrap user-data.
-    pub(super) grpc_addr: String,
     pub(super) event_store: EventStore,
     pub(super) token_store: TokenStore,
     /// Append-only audit log recording which principal performed each action.
@@ -76,6 +74,8 @@ pub struct FleetControlService {
     /// Accept agent streams authenticated by a bearer token instead of a
     /// node SVID. Only `ekafleet dev` enables this.
     pub(super) allow_bearer_agents: bool,
+    /// Server-owned reconcile loop (spawned by `serve_grpc`).
+    pub(super) controller: super::controller::Controller,
 }
 
 impl FleetControlService {
@@ -91,7 +91,16 @@ impl FleetControlService {
         token_store: TokenStore,
         data_dir: std::path::PathBuf,
     ) -> Self {
+        let controller = super::controller::Controller::new(
+            state.clone(),
+            raft_state.clone(),
+            instance_tracker.clone(),
+            join_token_store.clone(),
+            event_store.clone(),
+            grpc_addr,
+        );
         Self {
+            controller,
             state,
             cert_issuer: None,
             ca: None,
@@ -108,7 +117,6 @@ impl FleetControlService {
             metrics: MetricsAggregator::new(),
             raft_state,
             instance_tracker,
-            grpc_addr: grpc_addr.to_string(),
             event_store,
             token_store,
             audit_log: super::audit::AuditLog::new(),
@@ -133,7 +141,15 @@ impl FleetControlService {
         detail: &str,
         outcome: super::audit::AuditOutcome,
     ) {
-        let actor = request
+        let actor = Self::actor(request);
+        self.audit_log
+            .record(&actor, action, resource, detail, outcome)
+            .await;
+    }
+
+    /// The principal that issued `request`, as recorded in the audit log.
+    fn actor<T>(request: &Request<T>) -> String {
+        request
             .extensions()
             .get::<super::rbac::TokenIdentity>()
             .map(|id| id.actor())
@@ -143,10 +159,14 @@ impl FleetControlService {
                     .get::<super::rbac::PeerIdentity>()
                     .map(|peer| peer.actor())
             })
-            .unwrap_or_else(|| "unknown".to_string());
-        self.audit_log
-            .record(&actor, action, resource, detail, outcome)
-            .await;
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    /// The server-owned reconcile loop. `serve_grpc` spawns it; embedders
+    /// that build the service themselves spawn it with
+    /// [`super::controller::Controller::spawn`].
+    pub fn controller(&self) -> super::controller::Controller {
+        self.controller.clone()
     }
 
     /// Configure the service with a certificate issuer for SPIFFE SVID issuance.
@@ -389,14 +409,12 @@ impl FleetControl for FleetControlService {
     async fn plan(&self, request: Request<PlanRequest>) -> Result<Response<PlanResponse>, Status> {
         require_permission(&request, Permission::Read)?;
         let req = request.into_inner();
-        tracing::info!(config = %req.config_path, "Plan requested");
+        tracing::info!(flake_ref = %req.flake_ref, "Plan requested");
 
-        let config_path = std::path::Path::new(&req.config_path);
-
-        // Evaluate desired state from Nix
-        let desired = super::nix::eval_fleet(config_path)
+        let desired = super::nix::eval_flake(&req.flake_ref)
             .await
-            .map_err(|e| Status::internal(format!("nix eval failed: {e}")))?;
+            .map_err(|e| Status::failed_precondition(e.to_string()))?
+            .config;
 
         // Validate
         if let Err(errors) = crate::config::validate(&desired) {
@@ -477,281 +495,108 @@ impl FleetControl for FleetControlService {
         request: Request<ApplyRequest>,
     ) -> Result<Response<Self::ApplyStream>, Status> {
         require_permission(&request, Permission::Deploy)?;
+        let actor = Self::actor(&request);
+        let flake_ref = request.get_ref().flake_ref.clone();
+        if flake_ref.is_empty() {
+            return Err(Status::invalid_argument("flake_ref is required"));
+        }
         self.audit(
             &request,
             super::audit::AuditAction::Apply,
-            &request.get_ref().config_path,
+            &flake_ref,
             "apply requested",
             super::audit::AuditOutcome::Success,
         )
         .await;
-        let req = request.into_inner();
-        tracing::info!(
-            config = %req.config_path,
-            auto_approve = %req.auto_approve,
-            watch = %req.watch,
-            "Apply requested"
-        );
+        let follow = request.get_ref().follow;
+        tracing::info!(%flake_ref, follow, "Apply requested");
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
-        let state = self.state.clone();
-        let tracker = self.instance_tracker.clone();
-        let join_tokens = self.join_token_store.clone();
-        let config_path = std::path::PathBuf::from(&req.config_path);
-        let watch = req.watch;
-        let grpc_addr = self.grpc_addr.clone();
-        let ca_cert_pem = self.trust_bundle_pem.clone().unwrap_or_default();
         let raft_state = self.raft_state.clone();
-        let event_store = self.event_store.clone();
-
+        let controller = self.controller.clone();
         tokio::spawn(async move {
-            // Run a single reconciliation cycle
-            match super::reconciler::reconcile_once(
-                &config_path,
-                &state,
-                true,
-                Some(&tracker),
-                &raft_state,
+            let send = |revision: u64, status: crate::proto::ApplyStatus, message: String| {
+                let tx = tx.clone();
+                async move {
+                    tx.send(Ok(ApplyEvent {
+                        operation_id: uuid::Uuid::new_v4().to_string(),
+                        status: status as i32,
+                        message,
+                        revision,
+                    }))
+                    .await
+                    .is_ok()
+                }
+            };
+            use crate::proto::ApplyStatus::{ApplyFailed, ApplyInProgress};
+
+            send(0, ApplyInProgress, format!("Evaluating {flake_ref}")).await;
+            let evaluated = match super::nix::eval_flake(&flake_ref).await {
+                Ok(evaluated) => evaluated,
+                Err(e) => {
+                    send(0, ApplyFailed, format!("Apply failed: {e}")).await;
+                    return;
+                }
+            };
+            if let Err(errors) = crate::config::validate(&evaluated.config) {
+                send(
+                    0,
+                    ApplyFailed,
+                    format!("Apply failed: validation failed: {}", errors.join("; ")),
+                )
+                .await;
+                return;
+            }
+
+            let mut updates = controller.subscribe();
+            let revision = match raft_state
+                .apply_config(crate::raft::state::Command::ApplyConfig {
+                    flake_ref: evaluated.locked_ref.clone(),
+                    config_json: evaluated.json,
+                    applied_at: unix_now(),
+                    applied_by: actor,
+                    rollback_of: None,
+                })
+                .await
+            {
+                Ok(revision) => revision,
+                Err(e) => {
+                    send(
+                        0,
+                        ApplyFailed,
+                        format!("Apply failed: cannot record configuration: {e}"),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            controller.trigger();
+            if !send(
+                revision,
+                ApplyInProgress,
+                format!("Recorded revision {revision} ({})", evaluated.locked_ref),
             )
             .await
             {
-                Ok(plan) => {
-                    // Emit events for policy-blocked services
-                    for block in &plan.policy_blocked {
-                        event_store
-                            .emit_detail(
-                                super::events::EventLevel::Error,
-                                super::events::EventCategory::Scheduling,
-                                Some(&block.service_name),
-                                None,
-                                &format!(
-                                    "Deployment blocked by policy '{}': {}",
-                                    block.rule_name, block.message
-                                ),
-                            )
-                            .await;
-                    }
+                return;
+            }
 
-                    let msg = if plan.has_changes {
-                        format!(
-                            "Applied: {} creates, {} updates, {} destroys, {} reschedules",
-                            plan.creates.len(),
-                            plan.updates.len(),
-                            plan.destroys.len(),
-                            plan.reschedules.len(),
-                        )
-                    } else {
-                        "No changes detected".to_string()
-                    };
-                    let _ = tx
-                        .send(Ok(ApplyEvent {
-                            operation_id: uuid::Uuid::new_v4().to_string(),
-                            status: crate::proto::ApplyStatus::ApplySucceeded as i32,
-                            message: msg,
-                        }))
-                        .await;
-
-                    // If watch mode, start continuous reconciliation and scaling actuator
-                    if watch {
-                        // Evaluate config to build the scaling actuator
-                        if let Ok(mut fleet_config) = super::nix::eval_fleet(&config_path).await {
-                            // Resolve managed cloud images: build and register
-                            // any NixOS images whose store path has changed.
-                            let image_tracker =
-                                super::cloud::image_tracker::ImageTracker::new(raft_state.clone());
-                            let mut image_managers: std::collections::HashMap<
-                                String,
-                                Box<dyn super::cloud::image::CloudImageManagerDyn>,
-                            > = std::collections::HashMap::new();
-                            let mut active_hashes: std::collections::HashMap<String, String> =
-                                std::collections::HashMap::new();
-
-                            for (pool_name, pool_config) in &mut fleet_config.node_pools {
-                                let Some(cloud) = &mut pool_config.cloud else {
-                                    continue;
-                                };
-                                let Some(image_config) = &cloud.image else {
-                                    continue;
-                                };
-
-                                let manager =
-                                    super::cloud::image::build_image_manager(cloud, image_config);
-                                let manager_key = match cloud.provider {
-                                    crate::config::CloudProviderType::Aws => "aws",
-                                    crate::config::CloudProviderType::Azure => "azure",
-                                    crate::config::CloudProviderType::Gcp => "gcp",
-                                };
-
-                                match super::cloud::image::ensure_image(
-                                    pool_name,
-                                    cloud,
-                                    image_config,
-                                    &fleet_config.name,
-                                    &image_tracker,
-                                    manager.as_ref(),
-                                )
-                                .await
-                                {
-                                    Ok(resolved_id) => {
-                                        // Track the active hash for cleanup
-                                        if let Ok(toplevel) = super::nix::build(&format!(
-                                            "{}.config.system.build.toplevel",
-                                            image_config.nixos_config
-                                        ))
-                                        .await
-                                            && let Some(h) =
-                                                super::cloud::image::extract_store_path_hash(
-                                                    &toplevel,
-                                                )
-                                        {
-                                            active_hashes.insert(pool_name.clone(), h.to_string());
-                                        }
-
-                                        cloud.image_id = Some(resolved_id);
-                                        image_managers
-                                            .entry(manager_key.to_string())
-                                            .or_insert(manager);
-                                    }
-                                    Err(e) => {
-                                        tracing::error!(
-                                            pool = %pool_name,
-                                            error = %e,
-                                            "Failed to resolve managed cloud image"
-                                        );
-                                    }
-                                }
-                            }
-
-                            // Clean up expired images
-                            super::cloud::image::cleanup_expired_images(
-                                &fleet_config,
-                                &image_tracker,
-                                &image_managers,
-                                &active_hashes,
-                            )
-                            .await;
-
-                            let providers = super::cloud::CloudProviderRegistry::from_pool_configs(
-                                &fleet_config.node_pools,
-                            );
-                            let pool_engine =
-                                crate::server::scaling::PoolScalingEngine::new(state.clone());
-
-                            // Register pool scaling policies from config
-                            let mut pool_engine = pool_engine;
-                            for (pool_name, pool_config) in &fleet_config.node_pools {
-                                if let Some(scaling) = &pool_config.scaling {
-                                    pool_engine.register_policy(pool_name, scaling.clone());
-                                }
-                            }
-
-                            let server_addr = grpc_addr.clone();
-                            let ca_cert = ca_cert_pem.clone();
-
-                            let mut actuator = super::cloud::actuator::ScalingActuator::new(
-                                pool_engine,
-                                providers,
-                                tracker.clone(),
-                                join_tokens,
-                                state.clone(),
-                                fleet_config,
-                                server_addr,
-                                ca_cert,
-                            );
-
-                            // Run scaling actuator alongside reconciliation
-                            let tx_watch = tx.clone();
-                            let reconcile_tracker = tracker.clone();
-                            let reconcile_state = state.clone();
-                            let reconcile_path = config_path.clone();
-                            let reconcile_raft = raft_state.clone();
-                            let reconcile_events = event_store.clone();
-
-                            let reconcile_trigger = reconcile_state.reconcile_trigger();
-                            tokio::spawn(async move {
-                                let mut interval =
-                                    tokio::time::interval(std::time::Duration::from_secs(30));
-                                loop {
-                                    // Reconcile on the periodic tick OR as soon as an
-                                    // event (node eviction, agent disconnect, service
-                                    // crash) requests it — whichever comes first.
-                                    tokio::select! {
-                                        _ = interval.tick() => {}
-                                        _ = reconcile_trigger.notified() => {
-                                            tracing::debug!(
-                                                "Reconcile triggered by fleet event"
-                                            );
-                                        }
-                                    }
-
-                                    // Run scaling cycle
-                                    actuator.run_cycle().await;
-
-                                    // Run reconciliation cycle
-                                    match super::reconciler::reconcile_once(
-                                        &reconcile_path,
-                                        &reconcile_state,
-                                        true,
-                                        Some(&reconcile_tracker),
-                                        &reconcile_raft,
-                                    )
-                                    .await
-                                    {
-                                        Ok(plan) if plan.has_changes => {
-                                            for block in &plan.policy_blocked {
-                                                reconcile_events
-                                                    .emit_detail(
-                                                        super::events::EventLevel::Error,
-                                                        super::events::EventCategory::Scheduling,
-                                                        Some(&block.service_name),
-                                                        None,
-                                                        &format!(
-                                                            "Deployment blocked by policy '{}': {}",
-                                                            block.rule_name, block.message
-                                                        ),
-                                                    )
-                                                    .await;
-                                            }
-                                            let _ = tx_watch
-                                                .send(Ok(ApplyEvent {
-                                                    operation_id: uuid::Uuid::new_v4().to_string(),
-                                                    status:
-                                                        crate::proto::ApplyStatus::ApplySucceeded
-                                                            as i32,
-                                                    message: format!(
-                                                        "Reconciled: {} changes applied",
-                                                        plan.creates.len()
-                                                            + plan.updates.len()
-                                                            + plan.destroys.len()
-                                                    ),
-                                                }))
-                                                .await;
-                                        }
-                                        Err(e) => {
-                                            let _ = tx_watch
-                                                .send(Ok(ApplyEvent {
-                                                    operation_id: uuid::Uuid::new_v4().to_string(),
-                                                    status: crate::proto::ApplyStatus::ApplyFailed
-                                                        as i32,
-                                                    message: format!("Reconciliation failed: {e}"),
-                                                }))
-                                                .await;
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            });
+            let Some(first) = super::controller::Controller::wait_for(&mut updates, revision).await
+            else {
+                return;
+            };
+            if !send(first.revision, first.status, first.message).await || !follow {
+                return;
+            }
+            loop {
+                match updates.recv().await {
+                    Ok(update) if update.changed => {
+                        if !send(update.revision, update.status, update.message).await {
+                            return;
                         }
                     }
-                }
-                Err(e) => {
-                    let _ = tx
-                        .send(Ok(ApplyEvent {
-                            operation_id: uuid::Uuid::new_v4().to_string(),
-                            status: crate::proto::ApplyStatus::ApplyFailed as i32,
-                            message: format!("Apply failed: {e}"),
-                        }))
-                        .await;
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 }
             }
         });
@@ -805,97 +650,86 @@ impl FleetControl for FleetControlService {
         request: Request<RollbackRequest>,
     ) -> Result<Response<RollbackResponse>, Status> {
         require_permission(&request, Permission::Deploy)?;
+        let actor = Self::actor(&request);
+        let revisions = self.raft_state.config_revisions().await;
+        let Some(current) = revisions.last() else {
+            return Err(Status::failed_precondition(
+                "no configuration has been applied yet",
+            ));
+        };
+        let wanted = match request.get_ref().to_revision {
+            0 => current.revision.saturating_sub(1),
+            n => n,
+        };
+        if wanted == current.revision {
+            return Err(Status::invalid_argument(format!(
+                "revision {wanted} is already the current revision"
+            )));
+        }
+        let Some(target) = revisions.iter().find(|r| r.revision == wanted) else {
+            let oldest = revisions.first().map_or(0, |r| r.revision);
+            return Err(Status::not_found(format!(
+                "revision {wanted} is not retained (available: {oldest}..={})",
+                current.revision
+            )));
+        };
         self.audit(
             &request,
             super::audit::AuditAction::Rollback,
-            if request.get_ref().machine.is_empty() {
-                "all"
-            } else {
-                &request.get_ref().machine
-            },
-            &format!("rollback to generation {}", request.get_ref().to_generation),
+            &target.flake_ref,
+            &format!("rollback to revision {wanted}"),
             super::audit::AuditOutcome::Success,
         )
         .await;
-        let req = request.into_inner();
-        tracing::info!(
-            machine = %req.machine,
-            all = req.all,
-            to_generation = req.to_generation,
-            "Rollback requested"
-        );
 
-        let deployments = self.raft_state.all_deployments().await;
-        if deployments.is_empty() {
-            return Ok(Response::new(RollbackResponse {
-                success: false,
-                message: "No deployment history available".into(),
-            }));
-        }
+        let mut updates = self.controller.subscribe();
+        let revision = self
+            .raft_state
+            .apply_config(crate::raft::state::Command::ApplyConfig {
+                flake_ref: target.flake_ref.clone(),
+                config_json: target.config_json.clone(),
+                applied_at: unix_now(),
+                applied_by: actor,
+                rollback_of: Some(wanted),
+            })
+            .await
+            .map_err(|e| Status::internal(format!("cannot record configuration: {e}")))?;
+        self.controller.trigger();
+        tracing::info!(revision, rollback_of = wanted, "Rollback recorded");
 
-        // Determine which services/machines to roll back
-        let target_services: Vec<_> = if req.all || req.machine.is_empty() {
-            deployments.keys().cloned().collect()
-        } else {
-            // Find services deployed to the specified machine
-            deployments
-                .iter()
-                .filter(|(_, ds)| ds.placements.iter().any(|p| p.machine_name == req.machine))
-                .map(|(name, _)| name.clone())
-                .collect()
-        };
-
-        if target_services.is_empty() {
-            return Ok(Response::new(RollbackResponse {
-                success: false,
-                message: format!("No services found on machine '{}'", req.machine),
-            }));
-        }
-
-        let mut rolled_back = Vec::new();
-        for service_name in &target_services {
-            if let Some(deployment) = deployments.get(service_name) {
-                let target_gen = if req.to_generation == 0 {
-                    deployment.generation.saturating_sub(1)
-                } else {
-                    req.to_generation
-                };
-
-                if target_gen == 0 {
-                    continue;
-                }
-
-                // Send deploy commands with the previous store path to affected agents
-                for placement in &deployment.placements {
-                    let deploy_msg = crate::proto::ServerMessage {
-                        payload: Some(crate::proto::server_message::Payload::Deploy(
-                            crate::proto::DeployCommand {
-                                deployment_id: uuid::Uuid::new_v4().to_string(),
-                                service_name: service_name.clone(),
-                                store_path: deployment.store_path.clone(),
-                                strategy: 0,
-                                container_image: String::new(),
-                            },
-                        )),
-                    };
-                    self.state
-                        .send_to_agent(&placement.machine_name, deploy_msg)
-                        .await;
-                }
-                rolled_back.push(service_name.as_str());
-            }
-        }
-
-        let msg = format!(
-            "Rolled back {} services: {}",
-            rolled_back.len(),
-            rolled_back.join(", ")
-        );
-        tracing::info!("{msg}");
-
+        let update = super::controller::Controller::wait_for(&mut updates, revision)
+            .await
+            .ok_or_else(|| Status::unavailable("reconcile loop stopped"))?;
         Ok(Response::new(RollbackResponse {
-            success: true,
-            message: msg,
+            success: update.status == crate::proto::ApplyStatus::ApplySucceeded,
+            message: format!(
+                "Rolled back to revision {wanted} as revision {revision}. {}",
+                update.message
+            ),
+            revision,
+        }))
+    }
+
+    async fn list_config_revisions(
+        &self,
+        request: Request<crate::proto::ListConfigRevisionsRequest>,
+    ) -> Result<Response<crate::proto::ListConfigRevisionsResponse>, Status> {
+        require_permission(&request, Permission::Read)?;
+        let revisions = self.raft_state.config_revisions().await;
+        let current = revisions.last().map(|r| r.revision);
+        let revisions = revisions
+            .into_iter()
+            .map(|r| crate::proto::ConfigRevisionInfo {
+                current: Some(r.revision) == current,
+                revision: r.revision,
+                flake_ref: r.flake_ref,
+                applied_at: r.applied_at,
+                applied_by: r.applied_by,
+                rollback_of: r.rollback_of.unwrap_or(0),
+            })
+            .collect();
+        Ok(Response::new(crate::proto::ListConfigRevisionsResponse {
+            revisions,
         }))
     }
 
@@ -2078,6 +1912,11 @@ pub async fn serve_grpc(
     .with_ca(ca.clone())
     .with_fleet_key(fleet_key)
     .with_bearer_agents(allow_bearer_agents);
+    service.controller().spawn(
+        trust_bundle_pem.clone(),
+        super::controller::RECONCILE_INTERVAL,
+        shutdown.clone(),
+    );
     if allow_bearer_agents {
         tracing::warn!("Accepting bearer-token agents (development mode)");
     }
@@ -2100,6 +1939,13 @@ pub async fn serve_grpc(
         .await?;
 
     Ok(())
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 #[cfg(test)]

@@ -38,9 +38,11 @@ foreign distro, so no `/run/current-system` or NixOS module is required.
 
 ## Try it locally
 
+`<your-fleet-flake>` is a flake that exposes this `fleet.nix` as its `fleet` output (see the quickstart, step 4); the server evaluates it.
+
 ```bash
 ekafleet dev
-ekafleet plan --config examples/standalone-nonnixos/fleet.nix --server 127.0.0.1:7400
+ekafleet plan --flake <your-fleet-flake> --server 127.0.0.1:7400
 ```
 
 ## Deploy for real
@@ -54,7 +56,7 @@ TOKEN=$(ekafleet token create --type=agent)
 ekafleet agent --join server-ip:7400 --join-token "$TOKEN" --ca-cert /path/to/ca.pem
 
 # Apply the configuration from the control host
-ekafleet apply --config examples/standalone-nonnixos/fleet.nix
+ekafleet apply --flake <your-fleet-flake>
 ```
 
 ## Flakes-only hosts

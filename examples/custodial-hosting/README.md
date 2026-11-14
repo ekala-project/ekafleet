@@ -4,6 +4,8 @@ Demonstrates how to use ekafleet as the IaaS layer for a multi-tenant hosting pl
 
 ## Architecture
 
+`<your-fleet-flake>` is a flake that exposes this `fleet.nix` as its `fleet` output (see the quickstart, step 4); the server evaluates it.
+
 ```text
 Customer UI / API
        │
@@ -14,7 +16,7 @@ Web Service (generates Nix config from customer choices)
 fleet.nix (uses nix/lib/catalog.nix templates)
        │
        ▼
-ekafleet apply --config fleet.nix --watch
+ekafleet apply --flake <your-fleet-flake> --watch
        │
        ▼
 Agents deploy services with cgroup enforcement, SPIFFE identity, secrets
@@ -46,11 +48,11 @@ Each customer's services are isolated via:
 
 ```bash
 # Deploy all customer services
-ekafleet apply --config examples/custodial-hosting/fleet.nix
+ekafleet apply --flake <your-fleet-flake>
 
 # Create a namespace-scoped token for Customer A
 ekafleet acl token create --role viewer --namespace customer-a --description "Customer A dashboard"
 
 # Continuous reconciliation
-ekafleet apply --config examples/custodial-hosting/fleet.nix --watch
+ekafleet apply --flake <your-fleet-flake> --watch
 ```

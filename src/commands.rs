@@ -278,15 +278,39 @@ pub async fn cmd_agent(args: AgentArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn cmd_plan(config: PathBuf, server: String) -> anyhow::Result<()> {
-    let mut client = connect_server(&server).await?;
-    let resp = client
-        .plan(PlanRequest {
-            config_path: config.display().to_string(),
-        })
-        .await?;
-    let plan = resp.into_inner();
+/// Turn a local flake path into an absolute one so the server (which
+/// evaluates the flake) does not resolve it against its own working
+/// directory. Other references (`github:…`, `git+https://…`) pass through.
+pub fn resolve_flake_ref(flake_ref: &str) -> String {
+    let (flake, attr) = match flake_ref.split_once('#') {
+        Some((flake, attr)) => (flake, Some(attr)),
+        None => (flake_ref, None),
+    };
+    let is_path = !flake.contains(':') || flake.starts_with("path:");
+    let local = flake.strip_prefix("path:").unwrap_or(flake);
+    let flake = match std::fs::canonicalize(local) {
+        Ok(abs) if is_path => abs.display().to_string(),
+        _ => flake.to_string(),
+    };
+    match attr {
+        Some(attr) => format!("{flake}#{attr}"),
+        None => flake,
+    }
+}
 
+pub async fn cmd_plan(flake: String, server: String) -> anyhow::Result<()> {
+    let mut client = connect_server(&server).await?;
+    let plan = client
+        .plan(PlanRequest {
+            flake_ref: resolve_flake_ref(&flake),
+        })
+        .await?
+        .into_inner();
+    print_plan(&plan);
+    Ok(())
+}
+
+fn print_plan(plan: &ekafleet::proto::PlanResponse) {
     if !plan.has_changes {
         println!("No changes detected.");
     } else {
@@ -302,31 +326,58 @@ pub async fn cmd_plan(config: PathBuf, server: String) -> anyhow::Result<()> {
             );
         }
     }
-    Ok(())
 }
 
 pub async fn cmd_apply(
-    config: PathBuf,
+    flake: String,
     auto_approve: bool,
     follow: bool,
     server: String,
 ) -> anyhow::Result<()> {
+    use std::io::IsTerminal;
+    let flake_ref = resolve_flake_ref(&flake);
     let mut client = connect_server(&server).await?;
+
+    if !auto_approve {
+        let plan = client
+            .plan(PlanRequest {
+                flake_ref: flake_ref.clone(),
+            })
+            .await?
+            .into_inner();
+        print_plan(&plan);
+        if !std::io::stdin().is_terminal() {
+            anyhow::bail!("Refusing to apply without confirmation; pass --auto-approve");
+        }
+        eprint!("Apply {flake_ref}? [y/N] ");
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim(), "y" | "Y" | "yes") {
+            println!("Apply cancelled.");
+            return Ok(());
+        }
+    }
+
     let mut stream = client
-        .apply(ekafleet::proto::ApplyRequest {
-            config_path: config.display().to_string(),
-            auto_approve,
-            watch: follow,
-        })
+        .apply(ekafleet::proto::ApplyRequest { flake_ref, follow })
         .await?
         .into_inner();
 
+    let mut failed = false;
     while let Some(event) = stream.message().await? {
         let status = ekafleet::proto::ApplyStatus::try_from(event.status)
             .unwrap_or(ekafleet::proto::ApplyStatus::ApplyPending);
-        println!("[{:?}] {} — {}", status, event.operation_id, event.message);
+        failed = status == ekafleet::proto::ApplyStatus::ApplyFailed;
+        let label = match status {
+            ekafleet::proto::ApplyStatus::ApplyFailed => "failed",
+            ekafleet::proto::ApplyStatus::ApplySucceeded => "done",
+            _ => "...",
+        };
+        println!("[{label}] {}", event.message);
     }
-    println!("Apply complete.");
+    if failed {
+        anyhow::bail!("Apply failed");
+    }
     Ok(())
 }
 
@@ -434,32 +485,85 @@ pub async fn cmd_drift(server: String) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn cmd_rollback(
-    machine: Option<String>,
-    all: bool,
-    to: Option<u64>,
-    server: String,
-) -> anyhow::Result<()> {
-    if machine.is_none() && !all {
-        anyhow::bail!("Specify a machine name or --all");
-    }
-
+pub async fn cmd_rollback(to: Option<u64>, server: String) -> anyhow::Result<()> {
     let mut client = connect_server(&server).await?;
-    let resp = client
+    let result = client
         .rollback(RollbackRequest {
-            machine: machine.unwrap_or_default(),
-            all,
-            to_generation: to.unwrap_or(0),
+            to_revision: to.unwrap_or(0),
         })
-        .await?;
-    let result = resp.into_inner();
-
+        .await?
+        .into_inner();
     if result.success {
         println!("{}", result.message);
     } else {
         anyhow::bail!("Rollback failed: {}", result.message);
     }
     Ok(())
+}
+
+pub async fn cmd_history(server: String, output: &OutputFormat) -> anyhow::Result<()> {
+    let mut client = connect_server(&server).await?;
+    let revisions = client
+        .list_config_revisions(ekafleet::proto::ListConfigRevisionsRequest {})
+        .await?
+        .into_inner()
+        .revisions;
+    if matches!(output, OutputFormat::Json) {
+        let json: Vec<_> = revisions
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "revision": r.revision,
+                    "flakeRef": r.flake_ref,
+                    "appliedAt": r.applied_at,
+                    "appliedBy": r.applied_by,
+                    "rollbackOf": (r.rollback_of > 0).then_some(r.rollback_of),
+                    "current": r.current,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&json)?);
+        return Ok(());
+    }
+    if revisions.is_empty() {
+        println!("No configuration has been applied yet.");
+        return Ok(());
+    }
+    println!(
+        "{:<4} {:>8}  {:<20} {:<12} FLAKE",
+        "", "REVISION", "APPLIED", "BY"
+    );
+    for r in revisions.iter().rev() {
+        let note = if r.rollback_of > 0 {
+            format!(" (rollback of {})", r.rollback_of)
+        } else {
+            String::new()
+        };
+        println!(
+            "{:<4} {:>8}  {:<20} {:<12} {}{note}",
+            if r.current { "*" } else { "" },
+            r.revision,
+            ago(r.applied_at),
+            r.applied_by,
+            r.flake_ref,
+        );
+    }
+    Ok(())
+}
+
+/// "5m ago"-style rendering of a Unix timestamp.
+fn ago(epoch: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let secs = now.saturating_sub(epoch);
+    match secs {
+        0..60 => format!("{secs}s ago"),
+        60..3600 => format!("{}m ago", secs / 60),
+        3600..86400 => format!("{}h ago", secs / 3600),
+        _ => format!("{}d ago", secs / 86400),
+    }
 }
 
 pub async fn cmd_capacity(server: String) -> anyhow::Result<()> {

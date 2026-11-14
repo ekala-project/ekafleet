@@ -214,7 +214,7 @@ fn plan_help() {
         .args(["plan", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("--config").and(predicate::str::contains("--server")));
+        .stdout(predicate::str::contains("--flake").and(predicate::str::contains("--server")));
 }
 
 #[test]
@@ -232,9 +232,9 @@ fn apply_help() {
         .assert()
         .success()
         .stdout(
-            predicate::str::contains("--config")
+            predicate::str::contains("--flake")
                 .and(predicate::str::contains("--auto-approve"))
-                .and(predicate::str::contains("--watch"))
+                .and(predicate::str::contains("--follow"))
                 .and(predicate::str::contains("--server")),
         );
 }
@@ -285,19 +285,28 @@ fn rollback_help() {
         .assert()
         .success()
         .stdout(
-            predicate::str::contains("--all")
-                .and(predicate::str::contains("--to"))
-                .and(predicate::str::contains("--server")),
+            predicate::str::contains("--to")
+                .and(predicate::str::contains("--server"))
+                .and(predicate::str::contains("--all").not()),
         );
 }
 
 #[test]
-fn rollback_without_args_gives_guidance() {
+fn rollback_takes_a_revision_not_a_machine() {
     ekafleet()
-        .args(["rollback"])
+        .args(["rollback", "node-1"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("Specify a machine name or --all"));
+        .stderr(predicate::str::contains("unexpected argument"));
+}
+
+#[test]
+fn history_help() {
+    ekafleet()
+        .args(["history", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--server"));
 }
 
 // ─── Capacity subcommand ────────────────────────────────────────────

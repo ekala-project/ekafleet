@@ -15,11 +15,12 @@ ekafleet agent --join server:7400 --node-name web-1 --join-token-file jt --ca-ce
 
 ```bash
 ekafleet validate --config fleet.nix            # Validate config offline
-ekafleet plan --config fleet.nix                # Preview changes
-ekafleet apply --config fleet.nix               # Deploy
-ekafleet apply --config fleet.nix --watch       # Continuous reconciliation + autoscaling
-ekafleet rollback --all                         # Rollback all to previous generation
-ekafleet rollback node-1 --to 5                 # Rollback specific machine to gen 5
+ekafleet plan --flake .                         # Preview changes (server evaluates the flake)
+ekafleet apply --flake .                        # Plan, confirm, record a revision, reconcile
+ekafleet apply --flake . --auto-approve --follow  # Apply and stream later reconciles
+ekafleet history                                # Configuration revisions (* = current)
+ekafleet rollback                               # Re-apply the previous revision
+ekafleet rollback --to 5                        # Re-apply revision 5
 ```
 
 ## Status & Monitoring
