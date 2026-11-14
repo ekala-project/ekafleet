@@ -122,25 +122,65 @@ Create a `fleet.nix` that defines your services and machines:
 }
 ```
 
+Expose it as the `fleet` output of a flake (`flake.nix` next to `fleet.nix`).
+`evalFleet` type-checks it against the fleet schema:
+
+```nix
+{
+  inputs.nixpkgs.url = "github:nixos/nixpkgs/nixpkgs-unstable";
+  inputs.ekafleet.url = "github:ekala-project/ekafleet";
+
+  outputs = { nixpkgs, ekafleet, ... }:
+    let pkgs = nixpkgs.legacyPackages.x86_64-linux; in {
+      fleet = ekafleet.lib.evalFleet {
+        inherit (nixpkgs) lib;
+        userConfig = (import ./fleet.nix { inherit pkgs; }).fleet;
+      };
+    };
+}
+```
+
 ## 5. Plan and Apply
+
+The **server** evaluates the flake, so pass a reference it can fetch: a
+`github:`/`git+https:` URL, or a local path the server can read. Local paths
+are made absolute by the CLI. The attribute defaults to `fleet`.
 
 Preview what will change:
 
 ```bash
-ekafleet plan --config fleet.nix
+ekafleet plan --flake .
 ```
 
-Apply the deployment:
+Apply it. The CLI shows the plan and asks for confirmation (`--auto-approve`
+skips both):
 
 ```bash
-ekafleet apply --config fleet.nix
+ekafleet apply --flake github:my-org/my-fleet
 ```
 
-Or run in continuous reconciliation mode:
+The server resolves the reference (for git flakes, to the exact commit; commit
+your changes so history shows which one), stores the evaluated configuration
+in Raft as a new **revision**, and from then on
+reconciles toward it on its own: every 30 seconds and whenever a node joins or
+leaves or a service fails, including after a server restart. `apply` returns
+once the first reconcile of the new revision finishes. To keep watching later
+reconciles:
 
 ```bash
-ekafleet apply --config fleet.nix --watch
+ekafleet apply --flake github:my-org/my-fleet --auto-approve --follow
 ```
+
+List revisions and roll back:
+
+```bash
+ekafleet history            # * marks the current revision
+ekafleet rollback           # re-apply the previous revision
+ekafleet rollback --to 3    # re-apply revision 3
+```
+
+A rollback re-applies the whole recorded configuration (services, ports,
+environment, placement) as a new revision. The last 10 revisions are kept.
 
 ## 6. Check Status
 

@@ -45,6 +45,10 @@ struct StateMachineInner {
     /// share a subnet or an overlay segment.
     #[serde(default)]
     namespace_subnets: HashMap<String, u8>,
+    /// Applied fleet configurations, oldest first; the last one is what the
+    /// server reconciles toward. At most [`MAX_CONFIG_REVISIONS`].
+    #[serde(default)]
+    config_revisions: Vec<ConfigRevision>,
     /// Last applied log index
     last_applied: u64,
 }
@@ -86,6 +90,31 @@ pub struct DeploymentRevision {
 
 /// Revisions kept per service for rollback.
 pub const MAX_DEPLOYMENT_HISTORY: usize = 10;
+
+/// Number of applied fleet configurations kept for `ekafleet rollback`.
+pub const MAX_CONFIG_REVISIONS: usize = 10;
+
+/// One applied fleet configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigRevision {
+    /// Starts at 1 and increases with every apply or rollback.
+    pub revision: u64,
+    /// The flake reference the configuration was evaluated from.
+    pub flake_ref: String,
+    /// The evaluated configuration, exactly as `nix eval --json` printed it.
+    pub config_json: String,
+    pub applied_at: u64,
+    /// Principal that applied it, as recorded in the audit log.
+    pub applied_by: String,
+    /// Set when this revision re-applies an earlier one.
+    pub rollback_of: Option<u64>,
+}
+
+impl ConfigRevision {
+    pub fn config(&self) -> Result<crate::config::FleetConfig, serde_json::Error> {
+        serde_json::from_str(&self.config_json)
+    }
+}
 
 impl DeploymentState {
     /// The revision recorded as `generation`, current or historical.
@@ -130,6 +159,14 @@ struct DnsEntry {
 /// Commands that can be applied to the state machine via Raft log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Command {
+    /// Record a new desired fleet configuration (apply or rollback).
+    ApplyConfig {
+        flake_ref: String,
+        config_json: String,
+        applied_at: u64,
+        applied_by: String,
+        rollback_of: Option<u64>,
+    },
     Deploy {
         service_name: String,
         store_path: String,
@@ -425,6 +462,28 @@ impl FleetStateMachine {
             Command::UntrackCloudInstance { instance_id } => {
                 state.cloud_instances.remove(&instance_id);
             }
+            Command::ApplyConfig {
+                flake_ref,
+                config_json,
+                applied_at,
+                applied_by,
+                rollback_of,
+            } => {
+                let revision = state.config_revisions.last().map_or(1, |r| r.revision + 1);
+                state.config_revisions.push(ConfigRevision {
+                    revision,
+                    flake_ref,
+                    config_json,
+                    applied_at,
+                    applied_by,
+                    rollback_of,
+                });
+                let excess = state
+                    .config_revisions
+                    .len()
+                    .saturating_sub(MAX_CONFIG_REVISIONS);
+                state.config_revisions.drain(..excess);
+            }
             Command::AllocateNamespaceSubnet { namespace, octet } => {
                 state.namespace_subnets.insert(namespace, octet);
             }
@@ -464,6 +523,25 @@ impl FleetStateMachine {
     }
 
     /// Get all current deployments.
+    /// Record `command` (an [`Command::ApplyConfig`]) and return the
+    /// revision it created.
+    pub async fn apply_config(&self, command: Command) -> Result<u64, RaftError> {
+        debug_assert!(matches!(command, Command::ApplyConfig { .. }));
+        let mut state = self.inner.write().await;
+        self.commit_locked(&mut state, command).await?;
+        Ok(state.config_revisions.last().map_or(0, |r| r.revision))
+    }
+
+    /// The configuration the server currently reconciles toward.
+    pub async fn current_config(&self) -> Option<ConfigRevision> {
+        self.inner.read().await.config_revisions.last().cloned()
+    }
+
+    /// Retained configuration revisions, oldest first.
+    pub async fn config_revisions(&self) -> Vec<ConfigRevision> {
+        self.inner.read().await.config_revisions.clone()
+    }
+
     pub async fn all_deployments(&self) -> HashMap<String, DeploymentState> {
         let state = self.inner.read().await;
         state.deployments.clone()
@@ -781,6 +859,55 @@ mod tests {
         // a's freed host address is reused.
         let a3 = restarted.ensure_namespace_ip("a", "api@n1").await.unwrap();
         assert_eq!(a3, Some(a2));
+    }
+
+    fn apply_config_cmd(flake_ref: &str, rollback_of: Option<u64>) -> Command {
+        Command::ApplyConfig {
+            flake_ref: flake_ref.into(),
+            config_json: format!("{{\"ref\":\"{flake_ref}\"}}"),
+            applied_at: 1,
+            applied_by: "tester".into(),
+            rollback_of,
+        }
+    }
+
+    #[tokio::test]
+    async fn config_revisions_are_numbered_bounded_and_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(RaftStorage::new(dir.path(), &[3u8; 32]));
+        storage.initialize().await.unwrap();
+        let sm = FleetStateMachine::with_log(storage);
+        assert!(sm.current_config().await.is_none());
+        for i in 1..=12u64 {
+            let rev = sm
+                .apply_config(apply_config_cmd(&format!("r{i}"), None))
+                .await
+                .unwrap();
+            assert_eq!(rev, i);
+        }
+        let rev = sm
+            .apply_config(apply_config_cmd("r5", Some(5)))
+            .await
+            .unwrap();
+        assert_eq!(rev, 13);
+
+        let restarted =
+            FleetStateMachine::with_log(Arc::new(RaftStorage::new(dir.path(), &[3u8; 32])));
+        restarted.load().await.unwrap();
+        let revisions = restarted.config_revisions().await;
+        assert_eq!(revisions.len(), MAX_CONFIG_REVISIONS);
+        assert_eq!(revisions[0].revision, 4);
+        let current = restarted.current_config().await.unwrap();
+        assert_eq!((current.revision, current.rollback_of), (13, Some(5)));
+        assert_eq!(current.flake_ref, "r5");
+        // Numbering continues after a restart.
+        assert_eq!(
+            restarted
+                .apply_config(apply_config_cmd("r14", None))
+                .await
+                .unwrap(),
+            14
+        );
     }
 
     #[tokio::test]

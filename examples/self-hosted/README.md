@@ -16,9 +16,11 @@ A bare-metal fleet with three statically declared NixOS machines. No cloud provi
 
 ## Try it locally
 
+`<your-fleet-flake>` is a flake that exposes this `fleet.nix` as its `fleet` output (see the quickstart, step 4); the server evaluates it.
+
 ```bash
 ekafleet dev
-ekafleet plan --config examples/self-hosted/fleet.nix --server 127.0.0.1:7400
+ekafleet plan --flake <your-fleet-flake> --server 127.0.0.1:7400
 ```
 
 ## Deploy for real
@@ -32,5 +34,5 @@ TOKEN=$(ekafleet token create --type=agent)
 ekafleet agent --join server-ip:7400 --join-token $TOKEN --ca-cert /path/to/ca.pem
 
 # Apply the configuration
-ekafleet apply --config examples/self-hosted/fleet.nix
+ekafleet apply --flake <your-fleet-flake>
 ```

@@ -177,24 +177,31 @@ services.backup = {
 ## Manual Operations
 
 ```bash
-# Preview changes
-ekafleet plan --config fleet.nix
+# Preview changes (the server evaluates the flake's `fleet` output)
+ekafleet plan --flake github:my-org/my-fleet
 
 # Apply with confirmation
-ekafleet apply --config fleet.nix
+ekafleet apply --flake github:my-org/my-fleet
 
 # Apply without confirmation
-ekafleet apply --config fleet.nix --auto-approve
+ekafleet apply --flake github:my-org/my-fleet --auto-approve
 
-# Continuous reconciliation
-ekafleet apply --config fleet.nix --watch
+# Apply and keep streaming the server's later reconciles
+ekafleet apply --flake github:my-org/my-fleet --auto-approve --follow
 
-# Rollback a specific machine
-ekafleet rollback app-1
+# List configuration revisions
+ekafleet history
 
-# Rollback all machines
-ekafleet rollback --all
+# Re-apply the previous revision
+ekafleet rollback
 
-# Rollback to a specific generation
-ekafleet rollback --all --to=5
+# Re-apply revision 5
+ekafleet rollback --to 5
 ```
+
+Each apply records a configuration revision in Raft: the locked flake
+reference and the evaluated configuration. The server reconciles toward the
+current revision on its own (every 30 seconds, on fleet events, and after
+restarts), so the CLI does not need to stay connected. A rollback re-applies
+an earlier revision's whole configuration as a new revision; the last 10 are
+kept.
