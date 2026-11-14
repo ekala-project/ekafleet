@@ -127,7 +127,7 @@ The dashboard uses the same REST API endpoints as the CLI and requires authentic
 
 ## Key-Value Store
 
-ekafleet provides a general-purpose key-value store (similar to Consul KV) for coordination primitives:
+ekafleet provides a general-purpose key-value store (similar to Consul KV). Writes are persisted in the server's encrypted Raft log before they are acknowledged, so they survive restarts. Reads need the `viewer` role; writes and deletes need `operator` or `admin`:
 
 ```bash
 # Write a key
@@ -144,7 +144,7 @@ curl -H "Authorization: Bearer $TOKEN" http://server:7402/v1/kv?prefix=config/
 curl -X DELETE -H "Authorization: Bearer $TOKEN" http://server:7402/v1/kv/my-key
 ```
 
-Use the KV store for leader election, distributed locks, feature flags, and configuration sharing.
+Use the KV store for feature flags and configuration sharing. There is no compare-and-set yet, so it is not suitable for locks or leader election.
 
 ## Metric Queries
 

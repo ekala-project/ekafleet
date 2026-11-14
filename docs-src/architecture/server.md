@@ -19,14 +19,17 @@ Start with `ekafleet server`. The server runs the control plane and can optional
 
 ## State Machine
 
-The server maintains a persistent state machine backed by encrypted log entries and snapshots (AES-256-GCM). On startup, `restore_raft_state` loads the latest snapshot and replays trailing log entries so fleet state survives restarts. Multi-node consensus (`--peers`) is parsed but not yet wired; today a single server is authoritative.
+The server maintains a persistent state machine backed by an encrypted write-ahead log and snapshots (AES-256-GCM). Every change is appended to the log (atomically, mode 0600) before it is applied, so an acknowledged write survives a crash. On startup the server loads the latest snapshot and replays the log entries after it. If any file cannot be read (wrong key, corruption), the server **refuses to start** rather than continuing with empty state; restore the data directory from backup or move `raft/` aside explicitly. Multi-node consensus (`--peers`) is parsed but not yet wired; today a single server is authoritative.
 
 The state machine stores:
-- Fleet state (what's deployed where)
-- Encrypted secrets
-- Scheduling plans
+- Deployments: per service, the current store path, placements, a generation number (bumped when the store path changes) and the last 10 revisions. The reconciler records a deployment after a successful rollout and removes it when the service leaves the config
+- Runtime replica overrides (`ekafleet scale`)
+- The REST KV store (under an internal `user/` prefix)
 - DNS zone data
-- Cloud instance tracking (cloud VM ID to fleet node ID mappings)
+- Cloud instance and cloud image tracking (cloud VM ID to fleet node ID mappings)
+- Namespace IP allocations
+
+The `Restore` RPC installs an operator-supplied snapshot under a fresh log index and replaces the persisted state with it.
 
 ## State Persistence
 
@@ -40,17 +43,19 @@ Server state is stored in `--data-dir` (default: `/var/lib/ekafleet`):
 ├── ca-intermediate-key.pem # Short-lived intermediate CA key (sealed¹, mode 0600)
 ├── ca-intermediate-cert.pem# Intermediate CA certificate
 ├── fleet-key               # Fleet encryption key (sealed¹, mode 0600)
+├── raft-key                # Raft storage key (sealed¹, mode 0600), independent of fleet-key rotation
 ├── tokens.json             # Persisted ACL tokens (keyed by SHA-256 digest)
+├── join_tokens.json        # Pending join tokens (SHA-256 hashes, mode 0600)
 └── raft/
-    ├── log/                # Encrypted log entries (AES-256-GCM)
-    └── snapshots/          # Encrypted state machine snapshots
+    ├── log/                # Encrypted write-ahead log entries (AES-256-GCM, index-bound AAD)
+    └── snapshots/          # Latest encrypted state machine snapshot
 ```
 
 With an external `ca-signer`, the `ca-*.pem` files live in its own data directory (`/var/lib/ekafleet-ca` under the NixOS module) instead.
 
 ¹ When `EKAFLEET_SEAL_PASSPHRASE` (or `EKAFLEET_SEAL_PASSPHRASE_FILE`, a file holding it) is set, key files are encrypted at rest using PBKDF2-HMAC-SHA256 + AES-256-GCM envelope encryption. Without it, they are stored as plaintext with a warning. In-memory copies of all key material are wrapped in `Zeroizing<T>` so they are cleared on drop.
 
-Log compaction happens automatically after snapshots to prevent unbounded growth.
+A snapshot is taken roughly every 100 minutes; it replaces older snapshots and the log entries it covers are removed. Data directories created before `raft-key` existed (Raft storage encrypted with the fleet key) are read once with the fleet key and re-encrypted under `raft-key` on boot.
 
 ## Built-in Certificate Authority
 
@@ -98,6 +103,8 @@ The fleet encryption key can be rotated at runtime via the `RotateFleetKey` gRPC
 2. Re-encrypts every secret in the store under the new key
 3. Persists the new key to `<data-dir>/fleet-key`
 4. Pushes fresh HKDF-derived keys to all connected agents
+
+Raft storage has its own key (`raft-key`), so rotating the fleet key does not affect persisted fleet state.
 
 The key carries a monotonic version number so agents can detect rotations. Agents that connect after a rotation receive the current key version automatically. Rotation does not require downtime — agents update their decryption key in-place and continue injecting secrets normally.
 

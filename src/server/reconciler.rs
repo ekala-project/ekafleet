@@ -10,7 +10,7 @@ use super::nix;
 use super::scheduler::{self, CurrentPlacements, Placement};
 use super::state::FleetState;
 use crate::config::{self, CapacityConfig, FleetConfig, MachineConfig};
-use crate::raft::state::FleetStateMachine;
+use crate::raft::state::{Command, FleetStateMachine, PlacementRecord};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReconcileError {
@@ -964,6 +964,7 @@ async fn apply_plan(
     // definition — including resource limits — before starting workloads,
     // and stop services no longer assigned to them.
     send_desired_state(desired, plan, state, raft_state, &keep_previous).await;
+    record_undeploys(desired, raft_state).await?;
 
     // Compute deployment order
     let tiers = deployer::compute_deploy_order(&desired.services);
@@ -1019,9 +1020,13 @@ async fn apply_plan(
                     total_replicas: service_cfg.scheduling.replicas,
                     previous_store_path,
                 };
+                let store_path = deploy_plan.store_path.clone();
 
                 match deployer::execute(state, deploy_plan, events).await {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        record_deployment(raft_state, service_name, &store_path, &op.placements)
+                            .await?;
+                    }
                     Err(deployer::DeployError::AwaitingPromotion(id)) => {
                         tracing::info!(
                             service = %service_name,
@@ -1035,6 +1040,55 @@ async fn apply_plan(
         }
     }
 
+    Ok(())
+}
+
+/// Record a completed rollout in Raft, unless it changes nothing (the
+/// reconciler re-converges unchanged services every cycle).
+async fn record_deployment(
+    raft_state: &FleetStateMachine,
+    service_name: &str,
+    store_path: &str,
+    placements: &[Placement],
+) -> Result<(), crate::raft::RaftError> {
+    let placements: Vec<PlacementRecord> = placements
+        .iter()
+        .map(|p| PlacementRecord {
+            instance_id: p.instance_id.clone(),
+            machine_name: p.machine_name.clone(),
+        })
+        .collect();
+    if let Some(current) = raft_state.get_deployment(service_name).await
+        && !current.differs_from(store_path, &placements)
+    {
+        return Ok(());
+    }
+    raft_state
+        .apply_next(Command::Deploy {
+            service_name: service_name.to_string(),
+            store_path: store_path.to_string(),
+            placements,
+        })
+        .await?;
+    Ok(())
+}
+
+/// Forget deployments of services that left the desired state. Agents have
+/// already been sent desired state without them.
+async fn record_undeploys(
+    desired: &FleetConfig,
+    raft_state: &FleetStateMachine,
+) -> Result<(), crate::raft::RaftError> {
+    for service_name in raft_state.all_deployments().await.into_keys() {
+        if !desired.services.contains_key(&service_name) {
+            raft_state
+                .apply_next(Command::Undeploy {
+                    service_name: service_name.clone(),
+                })
+                .await?;
+            tracing::info!(service = %service_name, "Deployment removed from fleet state");
+        }
+    }
     Ok(())
 }
 
@@ -1263,8 +1317,12 @@ mod tests {
         let tracker = InstanceTracker::new(raft);
         tracker
             .track("i-abc", "aws", "workers", Some("10.0.1.5"))
-            .await;
-        tracker.associate_node("i-abc", "node-cloud-1").await;
+            .await
+            .unwrap();
+        tracker
+            .associate_node("i-abc", "node-cloud-1")
+            .await
+            .unwrap();
 
         let result = merge_dynamic_machines(&config, Some(&tracker)).await;
         assert_eq!(result.len(), 1);
@@ -1285,7 +1343,8 @@ mod tests {
         // Tracked but not joined — no fleet_node_id
         tracker
             .track("i-pending", "aws", "workers", Some("10.0.1.5"))
-            .await;
+            .await
+            .unwrap();
 
         let result = merge_dynamic_machines(&config, Some(&tracker)).await;
         assert!(result.is_empty());
@@ -1316,8 +1375,9 @@ mod tests {
         // Cloud instance joined with same node_id as a static machine
         tracker
             .track("i-dup", "aws", "default", Some("10.0.0.99"))
-            .await;
-        tracker.associate_node("i-dup", "node-1").await;
+            .await
+            .unwrap();
+        tracker.associate_node("i-dup", "node-1").await.unwrap();
 
         let result = merge_dynamic_machines(&config, Some(&tracker)).await;
         assert_eq!(result.len(), 1);
@@ -1546,5 +1606,47 @@ mod tests {
         assert!(desired_services(&mut rx2).is_empty());
         assert!(assignments.is_assigned("node-1", "db").await);
         assert!(!assignments.is_assigned("node-2", "db").await);
+    }
+
+    fn placed(instance: &str, machine: &str) -> Placement {
+        Placement {
+            service_name: "web".into(),
+            instance_id: instance.into(),
+            machine_name: machine.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn rollouts_are_recorded_once_and_removed_services_undeployed() {
+        let raft = FleetStateMachine::new();
+        let placements = [placed("web-0", "node-1")];
+        record_deployment(&raft, "web", "/nix/store/a", &placements)
+            .await
+            .unwrap();
+        // Re-converging an unchanged service writes nothing.
+        record_deployment(&raft, "web", "/nix/store/a", &placements)
+            .await
+            .unwrap();
+        assert_eq!(raft.last_applied().await, 1);
+
+        record_deployment(&raft, "web", "/nix/store/b", &placements)
+            .await
+            .unwrap();
+        let web = raft.get_deployment("web").await.unwrap();
+        assert_eq!(
+            (web.generation, web.store_path.as_str()),
+            (2, "/nix/store/b")
+        );
+        assert_eq!(web.revision(1).unwrap().store_path, "/nix/store/a");
+
+        let mut desired = empty_fleet_config();
+        desired.services.insert("web".into(), simple_service());
+        record_undeploys(&desired, &raft).await.unwrap();
+        assert!(raft.get_deployment("web").await.is_some());
+
+        record_undeploys(&empty_fleet_config(), &raft)
+            .await
+            .unwrap();
+        assert!(raft.get_deployment("web").await.is_none());
     }
 }

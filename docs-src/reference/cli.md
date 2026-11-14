@@ -455,7 +455,7 @@ All `/v1/` REST endpoints require a bearer token:
 curl -H "Authorization: Bearer $TOKEN" http://server:7402/v1/status
 ```
 
-The token is validated against the RBAC token store. Viewers can access read endpoints; operators and admins can access write endpoints.
+The token is validated against the RBAC token store. `GET` requests need the `Read` permission (viewer, operator, admin); every other method (KV writes and deletes, alert silences) needs `Deploy` (operator, admin) and otherwise returns `403`.
 
 ## REST API
 

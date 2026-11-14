@@ -134,26 +134,32 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     // The ScalingActuator is started later when a fleet config is available
     // (via `ekafleet apply --watch`), since it needs the pool/cloud configuration
     // from the evaluated Nix config. See cloud::actuator::ScalingActuator.
-    let raft_state = FleetStateMachine::new();
-
-    // Persistent (encrypted) Raft storage for snapshots and log. Encryption
-    // reuses the fleet key. On boot we restore the latest snapshot and replay
-    // any log entries recorded after it, so fleet state survives restarts.
+    // Fleet state persists in an encrypted, write-ahead Raft log plus
+    // snapshots under a dedicated storage key (fleet-key rotation must not
+    // strand it). Storage written by older versions under the fleet key is
+    // read with it once and re-encrypted. Unreadable state is fatal: the
+    // server never silently starts over with an empty fleet.
     let raft_storage = {
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&fleet_key);
-        let storage = Arc::new(crate::raft::storage::RaftStorage::new(
-            &config.data_dir,
-            &key,
-        ));
-        if let Err(e) = storage.initialize().await {
-            tracing::warn!(error = %e, "Failed to initialize Raft storage");
-        }
-        if let Err(e) = restore_raft_state(&raft_state, &storage).await {
-            tracing::warn!(error = %e, "Failed to restore Raft state from disk, starting empty");
-        }
+        let raft_key = get_or_create_key(&config.data_dir, "raft-key", "Raft storage key").await?;
+        let raft_key = key_array(&raft_key)?;
+        let legacy_key = key_array(&fleet_key)?;
+        let storage = crate::raft::storage::RaftStorage::new(&config.data_dir, &raft_key)
+            .with_legacy_key(&legacy_key);
         storage
+            .initialize()
+            .await
+            .map_err(|e| anyhow::anyhow!("initialize Raft storage: {e}"))?;
+        Arc::new(storage)
     };
+    let raft_state = FleetStateMachine::with_log(raft_storage.clone());
+    raft_state.load().await.map_err(|e| {
+        anyhow::anyhow!(
+            "cannot load fleet state from {}: {e}. Refusing to start with empty state; \
+             restore the data directory from backup, or move {} aside to start over",
+            config.data_dir.join("raft").display(),
+            config.data_dir.join("raft").display(),
+        )
+    })?;
 
     let instance_tracker = cloud::instance_tracker::InstanceTracker::new(raft_state.clone());
     let join_token_store = JoinTokenStore::with_persistence(&config.data_dir);
@@ -194,12 +200,12 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         metrics: metrics.clone(),
         alerts: alert_evaluator.clone(),
         event_store: event_store.clone(),
-        raft_storage: raft_storage.clone(),
     };
     tokio::spawn(async move {
         housekeeping_loop(hk_deps, hk_shutdown).await;
     });
 
+    let http_raft_state = grpc_config.raft_state.clone();
     tokio::select! {
         result = api::serve_grpc(grpc_config, fleet_state.clone(), token_store.clone(), grpc_shutdown) => {
             result?;
@@ -212,6 +218,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
             metrics,
             alert_evaluator,
             Some(instance_tracker),
+            http_raft_state,
             jwt_bundle,
             http_tls,
             http_shutdown,
@@ -228,84 +235,68 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
 }
 
 /// Get or create a persistent fleet encryption key (256-bit).
+async fn get_or_create_fleet_key(data_dir: &Path) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+    get_or_create_key(data_dir, "fleet-key", "fleet encryption key").await
+}
+
+/// Get or create a persistent 256-bit key at `data_dir/<file>`.
 ///
 /// The key is stored as hex and sealed at rest when a passphrase is configured
 /// (see [`seal`]). Legacy plaintext-hex files are read transparently.
 /// The returned key is wrapped in [`Zeroizing`] so it is cleared from memory on
 /// drop, consistent with how the WireGuard private key is handled.
-async fn get_or_create_fleet_key(data_dir: &Path) -> anyhow::Result<Zeroizing<Vec<u8>>> {
-    let key_path = data_dir.join("fleet-key");
+async fn get_or_create_key(
+    data_dir: &Path,
+    file: &str,
+    what: &str,
+) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+    let key_path = data_dir.join(file);
     if key_path.exists() {
         let hex_bytes = seal::read_maybe_sealed(&key_path).await?;
         let hex_str = Zeroizing::new(
             String::from_utf8(hex_bytes.to_vec())
-                .map_err(|e| anyhow::anyhow!("invalid fleet key encoding: {e}"))?
+                .map_err(|e| anyhow::anyhow!("invalid {what} encoding: {e}"))?
                 .trim()
                 .to_string(),
         );
-        let key: Vec<u8> = (0..hex_str.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&hex_str[i..i + 2], 16))
-            .collect::<Result<Vec<u8>, _>>()
-            .map_err(|e| anyhow::anyhow!("invalid fleet key hex: {e}"))?;
+        let key: Zeroizing<Vec<u8>> = Zeroizing::new(
+            (0..hex_str.len())
+                .step_by(2)
+                .map(|i| {
+                    hex_str
+                        .get(i..i + 2)
+                        .and_then(|h| u8::from_str_radix(h, 16).ok())
+                })
+                .collect::<Option<Vec<u8>>>()
+                .ok_or_else(|| anyhow::anyhow!("invalid {what} hex"))?,
+        );
         if key.len() != 32 {
-            anyhow::bail!("fleet key must be 32 bytes, got {}", key.len());
+            anyhow::bail!("{what} must be 32 bytes, got {}", key.len());
         }
-        tracing::info!("Fleet encryption key loaded from disk");
-        Ok(Zeroizing::new(key))
+        tracing::info!("{what} loaded from disk");
+        Ok(key)
     } else {
         use ring::rand::{SecureRandom, SystemRandom};
         let rng = SystemRandom::new();
         let mut key = Zeroizing::new([0u8; 32]);
         rng.fill(key.as_mut())
             .map_err(|_| anyhow::anyhow!("RNG failure"))?;
-        let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
-        seal::write_maybe_sealed(&key_path, hex.as_bytes(), "fleet encryption key").await?;
-        tracing::info!("Fleet encryption key generated and persisted");
+        let hex: Zeroizing<String> =
+            Zeroizing::new(key.iter().map(|b| format!("{b:02x}")).collect());
+        seal::write_maybe_sealed(&key_path, hex.as_bytes(), what).await?;
+        tracing::info!("{what} generated and persisted");
         Ok(Zeroizing::new(key.to_vec()))
     }
 }
 
-/// Restore fleet state at boot from the persistent Raft store: load the latest
-/// snapshot into the state machine, then replay any log entries recorded after
-/// the snapshot index. Idempotent — a fresh install with no snapshot/log leaves
-/// the state machine empty.
-///
-/// This is single-node restore-on-boot. True multi-node consensus (leader
-/// election, log replication across `--peers`) is not yet implemented; today a
-/// single server is authoritative and this restores its own durable state.
-async fn restore_raft_state(
-    raft_state: &FleetStateMachine,
-    storage: &crate::raft::storage::RaftStorage,
-) -> anyhow::Result<()> {
-    let snapshot_index = match storage.load_latest_snapshot().await? {
-        Some((index, data)) => {
-            raft_state
-                .restore(&data)
-                .await
-                .map_err(|e| anyhow::anyhow!("snapshot deserialization failed: {e}"))?;
-            tracing::info!(snapshot_index = index, "Restored Raft state from snapshot");
-            index
-        }
-        None => 0,
-    };
-
-    // Replay any log entries recorded after the snapshot. `apply` is idempotent
-    // via the `last_applied` guard, so overlapping entries are ignored.
-    let entries = storage.read_log_from(snapshot_index + 1).await?;
-    let replayed = entries.len();
-    for entry in entries {
-        raft_state.apply(entry.index, entry.command).await;
+/// Copy a 256-bit key into a fixed-size array that is zeroized on drop.
+fn key_array(key: &[u8]) -> anyhow::Result<Zeroizing<[u8; 32]>> {
+    let mut out = Zeroizing::new([0u8; 32]);
+    if key.len() != 32 {
+        anyhow::bail!("expected a 256-bit key, got {} bytes", key.len());
     }
-    if replayed > 0 {
-        tracing::info!(
-            replayed,
-            from_index = snapshot_index + 1,
-            "Replayed Raft log entries at boot"
-        );
-    }
-
-    Ok(())
+    out.copy_from_slice(key);
+    Ok(out)
 }
 
 /// Dependencies for the periodic housekeeping loop.
@@ -316,7 +307,6 @@ struct HousekeepingDeps {
     metrics: crate::metrics::aggregator::MetricsAggregator,
     alerts: crate::metrics::alerting::AlertEvaluator,
     event_store: events::EventStore,
-    raft_storage: Arc<crate::raft::storage::RaftStorage>,
 }
 
 /// Periodic housekeeping loop that runs every 60 seconds to clean up stale
@@ -329,7 +319,6 @@ async fn housekeeping_loop(deps: HousekeepingDeps, shutdown: CancellationToken) 
         metrics,
         alerts,
         event_store,
-        raft_storage,
     } = deps;
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
     let mut tick_count: u64 = 0;
@@ -384,22 +373,10 @@ async fn housekeeping_loop(deps: HousekeepingDeps, shutdown: CancellationToken) 
 
         // 5. Periodic Raft snapshot and log compaction (every ~100 minutes)
         if tick_count.is_multiple_of(100) {
-            let last = raft_state.last_applied().await;
-            if last > 0 {
-                tracing::info!(last_applied = last, "Taking periodic Raft snapshot");
-                let snapshot = raft_state.snapshot().await;
-                match raft_storage.save_snapshot(last, &snapshot).await {
-                    Ok(()) => {
-                        // The snapshot subsumes all log entries up to `last`;
-                        // compact them so the log does not grow without bound.
-                        if let Err(e) = raft_storage.compact_log(last).await {
-                            tracing::warn!(error = %e, "Failed to compact Raft log");
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Failed to persist Raft snapshot");
-                    }
-                }
+            match raft_state.checkpoint().await {
+                Ok(Some(index)) => tracing::info!(index, "Raft state checkpointed"),
+                Ok(None) => {}
+                Err(e) => tracing::warn!(error = %e, "Failed to checkpoint Raft state"),
             }
         }
     }
