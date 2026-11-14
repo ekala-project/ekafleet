@@ -111,22 +111,39 @@ impl NamespaceNetworkManager {
         let netns_name = format!("ekafleet-{namespace}");
         let bridge_name = bridge_name_for(namespace);
 
+        // Each step tolerates leftovers of a previous agent run: services
+        // that kept running are attached to the existing namespace.
+
         // 1. Create network namespace
-        run_ip(&["netns", "add", &netns_name]).await?;
+        if !std::path::Path::new("/run/netns")
+            .join(&netns_name)
+            .exists()
+        {
+            run_ip(&["netns", "add", &netns_name]).await?;
+        }
 
-        // 2. Create bridge and move it into the namespace
-        run_ip(&["link", "add", &bridge_name, "type", "bridge"]).await?;
-        run_ip(&["link", "set", &bridge_name, "netns", &netns_name]).await?;
+        // 2. Create the bridge inside the namespace (bridges cannot be moved
+        // between network namespaces)
+        if run_ip_netns(&netns_name, &["link", "show", &bridge_name])
+            .await
+            .is_err()
+        {
+            run_ip_netns(
+                &netns_name,
+                &["link", "add", &bridge_name, "type", "bridge"],
+            )
+            .await?;
+        }
 
-        // 3. Configure bridge inside the namespace
+        // 3. Configure the bridge
         let cidr = format!("{gateway}/{}", subnet_prefix_len(subnet));
-        run_ip_netns(&netns_name, &["addr", "add", &cidr, "dev", &bridge_name]).await?;
+        run_ip_netns(
+            &netns_name,
+            &["addr", "replace", &cidr, "dev", &bridge_name],
+        )
+        .await?;
         run_ip_netns(&netns_name, &["link", "set", &bridge_name, "up"]).await?;
         run_ip_netns(&netns_name, &["link", "set", "lo", "up"]).await?;
-
-        // 4. Add default route via the gateway for outbound traffic
-        // The host-side veth peer + NAT handles actual routing
-        run_ip_netns(&netns_name, &["route", "add", "default", "via", gateway]).await?;
 
         tracing::info!(
             namespace = %namespace,
@@ -186,6 +203,11 @@ impl NamespaceNetworkManager {
         let veth_host = veth_host_name(service_name);
         let veth_container = veth_container_name(service_name);
 
+        // Drop a pair left by a previous agent run (deleting one end
+        // deletes both).
+        let _ = run_ip_netns(&ns.netns_name, &["link", "del", &veth_host]).await;
+        let _ = run_ip(&["link", "del", &veth_host]).await;
+
         // 1. Create veth pair in the host namespace
         run_ip(&[
             "link",
@@ -216,7 +238,7 @@ impl NamespaceNetworkManager {
         let cidr = format!("{assigned_ip}/24");
         run_ip_netns(
             &ns.netns_name,
-            &["addr", "add", &cidr, "dev", &veth_container],
+            &["addr", "replace", &cidr, "dev", &veth_container],
         )
         .await?;
         run_ip_netns(&ns.netns_name, &["link", "set", &veth_container, "up"]).await?;
