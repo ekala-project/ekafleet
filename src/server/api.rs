@@ -107,6 +107,7 @@ impl FleetControlService {
             grpc_addr,
         );
         let mesh = super::mesh::MeshRegistry::new(raft_state.clone(), domain);
+        state.set_trust_domain(domain.to_string());
         Self {
             controller,
             mesh,
@@ -926,8 +927,8 @@ impl FleetControl for FleetControlService {
         let req = request.into_inner();
         tracing::info!(machine = %req.machine, deadline = req.deadline_seconds, "Drain requested");
 
-        // Mark node as unschedulable so no new services are placed here
-        self.state.set_schedulable(&req.machine, false).await;
+        // No new placements here, and existing ones move elsewhere.
+        self.state.set_draining(&req.machine).await;
 
         // Find services running on this node
         let (_, services, _) = self.state.fleet_status().await;
@@ -950,25 +951,10 @@ impl FleetControl for FleetControlService {
             "Draining services from node"
         );
 
-        // Send an empty DesiredState to the agent so it stops all services
-        // on the drained node. The next reconciliation cycle will reschedule
-        // them onto healthy, schedulable nodes.
-        let drain_msg = ServerMessage {
-            payload: Some(ServerPayload::DesiredState(crate::proto::DesiredState {
-                correlation_id: uuid::Uuid::new_v4().to_string(),
-                services: vec![],
-                system_path: String::new(),
-                namespace_networks: vec![],
-                cache_public_key: String::new(),
-            })),
-        };
-
-        if !self.state.send_to_agent(&req.machine, drain_msg).await {
-            tracing::warn!(
-                machine = %req.machine,
-                "Could not send drain command to agent (node may already be disconnected)"
-            );
-        }
+        // Reconcile now: the node is no longer a placement candidate, so its
+        // services are rescheduled (stateful ones migrating their volumes
+        // first) and its desired state then no longer lists them.
+        self.state.reconcile_trigger().trigger();
 
         Ok(Response::new(DrainResponse {
             success: true,
@@ -1479,6 +1465,8 @@ impl FleetControl for FleetControlService {
         self.state
             .set_schedulable(&req.node_id, req.schedulable)
             .await;
+        // Placement depends on eligibility.
+        self.state.reconcile_trigger().trigger();
 
         Ok(Response::new(UpdateNodeResponse { success: true }))
     }
@@ -1876,6 +1864,54 @@ impl FleetControl for FleetControlService {
         request: Request<crate::proto::DeleteSecretRequest>,
     ) -> Result<Response<crate::proto::DeleteSecretResponse>, Status> {
         self.handle_delete_secret(request).await.map(Response::new)
+    }
+
+    async fn create_volume_snapshot(
+        &self,
+        request: Request<crate::proto::VolumeSnapshotRequest>,
+    ) -> Result<Response<crate::proto::VolumeSnapshotResponse>, Status> {
+        self.handle_volume_snapshot(
+            request,
+            crate::proto::VolumeSnapshotAction::VolumeSnapshotCreate,
+        )
+        .await
+        .map(Response::new)
+    }
+
+    async fn list_volume_snapshots(
+        &self,
+        request: Request<crate::proto::VolumeSnapshotRequest>,
+    ) -> Result<Response<crate::proto::VolumeSnapshotResponse>, Status> {
+        self.handle_volume_snapshot(
+            request,
+            crate::proto::VolumeSnapshotAction::VolumeSnapshotList,
+        )
+        .await
+        .map(Response::new)
+    }
+
+    async fn restore_volume_snapshot(
+        &self,
+        request: Request<crate::proto::VolumeSnapshotRequest>,
+    ) -> Result<Response<crate::proto::VolumeSnapshotResponse>, Status> {
+        self.handle_volume_snapshot(
+            request,
+            crate::proto::VolumeSnapshotAction::VolumeSnapshotRestore,
+        )
+        .await
+        .map(Response::new)
+    }
+
+    async fn delete_volume_snapshot(
+        &self,
+        request: Request<crate::proto::VolumeSnapshotRequest>,
+    ) -> Result<Response<crate::proto::VolumeSnapshotResponse>, Status> {
+        self.handle_volume_snapshot(
+            request,
+            crate::proto::VolumeSnapshotAction::VolumeSnapshotDelete,
+        )
+        .await
+        .map(Response::new)
     }
 }
 

@@ -6,6 +6,7 @@ use tokio::sync::{RwLock, mpsc};
 
 use super::helpers::{install_node_svid, install_received_svid};
 use super::netns::NamespaceNetworkManager;
+use super::storage::VolumeManager;
 use super::supervisor;
 use super::types::{LocalState, NodeIdentity, PendingKeyStore};
 use crate::agent::health::HealthChecker;
@@ -53,16 +54,22 @@ async fn fetch_service_closures(
 }
 
 /// Bring the supervisor's services in line with the desired state: drop
-/// secret files no service declares, render templates, and (re)start
-/// services, except new ones still waiting for a declared secret.
-async fn converge_services(
+/// secret files no service declares, provision and reclaim volumes, render
+/// templates, and (re)start services, except new ones still waiting for a
+/// declared secret and services held for a volume operation (which stop).
+pub(super) async fn converge_services(
     supervisor: &Arc<RwLock<supervisor::Supervisor>>,
     local_state: &Arc<RwLock<LocalState>>,
     secret_injector: &Arc<RwLock<SecretInjector>>,
     templates: &Arc<TemplateManager>,
     dns: &Arc<AgentDns>,
+    volumes: &Arc<VolumeManager>,
 ) {
     let all = local_state.read().await.desired_services.clone();
+    if let Err(e) = volumes.provision(all.values()).await {
+        tracing::error!(error = %e, "Cannot provision volumes");
+    }
+    volumes.release_unassigned(all.keys().map(String::as_str));
     let mut desired = std::collections::HashMap::new();
     {
         let injector = secret_injector.read().await;
@@ -76,6 +83,10 @@ async fn converge_services(
         }
         let supervisor = supervisor.read().await;
         for (name, spec) in &all {
+            if volumes.is_held(name) {
+                tracing::info!(service = %name, "Service held for a volume operation");
+                continue;
+            }
             if !injector.has_all(name, &spec.secrets) && !supervisor.is_running(name).await {
                 tracing::info!(service = %name, secrets = ?spec.secrets, "Service waits for its secrets");
                 continue;
@@ -104,6 +115,10 @@ async fn converge_services(
         }
         Err(e) => tracing::error!(error = %e, "Service reconciliation failed"),
     }
+    // After the supervisor has stopped services no longer assigned here.
+    if let Err(e) = volumes.reclaim(all.values()).await {
+        tracing::warn!(error = %e, "Cannot reclaim volumes");
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -121,6 +136,7 @@ pub(super) async fn handle_server_message(
     policy_enforcer: &Arc<PolicyEnforcer>,
     health_checker: &HealthChecker,
     netns_manager: &Arc<NamespaceNetworkManager>,
+    volumes: &Arc<VolumeManager>,
     tx: &mpsc::Sender<AgentMessage>,
     node_id: &str,
     client: &super::closures::AgentClient,
@@ -353,7 +369,15 @@ pub(super) async fn handle_server_message(
                 }
             }
 
-            converge_services(supervisor, local_state, secret_injector, templates, dns).await;
+            converge_services(
+                supervisor,
+                local_state,
+                secret_injector,
+                templates,
+                dns,
+                volumes,
+            )
+            .await;
         }
         ServerPayload::Deploy(cmd) => {
             tracing::info!(
@@ -370,7 +394,15 @@ pub(super) async fn handle_server_message(
             {
                 svc.store_path = cmd.store_path.clone();
             }
-            converge_services(supervisor, local_state, secret_injector, templates, dns).await;
+            converge_services(
+                supervisor,
+                local_state,
+                secret_injector,
+                templates,
+                dns,
+                volumes,
+            )
+            .await;
         }
         ServerPayload::Secret(update) => {
             let service = update.service_name.as_str();
@@ -401,8 +433,15 @@ pub(super) async fn handle_server_message(
                 }
                 // Possibly the last secret a waiting service needed.
                 Ok(true) => {
-                    converge_services(supervisor, local_state, secret_injector, templates, dns)
-                        .await
+                    converge_services(
+                        supervisor,
+                        local_state,
+                        secret_injector,
+                        templates,
+                        dns,
+                        volumes,
+                    )
+                    .await
                 }
                 Ok(false) => {}
                 Err(e) => tracing::error!(
@@ -849,41 +888,155 @@ pub(super) async fn handle_server_message(
             });
         }
         ServerPayload::MigrateVolumeCommand(cmd) => {
-            let correlation_id = cmd.correlation_id.clone();
             let tx = tx.clone();
+            let volumes = volumes.clone();
+            let node_identity = node_identity.clone();
             tokio::spawn(async move {
-                let source_path = std::path::PathBuf::from(&cmd.source_path);
-                let dest_path = std::path::PathBuf::from(&cmd.dest_path);
-                let result =
-                    super::migrate::migrate_volume(&cmd.source_host, &source_path, &dest_path)
-                        .await;
-                let response = match result {
-                    Ok(r) => {
-                        tracing::info!(
-                            service = %cmd.service_name,
-                            bytes = r.bytes_transferred,
-                            "Volume migration completed"
-                        );
-                        AgentCommandResponse {
-                            correlation_id,
-                            success: true,
-                            error_message: String::new(),
-                            result: None,
-                        }
+                let result = super::migrate::pull(
+                    &volumes,
+                    &node_identity,
+                    &cmd.source_addr,
+                    &cmd.source_spiffe_id,
+                    &cmd.service_name,
+                )
+                .await;
+                if result.is_ok() {
+                    // Until the assignment that follows the migration.
+                    volumes.protect(&cmd.service_name, Duration::from_secs(600));
+                }
+                let error_message = match &result {
+                    Ok(_) => String::new(),
+                    Err(e) => {
+                        tracing::error!(service = %cmd.service_name, source = %cmd.source_addr, error = %e, "Volume migration failed");
+                        e.to_string()
                     }
-                    Err(e) => AgentCommandResponse {
-                        correlation_id,
-                        success: false,
-                        error_message: e.to_string(),
-                        result: None,
-                    },
                 };
-                let _ = tx
-                    .send(AgentMessage {
-                        payload: Some(Payload::CommandResponse(response)),
-                    })
-                    .await;
+                respond(&tx, cmd.correlation_id, error_message, None).await;
             });
+        }
+        ServerPayload::ExportVolumesCommand(cmd) => {
+            let service = cmd.service_name.as_str();
+            let ttl = Duration::from_secs(u64::from(cmd.ttl_seconds.clamp(30, 3600)));
+            let error_message = if let Err(e) = crate::secrets::validate_name("service", service) {
+                e
+            } else {
+                tracing::info!(service, dest = %cmd.dest_spiffe_id, ?ttl, "Stopping service to export its volumes");
+                volumes.hold(service, ttl);
+                volumes.grant_export(service, &cmd.dest_spiffe_id, ttl);
+                converge_services(
+                    supervisor,
+                    local_state,
+                    secret_injector,
+                    templates,
+                    dns,
+                    volumes,
+                )
+                .await;
+                if supervisor.read().await.is_running(service).await {
+                    format!("{service} did not stop")
+                } else if !volumes.service_dir(service).is_dir() {
+                    format!("{service} has no volumes on this node")
+                } else {
+                    String::new()
+                }
+            };
+            respond(tx, cmd.correlation_id, error_message, None).await;
+        }
+        ServerPayload::VolumeSnapshotCommand(cmd) => {
+            let tx = tx.clone();
+            let ctx = (
+                supervisor.clone(),
+                local_state.clone(),
+                secret_injector.clone(),
+                templates.clone(),
+                dns.clone(),
+                volumes.clone(),
+            );
+            let node = node_id.to_string();
+            tokio::spawn(async move {
+                let (supervisor, local_state, secret_injector, templates, dns, volumes) = &ctx;
+                let result = volume_snapshot(&cmd, volumes, || async {
+                    converge_services(
+                        supervisor,
+                        local_state,
+                        secret_injector,
+                        templates,
+                        dns,
+                        volumes,
+                    )
+                    .await
+                })
+                .await;
+                let (error_message, result) = match result {
+                    Ok(mut snapshots) => {
+                        for s in &mut snapshots {
+                            s.node = node.clone();
+                        }
+                        (
+                            String::new(),
+                            Some(CmdResult::VolumeSnapshotResult(
+                                crate::proto::VolumeSnapshotResult { snapshots },
+                            )),
+                        )
+                    }
+                    Err(e) => (e.to_string(), None),
+                };
+                respond(&tx, cmd.correlation_id, error_message, result).await;
+            });
+        }
+    }
+}
+
+/// Answer a correlated command; an empty `error_message` is success.
+async fn respond(
+    tx: &mpsc::Sender<AgentMessage>,
+    correlation_id: String,
+    error_message: String,
+    result: Option<CmdResult>,
+) {
+    let response = AgentCommandResponse {
+        correlation_id,
+        success: error_message.is_empty(),
+        error_message,
+        result,
+    };
+    let _ = tx
+        .send(AgentMessage {
+            payload: Some(Payload::CommandResponse(response)),
+        })
+        .await;
+}
+
+/// Run a snapshot command. A restore holds (stops) the service around the
+/// swap, running `converge` to stop and then start it again.
+async fn volume_snapshot<F, Fut>(
+    cmd: &crate::proto::VolumeSnapshotCommand,
+    volumes: &VolumeManager,
+    converge: F,
+) -> Result<Vec<crate::proto::VolumeSnapshotInfo>, super::storage::VolumeError>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    use crate::proto::VolumeSnapshotAction as Action;
+    let (service, volume, id) = (
+        cmd.service_name.as_str(),
+        cmd.volume_name.as_str(),
+        cmd.snapshot_id.as_str(),
+    );
+    match Action::try_from(cmd.action).unwrap_or(Action::VolumeSnapshotList) {
+        Action::VolumeSnapshotList => volumes.list_snapshots(service, volume).await,
+        Action::VolumeSnapshotCreate => Ok(vec![volumes.create_snapshot(service, volume).await?]),
+        Action::VolumeSnapshotDelete => {
+            Ok(vec![volumes.delete_snapshot(service, volume, id).await?])
+        }
+        Action::VolumeSnapshotRestore => {
+            volumes.hold(service, Duration::from_secs(3600));
+            converge().await;
+            let restored = volumes.restore_snapshot(service, volume, id).await;
+            volumes.release(service);
+            converge().await;
+            Ok(vec![restored?])
         }
     }
 }

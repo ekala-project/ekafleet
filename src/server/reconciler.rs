@@ -77,6 +77,24 @@ struct MigrationFailureSummary {
     orphaned_destinations: Vec<String>,
 }
 
+/// Pair each node a service leaves with a node it moves to (both sorted);
+/// nodes left over on either side are a scale-down or a fresh replica.
+fn node_moves<'a>(current: &[&'a str], desired: &[&'a str]) -> Vec<(&'a str, &'a str)> {
+    let mut leaving: Vec<&str> = current
+        .iter()
+        .filter(|n| !desired.contains(n))
+        .copied()
+        .collect();
+    let mut joining: Vec<&str> = desired
+        .iter()
+        .filter(|n| !current.contains(n))
+        .copied()
+        .collect();
+    leaving.dedup();
+    joining.dedup();
+    leaving.into_iter().zip(joining).collect()
+}
+
 /// Classify a set of per-instance migration results. Returns `None` if every
 /// migration succeeded (the reschedule may proceed), or a summary of the
 /// failure otherwise (the reschedule must be skipped). This is the pure
@@ -147,8 +165,13 @@ pub async fn compute_plan(
     instance_tracker: Option<&InstanceTracker>,
     raft_state: &FleetStateMachine,
 ) -> ReconcilePlan {
-    // Merge static machines with cloud-provisioned dynamic machines
-    let machines = merge_dynamic_machines(desired, instance_tracker).await;
+    // Merge static machines with cloud-provisioned dynamic machines, minus
+    // nodes being drained: their services move elsewhere, taking
+    // their volumes along.
+    let mut machines = merge_dynamic_machines(desired, instance_tracker).await;
+    for node in state.draining_nodes().await {
+        machines.remove(&node);
+    }
 
     // Build current placements from Raft state for data-locality scoring
     let mut current_placements: CurrentPlacements = HashMap::new();
@@ -278,31 +301,26 @@ pub async fn compute_plan(
             desired_sorted.sort();
 
             if current_sorted != desired_sorted && !current_nodes.is_empty() {
-                // For stateful services with local volumes and migrate_on_reschedule
-                // enabled, detect per-instance node changes that require data migration.
+                // Stateful services with ReadWriteOnce volumes and
+                // migrate_on_reschedule take their data along. Volumes belong
+                // to (service, node), so each node the service leaves hands
+                // its copy to one node it moves to.
                 let mut migrations = Vec::new();
                 if let Some(svc_cfg) = desired.services.get(service_name) {
                     let is_stateful = svc_cfg.scheduling.job_type == config::JobType::Stateful;
-                    let has_local_volumes = svc_cfg.volumes.iter().any(|v| {
-                        v.storage_class == "local"
-                            && v.access_mode == config::VolumeAccessMode::ReadWriteOnce
-                    });
                     let migrate_enabled = svc_cfg.scheduling.migrate.migrate_on_reschedule;
-
-                    if is_stateful && has_local_volumes && migrate_enabled {
-                        // Compare per-instance placements to find moves
-                        for dp in desired_placements {
-                            if let Some(old_machine) = current_placements
-                                .get(&(service_name.clone(), dp.instance_id.clone()))
-                                && old_machine != &dp.machine_name
-                            {
-                                migrations.push(MigrationOp {
-                                    instance_id: dp.instance_id.clone(),
-                                    source_machine: old_machine.clone(),
-                                    dest_machine: dp.machine_name.clone(),
-                                });
-                            }
-                        }
+                    if is_stateful
+                        && migrate_enabled
+                        && super::scheduler::one_replica_per_node(svc_cfg)
+                    {
+                        migrations = node_moves(&current_sorted, &desired_sorted)
+                            .into_iter()
+                            .map(|(source, dest)| MigrationOp {
+                                instance_id: format!("{service_name}@{source}"),
+                                source_machine: source.to_string(),
+                                dest_machine: dest.to_string(),
+                            })
+                            .collect();
                     }
                 }
 
@@ -769,6 +787,80 @@ async fn send_desired_state(
     Ok(())
 }
 
+/// How long the source keeps a service stopped and its export open.
+const MIGRATION_EXPORT_TTL_SECS: u32 = 900;
+
+/// Move `service`'s volumes from `source` to `dest`: the source stops the
+/// service and grants the destination one pull, then the destination pulls
+/// over the mesh. If the pull never happens the source starts the service
+/// again once the grant expires.
+async fn migrate_volumes(
+    state: &FleetState,
+    service: &str,
+    source: &str,
+    dest: &str,
+) -> Result<(), String> {
+    use crate::proto::server_message::Payload;
+    let source_ip = state
+        .mesh_ip_for_node(source)
+        .await
+        .ok_or_else(|| format!("{source} has no mesh address"))?;
+    let (Some(source_id), Some(dest_id)) =
+        (state.agent_spiffe_id(source), state.agent_spiffe_id(dest))
+    else {
+        return Err("the server's trust domain is not known".into());
+    };
+    let command = |payload| crate::proto::ServerMessage {
+        payload: Some(payload),
+    };
+    let run = |node: &str, payload, correlation_id: String, timeout| {
+        let node = node.to_string();
+        async move {
+            match state
+                .send_command(&node, command(payload), correlation_id, timeout)
+                .await
+            {
+                Ok(resp) if resp.success => Ok(()),
+                Ok(resp) => Err(format!("{node}: {}", resp.error_message)),
+                Err(e) => Err(format!("{node}: {e}")),
+            }
+        }
+    };
+
+    let correlation_id = uuid::Uuid::new_v4().to_string();
+    run(
+        source,
+        Payload::ExportVolumesCommand(crate::proto::ExportVolumesCommand {
+            correlation_id: correlation_id.clone(),
+            service_name: service.to_string(),
+            dest_spiffe_id: dest_id,
+            ttl_seconds: MIGRATION_EXPORT_TTL_SECS,
+        }),
+        correlation_id,
+        Duration::from_secs(120),
+    )
+    .await
+    .map_err(|e| format!("export from {e}"))?;
+
+    let correlation_id = uuid::Uuid::new_v4().to_string();
+    run(
+        dest,
+        Payload::MigrateVolumeCommand(crate::proto::MigrateVolumeCommand {
+            correlation_id: correlation_id.clone(),
+            service_name: service.to_string(),
+            source_addr: format!(
+                "{source_ip}:{}",
+                crate::agent::migrate::VOLUME_TRANSFER_PORT
+            ),
+            source_spiffe_id: source_id,
+        }),
+        correlation_id,
+        Duration::from_secs(u64::from(MIGRATION_EXPORT_TTL_SECS)),
+    )
+    .await
+    .map_err(|e| format!("pull to {e}"))
+}
+
 /// Execute a reconciliation plan.
 async fn apply_plan(
     desired: &FleetConfig,
@@ -794,94 +886,42 @@ async fn apply_plan(
         };
         let max_parallel = service_cfg.scheduling.migrate.max_parallel as usize;
 
-        // Volume paths for all local RWO volumes in this service.
-        let volume_names: Vec<String> = service_cfg
-            .volumes
-            .iter()
-            .filter(|v| {
-                v.storage_class == "local"
-                    && v.access_mode == config::VolumeAccessMode::ReadWriteOnce
-            })
-            .map(|v| v.name.clone())
-            .collect();
-
         let mut results: Vec<MigrationResult> = Vec::new();
         for chunk in op.migrations.chunks(max_parallel.max(1)) {
             let mut handles = Vec::new();
             for migration in chunk {
-                let source_host = desired
-                    .machines
-                    .get(&migration.source_machine)
-                    .map(|m| m.target_host.clone())
-                    .unwrap_or_default();
+                let service_name = op.service_name.clone();
+                let source = migration.source_machine.clone();
                 let dest_machine = migration.dest_machine.clone();
                 let instance_id = migration.instance_id.clone();
-                let service_name = op.service_name.clone();
-                let volume_names = volume_names.clone();
                 let s = state.clone();
 
                 // Each migration task returns a per-instance MigrationResult so
                 // the caller can reason about partial failures: which instances
                 // reached the destination and which did not.
                 handles.push(tokio::spawn(async move {
-                    for vol_name in &volume_names {
-                        let vol_path = format!(
-                            "/var/lib/ekafleet/data/volumes/{}/{}",
-                            service_name, vol_name
-                        );
-                        let correlation_id = uuid::Uuid::new_v4().to_string();
-                        let cmd = crate::proto::MigrateVolumeCommand {
-                            correlation_id: correlation_id.clone(),
-                            service_name: service_name.clone(),
-                            source_host: source_host.clone(),
-                            source_path: vol_path.clone(),
-                            dest_path: vol_path,
-                        };
-                        let msg = crate::proto::ServerMessage {
-                            payload: Some(
-                                crate::proto::server_message::Payload::MigrateVolumeCommand(cmd),
-                            ),
-                        };
-                        let timeout = Duration::from_secs(600);
-                        let outcome = s
-                            .send_command(&dest_machine, msg, correlation_id, timeout)
-                            .await;
-                        let err = match outcome {
-                            Ok(resp) if resp.success => None,
-                            Ok(resp) => Some(format!(
-                                "migration of volume {vol_name} to {dest_machine} failed: {}",
-                                resp.error_message
-                            )),
-                            Err(e) => Some(format!(
-                                "migration of volume {vol_name} to {dest_machine} failed: {e}"
-                            )),
-                        };
-                        if let Some(msg) = err {
-                            tracing::error!(
-                                service = %service_name,
-                                volume = %vol_name,
-                                dest = %dest_machine,
-                                instance = %instance_id,
-                                "Volume migration failed"
-                            );
-                            return MigrationResult {
-                                instance_id,
-                                dest_machine,
-                                error: Some(msg),
-                            };
-                        }
-                        tracing::info!(
+                    let error = migrate_volumes(&s, &service_name, &source, &dest_machine)
+                        .await
+                        .err();
+                    match &error {
+                        Some(e) => tracing::error!(
                             service = %service_name,
-                            volume = %vol_name,
+                            source = %source,
                             dest = %dest_machine,
-                            instance = %instance_id,
+                            error = %e,
+                            "Volume migration failed"
+                        ),
+                        None => tracing::info!(
+                            service = %service_name,
+                            source = %source,
+                            dest = %dest_machine,
                             "Volume migration completed"
-                        );
+                        ),
                     }
                     MigrationResult {
                         instance_id,
                         dest_machine,
-                        error: None,
+                        error,
                     }
                 }));
             }
@@ -909,10 +949,10 @@ async fn apply_plan(
 
         // Partial-failure semantics: a reschedule is all-or-nothing. If any
         // instance failed to migrate, skip the whole service's cutover so the
-        // service stays on its source nodes (source data is untouched — rsync
-        // copies, it does not move). Surface the destinations that *did* receive
-        // data as orphaned partial copies so an operator can reason about them;
-        // a retry is safe because the migration rsync is idempotent (--delete).
+        // service stays on its source nodes (source data is untouched — the
+        // pull copies, it does not move — and the source restarts the service
+        // when its export grant expires). Surface the destinations that *did*
+        // receive data as orphaned partial copies; a retry replaces them.
         if let Some(summary) = summarize_migration_failure(&results) {
             tracing::error!(
                 service = %op.service_name,
@@ -1437,6 +1477,84 @@ mod tests {
         let plan = compute_plan(&config, &["node-1".to_string()], &state, None, &raft).await;
         // The service should be blocked by the policy.
         assert!(plan.creates.is_empty(), "blocked-svc should not be created");
+    }
+
+    #[tokio::test]
+    async fn draining_moves_stateful_services_with_their_volumes() {
+        let state = FleetState::new();
+        let mut config = empty_fleet_config();
+        let mut receivers = Vec::new();
+        for node in ["alpha", "beta"] {
+            receivers.push(
+                state
+                    .register_agent(node, "127.0.0.1:5000".into(), "default".into())
+                    .await,
+            );
+            config.machines.insert(
+                node.into(),
+                MachineConfig {
+                    target_host: node.into(),
+                    labels: HashMap::new(),
+                    capacity: CapacityConfig {
+                        cpu: 4000,
+                        memory: 8192,
+                        disk: 0,
+                    },
+                    pool: "default".into(),
+                    reserved: CapacityConfig::default(),
+                    taints: vec![],
+                    extended_resources: HashMap::new(),
+                },
+            );
+        }
+        let mut db = simple_service();
+        db.scheduling.job_type = config::JobType::Stateful;
+        db.volumes = vec![
+            serde_json::from_value(serde_json::json!({
+                "name": "data",
+                "mountPath": "/var/lib/db",
+            }))
+            .unwrap(),
+        ];
+        config.services.insert("db".into(), db);
+        state
+            .update_status(
+                "alpha",
+                vec![crate::proto::ServiceInstance {
+                    service_name: "db".into(),
+                    instance_id: "db-0".into(),
+                    store_path: String::new(),
+                    state: crate::proto::ServiceState::ServiceRunning as i32,
+                }],
+            )
+            .await;
+        let raft = FleetStateMachine::new();
+
+        // Cordoning keeps the service where it is.
+        state.set_schedulable("alpha", false).await;
+        let plan = compute_plan(&config, &[], &state, None, &raft).await;
+        assert!(plan.reschedules.is_empty());
+
+        state.set_draining("alpha").await;
+        let plan = compute_plan(&config, &[], &state, None, &raft).await;
+        let [op] = plan.reschedules.as_slice() else {
+            panic!("expected one reschedule, got {:?}", plan.reschedules);
+        };
+        assert_eq!(op.placements[0].machine_name, "beta");
+        let [migration] = op.migrations.as_slice() else {
+            panic!("expected one migration, got {:?}", op.migrations);
+        };
+        assert_eq!(
+            (
+                migration.source_machine.as_str(),
+                migration.dest_machine.as_str()
+            ),
+            ("alpha", "beta")
+        );
+
+        // Making the node schedulable again ends the drain.
+        state.set_schedulable("alpha", true).await;
+        assert!(state.draining_nodes().await.is_empty());
     }
 
     fn simple_service() -> ServiceConfig {

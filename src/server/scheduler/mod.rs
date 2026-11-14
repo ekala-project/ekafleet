@@ -55,6 +55,9 @@ pub struct ResourceRequirements {
     pub cpu: u64,
     pub memory: u64,
     pub disk: u64,
+    /// Total size of the service's volumes (MB). Counted against a node's
+    /// disk only when the node declares a disk capacity.
+    pub volume_disk: u64,
     pub extended: HashMap<String, u64>,
 }
 
@@ -64,9 +67,27 @@ impl ResourceRequirements {
             cpu: resources.cpu.as_ref().map(|r| r.request).unwrap_or(0),
             memory: resources.memory.as_ref().map(|r| r.request).unwrap_or(0),
             disk: resources.disk.as_ref().map(|r| r.request).unwrap_or(0),
+            volume_disk: 0,
             extended: resources.extended.clone(),
         }
     }
+
+    /// The requirements of a service: its resources plus its volumes.
+    pub fn for_service(service: &ServiceConfig) -> Self {
+        Self {
+            volume_disk: service.volumes.iter().map(|v| v.size_mb).sum(),
+            ..Self::from_config(&service.resources)
+        }
+    }
+}
+
+/// Whether a service keeps per-node state that two replicas on one node
+/// would share: a `ReadWriteOnce` volume.
+pub fn one_replica_per_node(service: &ServiceConfig) -> bool {
+    service
+        .volumes
+        .iter()
+        .any(|v| v.access_mode == crate::config::VolumeAccessMode::ReadWriteOnce)
 }
 
 /// A machine candidate during scheduling with tracked allocated resources.
@@ -101,6 +122,16 @@ impl Candidate {
         self.schedulable_disk.saturating_sub(self.allocated_disk)
     }
 
+    /// The disk `reqs` take here: volumes count only on nodes that declare
+    /// a disk capacity.
+    fn disk_for(&self, reqs: &ResourceRequirements) -> u64 {
+        if self.schedulable_disk > 0 {
+            reqs.disk + reqs.volume_disk
+        } else {
+            reqs.disk
+        }
+    }
+
     fn utilization(&self) -> f64 {
         if self.schedulable_cpu == 0 && self.schedulable_memory == 0 {
             return 0.0;
@@ -122,7 +153,7 @@ impl Candidate {
     fn allocate(&mut self, reqs: &ResourceRequirements, service_name: &str) {
         self.allocated_cpu += reqs.cpu;
         self.allocated_memory += reqs.memory;
-        self.allocated_disk += reqs.disk;
+        self.allocated_disk += self.disk_for(reqs);
         for (key, val) in &reqs.extended {
             *self.allocated_extended.entry(key.clone()).or_insert(0) += val;
         }
@@ -133,7 +164,7 @@ impl Candidate {
     fn deallocate(&mut self, reqs: &ResourceRequirements, service_name: &str) {
         self.allocated_cpu = self.allocated_cpu.saturating_sub(reqs.cpu);
         self.allocated_memory = self.allocated_memory.saturating_sub(reqs.memory);
-        self.allocated_disk = self.allocated_disk.saturating_sub(reqs.disk);
+        self.allocated_disk = self.allocated_disk.saturating_sub(self.disk_for(reqs));
         for (key, val) in &reqs.extended {
             if let Some(alloc) = self.allocated_extended.get_mut(key) {
                 *alloc = alloc.saturating_sub(*val);
@@ -146,7 +177,7 @@ impl Candidate {
     fn has_resources_for(&self, reqs: &ResourceRequirements) -> bool {
         self.available_cpu() >= reqs.cpu
             && self.available_memory() >= reqs.memory
-            && self.available_disk() >= reqs.disk
+            && self.available_disk() >= self.disk_for(reqs)
             && reqs.extended.iter().all(|(key, needed)| {
                 let total = self.extended_resources.get(key).copied().unwrap_or(0);
                 let used = self.allocated_extended.get(key).copied().unwrap_or(0);
@@ -230,7 +261,8 @@ pub fn schedule(
 
     for (service_name, service_cfg) in service_list {
         let scheduling = &service_cfg.scheduling;
-        let reqs = ResourceRequirements::from_config(&service_cfg.resources);
+        let reqs = ResourceRequirements::for_service(service_cfg);
+        let exclusive = one_replica_per_node(service_cfg);
 
         // Expand pool preference into a synthetic affinity
         let mut affinities = scheduling.affinity.clone();
@@ -295,6 +327,9 @@ pub fn schedule(
                                 &candidates,
                             )
                         })
+                        .filter(|(_, c)| {
+                            !exclusive || !c.assigned_services.iter().any(|s| s == service_name)
+                        })
                         .filter(|(_, c)| c.has_resources_for(&reqs))
                         .map(|(i, _)| i)
                         .collect();
@@ -309,11 +344,16 @@ pub fn schedule(
                             scheduling.priority,
                             &reqs,
                             services,
-                        ) {
+                        ) && !(exclusive
+                            && candidates[preempt_idx]
+                                .assigned_services
+                                .iter()
+                                .any(|s| s == service_name))
+                        {
                             for ev in &evicted {
                                 preemptions.push(ev.clone());
-                                let ev_reqs = ResourceRequirements::from_config(
-                                    &services[&ev.evicted_service].resources,
+                                let ev_reqs = ResourceRequirements::for_service(
+                                    &services[&ev.evicted_service],
                                 );
                                 candidates[preempt_idx].deallocate(&ev_reqs, &ev.evicted_service);
                             }
