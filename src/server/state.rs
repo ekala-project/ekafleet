@@ -52,6 +52,7 @@ pub struct FleetState {
     /// Public key of the server's binary cache, stamped into every
     /// `DesiredState` so agents can verify fetched closures.
     cache_public_key: Arc<std::sync::OnceLock<String>>,
+    trust_domain: Arc<std::sync::OnceLock<String>>,
     /// Fired when a node's assignment is (re)sent, so secrets for newly
     /// assigned services follow right away.
     assignments_changed: ReconcileTrigger,
@@ -87,6 +88,9 @@ struct NodeInfo {
     /// Whether this node is eligible for new scheduling.
     /// Set to false during maintenance windows.
     schedulable: bool,
+    /// Drained: the node's services are moved elsewhere. Cleared when the
+    /// node is made schedulable again.
+    draining: bool,
     /// WireGuard mesh IP reported via heartbeat. Used by the reconciler to
     /// populate VXLAN tunnel endpoints for cross-node namespace networking.
     mesh_ip: Option<std::net::Ipv4Addr>,
@@ -119,6 +123,7 @@ impl FleetState {
             pending_canaries: super::deployer::PendingCanaryStore::new(),
             service_assignments: crate::ca::issuer::ServiceAssignments::new(),
             cache_public_key: Arc::default(),
+            trust_domain: Arc::default(),
             assignments_changed: ReconcileTrigger::new(),
         }
     }
@@ -132,6 +137,18 @@ impl FleetState {
     /// Record the binary cache's public key (once, at startup).
     pub fn set_cache_public_key(&self, key: String) {
         let _ = self.cache_public_key.set(key);
+    }
+
+    /// Record the fleet's SPIFFE trust domain (set once at startup).
+    pub fn set_trust_domain(&self, domain: String) {
+        let _ = self.trust_domain.set(domain);
+    }
+
+    /// The SPIFFE ID a node's agent presents on mTLS connections.
+    pub fn agent_spiffe_id(&self, node: &str) -> Option<String> {
+        self.trust_domain
+            .get()
+            .map(|d| format!("spiffe://{d}/agent/{node}"))
     }
 
     /// Store paths assigned to `node_id` across its services, i.e. the roots
@@ -296,10 +313,9 @@ impl FleetState {
         let mut state = self.inner.write().await;
         state.next_connection_id += 1;
         let connection_id = state.next_connection_id;
-        let schedulable = state
-            .nodes
-            .get(node_id)
-            .is_none_or(|existing| existing.schedulable);
+        let (schedulable, draining) = state.nodes.get(node_id).map_or((true, false), |existing| {
+            (existing.schedulable, existing.draining)
+        });
 
         state.nodes.insert(
             NodeId::new(node_id),
@@ -321,6 +337,7 @@ impl FleetState {
                 services: HashMap::new(),
                 tx,
                 schedulable,
+                draining,
                 mesh_ip: None,
             },
         );
@@ -695,8 +712,32 @@ impl FleetState {
         let mut state = self.inner.write().await;
         if let Some(node) = state.nodes.get_mut(node_id) {
             node.schedulable = schedulable;
+            if schedulable {
+                node.draining = false;
+            }
             tracing::info!(node_id, schedulable, "Node scheduling eligibility updated");
         }
+    }
+
+    /// Mark a node unschedulable and move its services elsewhere.
+    pub async fn set_draining(&self, node_id: &str) {
+        let mut state = self.inner.write().await;
+        if let Some(node) = state.nodes.get_mut(node_id) {
+            node.schedulable = false;
+            node.draining = true;
+            tracing::info!(node_id, "Node draining");
+        }
+    }
+
+    /// Connected nodes being drained.
+    pub async fn draining_nodes(&self) -> Vec<String> {
+        let state = self.inner.read().await;
+        state
+            .nodes
+            .iter()
+            .filter(|(_, n)| n.draining)
+            .map(|(id, _)| id.to_string())
+            .collect()
     }
 
     /// Check if a node is eligible for scheduling.

@@ -5,7 +5,6 @@ pub mod logs;
 pub mod migrate;
 pub mod netns;
 pub mod oci;
-pub mod snapshot;
 pub mod storage;
 pub mod supervisor;
 pub mod template;
@@ -171,6 +170,22 @@ pub async fn run_until(config: AgentConfig, stop: CancellationToken) -> anyhow::
     )));
     let policy_enforcer = Arc::new(PolicyEnforcer::new());
     let netns_manager = Arc::new(netns::NamespaceNetworkManager::new());
+    let volumes = Arc::new(storage::VolumeManager::new(
+        &config.data_dir,
+        config.ca_cert_pem.clone(),
+    ));
+    // Peers pull the volumes of services moving away from here; transfers
+    // need node SVIDs, so there is no listener without a CA.
+    if config.ca_cert_pem.is_some() {
+        let listen = std::net::SocketAddr::from(([0, 0, 0, 0], migrate::VOLUME_TRANSFER_PORT));
+        let (volumes, identity, stop) =
+            (volumes.clone(), node_identity.clone(), stop.child_token());
+        tokio::spawn(async move {
+            if let Err(e) = migrate::serve(listen, volumes, identity, stop).await {
+                tracing::error!(%listen, error = %e, "Volume transfer listener failed");
+            }
+        });
+    }
 
     // Pre-allocate strings used in every heartbeat to avoid per-tick allocations
     let version: Arc<str> = Arc::from(env!("CARGO_PKG_VERSION"));
@@ -199,6 +214,7 @@ pub async fn run_until(config: AgentConfig, stop: CancellationToken) -> anyhow::
         peer_manager,
         policy_enforcer,
         netns_manager,
+        volumes,
         node_identity,
         version,
     };
@@ -276,6 +292,7 @@ struct Components {
     peer_manager: Arc<RwLock<PeerManager>>,
     policy_enforcer: Arc<PolicyEnforcer>,
     netns_manager: Arc<netns::NamespaceNetworkManager>,
+    volumes: Arc<storage::VolumeManager>,
     node_identity: Arc<RwLock<NodeIdentity>>,
     version: Arc<str>,
 }
@@ -302,6 +319,7 @@ impl Components {
             peer_manager,
             policy_enforcer,
             netns_manager,
+            volumes,
             node_identity,
             version,
         } = self;
@@ -519,6 +537,19 @@ impl Components {
                     tracing::info!("Agent shutting down");
                     break;
                 }
+                // Start services whose volume hold ended (e.g. an export
+                // that was never pulled: the service stayed here).
+                _ = volumes.hold_ended() => {
+                    handlers::converge_services(
+                        supervisor,
+                        local_state,
+                        secret_injector,
+                        templates,
+                        dns,
+                        volumes,
+                    )
+                    .await;
+                }
                 result = inbound.message() => {
                     match result? {
                         Some(msg) => {
@@ -537,6 +568,7 @@ impl Components {
                                     policy_enforcer,
                                     health_checker,
                                     netns_manager,
+                                    volumes,
                                     &tx,
                                     node_id,
                                     &client,

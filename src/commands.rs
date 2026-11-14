@@ -1426,6 +1426,93 @@ pub async fn cmd_secret_list(service: Option<String>, server: String) -> anyhow:
     Ok(())
 }
 
+pub async fn cmd_volume_snapshot(
+    action: ekafleet::proto::VolumeSnapshotAction,
+    request: ekafleet::proto::VolumeSnapshotRequest,
+    server: String,
+) -> anyhow::Result<()> {
+    use ekafleet::proto::VolumeSnapshotAction as A;
+    let mut client = connect_server(&server).await?;
+    let target = format!("{}/{}", request.service_name, request.volume_name);
+    let id = request.snapshot_id.clone();
+    let snapshots = match action {
+        A::VolumeSnapshotList => client.list_volume_snapshots(request).await,
+        A::VolumeSnapshotCreate => client.create_volume_snapshot(request).await,
+        A::VolumeSnapshotRestore => client.restore_volume_snapshot(request).await,
+        A::VolumeSnapshotDelete => client.delete_volume_snapshot(request).await,
+    }?
+    .into_inner()
+    .snapshots;
+    match action {
+        A::VolumeSnapshotList if snapshots.is_empty() => println!("No snapshots."),
+        A::VolumeSnapshotList => {
+            println!(
+                "{:<16}  {:<20}  {:<16}  {:<18}  {:>12}  CREATED",
+                "NODE", "SERVICE", "VOLUME", "SNAPSHOT", "SIZE"
+            );
+            for s in &snapshots {
+                println!(
+                    "{:<16}  {:<20}  {:<16}  {:<18}  {:>12}  {}",
+                    s.node,
+                    s.service_name,
+                    s.volume_name,
+                    s.snapshot_id,
+                    format_bytes(s.size_bytes),
+                    format_unix_time(s.created_at)
+                );
+            }
+        }
+        A::VolumeSnapshotCreate => {
+            for s in &snapshots {
+                println!(
+                    "Created snapshot {} of {target} on {} ({})",
+                    s.snapshot_id,
+                    s.node,
+                    format_bytes(s.size_bytes)
+                );
+            }
+        }
+        A::VolumeSnapshotRestore => println!("Restored {target} from snapshot {id}"),
+        A::VolumeSnapshotDelete => println!("Deleted snapshot {id} of {target}"),
+    }
+    Ok(())
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn format_unix_time(secs: u64) -> String {
+    i64::try_from(secs)
+        .ok()
+        .and_then(|s| time::OffsetDateTime::from_unix_timestamp(s).ok())
+        .map_or_else(
+            || "-".to_string(),
+            |t| {
+                format!(
+                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}Z",
+                    t.year(),
+                    u8::from(t.month()),
+                    t.day(),
+                    t.hour(),
+                    t.minute(),
+                    t.second()
+                )
+            },
+        )
+}
+
 pub async fn cmd_secret_delete(
     service: String,
     name: String,

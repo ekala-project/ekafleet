@@ -471,6 +471,12 @@ enum Command {
         action: SecretAction,
     },
 
+    /// Persistent volumes of stateful services
+    Volume {
+        #[command(subcommand)]
+        action: VolumeAction,
+    },
+
     /// Execute a command in a service's context
     Exec {
         /// Service name
@@ -716,6 +722,66 @@ enum SecretAction {
         service: String,
         /// Secret name
         name: String,
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum VolumeAction {
+    /// Node-local volume snapshots
+    Snapshot {
+        #[command(subcommand)]
+        action: VolumeSnapshotAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum VolumeSnapshotAction {
+    /// Snapshot a volume on the node running the service
+    Create {
+        service: String,
+        volume: String,
+        /// Node holding the volume (needed when the service runs on several)
+        #[arg(long)]
+        node: Option<String>,
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+    /// List snapshots of a service's volumes on every node running it
+    List {
+        service: String,
+        /// Only this volume
+        volume: Option<String>,
+        /// Only this node
+        #[arg(long)]
+        node: Option<String>,
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+    /// Replace a volume's data with a snapshot (stops and restarts the service)
+    Restore {
+        service: String,
+        volume: String,
+        snapshot: String,
+        /// Node holding the volume (needed when the service runs on several)
+        #[arg(long)]
+        node: Option<String>,
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+    /// Delete a snapshot
+    Delete {
+        service: String,
+        volume: String,
+        snapshot: String,
+        /// Node holding the volume (needed when the service runs on several)
+        #[arg(long)]
+        node: Option<String>,
         /// Server address
         #[arg(long, default_value = "127.0.0.1:7400")]
         server: String,
@@ -1219,6 +1285,68 @@ async fn main() -> anyhow::Result<()> {
                 server,
             } => commands::cmd_secret_delete(service, name, server).await?,
         },
+
+        Command::Volume {
+            action: VolumeAction::Snapshot { action },
+        } => {
+            use ekafleet::proto::VolumeSnapshotAction as A;
+            let (action, service, volume, snapshot, node, server) = match action {
+                VolumeSnapshotAction::Create {
+                    service,
+                    volume,
+                    node,
+                    server,
+                } => (A::VolumeSnapshotCreate, service, volume, None, node, server),
+                VolumeSnapshotAction::List {
+                    service,
+                    volume,
+                    node,
+                    server,
+                } => (
+                    A::VolumeSnapshotList,
+                    service,
+                    volume.unwrap_or_default(),
+                    None,
+                    node,
+                    server,
+                ),
+                VolumeSnapshotAction::Restore {
+                    service,
+                    volume,
+                    snapshot,
+                    node,
+                    server,
+                } => (
+                    A::VolumeSnapshotRestore,
+                    service,
+                    volume,
+                    Some(snapshot),
+                    node,
+                    server,
+                ),
+                VolumeSnapshotAction::Delete {
+                    service,
+                    volume,
+                    snapshot,
+                    node,
+                    server,
+                } => (
+                    A::VolumeSnapshotDelete,
+                    service,
+                    volume,
+                    Some(snapshot),
+                    node,
+                    server,
+                ),
+            };
+            let request = ekafleet::proto::VolumeSnapshotRequest {
+                service_name: service,
+                volume_name: volume,
+                snapshot_id: snapshot.unwrap_or_default(),
+                node: node.unwrap_or_default(),
+            };
+            commands::cmd_volume_snapshot(action, request, server).await?
+        }
 
         Command::Acl { action } => match action {
             AclAction::Token { action } => match action {

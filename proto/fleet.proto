@@ -121,6 +121,13 @@ service FleetControl {
   rpc ListSecrets(ListSecretsRequest) returns (ListSecretsResponse);
   rpc DeleteSecret(DeleteSecretRequest) returns (DeleteSecretResponse);
 
+  // Volume snapshots, kept on the node that holds the volume.
+  rpc CreateVolumeSnapshot(VolumeSnapshotRequest) returns (VolumeSnapshotResponse);
+  rpc ListVolumeSnapshots(VolumeSnapshotRequest) returns (VolumeSnapshotResponse);
+  // Stops the service on that node, swaps the snapshot in and starts it again.
+  rpc RestoreVolumeSnapshot(VolumeSnapshotRequest) returns (VolumeSnapshotResponse);
+  rpc DeleteVolumeSnapshot(VolumeSnapshotRequest) returns (VolumeSnapshotResponse);
+
   // Binary cache for service closures. An agent may only fetch paths in the
   // closure of the store paths assigned to it; every narinfo is signed with
   // the server's cache key (DesiredState.cache_public_key).
@@ -173,6 +180,7 @@ message AgentCommandResponse {
     SystemGCCommandResult gc_result = 9;
     InspectServiceResult inspect_result = 10;
     SystemRebuildResult rebuild_result = 11;
+    VolumeSnapshotResult volume_snapshot_result = 12;
   }
 }
 
@@ -335,6 +343,8 @@ message ServerMessage {
     MigrateVolumeCommand migrate_volume_command = 20;
     JwtSvidResponse jwt_svid = 21;
     MeshAssignment mesh = 22;
+    ExportVolumesCommand export_volumes_command = 23;
+    VolumeSnapshotCommand volume_snapshot_command = 24;
   }
 }
 
@@ -405,12 +415,59 @@ message InspectServiceCommand {
   string service_name = 2;
 }
 
+// Sent to the node a stateful service moves to: pull the service's volumes
+// from the node it leaves (which was sent ExportVolumesCommand first) over
+// the mesh, authenticating both ends with node SVIDs.
 message MigrateVolumeCommand {
   string correlation_id = 1;
   string service_name = 2;
-  string source_host = 3;
-  string source_path = 4;
-  string dest_path = 5;
+  // host:port of the source agent's volume transfer listener (mesh address).
+  string source_addr = 3;
+  // SPIFFE ID the source must present.
+  string source_spiffe_id = 4;
+}
+
+// Sent to the node a stateful service leaves: stop the service and allow
+// one pull of its volumes by `dest_spiffe_id` within `ttl_seconds`. The
+// service stays stopped for that long; it starts again if it is still
+// assigned here afterwards (the migration failed).
+message ExportVolumesCommand {
+  string correlation_id = 1;
+  string service_name = 2;
+  string dest_spiffe_id = 3;
+  uint32 ttl_seconds = 4;
+}
+
+enum VolumeSnapshotAction {
+  VOLUME_SNAPSHOT_LIST = 0;
+  VOLUME_SNAPSHOT_CREATE = 1;
+  VOLUME_SNAPSHOT_RESTORE = 2;
+  VOLUME_SNAPSHOT_DELETE = 3;
+}
+
+message VolumeSnapshotCommand {
+  string correlation_id = 1;
+  VolumeSnapshotAction action = 2;
+  string service_name = 3;
+  // Empty lists every volume of the service.
+  string volume_name = 4;
+  // For restore and delete.
+  string snapshot_id = 5;
+}
+
+message VolumeSnapshotInfo {
+  string node = 1;
+  string service_name = 2;
+  string volume_name = 3;
+  string snapshot_id = 4;
+  // Unix seconds.
+  uint64 created_at = 5;
+  uint64 size_bytes = 6;
+}
+
+// The affected (create, restore, delete) or listed snapshots.
+message VolumeSnapshotResult {
+  repeated VolumeSnapshotInfo snapshots = 1;
 }
 
 // CA trust bundle pushed to agents for SPIFFE workload verification.
@@ -1260,6 +1317,23 @@ message DeleteSecretRequest {
 
 message DeleteSecretResponse {
   bool deleted = 1;
+}
+
+// --- Volume snapshots ---
+
+message VolumeSnapshotRequest {
+  string service_name = 1;
+  // Required for create, restore and delete; empty lists all volumes.
+  string volume_name = 2;
+  // Required for restore and delete.
+  string snapshot_id = 3;
+  // The node holding the volume. Optional when the service runs on exactly
+  // one node (or, for list, to list every node it runs on).
+  string node = 4;
+}
+
+message VolumeSnapshotResponse {
+  repeated VolumeSnapshotInfo snapshots = 1;
 }
 
 // --- Binary cache ---

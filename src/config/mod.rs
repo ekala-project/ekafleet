@@ -360,7 +360,7 @@ pub struct VolumeConfig {
     /// Requested storage size in megabytes.
     #[serde(default = "default_volume_size")]
     pub size_mb: u64,
-    /// Storage class (e.g., "local", "nfs", "zfs"). Defaults to "local".
+    /// Storage class; only "local" (a directory on the node) is supported.
     #[serde(default = "default_storage_class")]
     pub storage_class: String,
     /// Access mode: "ReadWriteOnce" (default) or "ReadWriteMany".
@@ -903,6 +903,32 @@ pub fn static_secrets(service: &ServiceConfig) -> Vec<String> {
     names
 }
 
+/// Whether `path` can be a volume's mount path: absolute, normalized, and
+/// not `/` or a system tree the service relies on.
+pub fn validate_mount_path(path: &str) -> Result<(), String> {
+    use std::path::{Component, Path};
+    let p = Path::new(path);
+    if !p.is_absolute() || (path.ends_with('/') && path != "/") {
+        return Err(format!(
+            "mount path '{path}' must be absolute, without a trailing '/'"
+        ));
+    }
+    if p.components()
+        .any(|c| !matches!(c, Component::RootDir | Component::Normal(_)))
+        || path.contains("//")
+    {
+        return Err(format!("mount path '{path}' must be normalized"));
+    }
+    const RESERVED: [&str; 7] = ["/", "/nix", "/proc", "/sys", "/dev", "/run/secrets", "/etc"];
+    if let Some(reserved) = RESERVED
+        .iter()
+        .find(|r| p == Path::new(r) || (**r != "/" && **r != "/etc" && p.starts_with(r)))
+    {
+        return Err(format!("mount path '{path}' is reserved ({reserved})"));
+    }
+    Ok(())
+}
+
 /// Validate a fleet configuration for consistency.
 pub fn validate(config: &FleetConfig) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
@@ -944,6 +970,38 @@ pub fn validate(config: &FleetConfig) -> Result<(), Vec<String>> {
                 errors.push(format!(
                     "service '{name}' secret '{key}': type must be 'static' or 'dynamic', not '{}'",
                     secret.secret_type
+                ));
+            }
+        }
+
+        if !service.volumes.is_empty()
+            && let Err(e) = crate::secrets::validate_name("service", name)
+        {
+            errors.push(format!("service '{name}' declares volumes: {e}"));
+        }
+        let mut volume_names = std::collections::HashSet::new();
+        let mut mounts = std::collections::HashSet::new();
+        for volume in &service.volumes {
+            let v = &volume.name;
+            if let Err(e) = crate::secrets::validate_name("volume", v) {
+                errors.push(format!("service '{name}' volume '{v}': {e}"));
+            }
+            if !volume_names.insert(v.as_str()) {
+                errors.push(format!("service '{name}' volume '{v}' is declared twice"));
+            }
+            if let Err(e) = validate_mount_path(&volume.mount_path) {
+                errors.push(format!("service '{name}' volume '{v}': {e}"));
+            }
+            if !mounts.insert(volume.mount_path.as_str()) {
+                errors.push(format!(
+                    "service '{name}' volume '{v}': mount path '{}' is used twice",
+                    volume.mount_path
+                ));
+            }
+            if volume.storage_class != "local" {
+                errors.push(format!(
+                    "service '{name}' volume '{v}': storage class must be 'local', not '{}'",
+                    volume.storage_class
                 ));
             }
         }
@@ -1267,6 +1325,51 @@ mod nix_module_tests {
         let errors = validate(&bad).unwrap_err().join("\n");
         assert!(errors.contains("secret '../x': secret name"), "{errors}");
         assert!(errors.contains("secret 'y': type must be"), "{errors}");
+    }
+
+    #[test]
+    fn volumes_are_local_named_and_mounted_at_clean_paths() {
+        let config = |volumes: serde_json::Value| -> FleetConfig {
+            serde_json::from_value(serde_json::json!({
+                "name": "t",
+                "domain": "fleet.test",
+                "services": {"db": {"command": "/bin/db", "volumes": volumes}},
+            }))
+            .unwrap()
+        };
+        let ok = config(serde_json::json!([
+            {"name": "data", "mountPath": "/var/lib/db"},
+            {"name": "wal", "mountPath": "/var/lib/db-wal", "reclaimRetain": false},
+        ]));
+        assert!(validate(&ok).is_ok(), "{:?}", validate(&ok));
+
+        let bad = config(serde_json::json!([
+            {"name": "../x", "mountPath": "/a"},
+            {"name": "a", "mountPath": "/a"},
+            {"name": "a", "mountPath": "/b/../c"},
+            {"name": "n", "mountPath": "/n", "storageClass": "nfs"},
+            {"name": "s", "mountPath": "/run/secrets/x"},
+            {"name": "r", "mountPath": "relative"},
+        ]));
+        let errors = validate(&bad).unwrap_err().join("\n");
+        for expected in [
+            "volume '../x': volume name",
+            "volume 'a' is declared twice",
+            "mount path '/a' is used twice",
+            "'/b/../c' must be normalized",
+            "storage class must be 'local', not 'nfs'",
+            "'/run/secrets/x' is reserved",
+            "'relative' must be absolute",
+        ] {
+            assert!(
+                errors.contains(expected),
+                "missing {expected:?} in {errors}"
+            );
+        }
+        assert!(validate_mount_path("/srv/data").is_ok());
+        assert!(validate_mount_path("/etc/app").is_ok());
+        assert!(validate_mount_path("/etc").is_err());
+        assert!(validate_mount_path("/nix/store").is_err());
     }
 
     #[test]

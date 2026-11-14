@@ -24,6 +24,7 @@ pub mod scheduler;
 pub mod seal;
 pub mod secrets;
 pub mod state;
+pub mod volumes;
 pub mod webhook;
 
 use std::path::{Path, PathBuf};

@@ -31,6 +31,8 @@ pub enum AuditAction {
     TokenRevoke,
     SecretWrite,
     SecretRead,
+    VolumeSnapshot,
+    VolumeRestore,
     NodeAttest,
     NodeJoin,
     NodeLeave,
