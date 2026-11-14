@@ -23,7 +23,7 @@ impl InstanceTracker {
         provider: &str,
         pool: &str,
         private_ip: Option<&str>,
-    ) {
+    ) -> Result<(), crate::raft::RaftError> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -37,36 +37,43 @@ impl InstanceTracker {
                 private_ip: private_ip.map(|s| s.to_string()),
                 created_at: now,
             })
-            .await;
+            .await?;
 
         tracing::info!(instance_id, provider, pool, "Tracking cloud instance");
+        Ok(())
     }
 
     /// Associate a cloud instance with a fleet node ID (when the agent joins).
-    pub async fn associate_node(&self, instance_id: &str, fleet_node_id: &str) {
+    pub async fn associate_node(
+        &self,
+        instance_id: &str,
+        fleet_node_id: &str,
+    ) -> Result<(), crate::raft::RaftError> {
         self.raft
             .apply_next(Command::UpdateCloudInstance {
                 instance_id: instance_id.to_string(),
                 fleet_node_id: fleet_node_id.to_string(),
             })
-            .await;
+            .await?;
 
         tracing::info!(
             instance_id,
             fleet_node_id,
             "Associated cloud instance with fleet node"
         );
+        Ok(())
     }
 
     /// Stop tracking a cloud instance (after termination).
-    pub async fn untrack(&self, instance_id: &str) {
+    pub async fn untrack(&self, instance_id: &str) -> Result<(), crate::raft::RaftError> {
         self.raft
             .apply_next(Command::UntrackCloudInstance {
                 instance_id: instance_id.to_string(),
             })
-            .await;
+            .await?;
 
         tracing::info!(instance_id, "Untracked cloud instance");
+        Ok(())
     }
 
     /// Get all tracked instances.
@@ -161,7 +168,8 @@ mod tests {
         let tracker = make_tracker();
         tracker
             .track("i-abc", "aws", "workers", Some("10.0.1.5"))
-            .await;
+            .await
+            .unwrap();
 
         let all = tracker.all().await;
         assert_eq!(all.len(), 1);
@@ -177,8 +185,12 @@ mod tests {
         let tracker = make_tracker();
         tracker
             .track("i-abc", "aws", "workers", Some("10.0.1.5"))
-            .await;
-        tracker.associate_node("i-abc", "node-uuid-1").await;
+            .await
+            .unwrap();
+        tracker
+            .associate_node("i-abc", "node-uuid-1")
+            .await
+            .unwrap();
 
         let inst = tracker.all().await;
         assert_eq!(inst["i-abc"].fleet_node_id.as_deref(), Some("node-uuid-1"));
@@ -190,10 +202,12 @@ mod tests {
         let tracker = make_tracker();
         tracker
             .track("i-abc", "aws", "workers", Some("10.0.1.5"))
-            .await;
+            .await
+            .unwrap();
         tracker
             .track("i-def", "aws", "workers", Some("10.0.1.6"))
-            .await;
+            .await
+            .unwrap();
 
         let found = tracker.find_by_ip("10.0.1.5").await;
         assert_eq!(found.unwrap().cloud_instance_id, "i-abc");
@@ -205,19 +219,22 @@ mod tests {
     #[tokio::test]
     async fn untrack_removes_instance() {
         let tracker = make_tracker();
-        tracker.track("i-abc", "aws", "workers", None).await;
+        tracker
+            .track("i-abc", "aws", "workers", None)
+            .await
+            .unwrap();
         assert_eq!(tracker.active_count_for_pool("workers").await, 1);
 
-        tracker.untrack("i-abc").await;
+        tracker.untrack("i-abc").await.unwrap();
         assert_eq!(tracker.active_count_for_pool("workers").await, 0);
     }
 
     #[tokio::test]
     async fn for_pool_filters_correctly() {
         let tracker = make_tracker();
-        tracker.track("i-1", "aws", "workers", None).await;
-        tracker.track("i-2", "aws", "compute", None).await;
-        tracker.track("i-3", "gcp", "workers", None).await;
+        tracker.track("i-1", "aws", "workers", None).await.unwrap();
+        tracker.track("i-2", "aws", "compute", None).await.unwrap();
+        tracker.track("i-3", "gcp", "workers", None).await.unwrap();
 
         assert_eq!(tracker.active_count_for_pool("workers").await, 2);
         assert_eq!(tracker.active_count_for_pool("compute").await, 1);
@@ -227,9 +244,9 @@ mod tests {
     #[tokio::test]
     async fn joined_node_ids_only_returns_associated() {
         let tracker = make_tracker();
-        tracker.track("i-1", "aws", "workers", None).await;
-        tracker.track("i-2", "aws", "workers", None).await;
-        tracker.associate_node("i-1", "node-A").await;
+        tracker.track("i-1", "aws", "workers", None).await.unwrap();
+        tracker.track("i-2", "aws", "workers", None).await.unwrap();
+        tracker.associate_node("i-1", "node-A").await.unwrap();
 
         let joined = tracker.joined_node_ids_for_pool("workers").await;
         assert_eq!(joined, vec!["node-A"]);
@@ -239,9 +256,15 @@ mod tests {
     async fn scaledown_prefers_unjoined() {
         let tracker = make_tracker();
         let fleet_state = crate::server::state::FleetState::new();
-        tracker.track("i-joined", "aws", "workers", None).await;
-        tracker.associate_node("i-joined", "node-A").await;
-        tracker.track("i-unjoined", "aws", "workers", None).await;
+        tracker
+            .track("i-joined", "aws", "workers", None)
+            .await
+            .unwrap();
+        tracker.associate_node("i-joined", "node-A").await.unwrap();
+        tracker
+            .track("i-unjoined", "aws", "workers", None)
+            .await
+            .unwrap();
 
         let candidate = tracker
             .select_scaledown_candidate("workers", &fleet_state)

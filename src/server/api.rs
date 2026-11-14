@@ -268,9 +268,18 @@ impl FleetControl for FleetControlService {
         // The remote address is "ip:port", so extract just the IP part.
         let agent_ip = remote.rsplit_once(':').map(|(ip, _)| ip).unwrap_or(&remote);
         if let Some(tracked) = self.instance_tracker.find_by_ip(agent_ip).await {
-            self.instance_tracker
+            if let Err(e) = self
+                .instance_tracker
                 .associate_node(&tracked.cloud_instance_id, &node_id)
-                .await;
+                .await
+            {
+                tracing::error!(
+                    node_id = %node_id,
+                    cloud_instance = %tracked.cloud_instance_id,
+                    error = %e,
+                    "Failed to record cloud instance correlation"
+                );
+            }
             tracing::info!(
                 node_id = %node_id,
                 cloud_instance = %tracked.cloud_instance_id,
@@ -995,7 +1004,8 @@ impl FleetControl for FleetControlService {
         // reconciliation cycle picks up the change.
         self.raft_state
             .set_replica_override(&req.service_name, req.desired_count)
-            .await;
+            .await
+            .map_err(|e| Status::internal(format!("failed to record replica count: {e}")))?;
 
         tracing::info!(
             service = %req.service_name,
@@ -1032,10 +1042,10 @@ impl FleetControl for FleetControlService {
         let req = request.into_inner();
         tracing::info!(data_len = req.data.len(), "Restore requested");
 
-        match self.raft_state.restore(&req.data).await {
-            Ok(()) => Ok(Response::new(RestoreResponse {
+        match self.raft_state.install_snapshot(&req.data).await {
+            Ok(index) => Ok(Response::new(RestoreResponse {
                 success: true,
-                message: "State restored successfully".into(),
+                message: format!("State restored successfully (index {index})"),
             })),
             Err(e) => Ok(Response::new(RestoreResponse {
                 success: false,

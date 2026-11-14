@@ -5,11 +5,20 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
+use super::RaftError;
+use super::storage::{LogEntry, RaftStorage};
+
+/// Term recorded in log entries. Single-node until consensus lands.
+const TERM: u64 = 1;
+
 /// Fleet state machine for Raft consensus.
 /// Stores all persistent fleet state: deployments, secrets, DNS, scheduling plans.
 #[derive(Clone)]
 pub struct FleetStateMachine {
     inner: Arc<RwLock<StateMachineInner>>,
+    /// Durable log. When set, every command is persisted before it is
+    /// applied, so an acknowledged write survives a crash.
+    log: Option<Arc<RaftStorage>>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -53,11 +62,52 @@ pub struct DeploymentState {
     pub service_name: String,
     pub store_path: String,
     pub placements: Vec<PlacementRecord>,
+    /// Bumped each time `store_path` changes (placement-only changes keep it).
     pub generation: u64,
+    pub deployed_at: u64,
+    /// Earlier revisions, oldest first, at most [`MAX_DEPLOYMENT_HISTORY`].
+    #[serde(default)]
+    pub history: Vec<DeploymentRevision>,
+}
+
+/// A previously deployed revision of a service.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeploymentRevision {
+    pub generation: u64,
+    pub store_path: String,
     pub deployed_at: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Revisions kept per service for rollback.
+pub const MAX_DEPLOYMENT_HISTORY: usize = 10;
+
+impl DeploymentState {
+    /// The revision recorded as `generation`, current or historical.
+    pub fn revision(&self, generation: u64) -> Option<DeploymentRevision> {
+        if generation == self.generation {
+            return Some(DeploymentRevision {
+                generation,
+                store_path: self.store_path.clone(),
+                deployed_at: self.deployed_at,
+            });
+        }
+        self.history
+            .iter()
+            .find(|r| r.generation == generation)
+            .cloned()
+    }
+
+    /// Whether recording `store_path` on `placements` would change anything.
+    pub fn differs_from(&self, store_path: &str, placements: &[PlacementRecord]) -> bool {
+        let mut current = self.placements.clone();
+        let mut new = placements.to_vec();
+        current.sort_by(|a, b| a.instance_id.cmp(&b.instance_id));
+        new.sort_by(|a, b| a.instance_id.cmp(&b.instance_id));
+        self.store_path != store_path || current != new
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlacementRecord {
     pub instance_id: String,
     pub machine_name: String,
@@ -137,7 +187,57 @@ impl FleetStateMachine {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(StateMachineInner::default())),
+            log: None,
         }
+    }
+
+    /// A state machine that persists every command to `storage` before
+    /// applying it. Load existing state first with [`Self::load`].
+    pub fn with_log(storage: Arc<RaftStorage>) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(StateMachineInner::default())),
+            log: Some(storage),
+        }
+    }
+
+    /// Restore the persisted state: the latest snapshot, then every log
+    /// entry after it. Any unreadable file is an error; callers must not
+    /// carry on with partial state. Storage written under the legacy key is
+    /// rewritten under the current one.
+    pub async fn load(&self) -> Result<(), RaftError> {
+        let Some(storage) = &self.log else {
+            return Ok(());
+        };
+        let snapshot_index = match storage.load_latest_snapshot().await? {
+            Some((index, data)) => {
+                self.restore(&data).await?;
+                tracing::info!(snapshot_index = index, "Restored Raft state from snapshot");
+                index
+            }
+            None => 0,
+        };
+        let entries = storage.read_log_from(snapshot_index + 1).await?;
+        let replayed = entries.len();
+        for entry in entries {
+            self.apply(entry.index, entry.command).await;
+        }
+        if replayed > 0 {
+            tracing::info!(
+                replayed,
+                from_index = snapshot_index + 1,
+                "Replayed Raft log entries"
+            );
+        }
+        if storage.used_legacy_key() {
+            let state = self.inner.read().await;
+            let data = serde_json::to_vec(&*state)?;
+            storage.rewrite(state.last_applied, &data).await?;
+            tracing::warn!(
+                index = state.last_applied,
+                "Re-encrypted Raft storage from the fleet key to the dedicated Raft key"
+            );
+        }
+        Ok(())
     }
 
     /// Apply a command to the state machine, allocating the next log index
@@ -148,11 +248,22 @@ impl FleetStateMachine {
     ///
     /// After a snapshot restore, `last_applied` already reflects the restored
     /// state, so newly allocated indices naturally continue past it.
-    pub async fn apply_next(&self, command: Command) -> u64 {
+    ///
+    /// With a log attached the command is persisted first; if that fails
+    /// nothing is applied and the error is returned.
+    pub async fn apply_next(&self, command: Command) -> Result<u64, RaftError> {
         let mut state = self.inner.write().await;
         let index = state.last_applied + 1;
+        if let Some(log) = &self.log {
+            log.append_log(&LogEntry {
+                index,
+                term: TERM,
+                command: command.clone(),
+            })
+            .await?;
+        }
         Self::apply_locked(&mut state, index, command);
-        index
+        Ok(index)
     }
 
     /// Apply a command to the state machine at an explicit index (used when
@@ -172,27 +283,42 @@ impl FleetStateMachine {
                 store_path,
                 placements,
             } => {
-                let generation = state
-                    .deployments
-                    .get(&service_name)
-                    .map(|d| d.generation + 1)
-                    .unwrap_or(1);
-
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
 
-                state.deployments.insert(
-                    service_name.clone(),
-                    DeploymentState {
-                        service_name,
-                        store_path,
-                        placements,
-                        generation,
-                        deployed_at: now,
-                    },
-                );
+                match state.deployments.get_mut(&service_name) {
+                    // Same revision, new placements (scale, reschedule).
+                    Some(current) if current.store_path == store_path => {
+                        current.placements = placements;
+                    }
+                    Some(current) => {
+                        current.history.push(DeploymentRevision {
+                            generation: current.generation,
+                            store_path: std::mem::replace(&mut current.store_path, store_path),
+                            deployed_at: current.deployed_at,
+                        });
+                        let excess = current.history.len().saturating_sub(MAX_DEPLOYMENT_HISTORY);
+                        current.history.drain(..excess);
+                        current.generation += 1;
+                        current.deployed_at = now;
+                        current.placements = placements;
+                    }
+                    None => {
+                        state.deployments.insert(
+                            service_name.clone(),
+                            DeploymentState {
+                                service_name,
+                                store_path,
+                                placements,
+                                generation: 1,
+                                deployed_at: now,
+                                history: Vec::new(),
+                            },
+                        );
+                    }
+                }
             }
             Command::Undeploy { service_name } => {
                 state.deployments.remove(&service_name);
@@ -316,7 +442,42 @@ impl FleetStateMachine {
         serde_json::to_vec(&*state).unwrap_or_default()
     }
 
-    /// Restore from a snapshot.
+    /// Replace the whole state with an operator-supplied snapshot (the
+    /// `Restore` RPC). The result takes a fresh index past both the current
+    /// and the snapshot's, and with a log attached it replaces the persisted
+    /// state, so it survives restarts and later writes build on it.
+    pub async fn install_snapshot(&self, data: &[u8]) -> Result<u64, RaftError> {
+        let mut restored: StateMachineInner = serde_json::from_slice(data)?;
+        let mut state = self.inner.write().await;
+        let index = restored.last_applied.max(state.last_applied) + 1;
+        restored.last_applied = index;
+        if let Some(log) = &self.log {
+            log.rewrite(index, &serde_json::to_vec(&restored)?).await?;
+        }
+        *state = restored;
+        Ok(index)
+    }
+
+    /// Persist a snapshot of the current state and drop the log entries it
+    /// subsumes. Returns the snapshot index, or `None` when there is nothing
+    /// to snapshot or no log is attached.
+    pub async fn checkpoint(&self) -> Result<Option<u64>, RaftError> {
+        let Some(log) = &self.log else {
+            return Ok(None);
+        };
+        // Hold the read lock so no entry is appended between serializing
+        // and compacting.
+        let state = self.inner.read().await;
+        if state.last_applied == 0 {
+            return Ok(None);
+        }
+        let data = serde_json::to_vec(&*state)?;
+        log.save_snapshot(state.last_applied, &data).await?;
+        log.compact_log(state.last_applied).await?;
+        Ok(Some(state.last_applied))
+    }
+
+    /// Restore from a snapshot as-is (boot-time load).
     pub async fn restore(&self, data: &[u8]) -> Result<(), serde_json::Error> {
         let restored: StateMachineInner = serde_json::from_slice(data)?;
         let mut state = self.inner.write().await;
@@ -431,11 +592,17 @@ impl FleetStateMachine {
     /// Set a runtime replica count override for a service.
     /// Stored in the KV store so it survives snapshots.
     /// The reconciler reads this to override the config-defined replica count.
-    pub async fn set_replica_override(&self, service_name: &str, count: u32) {
-        let key = format!("replica-override/{service_name}");
-        let value = count.to_le_bytes().to_vec();
-        let mut state = self.inner.write().await;
-        state.kv.insert(key, value);
+    pub async fn set_replica_override(
+        &self,
+        service_name: &str,
+        count: u32,
+    ) -> Result<(), RaftError> {
+        self.apply_next(Command::KvPut {
+            key: format!("replica-override/{service_name}"),
+            value: count.to_le_bytes().to_vec(),
+        })
+        .await
+        .map(drop)
     }
 
     /// Get the runtime replica count override for a service, if any.
@@ -449,10 +616,12 @@ impl FleetStateMachine {
     }
 
     /// Clear a runtime replica count override for a service.
-    pub async fn clear_replica_override(&self, service_name: &str) {
-        let key = format!("replica-override/{service_name}");
-        let mut state = self.inner.write().await;
-        state.kv.remove(&key);
+    pub async fn clear_replica_override(&self, service_name: &str) -> Result<(), RaftError> {
+        self.apply_next(Command::KvDelete {
+            key: format!("replica-override/{service_name}"),
+        })
+        .await
+        .map(drop)
     }
 }
 
@@ -468,13 +637,15 @@ mod tests {
                 key: "a".into(),
                 value: b"1".to_vec(),
             })
-            .await;
+            .await
+            .unwrap();
         let i2 = sm
             .apply_next(Command::KvPut {
                 key: "b".into(),
                 value: b"2".to_vec(),
             })
-            .await;
+            .await
+            .unwrap();
         assert_eq!(i1, 1);
         assert_eq!(i2, 2);
         assert_eq!(sm.last_applied().await, 2);
@@ -491,12 +662,14 @@ mod tests {
             key: "first".into(),
             value: b"x".to_vec(),
         })
-        .await;
+        .await
+        .unwrap();
         sm.apply_next(Command::KvPut {
             key: "second".into(),
             value: b"y".to_vec(),
         })
-        .await;
+        .await
+        .unwrap();
         assert_eq!(sm.kv_get("first").await, Some(b"x".to_vec()));
         assert_eq!(sm.kv_get("second").await, Some(b"y".to_vec()));
     }
@@ -508,7 +681,8 @@ mod tests {
             key: "k".into(),
             value: b"v".to_vec(),
         })
-        .await;
+        .await
+        .unwrap();
         let snap = sm.snapshot().await;
 
         // Simulate a fresh process restoring the snapshot.
@@ -524,7 +698,8 @@ mod tests {
                 key: "k2".into(),
                 value: b"v2".to_vec(),
             })
-            .await;
+            .await
+            .unwrap();
         assert_eq!(idx, 2);
         assert_eq!(restored.kv_get("k2").await, Some(b"v2".to_vec()));
     }
@@ -551,5 +726,199 @@ mod tests {
         .await;
         assert_eq!(sm.kv_get("k").await, Some(b"a".to_vec()));
         assert_eq!(sm.last_applied().await, 5);
+    }
+
+    fn durable(dir: &std::path::Path, key: u8) -> FleetStateMachine {
+        FleetStateMachine::with_log(Arc::new(RaftStorage::new(dir, &[key; 32])))
+    }
+
+    async fn durable_initialized(dir: &std::path::Path, key: u8) -> FleetStateMachine {
+        let storage = RaftStorage::new(dir, &[key; 32]);
+        storage.initialize().await.unwrap();
+        FleetStateMachine::with_log(Arc::new(storage))
+    }
+
+    fn put(key: &str, value: &str) -> Command {
+        Command::KvPut {
+            key: key.into(),
+            value: value.as_bytes().to_vec(),
+        }
+    }
+
+    #[tokio::test]
+    async fn acknowledged_writes_survive_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let sm = durable_initialized(dir.path(), 1).await;
+        sm.apply_next(put("a", "1")).await.unwrap();
+        sm.apply_next(Command::Deploy {
+            service_name: "web".into(),
+            store_path: "/nix/store/web".into(),
+            placements: Vec::new(),
+        })
+        .await
+        .unwrap();
+        sm.set_replica_override("web", 3).await.unwrap();
+
+        let reloaded = durable(dir.path(), 1);
+        reloaded.load().await.unwrap();
+        assert_eq!(reloaded.last_applied().await, 3);
+        assert_eq!(reloaded.kv_get("a").await, Some(b"1".to_vec()));
+        assert_eq!(
+            reloaded.get_deployment("web").await.unwrap().store_path,
+            "/nix/store/web"
+        );
+        assert_eq!(reloaded.get_replica_override("web").await, Some(3));
+
+        reloaded.clear_replica_override("web").await.unwrap();
+        let again = durable(dir.path(), 1);
+        again.load().await.unwrap();
+        assert_eq!(again.get_replica_override("web").await, None);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_compacts_and_later_writes_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let sm = durable_initialized(dir.path(), 1).await;
+        for i in 0..5 {
+            sm.apply_next(put(&format!("k{i}"), "v")).await.unwrap();
+        }
+        assert_eq!(sm.checkpoint().await.unwrap(), Some(5));
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("raft/log"))
+                .unwrap()
+                .count(),
+            0
+        );
+        sm.apply_next(put("after", "x")).await.unwrap();
+
+        let reloaded = durable(dir.path(), 1);
+        reloaded.load().await.unwrap();
+        assert_eq!(reloaded.last_applied().await, 6);
+        assert_eq!(reloaded.kv_get("k4").await, Some(b"v".to_vec()));
+        assert_eq!(reloaded.kv_get("after").await, Some(b"x".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn installed_snapshot_replaces_persisted_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let sm = durable_initialized(dir.path(), 1).await;
+        sm.apply_next(put("old", "1")).await.unwrap();
+        sm.apply_next(put("old2", "2")).await.unwrap();
+
+        // An operator backup taken from a different (older) fleet.
+        let other = FleetStateMachine::new();
+        other.apply_next(put("restored", "yes")).await.unwrap();
+        let backup = other.snapshot().await;
+
+        let index = sm.install_snapshot(&backup).await.unwrap();
+        assert_eq!(index, 3, "restores take a fresh index");
+        sm.apply_next(put("next", "z")).await.unwrap();
+
+        let reloaded = durable(dir.path(), 1);
+        reloaded.load().await.unwrap();
+        assert_eq!(reloaded.kv_get("old").await, None);
+        assert_eq!(reloaded.kv_get("restored").await, Some(b"yes".to_vec()));
+        assert_eq!(reloaded.kv_get("next").await, Some(b"z".to_vec()));
+        assert_eq!(reloaded.last_applied().await, 4);
+    }
+
+    #[tokio::test]
+    async fn unreadable_state_fails_to_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let sm = durable_initialized(dir.path(), 1).await;
+        sm.apply_next(put("a", "1")).await.unwrap();
+
+        let wrong_key = durable(dir.path(), 2);
+        assert!(wrong_key.load().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_persist_applies_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let sm = durable_initialized(dir.path(), 1).await;
+        let log = dir.path().join("raft/log");
+        std::fs::remove_dir(&log).unwrap();
+        std::fs::write(&log, b"not a directory").unwrap();
+
+        assert!(sm.apply_next(put("a", "1")).await.is_err());
+        assert_eq!(sm.kv_get("a").await, None);
+        assert_eq!(sm.last_applied().await, 0);
+    }
+
+    #[tokio::test]
+    async fn legacy_fleet_key_storage_is_re_encrypted() {
+        let dir = tempfile::tempdir().unwrap();
+        let fleet_key = [9u8; 32];
+        let legacy = RaftStorage::new(dir.path(), &fleet_key);
+        legacy.initialize().await.unwrap();
+        for (index, key) in [(1, "a"), (2, "b")] {
+            legacy
+                .append_log_legacy_format(&LogEntry {
+                    index,
+                    term: TERM,
+                    command: put(key, "v"),
+                })
+                .await
+                .unwrap();
+        }
+
+        let storage = RaftStorage::new(dir.path(), &[1; 32]).with_legacy_key(&fleet_key);
+        let sm = FleetStateMachine::with_log(Arc::new(storage));
+        sm.load().await.unwrap();
+        assert_eq!(sm.kv_get("b").await, Some(b"v".to_vec()));
+
+        // Everything is now under the Raft key alone.
+        let migrated = durable(dir.path(), 1);
+        migrated.load().await.unwrap();
+        assert_eq!(migrated.last_applied().await, 2);
+        assert_eq!(migrated.kv_get("a").await, Some(b"v".to_vec()));
+    }
+
+    fn deploy(path: &str, machines: &[&str]) -> Command {
+        Command::Deploy {
+            service_name: "web".into(),
+            store_path: path.into(),
+            placements: machines
+                .iter()
+                .enumerate()
+                .map(|(i, m)| PlacementRecord {
+                    instance_id: format!("web-{i}"),
+                    machine_name: m.to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn generations_track_store_paths_with_bounded_history() {
+        let sm = FleetStateMachine::new();
+        sm.apply_next(deploy("/nix/store/v1", &["a"]))
+            .await
+            .unwrap();
+        // Placement-only change keeps the generation.
+        sm.apply_next(deploy("/nix/store/v1", &["a", "b"]))
+            .await
+            .unwrap();
+        let web = sm.get_deployment("web").await.unwrap();
+        assert_eq!(web.generation, 1);
+        assert_eq!(web.placements.len(), 2);
+        assert!(web.history.is_empty());
+
+        for v in 2..=15 {
+            sm.apply_next(deploy(&format!("/nix/store/v{v}"), &["a"]))
+                .await
+                .unwrap();
+        }
+        let web = sm.get_deployment("web").await.unwrap();
+        assert_eq!(web.generation, 15);
+        assert_eq!(web.history.len(), MAX_DEPLOYMENT_HISTORY);
+        assert_eq!(web.history.first().unwrap().generation, 5);
+        assert_eq!(web.revision(14).unwrap().store_path, "/nix/store/v14");
+        assert_eq!(web.revision(15).unwrap().store_path, "/nix/store/v15");
+        assert!(web.revision(4).is_none());
+
+        assert!(!web.differs_from("/nix/store/v15", &web.placements));
+        assert!(web.differs_from("/nix/store/v16", &web.placements));
+        assert!(web.differs_from("/nix/store/v15", &[]));
     }
 }

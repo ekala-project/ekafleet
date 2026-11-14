@@ -136,7 +136,7 @@ curl $API/v1/query?metric=cpu&service=web       # Metric query
 curl $API/metrics                               # Prometheus metrics
 curl $API/ui/                                   # Web dashboard
 
-# KV store
+# KV store (durable; writes need operator or admin)
 curl -X PUT -d 'value' $API/v1/kv/my-key       # Write
 curl $API/v1/kv/my-key                          # Read
 curl -X DELETE $API/v1/kv/my-key                # Delete

@@ -78,6 +78,8 @@ pub enum DeployError {
     DisruptionBudgetViolation(String),
     #[error("canary healthy — awaiting manual promotion (deployment_id: {0})")]
     AwaitingPromotion(String),
+    #[error("failed to record deployment: {0}")]
+    State(#[from] crate::raft::RaftError),
 }
 
 /// A deployment operation for a single service.
