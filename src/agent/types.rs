@@ -182,6 +182,7 @@ pub struct AgentConfig {
     pub data_dir: PathBuf,
     pub ca_cert_pem: Option<String>,
     pub mesh: crate::mesh::peers::MeshSettings,
+    pub dns: crate::dns::agent::DnsSettings,
 }
 
 /// Tracks local desired state as received from server.

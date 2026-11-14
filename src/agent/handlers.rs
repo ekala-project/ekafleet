@@ -9,7 +9,7 @@ use super::netns::NamespaceNetworkManager;
 use super::supervisor;
 use super::types::{LocalState, NodeIdentity, PendingKeyStore};
 use crate::agent::health::HealthChecker;
-use crate::dns::resolver::DnsResolver;
+use crate::dns::agent::AgentDns;
 use crate::mesh::peers::PeerManager;
 use crate::policy::nftables::PolicyEnforcer;
 use crate::proto::agent_command_response::Result as CmdResult;
@@ -60,7 +60,7 @@ pub(super) async fn handle_server_message(
     pending_keys: &Arc<RwLock<PendingKeyStore>>,
     node_identity: &Arc<RwLock<NodeIdentity>>,
     secret_injector: &Arc<RwLock<SecretInjector>>,
-    dns_resolver: &Arc<DnsResolver>,
+    dns: &Arc<AgentDns>,
     peer_manager: &Arc<RwLock<PeerManager>>,
     policy_enforcer: &Arc<PolicyEnforcer>,
     health_checker: &HealthChecker,
@@ -135,6 +135,8 @@ pub(super) async fn handle_server_message(
                         error = %e,
                         "Failed to create namespace network"
                     );
+                } else if let Ok(gateway) = ns_cfg.gateway.parse() {
+                    dns.ensure_namespace(&ns_cfg.namespace, gateway).await;
                 }
                 active_namespaces.push(ns_cfg.namespace.clone());
             }
@@ -241,6 +243,7 @@ pub(super) async fn handle_server_message(
             }
 
             // GC namespaces that are no longer referenced
+            dns.retain(&active_namespaces).await;
             if let Err(e) = netns_manager.gc_namespaces(&active_namespaces).await {
                 tracing::warn!(error = %e, "Failed to GC namespace networks");
             }
@@ -351,24 +354,8 @@ pub(super) async fn handle_server_message(
             }
         }
         ServerPayload::Dns(update) => {
-            tracing::debug!(records = update.records.len(), "Received DNS update");
-            for record in &update.records {
-                let ips: Vec<std::net::Ipv4Addr> = record
-                    .values
-                    .iter()
-                    .filter_map(|v| v.parse().ok())
-                    .collect();
-                let ttl = Duration::from_secs(record.ttl as u64);
-                if record.namespace.is_empty() {
-                    // Fleet-wide record
-                    dns_resolver.update_cache(&record.name, ips, ttl).await;
-                } else {
-                    // Namespace-scoped record
-                    dns_resolver
-                        .update_namespace_cache(&record.namespace, &record.name, ips, ttl)
-                        .await;
-                }
-            }
+            tracing::debug!(records = update.records.len(), "Received DNS records");
+            dns.resolver().replace(&update.records).await;
         }
         ServerPayload::Cert(response) => {
             tracing::info!(
@@ -393,6 +380,7 @@ pub(super) async fn handle_server_message(
             // Update trust domain from server's authoritative value
             if !bundle.trust_domain.is_empty() {
                 workload_mgr.set_trust_domain(&bundle.trust_domain).await;
+                dns.resolver().set_domain(&bundle.trust_domain).await;
             }
             let pem = String::from_utf8_lossy(&bundle.ca_certificate_pem);
             if let Err(e) = workload_mgr.set_trust_bundle(&pem).await {

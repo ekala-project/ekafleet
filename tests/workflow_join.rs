@@ -362,6 +362,7 @@ async fn embedded_agent_joins_its_own_server_with_a_node_svid() {
             enabled: false,
             ..Default::default()
         },
+        dns: ekafleet::dns::agent::DnsSettings::disabled(),
     }))
     .await;
 

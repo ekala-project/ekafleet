@@ -28,7 +28,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::health::HealthChecker;
-use crate::dns::resolver::DnsResolver;
+use crate::dns::agent::AgentDns;
 use crate::mesh::peers::PeerManager;
 use crate::mesh::wireguard::WireguardManager;
 use crate::policy::nftables::PolicyEnforcer;
@@ -146,7 +146,17 @@ pub async fn run_until(config: AgentConfig, stop: CancellationToken) -> anyhow::
         &[0u8; 32],
     )));
     let health_checker = HealthChecker::new();
-    let dns_resolver = Arc::new(DnsResolver::new("fleet.internal", vec![]));
+    let dns = Arc::new(AgentDns::start(&config.dns, stop.child_token()).await);
+    if let Some(domain) = node_identity
+        .read()
+        .await
+        .spiffe_id
+        .as_deref()
+        .and_then(|id| id.strip_prefix("spiffe://"))
+        .and_then(|rest| rest.split('/').next())
+    {
+        dns.resolver().set_domain(domain).await;
+    }
     let wg_manager = WireguardManager::new("wg-fleet", config.mesh.listen_port);
     let peer_manager = Arc::new(RwLock::new(PeerManager::new(
         wg_manager,
@@ -178,7 +188,7 @@ pub async fn run_until(config: AgentConfig, stop: CancellationToken) -> anyhow::
         supervisor,
         secret_injector,
         health_checker,
-        dns_resolver,
+        dns,
         peer_manager,
         policy_enforcer,
         netns_manager,
@@ -254,7 +264,7 @@ struct Components {
     supervisor: Arc<RwLock<supervisor::Supervisor>>,
     secret_injector: Arc<RwLock<SecretInjector>>,
     health_checker: HealthChecker,
-    dns_resolver: Arc<DnsResolver>,
+    dns: Arc<AgentDns>,
     peer_manager: Arc<RwLock<PeerManager>>,
     policy_enforcer: Arc<PolicyEnforcer>,
     netns_manager: Arc<netns::NamespaceNetworkManager>,
@@ -279,7 +289,7 @@ impl Components {
             supervisor,
             secret_injector,
             health_checker,
-            dns_resolver,
+            dns,
             peer_manager,
             policy_enforcer,
             netns_manager,
@@ -512,7 +522,7 @@ impl Components {
                                     pending_keys,
                                     node_identity,
                                     secret_injector,
-                                    dns_resolver,
+                                    dns,
                                     peer_manager,
                                     policy_enforcer,
                                     health_checker,

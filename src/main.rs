@@ -160,6 +160,20 @@ enum Command {
         /// Keep the embedded agent out of the WireGuard mesh
         #[arg(long, env = "EKAFLEET_NO_MESH")]
         no_mesh: bool,
+
+        /// Where the agent answers DNS for the fleet domain (forwarding
+        /// other names upstream)
+        #[arg(long, env = "EKAFLEET_DNS_LISTEN", default_value = "127.0.0.1:53")]
+        dns_listen: std::net::SocketAddr,
+
+        /// Upstream resolvers for non-fleet names, comma-separated (default:
+        /// the nameservers in /etc/resolv.conf)
+        #[arg(long, env = "EKAFLEET_DNS_UPSTREAM")]
+        dns_upstream: Option<String>,
+
+        /// Run no DNS listeners
+        #[arg(long, env = "EKAFLEET_NO_DNS")]
+        no_dns: bool,
     },
 
     /// Start in agent mode (data plane)
@@ -213,6 +227,20 @@ enum Command {
         /// is not root or `wg`/`ip` are missing)
         #[arg(long, env = "EKAFLEET_NO_MESH")]
         no_mesh: bool,
+
+        /// Where the agent answers DNS for the fleet domain (forwarding
+        /// other names upstream)
+        #[arg(long, env = "EKAFLEET_DNS_LISTEN", default_value = "127.0.0.1:53")]
+        dns_listen: std::net::SocketAddr,
+
+        /// Upstream resolvers for non-fleet names, comma-separated (default:
+        /// the nameservers in /etc/resolv.conf)
+        #[arg(long, env = "EKAFLEET_DNS_UPSTREAM")]
+        dns_upstream: Option<String>,
+
+        /// Run no DNS listeners
+        #[arg(long, env = "EKAFLEET_NO_DNS")]
+        no_dns: bool,
     },
 
     /// Show desired-vs-actual diff
@@ -920,6 +948,7 @@ async fn main() -> anyhow::Result<()> {
                         enabled: false,
                         ..Default::default()
                     },
+                    dns: ekafleet::dns::agent::DnsSettings::disabled(),
                 })
             };
             commands::cmd_dev(data_dir, http_listen, listen, agent).await?
@@ -940,6 +969,9 @@ async fn main() -> anyhow::Result<()> {
             advertise_addr,
             mesh_port,
             no_mesh,
+            dns_listen,
+            dns_upstream,
+            no_dns,
         } => {
             let agent = if embedded_agent {
                 Some(ekafleet::server::EmbeddedAgentConfig {
@@ -950,6 +982,7 @@ async fn main() -> anyhow::Result<()> {
                         advertise_addr,
                         listen_port: mesh_port,
                     },
+                    dns: commands::dns_settings(dns_listen, dns_upstream, no_dns)?,
                 })
             } else {
                 None
@@ -982,6 +1015,9 @@ async fn main() -> anyhow::Result<()> {
             advertise_addr,
             mesh_port,
             no_mesh,
+            dns_listen,
+            dns_upstream,
+            no_dns,
         } => {
             commands::cmd_agent(commands::AgentArgs {
                 join,
@@ -995,6 +1031,7 @@ async fn main() -> anyhow::Result<()> {
                     advertise_addr,
                     listen_port: mesh_port,
                 },
+                dns: commands::dns_settings(dns_listen, dns_upstream, no_dns)?,
             })
             .await?
         }
