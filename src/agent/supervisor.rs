@@ -28,6 +28,8 @@ pub struct Supervisor {
     /// so `nix-collect-garbage` never reaps a store path a running service
     /// depends on. See [`Supervisor::add_gc_root`].
     gcroot_dir: PathBuf,
+    /// Where service volumes live (see `super::storage`).
+    volumes_dir: PathBuf,
     managed_units: HashMap<String, UnitState>,
 }
 
@@ -53,6 +55,7 @@ impl Supervisor {
         Self {
             unit_dir,
             gcroot_dir,
+            volumes_dir: super::storage::volumes_dir(data_dir),
             managed_units: HashMap::new(),
         }
     }
@@ -266,7 +269,7 @@ impl Supervisor {
         spec: &ServiceSpec,
     ) -> Result<(), SupervisorError> {
         tokio::fs::create_dir_all(&self.unit_dir).await?;
-        self.install_unit(unit_name, &native_unit_content(spec))
+        self.install_unit(unit_name, &native_unit_content(spec, &self.volumes_dir))
             .await
     }
 
@@ -282,7 +285,7 @@ impl Supervisor {
         spec: &ServiceSpec,
     ) -> Result<(), SupervisorError> {
         tokio::fs::create_dir_all(&self.unit_dir).await?;
-        self.install_unit(unit_name, &container_unit_content(spec))
+        self.install_unit(unit_name, &container_unit_content(spec, &self.volumes_dir))
             .await
     }
 
@@ -458,15 +461,20 @@ fn is_container_service(spec: &ServiceSpec) -> bool {
 }
 
 /// The unit file of a native service.
-fn native_unit_content(spec: &ServiceSpec) -> String {
+fn native_unit_content(spec: &ServiceSpec, volumes_dir: &Path) -> String {
     let env_lines = build_env_lines(spec);
     let extra_lines = build_extra_directives(spec);
     let netns_line = build_netns_directive(spec);
-    let binds: String = secrets_bind(spec)
+    let mut binds: String = volume_binds(spec, volumes_dir)
         .into_iter()
-        .chain(template_binds(spec))
-        .map(|(source, dest)| format!("BindReadOnlyPaths={source}:{dest}\n"))
+        .map(|(source, dest)| format!("BindPaths={source}:{dest}\n"))
         .collect();
+    binds.extend(
+        secrets_bind(spec)
+            .into_iter()
+            .chain(template_binds(spec))
+            .map(|(source, dest)| format!("BindReadOnlyPaths={source}:{dest}\n")),
+    );
 
     let unit_content = format!(
         r#"[Unit]
@@ -496,7 +504,7 @@ WantedBy=multi-user.target
 }
 
 /// The unit file of a container service.
-fn container_unit_content(spec: &ServiceSpec) -> String {
+fn container_unit_content(spec: &ServiceSpec, volumes_dir: &Path) -> String {
     let machine_name = format!("ekafleet-{}", spec.name);
     let bundle_path = format!("{OCI_STORE_DIR}/bundles/{}", spec.name);
 
@@ -523,6 +531,9 @@ fn container_unit_content(spec: &ServiceSpec) -> String {
         "--keep-unit".to_string(),
     ];
 
+    for (source, dest) in volume_binds(spec, volumes_dir) {
+        nspawn_args.push(format!("--bind={source}:{dest}"));
+    }
     for (source, dest) in secrets_bind(spec).into_iter().chain(template_binds(spec)) {
         nspawn_args.push(format!("--bind-ro={source}:{dest}"));
     }
@@ -596,7 +607,47 @@ fn version_key_for(spec: &ServiceSpec) -> String {
     if secrets_bind(spec).is_some() {
         key = format!("{key}#secrets={}", spec.secrets.join(","));
     }
+    let volumes = volume_binds(spec, Path::new(""));
+    if !volumes.is_empty() {
+        let mounts: Vec<String> = spec
+            .volumes
+            .iter()
+            .filter(|v| volumes.iter().any(|(_, dest)| *dest == v.mount_path))
+            .map(|v| format!("{}:{}", v.name, v.mount_path))
+            .collect();
+        key = format!("{key}#volumes={}", mounts.join(","));
+    }
     key
+}
+
+/// (host directory, mount path) of each valid volume of `spec`, by mount
+/// path. Names and paths are validated with the fleet config; anything
+/// invalid that still arrives is left out rather than mounted.
+fn volume_binds(spec: &ServiceSpec, volumes_dir: &Path) -> Vec<(String, String)> {
+    if crate::secrets::validate_name("service", &spec.name).is_err() {
+        return Vec::new();
+    }
+    let mut binds: Vec<(String, String)> = spec
+        .volumes
+        .iter()
+        .filter(|v| {
+            crate::secrets::validate_name("volume", &v.name).is_ok()
+                && crate::config::validate_mount_path(&v.mount_path).is_ok()
+        })
+        .map(|v| {
+            (
+                volumes_dir
+                    .join(&spec.name)
+                    .join(&v.name)
+                    .display()
+                    .to_string(),
+                v.mount_path.clone(),
+            )
+        })
+        .collect();
+    binds.sort_by(|a, b| a.1.cmp(&b.1));
+    binds.dedup_by(|a, b| a.1 == b.1);
+    binds
 }
 
 /// (agent directory, `/run/secrets`) for a service declaring static secrets.
@@ -817,6 +868,8 @@ async fn query_unit_state(unit_name: &str) -> crate::proto::ServiceState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const VOLS: &str = "/var/lib/ekafleet/volumes";
 
     fn native_spec(name: &str, command: &str, store_path: &str) -> ServiceSpec {
         ServiceSpec {
@@ -1200,7 +1253,7 @@ WantedBy=multi-user.target
             format!("{plain_key}#templates=/etc/web.conf")
         );
 
-        let content = native_unit_content(&spec);
+        let content = native_unit_content(&spec, Path::new(VOLS));
         let unit_path = dir.path().join("ekafleet-web.service");
         std::fs::write(&unit_path, &content).unwrap();
         assert!(content.contains(&format!(
@@ -1217,18 +1270,18 @@ WantedBy=multi-user.target
         );
 
         spec.container_image = "ghcr.io/org/web:1".into();
-        let content = container_unit_content(&spec);
+        let content = container_unit_content(&spec, Path::new(VOLS));
         assert!(content.contains(&format!("--bind-ro={}:/etc/web.conf", rendered.display())));
     }
 
     #[test]
     fn declared_secrets_are_bound_at_run_secrets() {
         let mut spec = native_spec("web", "/bin/web", "/nix/store/x");
-        assert!(!native_unit_content(&spec).contains("/run/secrets"));
+        assert!(!native_unit_content(&spec, Path::new(VOLS)).contains("/run/secrets"));
         let plain_key = version_key_for(&spec);
         spec.secrets = vec!["api-key".into(), "token".into()];
         assert!(
-            native_unit_content(&spec)
+            native_unit_content(&spec, Path::new(VOLS))
                 .contains("BindReadOnlyPaths=/run/ekafleet/secrets/web:/run/secrets\n")
         );
         assert_eq!(
@@ -1237,8 +1290,36 @@ WantedBy=multi-user.target
         );
         spec.container_image = "ghcr.io/org/web:1".into();
         assert!(
-            container_unit_content(&spec)
+            container_unit_content(&spec, Path::new(VOLS))
                 .contains("--bind-ro=/run/ekafleet/secrets/web:/run/secrets")
+        );
+    }
+
+    #[test]
+    fn volumes_are_bound_read_write_and_part_of_the_version() {
+        let mut spec = native_spec("db", "/bin/db", "/nix/store/x");
+        let plain_key = version_key_for(&spec);
+        let volume = |name: &str, mount: &str| crate::proto::VolumeMount {
+            name: name.into(),
+            mount_path: mount.into(),
+            ..Default::default()
+        };
+        spec.volumes = vec![
+            volume("data", "/var/lib/db"),
+            volume("../escape", "/x"),
+            volume("logs", "relative"),
+        ];
+        let content = native_unit_content(&spec, Path::new(VOLS));
+        assert!(content.contains(&format!("BindPaths={VOLS}/db/data:/var/lib/db\n")));
+        assert!(!content.contains("escape") && !content.contains("relative"));
+        assert_eq!(
+            version_key_for(&spec),
+            format!("{plain_key}#volumes=data:/var/lib/db")
+        );
+        spec.container_image = "ghcr.io/org/db:1".into();
+        assert!(
+            container_unit_content(&spec, Path::new(VOLS))
+                .contains(&format!("--bind={VOLS}/db/data:/var/lib/db"))
         );
     }
 

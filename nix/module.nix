@@ -464,6 +464,12 @@ in
       networking.firewall.allowedUDPPorts = lib.mkIf (
         cfg.agent.mesh.enable && cfg.agent.mesh.openFirewall
       ) [ cfg.agent.mesh.port ];
+      # Volume migration: agents pull volumes from each other over the mesh
+      # (mTLS with node SVIDs; a source serves only the destination the
+      # server named).
+      networking.firewall.interfaces."wg-fleet".allowedTCPPorts = lib.mkIf cfg.agent.mesh.enable [
+        7403
+      ];
 
       assertions = [
         {

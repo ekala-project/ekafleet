@@ -288,12 +288,19 @@ let
     sizeMb = mkOption {
       type = types.ints.unsigned;
       default = 1024;
-      description = "Requested storage size in MB.";
+      description = ''
+        Requested size in MB. Advisory: it is counted against the node's
+        disk capacity when scheduling, not enforced on disk.
+      '';
     };
     storageClass = mkOption {
-      type = types.str;
+      type = types.enum [ "local" ];
       default = "local";
-      description = "Storage class (local, nfs, zfs, ...).";
+      description = ''
+        Storage class. Only `local` exists: a directory on the node,
+        bind-mounted at `mountPath`, moved along when the service is
+        rescheduled (stateful services with `migrate.migrateOnReschedule`).
+      '';
     };
     accessMode = mkOption {
       type = types.enum [
@@ -301,12 +308,18 @@ let
         "ReadWriteMany"
       ];
       default = "ReadWriteOnce";
-      description = "Volume access mode.";
+      description = ''
+        `ReadWriteOnce`: at most one replica of the service per node (each
+        node has its own copy). `ReadWriteMany`: replicas on one node share it.
+      '';
     };
     reclaimRetain = mkOption {
       type = types.bool;
       default = true;
-      description = "Retain the volume when the service is destroyed.";
+      description = ''
+        Keep the volume's data on a node the service no longer runs on.
+        When false, the data and its snapshots are deleted there.
+      '';
     };
   };
 
@@ -747,6 +760,10 @@ let
     disk = mkOption {
       type = types.ints.unsigned;
       default = 0;
+      description = ''
+        Disk available for volumes, in MB. Volume `sizeMb` counts against
+        it; 0 means disk is not tracked on this machine.
+      '';
     };
   };
 

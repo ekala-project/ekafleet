@@ -1319,3 +1319,69 @@ fn stateful_sticky_falls_back_when_node_gone() {
     // Falls back to node-1 since node-2 doesn't exist
     assert_eq!(plan.placements[0].machine_name, "node-1");
 }
+
+fn volume_service(replicas: u32, access_mode: &str, size_mb: u64) -> ServiceConfig {
+    serde_json::from_value(serde_json::json!({
+        "command": "/bin/db",
+        "scheduling": {"replicas": replicas, "type": "stateful"},
+        "volumes": [{
+            "name": "data",
+            "mountPath": "/var/lib/db",
+            "sizeMb": size_mb,
+            "accessMode": access_mode,
+        }],
+    }))
+    .unwrap()
+}
+
+#[test]
+fn read_write_once_volumes_allow_one_replica_per_node() {
+    let machines: HashMap<String, MachineConfig> = [
+        make_machine("node-1", 4000, 8192, vec![]),
+        make_machine("node-2", 4000, 8192, vec![]),
+    ]
+    .into();
+    let current = CurrentPlacements::new();
+
+    let services = [("db".to_string(), volume_service(3, "ReadWriteOnce", 10))].into();
+    let plan = schedule(&services, &machines, &no_pools(), &current);
+    let mut nodes: Vec<_> = plan
+        .placements
+        .iter()
+        .map(|p| p.machine_name.as_str())
+        .collect();
+    nodes.sort();
+    assert_eq!(nodes, ["node-1", "node-2"]);
+    assert_eq!(plan.blocked.len(), 1);
+
+    let services = [("db".to_string(), volume_service(3, "ReadWriteMany", 10))].into();
+    let plan = schedule(&services, &machines, &no_pools(), &current);
+    assert_eq!(plan.placements.len(), 3);
+}
+
+#[test]
+fn volume_sizes_count_only_against_declared_disk() {
+    let mut small = make_machine("small", 4000, 8192, vec![]);
+    small.1.capacity.disk = 1000;
+    let mut big = make_machine("big", 4000, 8192, vec![]);
+    big.1.capacity.disk = 5000;
+    let current = CurrentPlacements::new();
+    let services = [("db".to_string(), volume_service(1, "ReadWriteOnce", 2048))].into();
+
+    let machines: HashMap<String, MachineConfig> = [small.clone(), big].into();
+    for _ in 0..5 {
+        let plan = schedule(&services, &machines, &no_pools(), &current);
+        assert_eq!(plan.placements.len(), 1);
+        assert_eq!(plan.placements[0].machine_name, "big");
+    }
+
+    // Too big for the only node declaring disk; a node without a declared
+    // disk capacity takes it.
+    let undeclared = make_machine("undeclared", 4000, 8192, vec![]);
+    let machines: HashMap<String, MachineConfig> = [small.clone(), undeclared].into();
+    let plan = schedule(&services, &machines, &no_pools(), &current);
+    assert_eq!(plan.placements[0].machine_name, "undeclared");
+    let machines: HashMap<String, MachineConfig> = [small].into();
+    let plan = schedule(&services, &machines, &no_pools(), &current);
+    assert!(plan.placements.is_empty());
+}
