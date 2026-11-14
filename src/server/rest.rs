@@ -279,7 +279,13 @@ pub async fn serve_http(
                     .and_then(|v| v.to_str().ok());
                 let token = extract_bearer_token(auth_header).ok_or(StatusCode::UNAUTHORIZED)?;
 
-                let role = store.authenticate(token).ok_or(StatusCode::UNAUTHORIZED)?;
+                let (role, identity) = store
+                    .authenticate_identity(token)
+                    .ok_or(StatusCode::UNAUTHORIZED)?;
+                // The HTTP API and dashboard show the whole fleet.
+                if identity.namespace.is_some() {
+                    return Err(StatusCode::FORBIDDEN);
+                }
 
                 // Reads need Read; anything that changes state (KV writes,
                 // alert silences) needs Deploy.
