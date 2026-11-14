@@ -229,6 +229,41 @@ pub fn require_permission<T>(
     Err(tonic::Status::unauthenticated("no authenticated principal"))
 }
 
+/// The namespace a namespace-scoped bearer token is bound to; `None` for
+/// fleet-wide principals (unscoped tokens and mTLS peers).
+pub fn namespace_scope<T>(request: &tonic::Request<T>) -> Option<&str> {
+    request
+        .extensions()
+        .get::<TokenIdentity>()
+        .and_then(|identity| identity.namespace.as_deref())
+}
+
+/// Like [`require_permission`], for operations on the fleet as a whole
+/// (nodes, the fleet configuration, tokens, Raft state, agent streams):
+/// namespace-scoped tokens are refused whatever their role.
+#[allow(clippy::result_large_err)]
+pub fn require_fleet_permission<T>(
+    request: &tonic::Request<T>,
+    perm: Permission,
+) -> Result<(), tonic::Status> {
+    require_permission(request, perm)?;
+    if let Some(ns) = namespace_scope(request) {
+        return Err(tonic::Status::permission_denied(format!(
+            "token is scoped to namespace '{ns}' and cannot perform fleet-wide operations"
+        )));
+    }
+    Ok(())
+}
+
+/// The namespace a service belongs to: empty means [`DEFAULT_NAMESPACE`].
+pub fn effective_namespace(namespace: &str) -> &str {
+    if namespace.is_empty() {
+        DEFAULT_NAMESPACE
+    } else {
+        namespace
+    }
+}
+
 /// Metadata for a registered token.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenEntry {
@@ -671,5 +706,38 @@ mod tests {
             .authenticate_identity("global-tok")
             .expect("known token");
         assert!(identity.namespace.is_none());
+    }
+
+    #[test]
+    fn namespace_tokens_are_refused_fleet_wide_operations() {
+        let request = |namespace: Option<&str>, request_ns: &str| {
+            let mut req = tonic::Request::new(());
+            req.extensions_mut().insert(Role::Admin);
+            req.extensions_mut().insert(TokenIdentity {
+                id: "token:t".into(),
+                description: "d".into(),
+                role: Role::Admin,
+                namespace: namespace.map(Into::into),
+            });
+            req.extensions_mut()
+                .insert(RequestNamespace(request_ns.into()));
+            req
+        };
+
+        let scoped = request(Some("team-a"), "team-a");
+        assert_eq!(namespace_scope(&scoped), Some("team-a"));
+        assert!(require_permission(&scoped, Permission::Deploy).is_ok());
+        let err = require_fleet_permission(&scoped, Permission::Read).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        // ...and every request made outside its namespace.
+        let elsewhere = request(Some("team-a"), "team-b");
+        assert!(require_permission(&elsewhere, Permission::Read).is_err());
+
+        let global = request(None, "team-b");
+        assert_eq!(namespace_scope(&global), None);
+        assert!(require_fleet_permission(&global, Permission::ManageTokens).is_ok());
+
+        assert_eq!(effective_namespace(""), DEFAULT_NAMESPACE);
+        assert_eq!(effective_namespace("team-a"), "team-a");
     }
 }
