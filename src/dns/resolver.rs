@@ -139,6 +139,56 @@ impl DnsResolver {
         }
     }
 
+    /// `ip:port` addresses of every service visible from `namespace`
+    /// (`None` on the host), keyed by service name: each SRV record's port
+    /// with the addresses of its target, or the bare A addresses of a
+    /// service without SRV records. Namespace services shadow fleet-wide
+    /// ones of the same name.
+    pub async fn service_addresses(&self, namespace: Option<&str>) -> HashMap<String, Vec<String>> {
+        let state = self.inner.read().await;
+        let scoped = |name: &str| -> Option<&Records> {
+            namespace
+                .and_then(|ns| state.namespaced.get(&(ns.to_string(), name.to_string())))
+                .or_else(|| state.fleet.get(name))
+        };
+        let mut names: Vec<&str> = state.fleet.keys().map(String::as_str).collect();
+        if let Some(ns) = namespace {
+            names.extend(
+                state
+                    .namespaced
+                    .keys()
+                    .filter(|(n, _)| n == ns)
+                    .map(|(_, name)| name.as_str()),
+            );
+        }
+        let mut out = HashMap::new();
+        for name in names {
+            let Some(service) = name.strip_suffix(".service") else {
+                continue;
+            };
+            let Some(records) = scoped(name) else {
+                continue;
+            };
+            let addresses: Vec<String> = if records.srv.is_empty() {
+                records.a.iter().map(Ipv4Addr::to_string).collect()
+            } else {
+                records
+                    .srv
+                    .iter()
+                    .flat_map(|(port, target)| {
+                        scoped(target)
+                            .map(|t| t.a.iter().map(|ip| format!("{ip}:{port}")).collect())
+                            .unwrap_or_else(Vec::new)
+                    })
+                    .collect()
+            };
+            if !addresses.is_empty() {
+                out.insert(service.to_string(), addresses);
+            }
+        }
+        out
+    }
+
     /// The fleet domain.
     pub async fn domain(&self) -> String {
         self.inner.read().await.domain.clone()

@@ -511,6 +511,20 @@ fn service_config_to_spec(name: &str, cfg: &config::ServiceConfig) -> crate::pro
         namespace: cfg.namespace.clone(),
         namespace_ip: String::new(), // populated below from Raft IP allocations
         store_paths: cfg.store_paths.clone(),
+        templates: {
+            let mut templates: Vec<_> = cfg
+                .templates
+                .values()
+                .map(|t| crate::proto::TemplateSpec {
+                    dest_path: t.dest_path.clone(),
+                    source: t.source.clone(),
+                    mode: config::template_mode(&t.perms).unwrap_or(0o644),
+                    change_signal: t.change_signal.clone().unwrap_or_default(),
+                })
+                .collect();
+            templates.sort_by(|a, b| a.dest_path.cmp(&b.dest_path));
+            templates
+        },
     }
 }
 
