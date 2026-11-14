@@ -114,6 +114,13 @@ service FleetControl {
   // all secrets in the store, and pushes derived keys to all connected agents.
   rpc RotateFleetKey(RotateFleetKeyRequest) returns (RotateFleetKeyResponse);
 
+  // Static secrets. Values are stored encrypted under the fleet key and only
+  // ever leave the server re-encrypted for the agents running the service;
+  // listing returns names and versions, never values.
+  rpc SetSecret(SetSecretRequest) returns (SetSecretResponse);
+  rpc ListSecrets(ListSecretsRequest) returns (ListSecretsResponse);
+  rpc DeleteSecret(DeleteSecretRequest) returns (DeleteSecretResponse);
+
   // Binary cache for service closures. An agent may only fetch paths in the
   // closure of the store paths assigned to it; every narinfo is signed with
   // the server's cache key (DesiredState.cache_public_key).
@@ -507,6 +514,11 @@ message ServiceSpec {
   // Config files rendered by the agent and bind-mounted read-only into the
   // service at their destination path.
   repeated TemplateSpec templates = 18;
+
+  // Static secrets the service declares, sorted. The agent bind-mounts their
+  // files read-only at /run/secrets/<name> and starts the service only once
+  // every one has arrived.
+  repeated string secrets = 19;
 }
 
 message TemplateSpec {
@@ -606,6 +618,8 @@ message SecretUpdate {
   string secret_name = 2;
   bytes encrypted_value = 3;
   uint64 version = 4;
+  // The secret no longer has a value: remove its file.
+  bool deleted = 5;
 }
 
 message DnsUpdate {
@@ -732,6 +746,9 @@ message PlanRequest {
 message PlanResponse {
   repeated PlannedOperation operations = 1;
   bool has_changes = 2;
+  // Problems that do not block the apply, e.g. declared secrets without a
+  // value (those services will not start until they are set).
+  repeated string warnings = 3;
 }
 
 message PlannedOperation {
@@ -1204,6 +1221,45 @@ message RotateFleetKeyResponse {
   uint64 new_version = 3;
   uint32 agents_notified = 4;    // Number of connected agents that received the new key
   string message = 5;
+}
+
+// --- Static secrets ---
+
+message SetSecretRequest {
+  string service_name = 1;
+  string secret_name = 2;
+  bytes value = 3;
+}
+
+message SetSecretResponse {
+  uint64 version = 1;
+}
+
+message ListSecretsRequest {
+  // Empty lists every service visible to the caller.
+  string service_name = 1;
+}
+
+message SecretInfo {
+  string service_name = 1;
+  string secret_name = 2;
+  // 0 when the secret is declared but has no value yet.
+  uint64 version = 3;
+  // Whether the current configuration declares it.
+  bool declared = 4;
+}
+
+message ListSecretsResponse {
+  repeated SecretInfo secrets = 1;
+}
+
+message DeleteSecretRequest {
+  string service_name = 1;
+  string secret_name = 2;
+}
+
+message DeleteSecretResponse {
+  bool deleted = 1;
 }
 
 // --- Binary cache ---

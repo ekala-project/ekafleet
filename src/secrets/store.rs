@@ -26,7 +26,7 @@ pub struct SecretStore {
     inner: Arc<RwLock<StoreState>>,
     key: Arc<LessSafeKey>,
     /// Raw key bytes retained for HKDF derivation and re-encryption.
-    raw_key: Arc<[u8; 32]>,
+    raw_key: Arc<zeroize::Zeroizing<[u8; 32]>>,
     rng: Arc<SystemRandom>,
 }
 
@@ -62,7 +62,7 @@ impl SecretStore {
                 secrets: HashMap::new(),
             })),
             key: Arc::new(key),
-            raw_key: Arc::new(*encryption_key),
+            raw_key: Arc::new(zeroize::Zeroizing::new(*encryption_key)),
             rng: Arc::new(SystemRandom::new()),
         }
     }
@@ -82,7 +82,10 @@ impl SecretStore {
 
         let nonce = Nonce::assume_unique_for_key(nonce_bytes);
 
-        let mut in_out = plaintext.to_vec();
+        // Room for the tag up front, so sealing never reallocates and leaves
+        // a plaintext copy behind.
+        let mut in_out = Vec::with_capacity(plaintext.len() + AES_256_GCM.tag_len());
+        in_out.extend_from_slice(plaintext);
         self.key
             .seal_in_place_append_tag(nonce, Aad::from(aad), &mut in_out)
             .map_err(|_| SecretStoreError::Encrypt)?;
@@ -95,7 +98,11 @@ impl SecretStore {
     }
 
     /// Decrypt a sealed value (nonce || ciphertext || tag) with additional authenticated data.
-    fn decrypt(&self, sealed: &[u8], aad: &[u8]) -> Result<Vec<u8>, SecretStoreError> {
+    fn decrypt(
+        &self,
+        sealed: &[u8],
+        aad: &[u8],
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>, SecretStoreError> {
         if sealed.len() < NONCE_LEN {
             return Err(SecretStoreError::Decrypt);
         }
@@ -104,13 +111,56 @@ impl SecretStore {
         let nonce =
             Nonce::try_assume_unique_for_key(nonce_bytes).map_err(|_| SecretStoreError::Decrypt)?;
 
-        let mut in_out = ciphertext_and_tag.to_vec();
-        let plaintext = self
+        let mut in_out = zeroize::Zeroizing::new(ciphertext_and_tag.to_vec());
+        let len = self
             .key
             .open_in_place(nonce, Aad::from(aad), &mut in_out)
-            .map_err(|_| SecretStoreError::Decrypt)?;
+            .map_err(|_| SecretStoreError::Decrypt)?
+            .len();
+        in_out.truncate(len);
+        Ok(in_out)
+    }
 
-        Ok(plaintext.to_vec())
+    /// Seal `value` for storage, bound to its service and name.
+    pub fn seal(
+        &self,
+        service_name: &str,
+        secret_name: &str,
+        value: &[u8],
+    ) -> Result<Vec<u8>, SecretStoreError> {
+        self.encrypt(value, &secret_aad(service_name, secret_name))
+    }
+
+    /// Open a value sealed by [`Self::seal`].
+    pub fn open(
+        &self,
+        service_name: &str,
+        secret_name: &str,
+        sealed: &[u8],
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>, SecretStoreError> {
+        self.decrypt(sealed, &secret_aad(service_name, secret_name))
+    }
+
+    /// Re-encrypt a sealed value under the key derived for one agent, which
+    /// is all that agent can decrypt (the fleet key never leaves the server).
+    pub fn seal_for_agent(
+        &self,
+        service_name: &str,
+        secret_name: &str,
+        sealed: &[u8],
+        agent_spiffe_id: &str,
+    ) -> Result<Vec<u8>, SecretStoreError> {
+        let agent_key = zeroize::Zeroizing::new(super::key_derivation::derive_agent_key(
+            self.raw_key(),
+            agent_spiffe_id,
+        ));
+        super::key_derivation::reencrypt(
+            self.raw_key(),
+            &agent_key,
+            sealed,
+            &secret_aad(service_name, secret_name),
+        )
+        .map_err(|_| SecretStoreError::Encrypt)
     }
 
     /// Store or update a secret for a service.
@@ -159,7 +209,7 @@ impl SecretStore {
             Some(entry) => {
                 let aad = secret_aad(service_name, secret_name);
                 let plaintext = self.decrypt(&entry.sealed, &aad)?;
-                Ok(Some((plaintext, entry.version)))
+                Ok(Some((plaintext.to_vec(), entry.version)))
             }
             None => Ok(None),
         }
@@ -224,15 +274,13 @@ impl SecretStore {
         service_names: &[String],
         agent_spiffe_id: &str,
     ) -> Vec<(String, String, Vec<u8>, u64)> {
-        let agent_key =
-            super::key_derivation::derive_agent_key(self.raw_key.as_ref(), agent_spiffe_id);
+        let agent_key = super::key_derivation::derive_agent_key(self.raw_key(), agent_spiffe_id);
         let entries = self.secrets_for_services(service_names).await;
         let mut result = Vec::with_capacity(entries.len());
 
         for (svc, name, sealed, version) in entries {
             let aad = secret_aad(&svc, &name);
-            match super::key_derivation::reencrypt(self.raw_key.as_ref(), &agent_key, &sealed, &aad)
-            {
+            match super::key_derivation::reencrypt(self.raw_key(), &agent_key, &sealed, &aad) {
                 Ok(reencrypted) => result.push((svc, name, reencrypted, version)),
                 Err(e) => {
                     tracing::error!(
@@ -273,7 +321,7 @@ impl SecretStore {
         let unbound =
             UnboundKey::new(&AES_256_GCM, new_key).map_err(|_| SecretStoreError::Encrypt)?;
         self.key = Arc::new(LessSafeKey::new(unbound));
-        self.raw_key = Arc::new(*new_key);
+        self.raw_key = Arc::new(zeroize::Zeroizing::new(*new_key));
 
         tracing::info!(count, "All secrets re-encrypted with new fleet key");
         Ok(count)
@@ -293,7 +341,10 @@ impl SecretStore {
 
         let unbound = UnboundKey::new(&AES_256_GCM, key).map_err(|_| SecretStoreError::Encrypt)?;
         let aead = LessSafeKey::new(unbound);
-        let mut in_out = plaintext.to_vec();
+        // Room for the tag up front, so sealing never reallocates and leaves
+        // a plaintext copy behind.
+        let mut in_out = Vec::with_capacity(plaintext.len() + AES_256_GCM.tag_len());
+        in_out.extend_from_slice(plaintext);
         aead.seal_in_place_append_tag(nonce, Aad::from(aad), &mut in_out)
             .map_err(|_| SecretStoreError::Encrypt)?;
 

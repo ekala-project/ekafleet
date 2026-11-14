@@ -173,8 +173,17 @@ let
   # `SecretConfig` (note: JSON key is `type`).
   secret = strictSubmodule {
     type = mkOption {
-      type = types.str;
-      description = "Secret backend type.";
+      type = types.enum [
+        "static"
+        "dynamic"
+      ];
+      default = "static";
+      description = ''
+        `static`: a value set with `ekafleet secret set <service> <name>`,
+        readable by the service at `/run/secrets/<name>`. The service starts
+        once every static secret it declares has a value. `dynamic`: issued by
+        a secret engine.
+      '';
     };
     engine = mkOption {
       type = types.nullOr types.str;

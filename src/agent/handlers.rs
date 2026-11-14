@@ -52,6 +52,60 @@ async fn fetch_service_closures(
     kept
 }
 
+/// Bring the supervisor's services in line with the desired state: drop
+/// secret files no service declares, render templates, and (re)start
+/// services, except new ones still waiting for a declared secret.
+async fn converge_services(
+    supervisor: &Arc<RwLock<supervisor::Supervisor>>,
+    local_state: &Arc<RwLock<LocalState>>,
+    secret_injector: &Arc<RwLock<SecretInjector>>,
+    templates: &Arc<TemplateManager>,
+    dns: &Arc<AgentDns>,
+) {
+    let all = local_state.read().await.desired_services.clone();
+    let mut desired = std::collections::HashMap::new();
+    {
+        let injector = secret_injector.read().await;
+        let declared = all
+            .values()
+            .filter(|s| !s.secrets.is_empty())
+            .map(|s| (s.name.clone(), s.secrets.clone()))
+            .collect();
+        if let Err(e) = injector.retain(&declared).await {
+            tracing::warn!(error = %e, "Cannot remove stale secret files");
+        }
+        let supervisor = supervisor.read().await;
+        for (name, spec) in &all {
+            if !injector.has_all(name, &spec.secrets) && !supervisor.is_running(name).await {
+                tracing::info!(service = %name, secrets = ?spec.secrets, "Service waits for its secrets");
+                continue;
+            }
+            desired.insert(name.clone(), spec.clone());
+        }
+    }
+
+    // Render before (re)starting, so new services find their files.
+    templates.set_services(all.values()).await;
+    let template_changes = templates.render_all(dns.resolver()).await;
+    match supervisor.write().await.reconcile(&desired).await {
+        Ok(actions) => {
+            for action in &actions {
+                tracing::info!(?action, "Supervisor action");
+            }
+            for (service, change) in &template_changes {
+                let fresh = actions.iter().any(|a| {
+                    matches!(a, supervisor::SupervisorAction::Started(s)
+                        | supervisor::SupervisorAction::Restarted(s) if s == service)
+                });
+                if !fresh && desired.contains_key(service) {
+                    templates::notify(service, change).await;
+                }
+            }
+        }
+        Err(e) => tracing::error!(error = %e, "Service reconciliation failed"),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_server_message(
     payload: ServerPayload,
@@ -299,30 +353,7 @@ pub(super) async fn handle_server_message(
                 }
             }
 
-            // Reconcile local services with desired state
-            let state = local_state.read().await;
-            let desired = state.desired_services.clone();
-            drop(state);
-            // Render before (re)starting, so new services find their files.
-            templates.set_services(desired.values()).await;
-            let template_changes = templates.render_all(dns.resolver()).await;
-            match supervisor.write().await.reconcile(&desired).await {
-                Ok(actions) => {
-                    for action in &actions {
-                        tracing::info!(?action, "Supervisor action");
-                    }
-                    for (service, change) in &template_changes {
-                        let fresh = actions.iter().any(|a| {
-                            matches!(a, supervisor::SupervisorAction::Started(s)
-                                | supervisor::SupervisorAction::Restarted(s) if s == service)
-                        });
-                        if !fresh {
-                            templates::notify(service, change).await;
-                        }
-                    }
-                }
-                Err(e) => tracing::error!(error = %e, "Service reconciliation failed"),
-            }
+            converge_services(supervisor, local_state, secret_injector, templates, dns).await;
         }
         ServerPayload::Deploy(cmd) => {
             tracing::info!(
@@ -331,48 +362,55 @@ pub(super) async fn handle_server_message(
                 "Received deploy command"
             );
             // Update the desired state for this service and reconcile
-            let mut state = local_state.write().await;
-            if let Some(svc) = state.desired_services.get_mut(&cmd.service_name) {
-                svc.store_path = cmd.store_path.clone();
-            }
-            let desired = state.desired_services.clone();
-            drop(state);
-            match supervisor.write().await.reconcile(&desired).await {
-                Ok(actions) => {
-                    for action in &actions {
-                        tracing::info!(?action, "Deploy action");
-                    }
-                }
-                Err(e) => tracing::error!(error = %e, "Deployment failed"),
-            }
-        }
-        ServerPayload::Secret(update) => {
-            tracing::info!(
-                service = %update.service_name,
-                secret = %update.secret_name,
-                "Received secret update"
-            );
-            match secret_injector
+            if let Some(svc) = local_state
                 .write()
                 .await
-                .inject(
-                    &update.service_name,
-                    &update.secret_name,
-                    &update.encrypted_value,
-                    update.version,
-                )
-                .await
+                .desired_services
+                .get_mut(&cmd.service_name)
             {
-                Ok(path) => {
-                    tracing::info!(path = %path.display(), "Secret injected");
-                    if let Some(change) = templates
-                        .render_service(&update.service_name, dns.resolver())
+                svc.store_path = cmd.store_path.clone();
+            }
+            converge_services(supervisor, local_state, secret_injector, templates, dns).await;
+        }
+        ServerPayload::Secret(update) => {
+            let service = update.service_name.as_str();
+            tracing::debug!(
+                service,
+                secret = %update.secret_name,
+                version = update.version,
+                deleted = update.deleted,
+                "Received secret update"
+            );
+            let changed = {
+                let injector = secret_injector.read().await;
+                if update.deleted {
+                    injector.remove(service, &update.secret_name).await
+                } else {
+                    injector
+                        .inject(service, &update.secret_name, &update.encrypted_value)
                         .await
-                    {
-                        templates::notify(&update.service_name, &change).await;
-                    }
                 }
-                Err(e) => tracing::error!(error = %e, "Secret injection failed"),
+            };
+            match changed {
+                Ok(true) if supervisor.read().await.is_running(service).await => {
+                    // Templates may read the secret; the restart picks up
+                    // both, so no separate template signal is needed.
+                    templates.render_service(service, dns.resolver()).await;
+                    tracing::info!(service, secret = %update.secret_name, "Restarting service for secret change");
+                    templates::notify(service, &templates::TemplateChange::Restart).await;
+                }
+                // Possibly the last secret a waiting service needed.
+                Ok(true) => {
+                    converge_services(supervisor, local_state, secret_injector, templates, dns)
+                        .await
+                }
+                Ok(false) => {}
+                Err(e) => tracing::error!(
+                    service,
+                    secret = %update.secret_name,
+                    error = %e,
+                    "Cannot apply secret update"
+                ),
             }
         }
         ServerPayload::Dns(update) => {
@@ -483,7 +521,7 @@ pub(super) async fn handle_server_message(
                 "Received fleet encryption key"
             );
             if key_update.encrypted_key.len() == 32 {
-                let mut key = [0u8; 32];
+                let mut key = zeroize::Zeroizing::new([0u8; 32]);
                 key.copy_from_slice(&key_update.encrypted_key);
                 let mut inj = secret_injector.write().await;
                 inj.update_key(&key);

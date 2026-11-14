@@ -1,329 +1,295 @@
-use std::collections::HashMap;
+//! Agent-side static secret files.
+//!
+//! Values arrive sealed under the key the server derived for this agent and
+//! are written, decrypted, to `<dir>/<service>/<name>` (mode 0400, on tmpfs
+//! under [`super::AGENT_SECRETS_DIR`]); the service's unit bind-mounts its
+//! directory read-only at `/run/secrets`.
+
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
+use zeroize::Zeroizing;
 
 const NONCE_LEN: usize = 12;
 
-/// Agent-side secret injection.
-/// Decrypts secrets received from the server and writes plaintext
-/// to files with restrictive permissions accessible by the target service.
+#[derive(Debug, thiserror::Error)]
+pub enum SecretInjectorError {
+    #[error("no fleet key received yet")]
+    NoKey,
+    #[error("secret does not decrypt with this agent's key")]
+    Decrypt,
+    #[error("{0}")]
+    InvalidName(String),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
+
 pub struct SecretInjector {
     secrets_dir: PathBuf,
-    /// service_name → secret_name → version
-    injected: HashMap<String, HashMap<String, u64>>,
-    key: Arc<LessSafeKey>,
+    key: Option<LessSafeKey>,
 }
 
 impl SecretInjector {
-    pub fn new(data_dir: &Path, encryption_key: &[u8; 32]) -> Self {
-        let unbound =
-            UnboundKey::new(&AES_256_GCM, encryption_key).expect("valid 256-bit key required");
-        let key = LessSafeKey::new(unbound);
-
+    /// An injector writing under `secrets_dir`, with no key until
+    /// [`Self::update_key`].
+    pub fn new(secrets_dir: &Path) -> Self {
         Self {
-            secrets_dir: data_dir.join("secrets"),
-            injected: HashMap::new(),
-            key: Arc::new(key),
+            secrets_dir: secrets_dir.to_path_buf(),
+            key: None,
         }
     }
 
-    /// Decrypt a sealed value (nonce || ciphertext || tag) with additional authenticated data.
-    fn decrypt(&self, sealed: &[u8], aad: &[u8]) -> Result<Vec<u8>, std::io::Error> {
-        if sealed.len() < NONCE_LEN {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "sealed data too short",
-            ));
-        }
-
-        let (nonce_bytes, ciphertext_and_tag) = sealed.split_at(NONCE_LEN);
-        let nonce = Nonce::try_assume_unique_for_key(nonce_bytes)
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid nonce"))?;
-
-        let mut in_out = ciphertext_and_tag.to_vec();
-        let plaintext = self
-            .key
-            .open_in_place(nonce, Aad::from(aad), &mut in_out)
-            .map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "decryption failed")
-            })?;
-
-        Ok(plaintext.to_vec())
-    }
-
-    /// Inject a secret for a service. Decrypts and writes to a file, returns the path.
-    pub async fn inject(
-        &mut self,
-        service_name: &str,
-        secret_name: &str,
-        encrypted_value: &[u8],
-        version: u64,
-    ) -> Result<PathBuf, std::io::Error> {
-        // Check if already at this version
-        if let Some(svc) = self.injected.get(service_name)
-            && svc.get(secret_name) == Some(&version)
-        {
-            let path = self.secret_path(service_name, secret_name);
-            return Ok(path);
-        }
-
-        let dir = self.secrets_dir.join(service_name);
-        tokio::fs::create_dir_all(&dir).await?;
-
-        let path = dir.join(secret_name);
-
-        // Decrypt before writing to disk (AAD binds ciphertext to service/secret context)
-        let aad = super::store::secret_aad(service_name, secret_name);
-        let plaintext = self.decrypt(encrypted_value, &aad)?;
-
-        // If the file already exists with read-only permissions, make it writable first
-        #[cfg(unix)]
-        if path.exists() {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            tokio::fs::set_permissions(&path, perms).await?;
-        }
-
-        tokio::fs::write(&path, &plaintext).await?;
-
-        // Set restrictive permissions (owner read-only)
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o400);
-            tokio::fs::set_permissions(&path, perms).await?;
-        }
-
-        self.injected
-            .entry(service_name.to_string())
-            .or_default()
-            .insert(secret_name.to_string(), version);
-
-        tracing::info!(
-            service = %service_name,
-            secret = %secret_name,
-            version,
-            path = %path.display(),
-            "Secret injected (decrypted)"
-        );
-
-        Ok(path)
-    }
-
-    /// Remove all secrets for a service.
-    pub async fn remove_service(&mut self, service_name: &str) -> Result<(), std::io::Error> {
-        let dir = self.secrets_dir.join(service_name);
-        if dir.exists() {
-            tokio::fs::remove_dir_all(&dir).await?;
-        }
-        self.injected.remove(service_name);
-        Ok(())
-    }
-
-    /// Update the encryption key (e.g., when the server distributes the fleet key).
-    pub fn update_key(&mut self, new_key: &[u8; 32]) {
-        let unbound = UnboundKey::new(&AES_256_GCM, new_key).expect("valid 256-bit key required");
-        self.key = Arc::new(LessSafeKey::new(unbound));
+    /// Install the key the server derived for this agent.
+    pub fn update_key(&mut self, key: &[u8; 32]) {
+        let unbound = UnboundKey::new(&AES_256_GCM, key).expect("valid 256-bit key required");
+        self.key = Some(LessSafeKey::new(unbound));
         tracing::info!("Secret injector encryption key updated");
     }
 
-    /// Inject a secret and notify the service to reload if the value changed.
-    /// Sends the specified signal (default SIGHUP) to the service's systemd unit.
-    pub async fn inject_and_notify(
-        &mut self,
-        service_name: &str,
-        secret_name: &str,
-        encrypted_value: &[u8],
-        version: u64,
-        signal: Option<&str>,
-    ) -> Result<PathBuf, std::io::Error> {
-        // Check if already at this version
-        let was_updated = self
-            .injected
-            .get(service_name)
-            .and_then(|svc| svc.get(secret_name))
-            != Some(&version);
-
-        let path = self
-            .inject(service_name, secret_name, encrypted_value, version)
-            .await?;
-
-        if was_updated {
-            let sig = signal.unwrap_or("SIGHUP");
-            let unit = format!("ekafleet-{service_name}.service");
-            if let Err(e) = notify_service_reload(&unit, sig).await {
-                tracing::warn!(
-                    service = %service_name,
-                    signal = %sig,
-                    error = %e,
-                    "Failed to notify service of secret rotation"
-                );
-            } else {
-                tracing::info!(
-                    service = %service_name,
-                    signal = %sig,
-                    "Service notified of secret rotation"
-                );
-            }
+    /// Decrypt a sealed value (nonce || ciphertext || tag) bound to `aad`.
+    fn decrypt(
+        &self,
+        sealed: &[u8],
+        aad: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>, SecretInjectorError> {
+        let key = self.key.as_ref().ok_or(SecretInjectorError::NoKey)?;
+        if sealed.len() < NONCE_LEN {
+            return Err(SecretInjectorError::Decrypt);
         }
-
-        Ok(path)
+        let (nonce_bytes, ciphertext_and_tag) = sealed.split_at(NONCE_LEN);
+        let nonce = Nonce::try_assume_unique_for_key(nonce_bytes)
+            .map_err(|_| SecretInjectorError::Decrypt)?;
+        let mut in_out = Zeroizing::new(ciphertext_and_tag.to_vec());
+        let len = key
+            .open_in_place(nonce, Aad::from(aad), &mut in_out)
+            .map_err(|_| SecretInjectorError::Decrypt)?
+            .len();
+        in_out.truncate(len);
+        Ok(in_out)
     }
 
-    fn secret_path(&self, service_name: &str, secret_name: &str) -> PathBuf {
-        self.secrets_dir.join(service_name).join(secret_name)
+    /// The directory holding a service's secret files.
+    pub fn service_dir(&self, service_name: &str) -> PathBuf {
+        self.secrets_dir.join(service_name)
+    }
+
+    fn path(&self, service_name: &str, secret_name: &str) -> Result<PathBuf, SecretInjectorError> {
+        super::validate_name("service", service_name).map_err(SecretInjectorError::InvalidName)?;
+        super::validate_name("secret", secret_name).map_err(SecretInjectorError::InvalidName)?;
+        Ok(self.service_dir(service_name).join(secret_name))
+    }
+
+    /// Decrypt and write a secret. Returns whether the file changed.
+    pub async fn inject(
+        &self,
+        service_name: &str,
+        secret_name: &str,
+        sealed: &[u8],
+    ) -> Result<bool, SecretInjectorError> {
+        let path = self.path(service_name, secret_name)?;
+        let plaintext =
+            self.decrypt(sealed, &super::store::secret_aad(service_name, secret_name))?;
+        if let Ok(current) = tokio::fs::read(&path).await {
+            let current = Zeroizing::new(current);
+            if *current == *plaintext {
+                return Ok(false);
+            }
+        }
+        create_private_dir(&self.secrets_dir).await?;
+        create_private_dir(&self.service_dir(service_name)).await?;
+        // Written whole under a temporary name and renamed into place, so the
+        // service never reads a partial value. Secret names cannot start
+        // with a dot, so the temporary name never collides with one.
+        let tmp = self
+            .service_dir(service_name)
+            .join(format!(".{secret_name}.tmp"));
+        let _ = tokio::fs::remove_file(&tmp).await;
+        write_read_only(&tmp, plaintext).await?;
+        tokio::fs::rename(&tmp, &path).await?;
+        tracing::info!(service = %service_name, secret = %secret_name, "Secret written");
+        Ok(true)
+    }
+
+    /// Remove one secret's file. Returns whether it existed.
+    pub async fn remove(
+        &self,
+        service_name: &str,
+        secret_name: &str,
+    ) -> Result<bool, SecretInjectorError> {
+        let path = self.path(service_name, secret_name)?;
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {
+                tracing::info!(service = %service_name, secret = %secret_name, "Secret removed");
+                Ok(true)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Whether every one of `names` has a file for `service_name`.
+    pub fn has_all(&self, service_name: &str, names: &[String]) -> bool {
+        names.iter().all(|name| {
+            self.path(service_name, name)
+                .is_ok_and(|path| path.is_file())
+        })
+    }
+
+    /// Delete the files of services and secrets not in `declared`
+    /// (service → secret names), keeping the directories of declared
+    /// services (they are bind-mounted into running units).
+    pub async fn retain(
+        &self,
+        declared: &HashMap<String, Vec<String>>,
+    ) -> Result<(), SecretInjectorError> {
+        let mut services = match tokio::fs::read_dir(&self.secrets_dir).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        while let Some(service) = services.next_entry().await? {
+            let name = service.file_name().to_string_lossy().into_owned();
+            let Some(keep) = declared.get(&name) else {
+                tokio::fs::remove_dir_all(service.path()).await?;
+                tracing::info!(service = %name, "Secrets of unassigned service removed");
+                continue;
+            };
+            let keep: HashSet<&str> = keep.iter().map(String::as_str).collect();
+            let mut files = tokio::fs::read_dir(service.path()).await?;
+            while let Some(file) = files.next_entry().await? {
+                let file_name = file.file_name().to_string_lossy().into_owned();
+                if !keep.contains(file_name.as_str()) {
+                    tokio::fs::remove_file(file.path()).await?;
+                    tracing::info!(service = %name, secret = %file_name, "Undeclared secret removed");
+                }
+            }
+        }
+        Ok(())
     }
 }
 
-/// Send a signal to a systemd service unit to trigger reload.
-async fn notify_service_reload(unit: &str, signal: &str) -> Result<(), std::io::Error> {
-    let output = tokio::process::Command::new("systemctl")
-        .args(["kill", "--signal", signal, unit])
-        .output()
-        .await?;
+async fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    tokio::fs::create_dir_all(dir).await?;
+    tokio::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).await
+}
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(std::io::Error::other(format!(
-            "systemctl kill failed: {}",
-            stderr.trim()
-        )));
-    }
-    Ok(())
+/// Create `path` with mode 0400 from the start and write `contents`.
+async fn write_read_only(path: &Path, contents: Zeroizing<Vec<u8>>) -> std::io::Result<()> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o400)
+            .open(&path)?;
+        file.write_all(&contents)
+    })
+    .await
+    .map_err(std::io::Error::other)?
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn test_key() -> [u8; 32] {
-        [0xAB; 32]
+    const KEY: [u8; 32] = [0xAB; 32];
+
+    fn injector(dir: &Path) -> SecretInjector {
+        let mut injector = SecretInjector::new(dir);
+        injector.update_key(&KEY);
+        injector
     }
 
-    /// Encrypt a value the same way SecretStore does, for test input.
-    /// AAD is built from service_name + secret_name to match inject().
-    fn encrypt_for(
-        key: &[u8; 32],
-        service_name: &str,
-        secret_name: &str,
-        plaintext: &[u8],
-    ) -> Vec<u8> {
-        use ring::aead::{AES_256_GCM, Aad, Nonce, UnboundKey};
-        use ring::rand::{SecureRandom, SystemRandom};
-
-        let aad = super::super::store::secret_aad(service_name, secret_name);
-        let unbound = UnboundKey::new(&AES_256_GCM, key).unwrap();
-        let sealing_key = LessSafeKey::new(unbound);
-        let rng = SystemRandom::new();
-
-        let mut nonce_bytes = [0u8; NONCE_LEN];
-        rng.fill(&mut nonce_bytes).unwrap();
-        let nonce = Nonce::assume_unique_for_key(nonce_bytes);
-
-        let mut in_out = plaintext.to_vec();
-        sealing_key
-            .seal_in_place_append_tag(nonce, Aad::from(aad.as_slice()), &mut in_out)
-            .unwrap();
-
-        let mut sealed = Vec::with_capacity(NONCE_LEN + in_out.len());
-        sealed.extend_from_slice(&nonce_bytes);
-        sealed.extend_from_slice(&in_out);
-        sealed
+    /// Seal a value the way the server does for this agent.
+    fn seal(key: &[u8; 32], service: &str, secret: &str, plaintext: &[u8]) -> Vec<u8> {
+        crate::secrets::store::SecretStore::new(key)
+            .seal(service, secret, plaintext)
+            .unwrap()
     }
 
     #[tokio::test]
-    async fn inject_decrypts_and_writes_file() {
+    async fn inject_writes_a_read_only_file_once_per_value() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let key = test_key();
-        let mut injector = SecretInjector::new(dir.path(), &key);
+        let injector = injector(dir.path());
 
-        let encrypted = encrypt_for(&key, "my-service", "db_pass", b"database-password");
-        let path = injector
-            .inject("my-service", "db_pass", &encrypted, 1)
+        let v1 = seal(&KEY, "web", "db_pass", b"one");
+        assert!(injector.inject("web", "db_pass", &v1).await.unwrap());
+        let path = dir.path().join("web/db_pass");
+        assert_eq!(std::fs::read(&path).unwrap(), b"one");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o400);
+        let dir_mode = std::fs::metadata(dir.path().join("web"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(dir_mode & 0o777, 0o700);
+
+        // The same value again (e.g. after a reconnect) changes nothing.
+        let again = seal(&KEY, "web", "db_pass", b"one");
+        assert!(!injector.inject("web", "db_pass", &again).await.unwrap());
+
+        let v2 = seal(&KEY, "web", "db_pass", b"two");
+        assert!(injector.inject("web", "db_pass", &v2).await.unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), b"two");
+        assert!(injector.has_all("web", &["db_pass".into()]));
+        assert!(!injector.has_all("web", &["db_pass".into(), "other".into()]));
+    }
+
+    #[tokio::test]
+    async fn values_open_only_with_the_right_key_and_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let sealed = seal(&KEY, "web", "key", b"secret");
+
+        assert!(matches!(
+            SecretInjector::new(dir.path())
+                .inject("web", "key", &sealed)
+                .await,
+            Err(SecretInjectorError::NoKey)
+        ));
+        let mut other = SecretInjector::new(dir.path());
+        other.update_key(&[0xBB; 32]);
+        assert!(matches!(
+            other.inject("web", "key", &sealed).await,
+            Err(SecretInjectorError::Decrypt)
+        ));
+        // Bound to its service and name.
+        let injector = injector(dir.path());
+        assert!(matches!(
+            injector.inject("api", "key", &sealed).await,
+            Err(SecretInjectorError::Decrypt)
+        ));
+        assert!(matches!(
+            injector.inject("web", "../key", &sealed).await,
+            Err(SecretInjectorError::InvalidName(_))
+        ));
+        assert!(!dir.path().join("web").exists());
+    }
+
+    #[tokio::test]
+    async fn retain_and_remove_drop_stale_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let injector = injector(dir.path());
+        for (service, secret) in [("web", "a"), ("web", "b"), ("old", "c")] {
+            let sealed = seal(&KEY, service, secret, b"v");
+            injector.inject(service, secret, &sealed).await.unwrap();
+        }
+
+        injector
+            .retain(&[("web".to_string(), vec!["a".to_string()])].into())
             .await
             .unwrap();
+        assert!(dir.path().join("web/a").exists());
+        assert!(!dir.path().join("web/b").exists());
+        assert!(!dir.path().join("old").exists());
 
-        let contents = tokio::fs::read(&path).await.unwrap();
-        assert_eq!(contents, b"database-password");
-    }
-
-    #[tokio::test]
-    async fn inject_sets_restrictive_permissions() {
-        let dir = tempfile::tempdir().unwrap();
-        let key = test_key();
-        let mut injector = SecretInjector::new(dir.path(), &key);
-
-        let encrypted = encrypt_for(&key, "svc", "key", b"secret");
-        let path = injector.inject("svc", "key", &encrypted, 1).await.unwrap();
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::metadata(&path).unwrap().permissions();
-            assert_eq!(
-                perms.mode() & 0o777,
-                0o400,
-                "secret file must be owner-read-only"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn inject_is_idempotent_for_same_version() {
-        let dir = tempfile::tempdir().unwrap();
-        let key = test_key();
-        let mut injector = SecretInjector::new(dir.path(), &key);
-
-        let encrypted = encrypt_for(&key, "svc", "key", b"value");
-        let path1 = injector.inject("svc", "key", &encrypted, 1).await.unwrap();
-        let path2 = injector.inject("svc", "key", &encrypted, 1).await.unwrap();
-
-        assert_eq!(path1, path2);
-    }
-
-    #[tokio::test]
-    async fn inject_updates_on_new_version() {
-        let dir = tempfile::tempdir().unwrap();
-        let key = test_key();
-        let mut injector = SecretInjector::new(dir.path(), &key);
-
-        let enc1 = encrypt_for(&key, "svc", "key", b"v1");
-        let enc2 = encrypt_for(&key, "svc", "key", b"v2");
-
-        injector.inject("svc", "key", &enc1, 1).await.unwrap();
-        let path = injector.inject("svc", "key", &enc2, 2).await.unwrap();
-
-        let contents = tokio::fs::read(&path).await.unwrap();
-        assert_eq!(contents, b"v2");
-    }
-
-    #[tokio::test]
-    async fn wrong_key_fails_to_inject() {
-        let dir = tempfile::tempdir().unwrap();
-        let encrypted = encrypt_for(&[0xAA; 32], "svc", "key", b"secret");
-
-        let mut injector = SecretInjector::new(dir.path(), &[0xBB; 32]);
-        let result = injector.inject("svc", "key", &encrypted, 1).await;
-
-        assert!(
-            result.is_err(),
-            "decryption with wrong key must fail during injection"
-        );
-    }
-
-    #[tokio::test]
-    async fn remove_service_cleans_up() {
-        let dir = tempfile::tempdir().unwrap();
-        let key = test_key();
-        let mut injector = SecretInjector::new(dir.path(), &key);
-
-        let encrypted = encrypt_for(&key, "svc", "key", b"secret");
-        let path = injector.inject("svc", "key", &encrypted, 1).await.unwrap();
-        assert!(path.exists());
-
-        injector.remove_service("svc").await.unwrap();
-        assert!(!path.exists());
+        assert!(injector.remove("web", "a").await.unwrap());
+        assert!(!injector.remove("web", "a").await.unwrap());
+        // The directory stays: a running unit has it mounted.
+        assert!(dir.path().join("web").is_dir());
     }
 }

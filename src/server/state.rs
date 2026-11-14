@@ -52,6 +52,9 @@ pub struct FleetState {
     /// Public key of the server's binary cache, stamped into every
     /// `DesiredState` so agents can verify fetched closures.
     cache_public_key: Arc<std::sync::OnceLock<String>>,
+    /// Fired when a node's assignment is (re)sent, so secrets for newly
+    /// assigned services follow right away.
+    assignments_changed: ReconcileTrigger,
 }
 
 struct FleetStateInner {
@@ -116,7 +119,14 @@ impl FleetState {
             pending_canaries: super::deployer::PendingCanaryStore::new(),
             service_assignments: crate::ca::issuer::ServiceAssignments::new(),
             cache_public_key: Arc::default(),
+            assignments_changed: ReconcileTrigger::new(),
         }
+    }
+
+    /// Wakes whoever distributes per-assignment data (static secrets) when
+    /// an assignment is sent or replayed, or a secret changes.
+    pub fn assignments_changed(&self) -> ReconcileTrigger {
+        self.assignments_changed.clone()
     }
 
     /// Record the binary cache's public key (once, at startup).
@@ -172,10 +182,12 @@ impl FleetState {
         let msg = ServerMessage {
             payload: Some(crate::proto::server_message::Payload::DesiredState(desired)),
         };
-        match tx {
+        let delivered = match tx {
             Some(tx) => tx.send(msg).await.is_ok(),
             None => false,
-        }
+        };
+        self.assignments_changed.trigger();
+        delivered
     }
 
     /// The last `DesiredState` assigned to a node, if any.
@@ -657,6 +669,17 @@ impl FleetState {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Connected nodes with the id of their current control stream, which
+    /// changes whenever a node reconnects.
+    pub async fn connections(&self) -> Vec<(String, u64)> {
+        let state = self.inner.read().await;
+        state
+            .nodes
+            .iter()
+            .map(|(id, info)| (id.to_string(), info.connection_id))
+            .collect()
     }
 
     /// Get list of connected node IDs.

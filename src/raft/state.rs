@@ -25,8 +25,13 @@ pub struct FleetStateMachine {
 struct StateMachineInner {
     /// Current deployed services and their placements
     deployments: HashMap<String, DeploymentState>,
-    /// Encrypted secrets
+    /// Static secrets: service → name → value sealed under the fleet key
+    /// (AAD bound to service and name).
     secrets: HashMap<String, HashMap<String, Vec<u8>>>,
+    /// service → name → last version stored. Kept after a delete so a value
+    /// set again gets a higher version than any agent has seen.
+    #[serde(default)]
+    secret_versions: HashMap<String, HashMap<String, u64>>,
     /// DNS zone data
     dns_zones: HashMap<String, Vec<DnsEntry>>,
     /// General-purpose key-value store (used for volume tracking, etc.)
@@ -198,6 +203,11 @@ pub enum Command {
     DeleteSecret {
         service_name: String,
         secret_name: String,
+    },
+    /// Swap every sealed value for one re-encrypted under a new fleet key,
+    /// keeping versions (fleet key rotation).
+    ResealSecrets {
+        secrets: HashMap<String, HashMap<String, Vec<u8>>>,
     },
     UpdateDns {
         zone: String,
@@ -419,6 +429,12 @@ impl FleetStateMachine {
                 secret_name,
                 encrypted_value,
             } => {
+                *state
+                    .secret_versions
+                    .entry(service_name.clone())
+                    .or_default()
+                    .entry(secret_name.clone())
+                    .or_default() += 1;
                 state
                     .secrets
                     .entry(service_name)
@@ -431,6 +447,20 @@ impl FleetStateMachine {
             } => {
                 if let Some(svc) = state.secrets.get_mut(&service_name) {
                     svc.remove(&secret_name);
+                    if svc.is_empty() {
+                        state.secrets.remove(&service_name);
+                    }
+                }
+            }
+            Command::ResealSecrets { secrets } => {
+                for (service, values) in secrets {
+                    if let Some(stored) = state.secrets.get_mut(&service) {
+                        for (name, sealed) in values {
+                            if let Some(slot) = stored.get_mut(&name) {
+                                *slot = sealed;
+                            }
+                        }
+                    }
                 }
             }
             Command::UpdateDns { zone, entries } => {
@@ -634,6 +664,82 @@ impl FleetStateMachine {
     pub async fn last_applied(&self) -> u64 {
         let state = self.inner.read().await;
         state.last_applied
+    }
+
+    /// Store a sealed secret value; returns its new version.
+    pub async fn put_secret(
+        &self,
+        service_name: &str,
+        secret_name: &str,
+        sealed: Vec<u8>,
+    ) -> Result<u64, RaftError> {
+        let mut state = self.inner.write().await;
+        self.commit_locked(
+            &mut state,
+            Command::PutSecret {
+                service_name: service_name.to_string(),
+                secret_name: secret_name.to_string(),
+                encrypted_value: sealed,
+            },
+        )
+        .await?;
+        Ok(state.secret_versions[service_name][secret_name])
+    }
+
+    /// Delete a secret's value. Returns whether it had one.
+    pub async fn delete_secret(
+        &self,
+        service_name: &str,
+        secret_name: &str,
+    ) -> Result<bool, RaftError> {
+        let mut state = self.inner.write().await;
+        if !state
+            .secrets
+            .get(service_name)
+            .is_some_and(|svc| svc.contains_key(secret_name))
+        {
+            return Ok(false);
+        }
+        self.commit_locked(
+            &mut state,
+            Command::DeleteSecret {
+                service_name: service_name.to_string(),
+                secret_name: secret_name.to_string(),
+            },
+        )
+        .await?;
+        Ok(true)
+    }
+
+    /// Every stored secret: service → name → (sealed value, version).
+    pub async fn secrets(&self) -> HashMap<String, HashMap<String, (Vec<u8>, u64)>> {
+        let state = self.inner.read().await;
+        state
+            .secrets
+            .iter()
+            .map(|(service, values)| {
+                let versions = state.secret_versions.get(service);
+                let values = values
+                    .iter()
+                    .map(|(name, sealed)| {
+                        let version = versions.and_then(|v| v.get(name)).copied().unwrap_or(1);
+                        (name.clone(), (sealed.clone(), version))
+                    })
+                    .collect();
+                (service.clone(), values)
+            })
+            .collect()
+    }
+
+    /// Replace sealed values after a fleet key rotation (versions kept).
+    pub async fn reseal_secrets(
+        &self,
+        secrets: HashMap<String, HashMap<String, Vec<u8>>>,
+    ) -> Result<(), RaftError> {
+        let mut state = self.inner.write().await;
+        self.commit_locked(&mut state, Command::ResealSecrets { secrets })
+            .await
+            .map(drop)
     }
 
     /// Get a value from the key-value store.
@@ -894,6 +1000,50 @@ impl FleetStateMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn secrets_are_versioned_durable_and_resealed() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = || Arc::new(RaftStorage::new(dir.path(), &[5u8; 32]));
+        let first = storage();
+        first.initialize().await.unwrap();
+        let sm = FleetStateMachine::with_log(first);
+
+        assert_eq!(sm.put_secret("web", "key", b"a".to_vec()).await.unwrap(), 1);
+        assert_eq!(sm.put_secret("web", "key", b"b".to_vec()).await.unwrap(), 2);
+        assert_eq!(sm.put_secret("db", "pw", b"c".to_vec()).await.unwrap(), 1);
+        assert_eq!(sm.secrets().await["web"]["key"], (b"b".to_vec(), 2));
+
+        // A value set again after a delete gets a newer version.
+        assert!(sm.delete_secret("web", "key").await.unwrap());
+        assert!(!sm.delete_secret("web", "key").await.unwrap());
+        assert!(!sm.secrets().await.contains_key("web"));
+        assert_eq!(sm.put_secret("web", "key", b"d".to_vec()).await.unwrap(), 3);
+
+        // Resealing swaps values only for secrets that still exist.
+        sm.reseal_secrets(
+            [
+                (
+                    "web".to_string(),
+                    [("key".to_string(), b"D".to_vec())].into(),
+                ),
+                (
+                    "gone".to_string(),
+                    [("x".to_string(), b"X".to_vec())].into(),
+                ),
+            ]
+            .into(),
+        )
+        .await
+        .unwrap();
+
+        let restarted = FleetStateMachine::with_log(storage());
+        restarted.load().await.unwrap();
+        let secrets = restarted.secrets().await;
+        assert_eq!(secrets["web"]["key"], (b"D".to_vec(), 3));
+        assert_eq!(secrets["db"]["pw"], (b"c".to_vec(), 1));
+        assert!(!secrets.contains_key("gone"));
+    }
 
     #[tokio::test]
     async fn mesh_ips_are_unique_stable_and_reusable() {
