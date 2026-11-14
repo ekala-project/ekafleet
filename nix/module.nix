@@ -468,12 +468,15 @@ in
             # /run/ekafleet; every call is attested via SO_PEERCRED + cgroup).
             # The proxy, which handles untrusted network traffic, runs
             # unprivileged in its own unit.
-            ProtectHome = true;
-            PrivateTmp = true;
+            #
+            # No mount-namespacing options (PrivateTmp, ProtectHome, ...):
+            # the network namespaces the agent creates are nsfs mounts under
+            # /run/netns that service units must see, and mounts made in a
+            # private mount namespace never reach the host.
             RuntimeDirectory = "ekafleet";
             RuntimeDirectoryMode = "0755";
             RuntimeDirectoryPreserve = "yes";
-            # Nix's caches (ProtectHome makes /root read-only).
+            # Nix's caches.
             CacheDirectory = "ekafleet-agent";
           };
 
