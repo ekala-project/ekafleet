@@ -3,6 +3,7 @@ pub mod api;
 mod api_system;
 pub mod audit;
 pub mod bootstrap;
+pub mod cache;
 pub mod cloud;
 pub mod controller;
 pub mod deployer;
@@ -168,6 +169,8 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         tracing::warn!(error = %e, "Failed to load persisted join tokens, starting fresh");
     }
 
+    let binary_cache = cache::BinaryCache::open(&config.data_dir, &config.domain).await?;
+
     // Create a cancellation token for graceful shutdown
     let shutdown = CancellationToken::new();
 
@@ -187,6 +190,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         event_store: event_store.clone(),
         data_dir: config.data_dir.clone(),
         allow_bearer_agents: config.allow_bearer_agents,
+        binary_cache: Some(binary_cache),
     };
 
     let grpc_shutdown = shutdown.clone();

@@ -40,6 +40,9 @@ struct UnitState {
     running: bool,
 }
 
+/// Where unit files are linked for systemd to load.
+const SYSTEMD_RUNTIME_UNIT_DIR: &str = "/run/systemd/system";
+
 /// The path to the OCI bundle store used by the supervisor.
 const OCI_STORE_DIR: &str = "/var/lib/ekafleet/oci";
 
@@ -155,9 +158,21 @@ impl Supervisor {
             let version_key = version_key_for(spec);
 
             match self.managed_units.get(name) {
-                Some(existing) if existing.version_key == version_key => {
-                    // Already running with correct version
+                Some(existing) if existing.version_key == version_key && existing.running => {
                     tracing::debug!(service = %name, "Already up-to-date");
+                }
+                Some(existing) if existing.version_key == version_key => {
+                    // Adopted but not running, e.g. after a reboot cleared
+                    // the runtime unit directory.
+                    tracing::info!(service = %name, "Starting adopted service");
+                    self.root_service_closure(name, spec).await;
+                    self.write_unit_file(&unit_name, spec).await?;
+                    systemctl(&["daemon-reload"]).await?;
+                    systemctl(&["start", &unit_name]).await?;
+                    if let Some(unit) = self.managed_units.get_mut(name) {
+                        unit.running = true;
+                    }
+                    actions.push(SupervisorAction::Started(name.clone()));
                 }
                 Some(existing) => {
                     // Version changed — restart
@@ -187,7 +202,7 @@ impl Supervisor {
                     self.root_service_closure(name, spec).await;
                     self.write_unit_file(&unit_name, spec).await?;
                     systemctl(&["daemon-reload"]).await?;
-                    systemctl(&["enable", "--now", &unit_name]).await?;
+                    systemctl(&["start", &unit_name]).await?;
                     self.managed_units.insert(
                         name.clone(),
                         UnitState {
@@ -212,7 +227,10 @@ impl Supervisor {
         for name in to_remove {
             if let Some(state) = self.managed_units.remove(&name) {
                 tracing::info!(service = %name, "Stopping removed service");
-                systemctl(&["disable", "--now", &state.unit_name]).await?;
+                // An orphan from before a reboot is no longer loaded.
+                if let Err(e) = systemctl(&["stop", &state.unit_name]).await {
+                    tracing::warn!(service = %name, error = %e, "Cannot stop removed service");
+                }
                 self.remove_unit_file(&state.unit_name).await?;
                 self.remove_gc_root(&name).await;
                 actions.push(SupervisorAction::Stopped(name));
@@ -367,8 +385,10 @@ WantedBy=multi-user.target
         let path = self.unit_dir.join(unit_name);
         tokio::fs::write(&path, content).await?;
 
-        // Symlink into systemd directory
-        let systemd_path = PathBuf::from("/etc/systemd/system").join(unit_name);
+        // Link into systemd's runtime unit directory: /etc/systemd/system is
+        // read-only on NixOS, and the agent reinstalls its units after a
+        // reboot anyway.
+        let systemd_path = Path::new(SYSTEMD_RUNTIME_UNIT_DIR).join(unit_name);
         // Remove existing symlink if present
         let _ = tokio::fs::remove_file(&systemd_path).await;
         tokio::fs::symlink(&path, &systemd_path).await?;
@@ -381,7 +401,7 @@ WantedBy=multi-user.target
         let path = self.unit_dir.join(unit_name);
         let _ = tokio::fs::remove_file(&path).await;
 
-        let systemd_path = PathBuf::from("/etc/systemd/system").join(unit_name);
+        let systemd_path = Path::new(SYSTEMD_RUNTIME_UNIT_DIR).join(unit_name);
         let _ = tokio::fs::remove_file(&systemd_path).await;
 
         systemctl(&["daemon-reload"]).await?;
@@ -395,7 +415,20 @@ WantedBy=multi-user.target
     /// Failure to root is logged but not fatal: the service can still run;
     /// it is just exposed to GC until the next successful reconcile.
     async fn root_service_closure(&self, name: &str, spec: &ServiceSpec) {
-        if is_container_service(spec) || spec.store_path.is_empty() {
+        if is_container_service(spec) {
+            return;
+        }
+        if !spec.store_paths.is_empty() {
+            if let Err(e) = self.add_closure_roots(name, &spec.store_paths).await {
+                tracing::warn!(
+                    service = %name,
+                    error = %e,
+                    "Failed to register GC roots for service closure — paths are exposed to nix GC"
+                );
+            }
+            return;
+        }
+        if spec.store_path.is_empty() {
             return;
         }
         if let Err(e) = self.add_gc_root(name, &spec.store_path).await {
@@ -442,9 +475,40 @@ WantedBy=multi-user.target
         Ok(())
     }
 
+    /// Directory holding a service's closure roots (`root`, `root-2`, ...).
+    fn closure_root_dir(&self, name: &str) -> PathBuf {
+        self.gcroot_dir.join(format!("{name}.closure"))
+    }
+
+    /// Root every store path a service needs, replacing its previous roots.
+    async fn add_closure_roots(&self, name: &str, paths: &[String]) -> Result<(), SupervisorError> {
+        let dir = self.closure_root_dir(name);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await?;
+        let root = dir.join("root");
+        let output = tokio::process::Command::new("nix-store")
+            .arg("--add-root")
+            .arg(&root)
+            .arg("--realise")
+            .args(paths)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .await?;
+        if !output.status.success() {
+            return Err(SupervisorError::Systemctl(format!(
+                "nix-store --add-root failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        tracing::debug!(service = %name, paths = paths.len(), "Registered GC roots for service closure");
+        Ok(())
+    }
+
     /// Remove the indirect GC root for a service, allowing its (now unused)
     /// closure to be collected by a future `nix-collect-garbage`.
     async fn remove_gc_root(&self, name: &str) {
+        let _ = tokio::fs::remove_dir_all(self.closure_root_dir(name)).await;
         let root_link = self.gcroot_dir.join(name);
         if let Err(e) = tokio::fs::remove_file(&root_link).await
             && e.kind() != std::io::ErrorKind::NotFound

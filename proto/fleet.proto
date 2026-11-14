@@ -113,6 +113,12 @@ service FleetControl {
   // Rotate the fleet encryption key. Generates a new master key, re-encrypts
   // all secrets in the store, and pushes derived keys to all connected agents.
   rpc RotateFleetKey(RotateFleetKeyRequest) returns (RotateFleetKeyResponse);
+
+  // Binary cache for service closures. An agent may only fetch paths in the
+  // closure of the store paths assigned to it; every narinfo is signed with
+  // the server's cache key (DesiredState.cache_public_key).
+  rpc CacheNarInfo(CacheNarInfoRequest) returns (CacheNarInfoResponse);
+  rpc CacheNar(CacheNarRequest) returns (stream CacheNarChunk);
 }
 
 // --- Agent → Server messages ---
@@ -403,6 +409,9 @@ message DesiredState {
   // Same-host implementation uses this for bridge/subnet setup.
   // Cross-node will extend it with remote peer entries.
   repeated NamespaceNetworkConfig namespace_networks = 4;
+  // Public key (`name:base64`) that signs the server's binary cache, used
+  // to verify fetched closures.
+  string cache_public_key = 5;
 }
 
 // Network configuration for a namespace on this agent.
@@ -476,6 +485,11 @@ message ServiceSpec {
   // this on the service's veth interface. Globally unique within the
   // namespace across all nodes.
   string namespace_ip = 16;
+
+  // Store paths the service needs (the outputs its configuration refers
+  // to), built by the server at apply time. The agent fetches their
+  // closures from the server's binary cache before starting the service.
+  repeated string store_paths = 17;
 }
 
 message VolumeMount {
@@ -1161,4 +1175,25 @@ message RotateFleetKeyResponse {
   uint64 new_version = 3;
   uint32 agents_notified = 4;    // Number of connected agents that received the new key
   string message = 5;
+}
+
+// --- Binary cache ---
+
+message CacheNarInfoRequest {
+  // The 32-character hash part of the store path.
+  string hash_part = 1;
+}
+
+message CacheNarInfoResponse {
+  bool found = 1;
+  // The signed `.narinfo` document (NAR uncompressed, URL nar/<hash>.nar).
+  string narinfo = 2;
+}
+
+message CacheNarRequest {
+  string hash_part = 1;
+}
+
+message CacheNarChunk {
+  bytes data = 1;
 }

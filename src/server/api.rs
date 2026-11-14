@@ -76,6 +76,8 @@ pub struct FleetControlService {
     pub(super) allow_bearer_agents: bool,
     /// Server-owned reconcile loop (spawned by `serve_grpc`).
     pub(super) controller: super::controller::Controller,
+    /// Signed binary cache agents fetch service closures from.
+    pub(super) binary_cache: Option<super::cache::BinaryCache>,
 }
 
 impl FleetControlService {
@@ -121,7 +123,37 @@ impl FleetControlService {
             token_store,
             audit_log: super::audit::AuditLog::new(),
             allow_bearer_agents: false,
+            binary_cache: None,
         }
+    }
+
+    /// Serve service closures from `cache` and advertise its key to agents.
+    pub fn with_binary_cache(mut self, cache: super::cache::BinaryCache) -> Self {
+        self.state.set_cache_public_key(cache.public_key());
+        self.binary_cache = Some(cache);
+        self
+    }
+
+    /// The binary cache and the store paths the caller may fetch from it:
+    /// an agent's own assigned closures, or every node's for bearer-token
+    /// callers allowed to act as agents (`ekafleet dev`).
+    #[allow(clippy::result_large_err)]
+    async fn cache_scope<T>(
+        &self,
+        request: &Request<T>,
+    ) -> Result<(&super::cache::BinaryCache, Vec<String>), Status> {
+        require_permission(request, Permission::AgentConnect)?;
+        let cache = self
+            .binary_cache
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("this server has no binary cache"))?;
+        let node = match request.extensions().get::<PeerIdentity>() {
+            Some(peer) => Some(peer.agent_name(&self.domain).ok_or_else(|| {
+                Status::permission_denied(format!("{} is not an agent identity", peer.spiffe_id))
+            })?),
+            None => None,
+        };
+        Ok((cache, self.state.assigned_store_paths(node).await))
     }
 
     /// Accept bearer-token agent streams (development only).
@@ -213,6 +245,49 @@ impl FleetControlService {
 impl FleetControl for FleetControlService {
     type StreamControlStream = Pin<Box<ReceiverStream<Result<ServerMessage, Status>>>>;
     type LogsStream = Pin<Box<ReceiverStream<Result<LogsChunk, Status>>>>;
+    type CacheNarStream = Pin<Box<ReceiverStream<Result<crate::proto::CacheNarChunk, Status>>>>;
+
+    async fn cache_nar_info(
+        &self,
+        request: Request<crate::proto::CacheNarInfoRequest>,
+    ) -> Result<Response<crate::proto::CacheNarInfoResponse>, Status> {
+        let (cache, roots) = self.cache_scope(&request).await?;
+        let info = cache
+            .authorize(&roots, &request.get_ref().hash_part)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(crate::proto::CacheNarInfoResponse {
+            found: info.is_some(),
+            narinfo: info.map(|i| cache.narinfo(&i)).unwrap_or_default(),
+        }))
+    }
+
+    async fn cache_nar(
+        &self,
+        request: Request<crate::proto::CacheNarRequest>,
+    ) -> Result<Response<Self::CacheNarStream>, Status> {
+        let (cache, roots) = self.cache_scope(&request).await?;
+        let hash = &request.get_ref().hash_part;
+        let info = cache
+            .authorize(&roots, hash)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found(format!("{hash} is not in an assigned closure")))?;
+        let mut chunks = super::cache::BinaryCache::dump(&info.path);
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(async move {
+            while let Some(chunk) = chunks.recv().await {
+                let msg = chunk
+                    .map(|data| crate::proto::CacheNarChunk { data })
+                    .map_err(|e| Status::internal(e.to_string()));
+                let failed = msg.is_err();
+                if tx.send(msg).await.is_err() || failed {
+                    return;
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+    }
 
     async fn stream_control(
         &self,
@@ -514,6 +589,7 @@ impl FleetControl for FleetControlService {
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let raft_state = self.raft_state.clone();
         let controller = self.controller.clone();
+        let gcroots = self.data_dir.join("gcroots");
         tokio::spawn(async move {
             let send = |revision: u64, status: crate::proto::ApplyStatus, message: String| {
                 let tx = tx.clone();
@@ -548,6 +624,15 @@ impl FleetControl for FleetControlService {
                 return;
             }
 
+            let closures =
+                match build_service_closures(&evaluated.locked_ref, &gcroots, &send).await {
+                    Ok(closures) => closures,
+                    Err(e) => {
+                        send(0, ApplyFailed, format!("Apply failed: {e}")).await;
+                        return;
+                    }
+                };
+
             let mut updates = controller.subscribe();
             let revision = match raft_state
                 .apply_config(crate::raft::state::Command::ApplyConfig {
@@ -556,6 +641,7 @@ impl FleetControl for FleetControlService {
                     applied_at: unix_now(),
                     applied_by: actor,
                     rollback_of: None,
+                    closures,
                 })
                 .await
             {
@@ -571,6 +657,7 @@ impl FleetControl for FleetControlService {
                 }
             };
             controller.trigger();
+            prune_gcroots(&gcroots, &raft_state.config_revisions().await).await;
             if !send(
                 revision,
                 ApplyInProgress,
@@ -682,6 +769,12 @@ impl FleetControl for FleetControlService {
         )
         .await;
 
+        // The target's closures are normally still rooted (and in the store)
+        // because retained revisions keep their GC roots.
+        root_closures(&self.data_dir.join("gcroots"), &target.closures)
+            .await
+            .map_err(|e| Status::failed_precondition(format!("revision {wanted}: {e}")))?;
+
         let mut updates = self.controller.subscribe();
         let revision = self
             .raft_state
@@ -691,6 +784,7 @@ impl FleetControl for FleetControlService {
                 applied_at: unix_now(),
                 applied_by: actor,
                 rollback_of: Some(wanted),
+                closures: target.closures.clone(),
             })
             .await
             .map_err(|e| Status::internal(format!("cannot record configuration: {e}")))?;
@@ -782,6 +876,7 @@ impl FleetControl for FleetControlService {
                 services: vec![],
                 system_path: String::new(),
                 namespace_networks: vec![],
+                cache_public_key: String::new(),
             })),
         };
 
@@ -1787,6 +1882,8 @@ pub struct GrpcServerConfig {
     pub data_dir: std::path::PathBuf,
     /// Accept bearer-token agent streams (`ekafleet dev` only).
     pub allow_bearer_agents: bool,
+    /// Binary cache for service closures.
+    pub binary_cache: Option<super::cache::BinaryCache>,
 }
 
 /// Start the gRPC server with TLS and RBAC-based authentication.
@@ -1811,6 +1908,7 @@ pub async fn serve_grpc(
         event_store,
         data_dir,
         allow_bearer_agents,
+        binary_cache,
     } = config;
 
     tracing::info!(%addr, domain = %domain, "gRPC server listening (TLS + RBAC + SPIFFE)");
@@ -1912,6 +2010,10 @@ pub async fn serve_grpc(
     .with_ca(ca.clone())
     .with_fleet_key(fleet_key)
     .with_bearer_agents(allow_bearer_agents);
+    let service = match binary_cache {
+        Some(cache) => service.with_binary_cache(cache),
+        None => service,
+    };
     service.controller().spawn(
         trust_bundle_pem.clone(),
         super::controller::RECONCILE_INTERVAL,
@@ -1939,6 +2041,108 @@ pub async fn serve_grpc(
         .await?;
 
     Ok(())
+}
+
+type Closures = std::collections::BTreeMap<String, Vec<String>>;
+
+/// GC-root directory for a set of closures, named by their content so a
+/// rollback to the same closures reuses it.
+fn closure_root_dir(gcroots: &std::path::Path, closures: &Closures) -> Option<std::path::PathBuf> {
+    if closures.values().all(Vec::is_empty) {
+        return None;
+    }
+    let json = serde_json::to_vec(closures).unwrap_or_default();
+    let digest = ring::digest::digest(&ring::digest::SHA256, &json);
+    let name: String = digest.as_ref()[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    Some(gcroots.join(name))
+}
+
+/// Build the store paths every service of `locked_ref` refers to, rooted
+/// under `gcroots`, reporting progress through `send`.
+async fn build_service_closures<F, Fut>(
+    locked_ref: &str,
+    gcroots: &std::path::Path,
+    send: &F,
+) -> Result<Closures, super::nix::NixError>
+where
+    F: Fn(u64, crate::proto::ApplyStatus, String) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let installables = super::nix::service_installables(locked_ref).await?;
+    let count: usize = installables.values().map(Vec::len).sum();
+    if count == 0 {
+        return Ok(installables);
+    }
+    send(
+        0,
+        crate::proto::ApplyStatus::ApplyInProgress,
+        format!(
+            "Building {count} store paths for {} services",
+            installables.len()
+        ),
+    )
+    .await;
+    // Build under a staging root (the content-named directory is only known
+    // afterwards), re-root under that directory, then drop the staging root.
+    let staging = gcroots.join(format!("staging-{}", uuid::Uuid::new_v4()));
+    let built = match super::nix::build_closures(&installables, &staging).await {
+        Ok(closures) => root_closures(gcroots, &closures).await.map(|()| closures),
+        Err(e) => Err(e),
+    };
+    let _ = tokio::fs::remove_dir_all(&staging).await;
+    built
+}
+
+/// Make sure `closures` are present and rooted under their content-named
+/// directory. Building already-built paths only creates the roots.
+async fn root_closures(
+    gcroots: &std::path::Path,
+    closures: &Closures,
+) -> Result<(), super::nix::NixError> {
+    let Some(dir) = closure_root_dir(gcroots, closures) else {
+        return Ok(());
+    };
+    if tokio::fs::try_exists(&dir).await.unwrap_or(false) {
+        return Ok(());
+    }
+    // Roots are indirect (registered by link path), so they are created in
+    // place rather than built elsewhere and renamed. A partial result is
+    // removed so the next attempt starts over.
+    let all: Closures = [(
+        String::new(),
+        closures.values().flatten().cloned().collect(),
+    )]
+    .into();
+    if let Err(e) = super::nix::build_closures(&all, &dir).await {
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Drop GC roots of closures no retained revision uses.
+async fn prune_gcroots(gcroots: &std::path::Path, retained: &[crate::raft::state::ConfigRevision]) {
+    let keep: std::collections::HashSet<std::path::PathBuf> = retained
+        .iter()
+        .filter_map(|r| closure_root_dir(gcroots, &r.closures))
+        .collect();
+    let Ok(mut entries) = tokio::fs::read_dir(gcroots).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        let name = entry.file_name();
+        // Leave other applies' in-flight builds alone.
+        if keep.contains(&path) || name.to_string_lossy().starts_with("staging-") {
+            continue;
+        }
+        if let Err(e) = tokio::fs::remove_dir_all(&path).await {
+            tracing::warn!(path = %path.display(), error = %e, "Failed to drop closure GC roots");
+        }
+    }
 }
 
 fn unix_now() -> u64 {

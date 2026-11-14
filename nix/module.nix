@@ -321,6 +321,12 @@ in
           ];
           wants = [ "network-online.target" ];
           requires = [ "ekafleet-ca-signer.service" ];
+          # Apply evaluates and builds flakes, and the binary cache reads
+          # the store.
+          path = [
+            config.nix.package
+            pkgs.git
+          ];
 
           serviceConfig =
             let
@@ -359,6 +365,9 @@ in
             EKAFLEET_NIX_EVAL_TIMEOUT = toString cfg.server.nixEvalTimeout;
             EKAFLEET_NIX_BUILD_TIMEOUT = toString cfg.server.nixBuildTimeout;
             EKAFLEET_NIX_COPY_TIMEOUT = toString cfg.server.nixCopyTimeout;
+            NIX_CONFIG = "extra-experimental-features = nix-command flakes";
+            # The service user has no writable home for Nix's caches.
+            XDG_CACHE_HOME = "${cfg.server.dataDir}/cache";
           }
           // sealEnv
           // lib.optionalAttrs (cfg.server.nixOptions != { }) {
@@ -384,6 +393,8 @@ in
         wantedBy = [ "multi-user.target" ];
         after = [ "network-online.target" ];
         wants = [ "network-online.target" ];
+        # Fetches and roots service closures.
+        path = [ config.nix.package ];
 
         serviceConfig =
           let
@@ -412,10 +423,13 @@ in
             RuntimeDirectory = "ekafleet";
             RuntimeDirectoryMode = "0755";
             RuntimeDirectoryPreserve = "yes";
+            # Nix's caches (ProtectHome makes /root read-only).
+            CacheDirectory = "ekafleet-agent";
           };
 
         environment = {
           RUST_LOG = "info";
+          XDG_CACHE_HOME = "/var/cache/ekafleet-agent";
           EKAFLEET_KEEP_GENERATIONS = toString cfg.agent.keepGenerations;
         }
         // lib.optionalAttrs (cfg.agent.keepGenerationsDays != null) {
