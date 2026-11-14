@@ -21,6 +21,7 @@ pub(crate) use helpers::now_epoch;
 pub use helpers::system_hostname;
 pub use types::{AgentConfig, NodeIdentity};
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -141,16 +142,15 @@ pub async fn run_until(config: AgentConfig, stop: CancellationToken) -> anyhow::
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, "Failed to re-adopt existing service units"),
     }
-    // Secret injector initialized with zeroed key; updated when FleetKeyUpdate is received
-    let secret_injector = Arc::new(RwLock::new(SecretInjector::new(
-        &config.data_dir,
-        &[0u8; 32],
-    )));
+    // Keyless until the server sends this agent's derived fleet key.
+    let secret_injector = Arc::new(RwLock::new(SecretInjector::new(Path::new(
+        crate::secrets::AGENT_SECRETS_DIR,
+    ))));
     let health_checker = HealthChecker::new();
     let dns = Arc::new(AgentDns::start(&config.dns, stop.child_token()).await);
     let templates = Arc::new(templates::TemplateManager::new(
         std::path::PathBuf::from(templates::TEMPLATES_DIR),
-        config.data_dir.join("secrets"),
+        PathBuf::from(crate::secrets::AGENT_SECRETS_DIR),
         &node_id,
     ));
     if let Some(domain) = node_identity

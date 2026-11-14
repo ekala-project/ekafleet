@@ -160,6 +160,8 @@ pub enum Permission {
     Drain,
     /// Create/revoke tokens, manage RBAC
     ManageTokens,
+    /// Set and delete static secret values (listing names needs only Read)
+    ManageSecrets,
     /// Stream control (agent connections)
     AgentConnect,
 }
@@ -175,6 +177,7 @@ impl Role {
                     | Permission::Deploy
                     | Permission::Scale
                     | Permission::Drain
+                    | Permission::ManageSecrets
                     | Permission::AgentConnect
             ),
             Role::Viewer => matches!(permission, Permission::Read),
@@ -506,6 +509,9 @@ mod tests {
         assert!(!Role::Viewer.has_permission(Permission::Scale));
         assert!(!Role::Viewer.has_permission(Permission::Drain));
         assert!(!Role::Viewer.has_permission(Permission::ManageTokens));
+        assert!(!Role::Viewer.has_permission(Permission::ManageSecrets));
+        assert!(!Role::Agent.has_permission(Permission::ManageSecrets));
+        assert!(Role::Operator.has_permission(Permission::ManageSecrets));
     }
 
     #[tokio::test]

@@ -483,43 +483,58 @@ async fn secret_encrypt_transmit_decrypt_chain() {
     let key = [0x42u8; 32];
     let plaintext = b"postgres://user:pass@db:5432/mydb";
 
-    // Server side: encrypt
+    // Server side: sealed under the fleet key for storage, then re-sealed
+    // under the key derived for one agent.
     let store = ekafleet::secrets::store::SecretStore::new(&key);
-    store
-        .put("my-app", "DATABASE_URL", plaintext)
-        .await
+    let stored = store.seal("my-app", "DATABASE_URL", plaintext).unwrap();
+    let agent_id = "spiffe://fleet.internal/agent/node-1";
+    let in_transit = store
+        .seal_for_agent("my-app", "DATABASE_URL", &stored, agent_id)
         .unwrap();
-
-    // Get the encrypted value (as would be sent in SecretUpdate)
-    let sealed_secrets = store.secrets_for_services(&["my-app".into()]).await;
-    assert_eq!(sealed_secrets.len(), 1);
-
-    let (_svc, _name, encrypted_value, version) = &sealed_secrets[0];
     assert_ne!(
-        encrypted_value,
-        &plaintext.to_vec(),
+        in_transit,
+        plaintext.to_vec(),
         "must be encrypted in transit"
     );
 
-    // Agent side: decrypt and inject
+    // Agent side: only this agent's derived key opens it.
     let dir = tempfile::tempdir().unwrap();
-    let mut injector = ekafleet::secrets::injector::SecretInjector::new(dir.path(), &key);
-    let path = injector
-        .inject("my-app", "DATABASE_URL", encrypted_value, *version)
-        .await
-        .unwrap();
+    let mut injector = ekafleet::secrets::injector::SecretInjector::new(dir.path());
+    injector.update_key(&key);
+    assert!(
+        injector
+            .inject("my-app", "DATABASE_URL", &in_transit)
+            .await
+            .is_err(),
+        "the fleet key itself is not the agent's key"
+    );
+    let other = ekafleet::secrets::key_derivation::derive_agent_key(
+        &key,
+        "spiffe://fleet.internal/agent/node-2",
+    );
+    injector.update_key(&other);
+    assert!(
+        injector
+            .inject("my-app", "DATABASE_URL", &in_transit)
+            .await
+            .is_err()
+    );
+    injector.update_key(&ekafleet::secrets::key_derivation::derive_agent_key(
+        &key, agent_id,
+    ));
+    assert!(
+        injector
+            .inject("my-app", "DATABASE_URL", &in_transit)
+            .await
+            .unwrap()
+    );
 
-    // Verify the file contains the original plaintext
+    let path = dir.path().join("my-app/DATABASE_URL");
     let on_disk = tokio::fs::read(&path).await.unwrap();
     assert_eq!(on_disk, plaintext, "decrypted secret must match original");
-
-    // Verify file permissions
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::metadata(&path).unwrap().permissions();
-        assert_eq!(perms.mode() & 0o777, 0o400);
-    }
+    use std::os::unix::fs::PermissionsExt;
+    let perms = std::fs::metadata(&path).unwrap().permissions();
+    assert_eq!(perms.mode() & 0o777, 0o400);
 }
 
 // ─── Events RPC ────────────────────────────────────────────────────

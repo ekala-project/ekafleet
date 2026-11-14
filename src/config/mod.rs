@@ -467,10 +467,13 @@ fn default_threshold() -> u32 {
     3
 }
 
+/// A secret a service declares. `type = "static"` secrets are values set
+/// with `ekafleet secret set`, delivered to the service at
+/// `/run/secrets/<name>`; `"dynamic"` ones come from a secret engine.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecretConfig {
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default = "default_secret_type")]
     pub secret_type: String,
     #[serde(default)]
     pub engine: Option<String>,
@@ -884,6 +887,22 @@ pub struct SidecarConfig {
     pub environment: HashMap<String, String>,
 }
 
+fn default_secret_type() -> String {
+    "static".to_string()
+}
+
+/// The static secrets a service declares, sorted.
+pub fn static_secrets(service: &ServiceConfig) -> Vec<String> {
+    let mut names: Vec<String> = service
+        .secrets
+        .iter()
+        .filter(|(_, s)| s.secret_type == "static")
+        .map(|(name, _)| name.clone())
+        .collect();
+    names.sort();
+    names
+}
+
 /// Validate a fleet configuration for consistency.
 pub fn validate(config: &FleetConfig) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
@@ -910,6 +929,25 @@ pub fn validate(config: &FleetConfig) -> Result<(), Vec<String>> {
     }
 
     for (name, service) in &config.services {
+        let mut secrets: Vec<_> = service.secrets.iter().collect();
+        secrets.sort_by_key(|(key, _)| key.as_str());
+        if !secrets.is_empty()
+            && let Err(e) = crate::secrets::validate_name("service", name)
+        {
+            errors.push(format!("service '{name}' declares secrets: {e}"));
+        }
+        for (key, secret) in secrets {
+            if let Err(e) = crate::secrets::validate_name("secret", key) {
+                errors.push(format!("service '{name}' secret '{key}': {e}"));
+            }
+            if !matches!(secret.secret_type.as_str(), "static" | "dynamic") {
+                errors.push(format!(
+                    "service '{name}' secret '{key}': type must be 'static' or 'dynamic', not '{}'",
+                    secret.secret_type
+                ));
+            }
+        }
+
         let mut dests = std::collections::HashSet::new();
         let mut templates: Vec<_> = service.templates.iter().collect();
         templates.sort_by_key(|(key, _)| key.as_str());
@@ -1202,6 +1240,33 @@ mod nix_module_tests {
             "{errors}"
         );
         assert!(errors.contains("template 'c': invalid signal"), "{errors}");
+    }
+
+    #[test]
+    fn secrets_are_validated_and_static_ones_listed() {
+        let config = |secrets: serde_json::Value| -> FleetConfig {
+            serde_json::from_value(serde_json::json!({
+                "name": "t",
+                "domain": "fleet.test",
+                "services": {"api": {"command": "/bin/api", "secrets": secrets}},
+            }))
+            .unwrap()
+        };
+        let ok = config(serde_json::json!({
+            "token": {},
+            "db": {"type": "dynamic", "engine": "postgres", "role": "ro"},
+            "api-key": {"type": "static"},
+        }));
+        assert!(validate(&ok).is_ok(), "{:?}", validate(&ok));
+        assert_eq!(static_secrets(&ok.services["api"]), ["api-key", "token"]);
+
+        let bad = config(serde_json::json!({
+            "../x": {},
+            "y": {"type": "vault"},
+        }));
+        let errors = validate(&bad).unwrap_err().join("\n");
+        assert!(errors.contains("secret '../x': secret name"), "{errors}");
+        assert!(errors.contains("secret 'y': type must be"), "{errors}");
     }
 
     #[test]

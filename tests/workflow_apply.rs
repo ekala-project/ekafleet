@@ -208,6 +208,8 @@ fn commit(flake: &Path) {
 struct Agent {
     /// Each `web` spec received, with the `DesiredState`'s cache key.
     commands: mpsc::UnboundedReceiver<(ServiceSpec, String)>,
+    /// Fleet key and secret updates, in the order received.
+    secrets: mpsc::UnboundedReceiver<ServerPayload>,
 }
 
 async fn join_agent(server: &Server, dir: &Path, agent_dir: &Path) -> Identity {
@@ -254,6 +256,7 @@ async fn connect_agent(server: &Server, dir: &Path, identity: Identity) -> Agent
         .into_inner();
 
     let (commands_tx, commands) = mpsc::unbounded_channel();
+    let (secrets_tx, secrets) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         let mut services: Vec<String> = Vec::new();
         let mut tick = tokio::time::interval(Duration::from_millis(200));
@@ -261,7 +264,9 @@ async fn connect_agent(server: &Server, dir: &Path, identity: Identity) -> Agent
             tokio::select! {
                 msg = inbound.message() => {
                     let Ok(Some(msg)) = msg else { return };
-                    if let Some(ServerPayload::DesiredState(ds)) = msg.payload {
+                    if let Some(p @ (ServerPayload::FleetKey(_) | ServerPayload::Secret(_))) = msg.payload {
+                        let _ = secrets_tx.send(p);
+                    } else if let Some(ServerPayload::DesiredState(ds)) = msg.payload {
                         services = ds.services.iter().map(|s| s.name.clone()).collect();
                         if let Some(web) = ds.services.iter().find(|s| s.name == "web") {
                             let _ = commands_tx.send((web.clone(), ds.cache_public_key.clone()));
@@ -307,10 +312,40 @@ async fn connect_agent(server: &Server, dir: &Path, identity: Identity) -> Agent
             }
         }
     });
-    Agent { commands }
+    Agent { commands, secrets }
 }
 
 impl Agent {
+    /// The next secret update, with the last fleet key received before it
+    /// (if any).
+    async fn next_secret(&mut self) -> (ekafleet::proto::SecretUpdate, Option<Vec<u8>>) {
+        let mut key = None;
+        loop {
+            let msg = tokio::time::timeout(Duration::from_secs(30), self.secrets.recv())
+                .await
+                .expect("no secret update")
+                .expect("agent stream closed");
+            match msg {
+                ServerPayload::FleetKey(k) => key = Some(k.encrypted_key),
+                ServerPayload::Secret(update) => return (update, key),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    /// The next secret value (skipping removals of unset secrets), with the
+    /// last fleet key received before it.
+    async fn next_secret_value(&mut self) -> (ekafleet::proto::SecretUpdate, Option<Vec<u8>>) {
+        let mut last_key = None;
+        loop {
+            let (update, key) = self.next_secret().await;
+            last_key = key.or(last_key);
+            if !update.deleted {
+                return (update, last_key);
+            }
+        }
+    }
+
     /// The next `web` spec the server assigns whose command equals `want`,
     /// with the binary cache key.
     async fn expect_command(&mut self, want: &str) -> (ServiceSpec, String) {
@@ -867,4 +902,208 @@ async fn namespace_tokens_reach_only_their_own_services() {
         .await
         .map(drop),
     );
+}
+
+#[tokio::test]
+async fn static_secrets_are_set_scoped_and_pushed_to_the_assigned_agent() {
+    use ekafleet::proto::{DeleteSecretRequest, ListSecretsRequest, SetSecretRequest};
+    if !nix_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let flake = dir.path().join("fleet");
+    let server = start(dir.path()).await;
+    let mut admin = client(&server, dir.path(), ADMIN_TOKEN).await;
+    let identity = join_agent(&server, dir.path(), &dir.path().join("agent")).await;
+    let mut agent = connect_agent(&server, dir.path(), identity).await;
+
+    let service = |command: &str, namespace: &str, secret: &str| {
+        serde_json::json!({
+            "command": command,
+            "namespace": namespace,
+            "secrets": { secret: {} },
+            "resources": { "cpu": { "request": 100 }, "memory": { "request": 64 } },
+            "scheduling": {
+                "replicas": 1,
+                "update": { "minHealthyTime": 0, "healthyDeadline": 30 }
+            }
+        })
+    };
+    write_fleet_services(
+        &flake,
+        serde_json::json!({
+            "web": service("/bin/web", "team-a", "api-key"),
+            "db": service("/bin/db", "team-b", "password"),
+        }),
+    );
+    commit(&flake);
+
+    // Plan and apply warn about declared secrets without a value.
+    let plan = admin
+        .plan(PlanRequest {
+            flake_ref: flake.display().to_string(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(plan.warnings.len(), 2, "{:?}", plan.warnings);
+    assert!(plan.warnings[1].contains("service 'web' declares secret 'api-key'"));
+    let (status, _, messages) = apply(&mut admin, &flake).await;
+    assert_eq!(status, ApplyStatus::ApplySucceeded, "{messages:?}");
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.starts_with("Warning: service 'db'")),
+        "{messages:?}"
+    );
+    let (spec, _) = agent.expect_command("/bin/web").await;
+    assert_eq!(spec.secrets, ["api-key"]);
+
+    let token = |role: &str, namespace: &str| {
+        let mut admin = admin.clone();
+        let (role, namespace) = (role.to_string(), namespace.to_string());
+        async move {
+            admin
+                .create_acl_token(CreateAclTokenRequest {
+                    role,
+                    description: String::new(),
+                    namespace,
+                })
+                .await
+                .unwrap()
+                .into_inner()
+                .token
+        }
+    };
+    let set = |service: &str, value: &[u8]| SetSecretRequest {
+        service_name: service.into(),
+        secret_name: if service == "web" {
+            "api-key"
+        } else {
+            "password"
+        }
+        .into(),
+        value: value.to_vec(),
+    };
+    let denied = |r: Result<_, tonic::Status>| match r {
+        Err(e) => assert_eq!(e.code(), tonic::Code::PermissionDenied, "{e}"),
+        Ok(_) => panic!("request was allowed"),
+    };
+
+    // Viewers cannot set secrets; namespace tokens only for their services.
+    let mut viewer = client(&server, dir.path(), &token("viewer", "").await).await;
+    denied(viewer.set_secret(set("web", b"x")).await.map(drop));
+    let mut team = namespaced_client(
+        &server,
+        dir.path(),
+        &token("operator", "team-a").await,
+        Some("team-a"),
+    )
+    .await;
+    denied(team.set_secret(set("db", b"x")).await.map(drop));
+    let invalid = team
+        .set_secret(SetSecretRequest {
+            secret_name: "../escape".into(),
+            ..set("web", b"x")
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(invalid.code(), tonic::Code::InvalidArgument);
+    let version = team
+        .set_secret(set("web", b"s3cret"))
+        .await
+        .unwrap()
+        .into_inner()
+        .version;
+    assert_eq!(version, 1);
+
+    // The agent gets its derived key, then the value sealed for it alone.
+    let (update, key) = agent.next_secret_value().await;
+    let key = key.expect("the fleet key comes before any secret");
+    assert_eq!(
+        (update.service_name.as_str(), update.secret_name.as_str()),
+        ("web", "api-key")
+    );
+    let secrets_dir = dir.path().join("agent-secrets");
+    let mut injector = ekafleet::secrets::injector::SecretInjector::new(&secrets_dir);
+    injector.update_key(&key.as_slice().try_into().unwrap());
+    assert!(
+        injector
+            .inject("web", "api-key", &update.encrypted_value)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        std::fs::read(secrets_dir.join("web/api-key")).unwrap(),
+        b"s3cret"
+    );
+
+    // Listing shows names and versions, scoped like everything else.
+    let listed = team
+        .list_secrets(ListSecretsRequest::default())
+        .await
+        .unwrap()
+        .into_inner()
+        .secrets;
+    let listed: Vec<_> = listed
+        .iter()
+        .map(|s| {
+            (
+                s.service_name.as_str(),
+                s.secret_name.as_str(),
+                s.version,
+                s.declared,
+            )
+        })
+        .collect();
+    assert_eq!(listed, [("web", "api-key", 1, true)]);
+    denied(
+        team.list_secrets(ListSecretsRequest {
+            service_name: "db".into(),
+        })
+        .await
+        .map(drop),
+    );
+
+    // Values survive a server restart.
+    server.crash();
+    let server = start(dir.path()).await;
+    let mut admin = client(&server, dir.path(), ADMIN_TOKEN).await;
+    let listed = admin
+        .list_secrets(ListSecretsRequest::default())
+        .await
+        .unwrap()
+        .into_inner()
+        .secrets;
+    let listed: Vec<_> = listed
+        .iter()
+        .map(|s| (s.service_name.as_str(), s.version))
+        .collect();
+    assert_eq!(listed, [("db", 0), ("web", 1)]);
+
+    // Deleting tells the (reconnected) agent to remove the file.
+    let identity = join_agent(&server, dir.path(), &dir.path().join("agent2")).await;
+    let mut agent = connect_agent(&server, dir.path(), identity).await;
+    agent.expect_command("/bin/web").await;
+    let (update, key) = agent.next_secret_value().await;
+    assert!(key.is_some());
+    assert_eq!((update.version, update.deleted), (1, false));
+    assert!(
+        admin
+            .delete_secret(DeleteSecretRequest {
+                service_name: "web".into(),
+                secret_name: "api-key".into(),
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .deleted
+    );
+    loop {
+        let (update, _) = agent.next_secret().await;
+        if update.service_name == "web" {
+            assert!(update.deleted);
+            break;
+        }
+    }
 }

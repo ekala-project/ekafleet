@@ -22,6 +22,7 @@ pub mod rest;
 pub mod scaling;
 pub mod scheduler;
 pub mod seal;
+pub mod secrets;
 pub mod state;
 pub mod webhook;
 
@@ -180,6 +181,22 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
             config.data_dir.join("raft").display(),
         )
     })?;
+
+    // A fleet key rotation interrupted by a crash leaves its key staged.
+    let staged_key = if config.data_dir.join(secrets::NEXT_FLEET_KEY_FILE).exists() {
+        Some(
+            get_or_create_key(
+                &config.data_dir,
+                secrets::NEXT_FLEET_KEY_FILE,
+                "staged fleet encryption key",
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let fleet_key =
+        secrets::settle_fleet_key(&config.data_dir, fleet_key, staged_key, &raft_state).await?;
 
     let instance_tracker = cloud::instance_tracker::InstanceTracker::new(raft_state.clone());
     let join_token_store = JoinTokenStore::with_persistence(&config.data_dir);

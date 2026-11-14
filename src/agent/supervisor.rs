@@ -462,8 +462,9 @@ fn native_unit_content(spec: &ServiceSpec) -> String {
     let env_lines = build_env_lines(spec);
     let extra_lines = build_extra_directives(spec);
     let netns_line = build_netns_directive(spec);
-    let binds: String = template_binds(spec)
+    let binds: String = secrets_bind(spec)
         .into_iter()
+        .chain(template_binds(spec))
         .map(|(source, dest)| format!("BindReadOnlyPaths={source}:{dest}\n"))
         .collect();
 
@@ -501,7 +502,6 @@ fn container_unit_content(spec: &ServiceSpec) -> String {
 
     // Build nspawn command with bind mounts
     let spiffe_socket = crate::spiffe::socket::DEFAULT_SOCKET_PATH;
-    let secrets_dir = format!("/var/lib/ekafleet/secrets/{}", spec.name);
 
     // Determine network namespace: non-default namespaces use their own
     // netns for isolation; default namespace uses host networking.
@@ -517,15 +517,13 @@ fn container_unit_content(spec: &ServiceSpec) -> String {
         format!("--network-namespace-path={netns_path}"),
         // Bind-mount SPIFFE workload API socket
         format!("--bind={spiffe_socket}"),
-        // Bind-mount secrets directory (read-only inside container)
-        format!("--bind-ro={secrets_dir}:/run/secrets"),
         // Register with machined for machinectl access
         "--register=yes".to_string(),
         // Keep unit running (don't daemonize)
         "--keep-unit".to_string(),
     ];
 
-    for (source, dest) in template_binds(spec) {
+    for (source, dest) in secrets_bind(spec).into_iter().chain(template_binds(spec)) {
         nspawn_args.push(format!("--bind-ro={source}:{dest}"));
     }
 
@@ -586,15 +584,30 @@ fn version_key_for(spec: &ServiceSpec) -> String {
     } else {
         spec.store_path.clone()
     };
-    // The set of template mounts is part of the unit; their content is
-    // not (changes are applied by the template manager).
+    // The set of template mounts and declared secrets is part of the unit;
+    // their content is not (changes are applied by the template manager
+    // and the secret handler).
+    let mut key = base;
     let binds = template_binds(spec);
-    if binds.is_empty() {
-        base
-    } else {
+    if !binds.is_empty() {
         let dests: Vec<&str> = binds.iter().map(|(_, dest)| dest.as_str()).collect();
-        format!("{base}#templates={}", dests.join(","))
+        key = format!("{key}#templates={}", dests.join(","));
     }
+    if secrets_bind(spec).is_some() {
+        key = format!("{key}#secrets={}", spec.secrets.join(","));
+    }
+    key
+}
+
+/// (agent directory, `/run/secrets`) for a service declaring static secrets.
+fn secrets_bind(spec: &ServiceSpec) -> Option<(String, String)> {
+    if spec.secrets.is_empty() || crate::secrets::validate_name("service", &spec.name).is_err() {
+        return None;
+    }
+    Some((
+        format!("{}/{}", crate::secrets::AGENT_SECRETS_DIR, spec.name),
+        crate::secrets::SERVICE_SECRETS_DIR.to_string(),
+    ))
 }
 
 /// (rendered file, destination) of each valid template of `spec`.
@@ -1206,6 +1219,27 @@ WantedBy=multi-user.target
         spec.container_image = "ghcr.io/org/web:1".into();
         let content = container_unit_content(&spec);
         assert!(content.contains(&format!("--bind-ro={}:/etc/web.conf", rendered.display())));
+    }
+
+    #[test]
+    fn declared_secrets_are_bound_at_run_secrets() {
+        let mut spec = native_spec("web", "/bin/web", "/nix/store/x");
+        assert!(!native_unit_content(&spec).contains("/run/secrets"));
+        let plain_key = version_key_for(&spec);
+        spec.secrets = vec!["api-key".into(), "token".into()];
+        assert!(
+            native_unit_content(&spec)
+                .contains("BindReadOnlyPaths=/run/ekafleet/secrets/web:/run/secrets\n")
+        );
+        assert_eq!(
+            version_key_for(&spec),
+            format!("{plain_key}#secrets=api-key,token")
+        );
+        spec.container_image = "ghcr.io/org/web:1".into();
+        assert!(
+            container_unit_content(&spec)
+                .contains("--bind-ro=/run/ekafleet/secrets/web:/run/secrets")
+        );
     }
 
     #[test]
