@@ -589,9 +589,12 @@ fn build_netns_directive(spec: &ServiceSpec) -> String {
     if crate::agent::netns::is_default_namespace(&spec.namespace) {
         String::new()
     } else {
+        // The namespace's DNS listener, when the agent runs one.
         format!(
-            "NetworkNamespacePath=/run/netns/ekafleet-{}\n",
-            spec.namespace
+            "NetworkNamespacePath=/run/netns/ekafleet-{ns}\n\
+             BindReadOnlyPaths=-{resolv}:/etc/resolv.conf\n",
+            ns = spec.namespace,
+            resolv = crate::dns::agent::namespace_resolv_conf(&spec.namespace).display(),
         )
     }
 }

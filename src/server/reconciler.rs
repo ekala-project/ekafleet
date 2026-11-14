@@ -750,44 +750,7 @@ async fn send_desired_state(
         }
     }
 
-    // Push namespace-scoped DNS records so services can resolve each other
-    // across nodes within the same namespace.
-    for (node, namespaces) in &per_node_namespaces {
-        // One A record per service listing every replica's address.
-        let mut replicas: std::collections::BTreeMap<(&str, &str), Vec<String>> =
-            std::collections::BTreeMap::new();
-        for ns in namespaces {
-            for (_, svcs) in ns_to_nodes.get(ns).into_iter().flatten() {
-                for svc in svcs {
-                    replicas
-                        .entry((ns.as_str(), svc.service_name.as_str()))
-                        .or_default()
-                        .push(svc.ip.clone());
-                }
-            }
-        }
-        let records: Vec<crate::proto::DnsRecord> = replicas
-            .into_iter()
-            .map(|((ns, name), mut values)| {
-                values.sort();
-                crate::proto::DnsRecord {
-                    name: name.to_string(),
-                    record_type: crate::proto::DnsRecordType::A as i32,
-                    values,
-                    ttl: 30,
-                    namespace: ns.to_string(),
-                }
-            })
-            .collect();
-        if !records.is_empty() {
-            let dns_msg = crate::proto::ServerMessage {
-                payload: Some(crate::proto::server_message::Payload::Dns(
-                    crate::proto::DnsUpdate { records },
-                )),
-            };
-            let _ = state.send_to_agent(node, dns_msg).await;
-        }
-    }
+    // DNS records follow from these assignments; see `super::dns`.
     Ok(())
 }
 
@@ -1573,21 +1536,17 @@ mod tests {
         assert!(assignments.is_assigned("node-1", "web").await);
     }
 
-    /// Every queued message for a node: (DesiredState, DnsUpdate records).
+    /// The last DesiredState queued for a node.
     fn drain(
         rx: &mut tokio::sync::mpsc::Receiver<crate::proto::ServerMessage>,
-    ) -> (crate::proto::DesiredState, Vec<crate::proto::DnsRecord>) {
-        let (mut desired, mut dns) = (None, Vec::new());
+    ) -> crate::proto::DesiredState {
+        let mut desired = None;
         while let Ok(msg) = rx.try_recv() {
-            match msg.payload {
-                Some(crate::proto::server_message::Payload::DesiredState(ds)) => desired = Some(ds),
-                Some(crate::proto::server_message::Payload::Dns(update)) => {
-                    dns.extend(update.records)
-                }
-                _ => {}
+            if let Some(crate::proto::server_message::Payload::DesiredState(ds)) = msg.payload {
+                desired = Some(ds);
             }
         }
-        (desired.expect("a DesiredState"), dns)
+        desired.expect("a DesiredState")
     }
 
     #[tokio::test]
@@ -1624,8 +1583,8 @@ mod tests {
             .await
             .unwrap();
 
-        let (ds1, dns1) = drain(&mut rx1);
-        let (ds2, _) = drain(&mut rx2);
+        let ds1 = drain(&mut rx1);
+        let ds2 = drain(&mut rx2);
         let ip = |ds: &crate::proto::DesiredState, name: &str| {
             let spec = ds.services.iter().find(|s| s.name == name).unwrap();
             spec.namespace_ip.parse::<std::net::Ipv4Addr>().unwrap()
@@ -1650,17 +1609,11 @@ mod tests {
                 .any(|n| n.namespace == "globex")
         );
 
-        // DNS lists both web replicas under one name.
-        let web_dns = dns1.iter().find(|r| r.name == "web").unwrap();
-        let mut expected = vec![web1.to_string(), web2.to_string()];
-        expected.sort();
-        assert_eq!(web_dns.values, expected);
-
         // Same placement again keeps the same addresses.
         send_desired_state(&config, &plan, &state, &raft, &none)
             .await
             .unwrap();
-        assert_eq!(ip(&drain(&mut rx2).0, "web"), web2);
+        assert_eq!(ip(&drain(&mut rx2), "web"), web2);
 
         // db leaves: its address and the globex subnet are released.
         config.services.remove("db");

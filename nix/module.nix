@@ -254,6 +254,52 @@ in
           description = "Open the mesh port in the firewall.";
         };
       };
+
+      dns = {
+        enable = lib.mkOption {
+          type = lib.types.bool;
+          default = true;
+          description = ''
+            Answer DNS for the fleet domain: `<service>.service.<domain>`
+            (mesh addresses of nodes with healthy replicas, plus SRV records
+            with the service port) and `<node>.node.<domain>`. Services in a
+            namespace resolve against a listener on their bridge gateway that
+            also sees the namespace's own services. Other names are forwarded
+            upstream.
+          '';
+        };
+
+        listen = lib.mkOption {
+          type = lib.types.str;
+          default = "127.0.0.1:53";
+          description = "Address of the host DNS listener.";
+        };
+
+        upstream = lib.mkOption {
+          type = lib.types.listOf lib.types.str;
+          default = [ ];
+          example = [
+            "1.1.1.1"
+            "9.9.9.9:53"
+          ];
+          description = ''
+            Resolvers for names outside the fleet domain. Empty uses the
+            nameservers in /etc/resolv.conf (other than the agent itself).
+          '';
+        };
+
+        configureResolver = lib.mkOption {
+          type = lib.types.bool;
+          default = !config.services.resolved.enable;
+          defaultText = lib.literalExpression "!config.services.resolved.enable";
+          description = ''
+            Put the agent first in the host's nameservers so local programs
+            resolve fleet names. Requires `listen` on port 53 of 127.0.0.1.
+            Off by default with systemd-resolved, which would otherwise
+            forward every query to the agent and back.
+          '';
+        };
+      };
     };
   };
 
@@ -424,7 +470,17 @@ in
           assertion = cfg.agent.joinTokenFile == null || cfg.agent.caCert != null;
           message = "services.ekafleet.agent.joinTokenFile requires services.ekafleet.agent.caCert.";
         }
+        {
+          assertion =
+            !(cfg.agent.dns.enable && cfg.agent.dns.configureResolver)
+            || cfg.agent.dns.listen == "127.0.0.1:53";
+          message = "services.ekafleet.agent.dns.configureResolver requires dns.listen = \"127.0.0.1:53\".";
+        }
       ];
+
+      networking.nameservers = lib.mkIf (cfg.agent.dns.enable && cfg.agent.dns.configureResolver) (
+        lib.mkBefore [ "127.0.0.1" ]
+      );
 
       systemd.services.ekafleet-agent = {
         description = "ekafleet data plane agent";
@@ -454,13 +510,21 @@ in
                 ) " --advertise-addr ${lib.escapeShellArg cfg.agent.mesh.advertiseAddr}"
               else
                 "--no-mesh";
+            dnsArgs =
+              if cfg.agent.dns.enable then
+                "--dns-listen ${lib.escapeShellArg cfg.agent.dns.listen}"
+                + lib.optionalString (
+                  cfg.agent.dns.upstream != [ ]
+                ) " --dns-upstream ${lib.escapeShellArg (lib.concatStringsSep "," cfg.agent.dns.upstream)}"
+              else
+                "--no-dns";
           in
           {
             Type = "simple";
             Restart = "on-failure";
             RestartSec = 5;
 
-            ExecStart = "${cfg.agent.package}/bin/ekafleet agent --join ${cfg.agent.serverAddr} --node-name ${lib.escapeShellArg cfg.agent.nodeName} --data-dir ${cfg.agent.dataDir} ${joinTokenArg} ${caCertArg} ${meshArgs}";
+            ExecStart = "${cfg.agent.package}/bin/ekafleet agent --join ${cfg.agent.serverAddr} --node-name ${lib.escapeShellArg cfg.agent.nodeName} --data-dir ${cfg.agent.dataDir} ${joinTokenArg} ${caCertArg} ${meshArgs} ${dnsArgs}";
 
             # The agent requires root for systemd unit management,
             # WireGuard, nftables, and systemd-nspawn containers. It also

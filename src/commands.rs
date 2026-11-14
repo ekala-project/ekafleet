@@ -252,6 +252,34 @@ pub struct AgentArgs {
     pub data_dir: PathBuf,
     pub ca_cert: Option<PathBuf>,
     pub mesh: ekafleet::mesh::peers::MeshSettings,
+    pub dns: ekafleet::dns::agent::DnsSettings,
+}
+
+/// Agent DNS settings from `--dns-listen`, `--dns-upstream` (comma-separated
+/// `ip` or `ip:port`) and `--no-dns`.
+pub fn dns_settings(
+    listen: std::net::SocketAddr,
+    upstream: Option<String>,
+    disabled: bool,
+) -> anyhow::Result<ekafleet::dns::agent::DnsSettings> {
+    if disabled {
+        return Ok(ekafleet::dns::agent::DnsSettings::disabled());
+    }
+    let upstream = upstream
+        .iter()
+        .flat_map(|list| list.split(','))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<std::net::SocketAddr>()
+                .or_else(|_| s.parse::<std::net::IpAddr>().map(|ip| (ip, 53).into()))
+                .map_err(|_| anyhow::anyhow!("invalid DNS upstream '{s}'"))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    Ok(ekafleet::dns::agent::DnsSettings {
+        listen: Some(listen),
+        upstream,
+    })
 }
 
 pub async fn cmd_agent(args: AgentArgs) -> anyhow::Result<()> {
@@ -269,6 +297,7 @@ pub async fn cmd_agent(args: AgentArgs) -> anyhow::Result<()> {
         data_dir: args.data_dir,
         ca_cert_pem,
         mesh: args.mesh,
+        dns: args.dns,
     };
 
     agent::run(config).await?;

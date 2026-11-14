@@ -7,6 +7,7 @@ pub mod cache;
 pub mod cloud;
 pub mod controller;
 pub mod deployer;
+pub mod dns;
 pub mod events;
 pub mod federation;
 pub mod mesh;
@@ -63,6 +64,7 @@ pub struct EmbeddedAgentConfig {
     pub node_name: String,
     pub data_dir: PathBuf,
     pub mesh: crate::mesh::peers::MeshSettings,
+    pub dns: crate::dns::agent::DnsSettings,
 }
 
 /// How long the embedded agent's join token stays valid.
@@ -228,6 +230,8 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         housekeeping_loop(hk_deps, hk_shutdown).await;
     });
 
+    dns::DnsPublisher::new(fleet_state.clone()).spawn(shutdown.child_token());
+
     if let Some(agent) = config.embedded_agent {
         spawn_embedded_agent(
             agent,
@@ -306,6 +310,7 @@ async fn spawn_embedded_agent(
         data_dir: agent.data_dir,
         ca_cert_pem: Some(ca_cert_pem),
         mesh: agent.mesh,
+        dns: agent.dns,
     };
     tracing::info!(node = %agent.node_name, server = %server_addr, "Starting embedded agent");
     tokio::spawn(async move {
