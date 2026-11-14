@@ -134,6 +134,10 @@ message AgentMessage {
     NodeAttestationResponse attest_response = 7;
     AgentCommandResponse command_response = 8;
     JwtSvidRequest jwt_svid_request = 9;
+    // This node's WireGuard peer advertisement, sent after each
+    // MeshAssignment. Signed with the node SVID the stream authenticated
+    // with; `allowed_ip` must be the assigned address as a /32.
+    WireguardPeer mesh_advert = 10;
   }
 }
 
@@ -216,9 +220,9 @@ message Heartbeat {
   NodeResources available_resources = 3;
   string pool = 4;
   string version = 5;
-  // WireGuard mesh IP (10.100.x.y) reported by the agent so the server
-  // can populate VXLAN tunnel endpoints for cross-node namespace networking.
-  string mesh_ip = 6;
+  // Mesh addresses are server-assigned (MeshAssignment), never self-reported.
+  reserved 6;
+  reserved "mesh_ip";
 }
 
 message NodeResources {
@@ -323,7 +327,16 @@ message ServerMessage {
     InspectServiceCommand inspect_service_command = 19;
     MigrateVolumeCommand migrate_volume_command = 20;
     JwtSvidResponse jwt_svid = 21;
+    MeshAssignment mesh = 22;
   }
+}
+
+// The node's WireGuard mesh address, allocated by the server. Sent on
+// connect; the agent brings up its interface and answers with a
+// mesh_advert. Peers follow in PeerUpdate messages.
+message MeshAssignment {
+  string mesh_ip = 1;
+  uint32 prefix_len = 2;
 }
 
 message JwtSvidResponse {

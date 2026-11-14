@@ -386,7 +386,7 @@ impl FleetState {
         }
     }
 
-    /// Update the WireGuard mesh IP for a node (reported via heartbeat).
+    /// Record a node's mesh address once its peer advertisement is accepted.
     pub async fn update_mesh_ip(&self, node_id: &str, ip: std::net::Ipv4Addr) {
         let mut state = self.inner.write().await;
         if let Some(node) = state.nodes.get_mut(node_id) {
@@ -394,7 +394,7 @@ impl FleetState {
         }
     }
 
-    /// Get the WireGuard mesh IP for a node, if reported.
+    /// The mesh address of a connected node that joined the mesh.
     pub async fn mesh_ip_for_node(&self, node_id: &str) -> Option<std::net::Ipv4Addr> {
         let state = self.inner.read().await;
         state.nodes.get(node_id).and_then(|n| n.mesh_ip)

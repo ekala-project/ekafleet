@@ -78,6 +78,8 @@ pub struct FleetControlService {
     pub(super) controller: super::controller::Controller,
     /// Signed binary cache agents fetch service closures from.
     pub(super) binary_cache: Option<super::cache::BinaryCache>,
+    /// Mesh address assignments and verified WireGuard peers.
+    pub(super) mesh: super::mesh::MeshRegistry,
 }
 
 impl FleetControlService {
@@ -101,8 +103,10 @@ impl FleetControlService {
             event_store.clone(),
             grpc_addr,
         );
+        let mesh = super::mesh::MeshRegistry::new(raft_state.clone(), domain);
         Self {
             controller,
+            mesh,
             state,
             cert_issuer: None,
             ca: None,
@@ -320,6 +324,11 @@ impl FleetControl for FleetControlService {
             .remote_addr()
             .map(|a| a.to_string())
             .unwrap_or_else(|| "unknown".into());
+        // The node SVID this stream authenticated with (mTLS only).
+        let stream_cert: Option<Vec<u8>> = authenticated_node
+            .as_ref()
+            .and_then(|_| request.peer_certs())
+            .and_then(|certs| certs.first().map(|c| c.to_vec()));
 
         let mut inbound = request.into_inner();
 
@@ -419,6 +428,19 @@ impl FleetControl for FleetControlService {
             }
         }
 
+        // The node's mesh address, then the peers it should configure. The
+        // agent answers with its own signed advertisement.
+        if let Some(assignment) = self.mesh.assignment(&node_id).await {
+            let msg = ServerMessage {
+                payload: Some(ServerPayload::Mesh(assignment)),
+            };
+            let _ = self.state.send_to_agent(&node_id, msg).await;
+            let msg = ServerMessage {
+                payload: Some(ServerPayload::Peers(self.mesh.peers_for(&node_id).await)),
+            };
+            let _ = self.state.send_to_agent(&node_id, msg).await;
+        }
+
         // Replay the node's assigned desired state so a reconnecting agent
         // converges immediately instead of waiting for the next reconcile.
         // Sent after the trust bundle, which the agent needs to request SVIDs.
@@ -430,14 +452,15 @@ impl FleetControl for FleetControlService {
         }
 
         // Process the first message
-        let mtls = authenticated_node.is_some();
-        self.process_message(&node_id, first_msg, mtls).await;
+        self.process_message(&node_id, first_msg, stream_cert.as_deref())
+            .await;
 
         // Spawn task to process remaining inbound messages
         let state = self.state.clone();
         let nid = node_id.clone();
         let issuer = self.cert_issuer.clone();
         let metrics = self.metrics.clone();
+        let mesh = self.mesh.clone();
         tokio::spawn(async move {
             loop {
                 match inbound.message().await {
@@ -448,7 +471,8 @@ impl FleetControl for FleetControlService {
                             msg,
                             issuer.as_ref(),
                             &metrics,
-                            mtls,
+                            &mesh,
+                            stream_cert.as_deref(),
                         )
                         .await;
                     }
@@ -1819,14 +1843,15 @@ impl FleetControl for FleetControlService {
 }
 
 impl FleetControlService {
-    async fn process_message(&self, node_id: &str, msg: AgentMessage, mtls: bool) {
+    async fn process_message(&self, node_id: &str, msg: AgentMessage, stream_cert: Option<&[u8]>) {
         super::agent_msg::process_agent_message(
             &self.state,
             node_id,
             msg,
             self.cert_issuer.as_ref(),
             &self.metrics,
-            mtls,
+            &self.mesh,
+            stream_cert,
         )
         .await;
     }

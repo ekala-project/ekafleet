@@ -45,6 +45,9 @@ struct StateMachineInner {
     /// share a subnet or an overlay segment.
     #[serde(default)]
     namespace_subnets: HashMap<String, u8>,
+    /// WireGuard mesh addresses: node → address in [`MESH_NETWORK`]/16.
+    #[serde(default)]
+    mesh_ips: HashMap<String, Ipv4Addr>,
     /// Applied fleet configurations, oldest first; the last one is what the
     /// server reconciles toward. At most [`MAX_CONFIG_REVISIONS`].
     #[serde(default)]
@@ -237,7 +240,18 @@ pub enum Command {
         #[serde(alias = "service_name")]
         holder: String,
     },
+    AllocateMeshIp {
+        node_id: String,
+        ip: Ipv4Addr,
+    },
+    ReleaseMeshIp {
+        node_id: String,
+    },
 }
+
+/// The WireGuard mesh network, `10.100.0.0/16`.
+pub const MESH_NETWORK: Ipv4Addr = Ipv4Addr::new(10, 100, 0, 0);
+pub const MESH_PREFIX_LEN: u8 = 16;
 
 /// Allocation key for one replica of a service in a namespace network.
 pub fn namespace_ip_holder(service_name: &str, node: &str) -> String {
@@ -525,6 +539,12 @@ impl FleetStateMachine {
                     state.namespace_subnets.remove(&namespace);
                 }
             }
+            Command::AllocateMeshIp { node_id, ip } => {
+                state.mesh_ips.insert(node_id, ip);
+            }
+            Command::ReleaseMeshIp { node_id } => {
+                state.mesh_ips.remove(&node_id);
+            }
         }
 
         state.last_applied = index;
@@ -783,6 +803,58 @@ impl FleetStateMachine {
         Ok(released)
     }
 
+    /// The mesh address assigned to `node_id`, if any.
+    pub async fn mesh_ip(&self, node_id: &str) -> Option<Ipv4Addr> {
+        self.inner.read().await.mesh_ips.get(node_id).copied()
+    }
+
+    /// Return the mesh address of `node_id`, allocating a free one in
+    /// `10.100.0.0/16` first if needed (check and commit under one lock).
+    /// `Ok(None)` means the mesh network is full.
+    pub async fn ensure_mesh_ip(&self, node_id: &str) -> Result<Option<Ipv4Addr>, RaftError> {
+        let mut state = self.inner.write().await;
+        if let Some(ip) = state.mesh_ips.get(node_id) {
+            return Ok(Some(*ip));
+        }
+        let used: std::collections::HashSet<u32> =
+            state.mesh_ips.values().map(|ip| u32::from(*ip)).collect();
+        let base = u32::from(MESH_NETWORK);
+        let hosts = (1u32 << (32 - MESH_PREFIX_LEN)) - 1;
+        // Neither the network nor the broadcast address.
+        let Some(ip) = (1..hosts)
+            .map(|h| base + h)
+            .find(|ip| !used.contains(ip))
+            .map(Ipv4Addr::from)
+        else {
+            return Ok(None);
+        };
+        self.commit_locked(
+            &mut state,
+            Command::AllocateMeshIp {
+                node_id: node_id.to_string(),
+                ip,
+            },
+        )
+        .await?;
+        Ok(Some(ip))
+    }
+
+    /// Release the mesh address of a node that left the fleet.
+    pub async fn release_mesh_ip(&self, node_id: &str) -> Result<(), RaftError> {
+        let mut state = self.inner.write().await;
+        if !state.mesh_ips.contains_key(node_id) {
+            return Ok(());
+        }
+        self.commit_locked(
+            &mut state,
+            Command::ReleaseMeshIp {
+                node_id: node_id.to_string(),
+            },
+        )
+        .await
+        .map(drop)
+    }
+
     /// Set a runtime replica count override for a service.
     /// Stored in the KV store so it survives snapshots.
     /// The reconciler reads this to override the config-defined replica count.
@@ -822,6 +894,23 @@ impl FleetStateMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn mesh_ips_are_unique_stable_and_reusable() {
+        let sm = FleetStateMachine::new();
+        let a = sm.ensure_mesh_ip("a").await.unwrap().unwrap();
+        let b = sm.ensure_mesh_ip("b").await.unwrap().unwrap();
+        assert_eq!(a, Ipv4Addr::new(10, 100, 0, 1));
+        assert_eq!(b, Ipv4Addr::new(10, 100, 0, 2));
+        assert_eq!(sm.ensure_mesh_ip("a").await.unwrap(), Some(a));
+        sm.release_mesh_ip("a").await.unwrap();
+        assert_eq!(sm.mesh_ip("a").await, None);
+        assert_eq!(sm.ensure_mesh_ip("c").await.unwrap(), Some(a));
+        // Survives a snapshot round trip.
+        let restored = FleetStateMachine::new();
+        restored.restore(&sm.snapshot().await).await.unwrap();
+        assert_eq!(restored.mesh_ip("b").await, Some(b));
+    }
 
     #[tokio::test]
     async fn namespace_allocations_are_unique_durable_and_released() {

@@ -197,6 +197,13 @@ pub(super) async fn handle_server_message(
                     let _ = netns_manager.remove_vxlan_tunnel(&ns_cfg.namespace).await;
                     continue;
                 }
+                let Some(local_mesh_ip) = local_mesh_ip else {
+                    tracing::warn!(
+                        namespace = %ns_cfg.namespace,
+                        "No mesh interface; cannot reach this namespace on other nodes"
+                    );
+                    continue;
+                };
 
                 let peers: Vec<super::netns::RemotePeerInfo> = ns_cfg
                     .remote_peers
@@ -400,6 +407,32 @@ pub(super) async fn handle_server_message(
         }
         ServerPayload::JwtSvid(response) => {
             workload_mgr.jwt_broker().complete(response).await;
+        }
+        ServerPayload::Mesh(assignment) => {
+            tracing::info!(mesh_ip = %assignment.mesh_ip, "Received mesh assignment");
+            let identity = node_identity.read().await;
+            let svid = identity
+                .cert_pem
+                .as_deref()
+                .zip(identity.key_pem.as_deref().map(String::as_str));
+            let advert = peer_manager
+                .write()
+                .await
+                .activate(node_id, &assignment, svid)
+                .await;
+            drop(identity);
+            match advert {
+                Ok(Some(peer)) => {
+                    let msg = AgentMessage {
+                        payload: Some(crate::proto::agent_message::Payload::MeshAdvert(peer)),
+                    };
+                    if tx.send(msg).await.is_err() {
+                        tracing::warn!("Cannot send mesh advertisement: stream closed");
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => tracing::error!(error = %e, "Cannot join the WireGuard mesh"),
+            }
         }
         ServerPayload::Peers(update) => {
             tracing::info!(peers = update.peers.len(), "Received peer update");
