@@ -482,3 +482,38 @@ async fn rotate_intermediate_replaces_current() {
     let after = ca.intermediate_certificate_pem().await.unwrap();
     assert_eq!(after, rotated_cert, "rotated cert must be the active one");
 }
+
+#[tokio::test]
+async fn certificates_are_valid_from_now_not_1975() {
+    let ca = initialized_ca().await;
+    let (cert_pem, chain_pem, expires_at) = ca
+        .sign_csr(
+            &forged_csr(),
+            &crate::ca::SvidSubject::Agent("node-1".into()),
+            None,
+        )
+        .await
+        .unwrap();
+    let now = unix_now();
+    let mut pems = cert_pem.clone();
+    pems.extend_from_slice(&chain_pem);
+    let mut seen = 0;
+    for pem in x509_parser::pem::Pem::iter_from_buffer(&pems) {
+        let pem = pem.unwrap();
+        let cert = pem.parse_x509().unwrap();
+        let not_before = cert.validity().not_before.timestamp() as u64;
+        assert!(
+            not_before <= now && not_before + 600 >= now,
+            "{}: notBefore {not_before} is not recent (now {now})",
+            cert.subject()
+        );
+        seen += 1;
+    }
+    assert!(seen >= 2, "leaf plus chain");
+
+    // Half-life renewal of a fresh node SVID is ~12h away.
+    let (_, leaf) = x509_parser::pem::parse_x509_pem(&cert_pem).unwrap();
+    let leaf = leaf.parse_x509().unwrap();
+    let not_before = leaf.validity().not_before.timestamp() as u64;
+    assert!(not_before + (expires_at - not_before) / 2 > now + 11 * 3600);
+}

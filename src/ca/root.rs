@@ -26,6 +26,16 @@ const DEFAULT_INTERMEDIATE_TTL: Duration = Duration::from_secs(90 * 24 * 3600); 
 /// before the leaves they sign.
 const INTERMEDIATE_RENEW_BEFORE: Duration = Duration::from_secs(7 * 24 * 3600); // 7 days
 
+/// How far `notBefore` is backdated, to tolerate clock skew between the CA
+/// and verifiers.
+const CLOCK_SKEW: time::Duration = time::Duration::minutes(5);
+
+/// Start of a new certificate's validity window. Without this rcgen defaults
+/// `notBefore` to 1975, which also defeats half-life renewal.
+fn validity_start() -> time::OffsetDateTime {
+    time::OffsetDateTime::now_utc() - CLOCK_SKEW
+}
+
 struct CaState {
     /// Fleet domain for SPIFFE URIs (e.g., fleet.internal)
     domain: String,
@@ -116,6 +126,7 @@ impl RootCa {
                 params.key_usages.push(KeyUsagePurpose::KeyCertSign);
                 params.key_usages.push(KeyUsagePurpose::CrlSign);
                 // CA cert valid for 10 years
+                params.not_before = validity_start();
                 params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(3650);
 
                 // Generate a random serial number
@@ -221,6 +232,7 @@ impl RootCa {
             .push(DnType::OrganizationName, "ekafleet");
         params.key_usages.push(KeyUsagePurpose::KeyCertSign);
         params.key_usages.push(KeyUsagePurpose::CrlSign);
+        params.not_before = validity_start();
         params.not_after = time::OffsetDateTime::now_utc()
             + time::Duration::seconds(DEFAULT_INTERMEDIATE_TTL.as_secs() as i64);
         params.serial_number = Some(generate_serial()?);
@@ -294,6 +306,7 @@ impl RootCa {
         leaf_params
             .key_usages
             .push(KeyUsagePurpose::DigitalSignature);
+        leaf_params.not_before = validity_start();
         leaf_params.not_after = time::OffsetDateTime::now_utc()
             + time::Duration::seconds(state.default_ttl.as_secs() as i64);
 
@@ -386,6 +399,7 @@ impl RootCa {
             ExtendedKeyUsagePurpose::ServerAuth,
             ExtendedKeyUsagePurpose::ClientAuth,
         ];
+        params.not_before = validity_start();
         params.not_after =
             time::OffsetDateTime::now_utc() + time::Duration::seconds(ttl.as_secs() as i64);
         params.serial_number = Some(generate_serial()?);
@@ -464,6 +478,7 @@ impl RootCa {
         leaf_params
             .key_usages
             .push(KeyUsagePurpose::DigitalSignature);
+        leaf_params.not_before = validity_start();
         leaf_params.not_after = time::OffsetDateTime::now_utc()
             + time::Duration::seconds(state.default_ttl.as_secs() as i64);
 
