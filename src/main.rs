@@ -61,6 +61,14 @@ enum Command {
         /// gRPC listen address
         #[arg(long, default_value = "127.0.0.1:7400")]
         listen: String,
+
+        /// Do not run the in-process agent for this host
+        #[arg(long)]
+        no_agent: bool,
+
+        /// Name of the in-process agent's node (defaults to the short hostname)
+        #[arg(long, env = "EKAFLEET_NODE_NAME")]
+        node_name: Option<String>,
     },
 
     /// Standalone service mesh proxy daemon (process-isolated, unprivileged)
@@ -127,6 +135,31 @@ enum Command {
         /// Path to CA signer Unix socket (uses external ca-signer daemon instead of embedding CA)
         #[arg(long)]
         ca_socket: Option<PathBuf>,
+
+        /// Also run an agent for this host in-process (needs root). It joins
+        /// this server over loopback with a node SVID like any other node.
+        #[arg(long, env = "EKAFLEET_EMBEDDED_AGENT")]
+        embedded_agent: bool,
+
+        /// Node name of the embedded agent (defaults to the short hostname)
+        #[arg(long, env = "EKAFLEET_NODE_NAME", requires = "embedded_agent")]
+        node_name: Option<String>,
+
+        /// Data directory of the embedded agent [default: <data-dir>/agent]
+        #[arg(long, requires = "embedded_agent")]
+        agent_data_dir: Option<PathBuf>,
+
+        /// Mesh address other nodes reach the embedded agent on
+        #[arg(long, env = "EKAFLEET_ADVERTISE_ADDR", requires = "embedded_agent")]
+        advertise_addr: Option<std::net::IpAddr>,
+
+        /// UDP port of the embedded agent's WireGuard mesh interface
+        #[arg(long, env = "EKAFLEET_MESH_PORT", default_value_t = 51820)]
+        mesh_port: u16,
+
+        /// Keep the embedded agent out of the WireGuard mesh
+        #[arg(long, env = "EKAFLEET_NO_MESH")]
+        no_mesh: bool,
     },
 
     /// Start in agent mode (data plane)
@@ -873,7 +906,24 @@ async fn main() -> anyhow::Result<()> {
             data_dir,
             http_listen,
             listen,
-        } => commands::cmd_dev(data_dir, http_listen, listen).await?,
+            no_agent,
+            node_name,
+        } => {
+            let agent = if no_agent {
+                None
+            } else {
+                Some(ekafleet::server::EmbeddedAgentConfig {
+                    node_name: commands::node_name_or_hostname(node_name)?,
+                    data_dir: data_dir.join("agent"),
+                    // Dev is a single-node playground.
+                    mesh: ekafleet::mesh::peers::MeshSettings {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                })
+            };
+            commands::cmd_dev(data_dir, http_listen, listen, agent).await?
+        }
 
         Command::Server {
             data_dir,
@@ -884,18 +934,39 @@ async fn main() -> anyhow::Result<()> {
             token_file,
             domain,
             ca_socket,
+            embedded_agent,
+            node_name,
+            agent_data_dir,
+            advertise_addr,
+            mesh_port,
+            no_mesh,
         } => {
-            commands::cmd_server(
+            let agent = if embedded_agent {
+                Some(ekafleet::server::EmbeddedAgentConfig {
+                    node_name: commands::node_name_or_hostname(node_name)?,
+                    data_dir: agent_data_dir.unwrap_or_else(|| data_dir.join("agent")),
+                    mesh: ekafleet::mesh::peers::MeshSettings {
+                        enabled: !no_mesh,
+                        advertise_addr,
+                        listen_port: mesh_port,
+                    },
+                })
+            } else {
+                None
+            };
+            commands::cmd_server(ekafleet::server::ServerConfig {
                 data_dir,
-                peers,
-                listen,
+                peers: commands::peer_list(peers),
+                grpc_listen: listen,
                 http_listen,
-                commands::secret_arg(token, token_file)?
+                token: commands::secret_arg(token, token_file)?
                     .ok_or_else(|| anyhow::anyhow!("--token or --token-file is required"))?
                     .to_string(),
                 domain,
                 ca_socket,
-            )
+                allow_bearer_agents: false,
+                embedded_agent: agent,
+            })
             .await?
         }
 

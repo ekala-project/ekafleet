@@ -122,12 +122,28 @@ pub fn generate_token() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-pub async fn cmd_dev(data_dir: PathBuf, http_listen: String, listen: String) -> anyhow::Result<()> {
+/// `name`, or the short system hostname, checked as a node identity name.
+pub fn node_name_or_hostname(name: Option<String>) -> anyhow::Result<String> {
+    let name = match name {
+        Some(name) => name,
+        None => agent::system_hostname()?,
+    };
+    ekafleet::ca::validate_identity_name(&name)
+        .map_err(|e| anyhow::anyhow!("invalid node name: {e} (set --node-name)"))?;
+    Ok(name)
+}
+
+pub async fn cmd_dev(
+    data_dir: PathBuf,
+    http_listen: String,
+    listen: String,
+    embedded_agent: Option<server::EmbeddedAgentConfig>,
+) -> anyhow::Result<()> {
     tracing::info!(
         data_dir = %data_dir.display(),
         grpc = %listen,
         http = %http_listen,
-        "Starting ekafleet in dev mode (no TLS, no WireGuard)"
+        "Starting ekafleet in dev mode (bearer tokens accepted, no WireGuard)"
     );
 
     let dev_token = "dev-token";
@@ -142,6 +158,7 @@ pub async fn cmd_dev(data_dir: PathBuf, http_listen: String, listen: String) -> 
         domain: "dev.local".to_string(),
         ca_socket: None,
         allow_bearer_agents: true,
+        embedded_agent,
     };
 
     server::run(config).await?;
@@ -175,32 +192,15 @@ pub async fn cmd_ca_signer(
     .await
 }
 
-pub async fn cmd_server(
-    data_dir: PathBuf,
-    peers: Option<String>,
-    listen: String,
-    http_listen: String,
-    token: String,
-    domain: String,
-    ca_socket: Option<PathBuf>,
-) -> anyhow::Result<()> {
-    let peer_list: Vec<String> = peers
+pub async fn cmd_server(config: server::ServerConfig) -> anyhow::Result<()> {
+    server::run(config).await
+}
+
+/// `a,b,c` → `["a", "b", "c"]`.
+pub fn peer_list(peers: Option<String>) -> Vec<String> {
+    peers
         .map(|p| p.split(',').map(String::from).collect())
-        .unwrap_or_default();
-
-    let config = server::ServerConfig {
-        data_dir,
-        peers: peer_list,
-        grpc_listen: listen,
-        http_listen,
-        token,
-        domain,
-        ca_socket,
-        allow_bearer_agents: false,
-    };
-
-    server::run(config).await?;
-    Ok(())
+        .unwrap_or_default()
 }
 
 /// Read a secret given inline or as a file (trailing whitespace dropped).
@@ -259,12 +259,7 @@ pub async fn cmd_agent(args: AgentArgs) -> anyhow::Result<()> {
         Some(path) => Some(std::fs::read_to_string(path)?),
         None => None,
     };
-    let node_name = match args.node_name {
-        Some(name) => name,
-        None => agent::system_hostname()?,
-    };
-    ekafleet::ca::validate_identity_name(&node_name)
-        .map_err(|e| anyhow::anyhow!("invalid node name: {e} (set --node-name)"))?;
+    let node_name = node_name_or_hostname(args.node_name)?;
 
     let config = agent::AgentConfig {
         server_addr: args.join,

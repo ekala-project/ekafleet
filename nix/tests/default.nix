@@ -7,6 +7,7 @@
   server-agent = import ./server-agent.nix { inherit pkgs lib; };
   deploy-closure = import ./deploy-closure.nix { inherit pkgs lib; };
   mesh = import ./mesh.nix { inherit pkgs lib; };
+  colocated = import ./colocated.nix { inherit pkgs lib; };
   oci-container = import ./oci-container.nix { inherit pkgs lib; };
   lifecycle = import ./lifecycle.nix { inherit pkgs lib; };
   fleet-module = import ./fleet-module.nix { inherit pkgs lib; };
