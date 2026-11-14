@@ -173,7 +173,13 @@ impl ScalingActuator {
                         continue;
                     }
 
-                    self.tracker.untrack(&instance.cloud_instance_id).await;
+                    if let Err(e) = self.tracker.untrack(&instance.cloud_instance_id).await {
+                        tracing::error!(
+                            instance_id = %instance.cloud_instance_id,
+                            error = %e,
+                            "Terminated instance is still tracked"
+                        );
+                    }
 
                     if let Some(events) = &self.events {
                         events
@@ -356,7 +362,13 @@ impl ScalingActuator {
 
             match provider.destroy_machine(&candidate.cloud_instance_id).await {
                 Ok(()) => {
-                    self.tracker.untrack(&candidate.cloud_instance_id).await;
+                    if let Err(e) = self.tracker.untrack(&candidate.cloud_instance_id).await {
+                        tracing::error!(
+                            instance_id = %candidate.cloud_instance_id,
+                            error = %e,
+                            "Terminated instance is still tracked"
+                        );
+                    }
                     tracing::info!(
                         pool = %decision.pool_name,
                         instance_id = %candidate.cloud_instance_id,
@@ -449,7 +461,10 @@ impl ScalingActuator {
                 pool_name,
                 instance.private_ip.as_deref(),
             )
-            .await;
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("instance {instance_id} was created but could not be tracked: {e}")
+            })?;
 
         Ok(instance_id)
     }

@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -172,7 +171,8 @@ pub struct HttpApiState {
     pub token_store: TokenStore,
     pub metrics: MetricsAggregator,
     pub alert_evaluator: AlertEvaluator,
-    pub kv_store: Arc<tokio::sync::RwLock<HashMap<String, Vec<u8>>>>,
+    /// Durable fleet state; user KV lives under [`USER_KV_PREFIX`].
+    pub raft_state: crate::raft::state::FleetStateMachine,
     pub instance_tracker: Option<super::cloud::instance_tracker::InstanceTracker>,
 }
 
@@ -225,6 +225,7 @@ pub async fn serve_http(
     metrics: MetricsAggregator,
     alert_evaluator: AlertEvaluator,
     instance_tracker: Option<super::cloud::instance_tracker::InstanceTracker>,
+    raft_state: crate::raft::state::FleetStateMachine,
     jwt_bundle: String,
     tls: Option<HttpTlsConfig>,
     shutdown: tokio_util::sync::CancellationToken,
@@ -238,7 +239,7 @@ pub async fn serve_http(
         token_store: token_store.clone(),
         metrics,
         alert_evaluator,
-        kv_store: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+        raft_state,
         instance_tracker,
     };
 
@@ -280,7 +281,17 @@ pub async fn serve_http(
 
                 let role = store.authenticate(token).ok_or(StatusCode::UNAUTHORIZED)?;
 
-                if !role.has_permission(Permission::Read) {
+                // Reads need Read; anything that changes state (KV writes,
+                // alert silences) needs Deploy.
+                let needed = if matches!(
+                    *req.method(),
+                    axum::http::Method::GET | axum::http::Method::HEAD
+                ) {
+                    Permission::Read
+                } else {
+                    Permission::Deploy
+                };
+                if !role.has_permission(needed) {
                     return Err(StatusCode::FORBIDDEN);
                 }
 
@@ -717,16 +728,32 @@ async fn rest_delete_silence(
 
 // --- Feature 23: Consul KV API ---
 
-/// GET /v1/kv/:key — Read a key from the in-memory KV store.
+/// Raft KV namespace for user keys, kept apart from internal state such as
+/// `replica-override/*` so the KV API can neither read nor clobber it.
+pub const USER_KV_PREFIX: &str = "user/";
+
+fn kv_write_failed(e: crate::raft::RaftError) -> axum::response::Response {
+    tracing::error!(error = %e, "KV write failed");
+    (
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        axum::Json(serde_json::json!({"error": "failed to persist KV write"})),
+    )
+        .into_response()
+}
+
+/// GET /v1/kv/:key — Read a key from the durable KV store.
 /// Returns the value as a UTF-8 string. Non-UTF-8 bytes are replaced with U+FFFD.
 async fn rest_kv_get(
     axum::extract::State(state): axum::extract::State<HttpApiState>,
     axum::extract::Path(key): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    let store = state.kv_store.read().await;
-    match store.get(&key) {
+    match state
+        .raft_state
+        .kv_get(&format!("{USER_KV_PREFIX}{key}"))
+        .await
+    {
         Some(value) => {
-            let value_str = String::from_utf8_lossy(value).into_owned();
+            let value_str = String::from_utf8_lossy(&value).into_owned();
             (
                 axum::http::StatusCode::OK,
                 axum::Json(serde_json::json!([{
@@ -742,25 +769,39 @@ async fn rest_kv_get(
     }
 }
 
-/// PUT /v1/kv/:key — Write a key to the in-memory KV store.
+/// PUT /v1/kv/:key — Write a key to the durable KV store.
 async fn rest_kv_put(
     axum::extract::State(state): axum::extract::State<HttpApiState>,
     axum::extract::Path(key): axum::extract::Path<String>,
     body: axum::body::Bytes,
-) -> axum::Json<serde_json::Value> {
-    let mut store = state.kv_store.write().await;
-    store.insert(key, body.to_vec());
-    axum::Json(serde_json::json!(true))
+) -> axum::response::Response {
+    let command = crate::raft::state::Command::KvPut {
+        key: format!("{USER_KV_PREFIX}{key}"),
+        value: body.to_vec(),
+    };
+    match state.raft_state.apply_next(command).await {
+        Ok(_) => axum::Json(serde_json::json!(true)).into_response(),
+        Err(e) => kv_write_failed(e),
+    }
 }
 
-/// DELETE /v1/kv/:key — Delete a key from the in-memory KV store.
+/// DELETE /v1/kv/:key — Delete a key from the durable KV store.
 async fn rest_kv_delete(
     axum::extract::State(state): axum::extract::State<HttpApiState>,
     axum::extract::Path(key): axum::extract::Path<String>,
-) -> axum::Json<serde_json::Value> {
-    let mut store = state.kv_store.write().await;
-    let existed = store.remove(&key).is_some();
-    axum::Json(serde_json::json!(existed))
+) -> axum::response::Response {
+    let key = format!("{USER_KV_PREFIX}{key}");
+    if state.raft_state.kv_get(&key).await.is_none() {
+        return axum::Json(serde_json::json!(false)).into_response();
+    }
+    match state
+        .raft_state
+        .apply_next(crate::raft::state::Command::KvDelete { key })
+        .await
+    {
+        Ok(_) => axum::Json(serde_json::json!(true)).into_response(),
+        Err(e) => kv_write_failed(e),
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -773,9 +814,15 @@ async fn rest_kv_list(
     axum::extract::State(state): axum::extract::State<HttpApiState>,
     query: axum::extract::Query<KvListQuery>,
 ) -> axum::Json<serde_json::Value> {
-    let store = state.kv_store.read().await;
-    let prefix = query.prefix.as_deref().unwrap_or("");
-    let keys: Vec<&String> = store.keys().filter(|k| k.starts_with(prefix)).collect();
+    let prefix = format!("{USER_KV_PREFIX}{}", query.prefix.as_deref().unwrap_or(""));
+    let mut keys: Vec<String> = state
+        .raft_state
+        .kv_list_prefix(&prefix)
+        .await
+        .into_iter()
+        .map(|(k, _)| k[USER_KV_PREFIX.len()..].to_string())
+        .collect();
+    keys.sort();
     axum::Json(serde_json::json!(keys))
 }
 

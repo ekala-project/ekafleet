@@ -870,7 +870,7 @@ pub async fn ensure_image(
         fleet_name: fleet_name.to_string(),
         storage_uri: Some(result.storage_uri),
     };
-    image_tracker.put(&registered).await;
+    image_tracker.put(&registered).await?;
 
     tracing::info!(
         pool = %pool_name,
@@ -976,9 +976,12 @@ pub async fn cleanup_expired_images(
             }
 
             // Remove from tracker
-            image_tracker
+            if let Err(e) = image_tracker
                 .delete(&img.provider, &img.region, &img.store_path_hash)
-                .await;
+                .await
+            {
+                tracing::warn!(image_id = %img.image_id, error = %e, "Failed to untrack expired image");
+            }
         }
     }
 }

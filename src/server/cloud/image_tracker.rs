@@ -67,10 +67,10 @@ impl ImageTracker {
     }
 
     /// Store a registered image in the tracker.
-    pub async fn put(&self, image: &RegisteredImage) {
+    pub async fn put(&self, image: &RegisteredImage) -> Result<(), crate::raft::RaftError> {
         let key = Self::key(&image.provider, &image.region, &image.store_path_hash);
         let value = serde_json::to_vec(image).expect("RegisteredImage serialization");
-        self.raft.apply_next(Command::KvPut { key, value }).await;
+        self.raft.apply_next(Command::KvPut { key, value }).await?;
 
         tracing::info!(
             image_id = %image.image_id,
@@ -80,14 +80,21 @@ impl ImageTracker {
             pool = %image.pool,
             "Tracked cloud image"
         );
+        Ok(())
     }
 
     /// Remove a tracked image.
-    pub async fn delete(&self, provider: &str, region: &str, store_path_hash: &str) {
+    pub async fn delete(
+        &self,
+        provider: &str,
+        region: &str,
+        store_path_hash: &str,
+    ) -> Result<(), crate::raft::RaftError> {
         let key = Self::key(provider, region, store_path_hash);
-        self.raft.apply_next(Command::KvDelete { key }).await;
+        self.raft.apply_next(Command::KvDelete { key }).await?;
 
         tracing::info!(store_path_hash, provider, region, "Untracked cloud image");
+        Ok(())
     }
 
     /// List all tracked images.
@@ -110,11 +117,17 @@ impl ImageTracker {
     }
 
     /// Update the `last_used_at` timestamp for an image.
-    pub async fn touch(&self, provider: &str, region: &str, store_path_hash: &str) {
+    pub async fn touch(
+        &self,
+        provider: &str,
+        region: &str,
+        store_path_hash: &str,
+    ) -> Result<(), crate::raft::RaftError> {
         if let Some(mut image) = self.get(provider, region, store_path_hash).await {
             image.last_used_at = now_epoch();
-            self.put(&image).await;
+            self.put(&image).await?;
         }
+        Ok(())
     }
 }
 
@@ -155,7 +168,7 @@ mod tests {
         let tracker = make_tracker();
         let img = sample_image("abc123");
 
-        tracker.put(&img).await;
+        tracker.put(&img).await.unwrap();
         let found = tracker.get("aws", "us-east-1", "abc123").await;
         assert!(found.is_some());
         let found = found.unwrap();
@@ -174,18 +187,18 @@ mod tests {
         let tracker = make_tracker();
         let img = sample_image("abc123");
 
-        tracker.put(&img).await;
+        tracker.put(&img).await.unwrap();
         assert!(tracker.get("aws", "us-east-1", "abc123").await.is_some());
 
-        tracker.delete("aws", "us-east-1", "abc123").await;
+        tracker.delete("aws", "us-east-1", "abc123").await.unwrap();
         assert!(tracker.get("aws", "us-east-1", "abc123").await.is_none());
     }
 
     #[tokio::test]
     async fn list_all() {
         let tracker = make_tracker();
-        tracker.put(&sample_image("aaa")).await;
-        tracker.put(&sample_image("bbb")).await;
+        tracker.put(&sample_image("aaa")).await.unwrap();
+        tracker.put(&sample_image("bbb")).await.unwrap();
 
         let all = tracker.list_all().await;
         assert_eq!(all.len(), 2);
@@ -194,11 +207,11 @@ mod tests {
     #[tokio::test]
     async fn list_for_pool_filters() {
         let tracker = make_tracker();
-        tracker.put(&sample_image("aaa")).await;
+        tracker.put(&sample_image("aaa")).await.unwrap();
 
         let mut other = sample_image("bbb");
         other.pool = "compute".to_string();
-        tracker.put(&other).await;
+        tracker.put(&other).await.unwrap();
 
         let workers = tracker.list_for_pool("test-fleet", "workers").await;
         assert_eq!(workers.len(), 1);
@@ -213,12 +226,12 @@ mod tests {
     async fn touch_updates_last_used() {
         let tracker = make_tracker();
         let img = sample_image("abc123");
-        tracker.put(&img).await;
+        tracker.put(&img).await.unwrap();
 
         let before = tracker.get("aws", "us-east-1", "abc123").await.unwrap();
         assert_eq!(before.last_used_at, 1000);
 
-        tracker.touch("aws", "us-east-1", "abc123").await;
+        tracker.touch("aws", "us-east-1", "abc123").await.unwrap();
 
         let after = tracker.get("aws", "us-east-1", "abc123").await.unwrap();
         assert!(after.last_used_at >= before.last_used_at);
@@ -232,8 +245,8 @@ mod tests {
         img2.region = "eu-west-1".to_string();
         img2.image_id = "ami-eu-abc123".to_string();
 
-        tracker.put(&img1).await;
-        tracker.put(&img2).await;
+        tracker.put(&img1).await.unwrap();
+        tracker.put(&img2).await.unwrap();
 
         let us = tracker.get("aws", "us-east-1", "abc123").await.unwrap();
         assert_eq!(us.image_id, "ami-abc123");
