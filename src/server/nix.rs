@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::OnceLock;
@@ -265,6 +266,117 @@ pub async fn eval_flake(flake_ref: &str) -> Result<EvaluatedFleet, NixError> {
     })
 }
 
+/// Applied to the fleet attribute: for each service, the installables its
+/// configuration's string context refers to (derivation outputs as
+/// `drv^out`, plain store paths such as copied sources as themselves).
+/// `toJSON` keeps context, so commands, environment, templates and sidecars
+/// are all covered.
+const SERVICE_INSTALLABLES: &str = r#"fleet: builtins.mapAttrs (_: s:
+  let ctx = builtins.getContext (builtins.toJSON s); in
+  builtins.concatLists (map (p:
+    let v = ctx.${p}; in
+    (if v.path or false then [ p ] else [ ])
+    ++ (if v.allOutputs or false then [ "${p}^*" ] else [ ])
+    ++ map (o: "${p}^${o}") (v.outputs or [ ]))
+  (builtins.attrNames ctx))) (fleet.services or { })"#;
+
+/// The installables each service of the fleet at `locked_ref` needs.
+pub async fn service_installables(
+    locked_ref: &str,
+) -> Result<BTreeMap<String, Vec<String>>, NixError> {
+    let opts = options();
+    let mut args = vec![
+        "eval".to_string(),
+        "--json".to_string(),
+        locked_ref.to_string(),
+        "--apply".to_string(),
+        SERVICE_INSTALLABLES.to_string(),
+    ];
+    args.extend(opts.option_args());
+    let json = run_nix(args, opts.eval_timeout, "nix eval (service closures)").await?;
+    serde_json::from_str(&json).map_err(|e| NixError::ParseError(e.to_string()))
+}
+
+/// Build every service's installables and return each service's store
+/// paths. The results are rooted under `out_link_dir` (`result`,
+/// `result-1`, ...) so the server's garbage collector keeps them while the
+/// revision is retained.
+pub async fn build_closures(
+    installables: &BTreeMap<String, Vec<String>>,
+    out_link_dir: &Path,
+) -> Result<BTreeMap<String, Vec<String>>, NixError> {
+    let mut all: Vec<String> = installables.values().flatten().cloned().collect();
+    all.sort();
+    all.dedup();
+    if all.is_empty() {
+        return Ok(installables
+            .keys()
+            .map(|k| (k.clone(), Vec::new()))
+            .collect());
+    }
+    tokio::fs::create_dir_all(out_link_dir).await?;
+    let opts = options();
+    let mut args = vec![
+        "build".to_string(),
+        "--json".to_string(),
+        "--out-link".to_string(),
+        out_link_dir.join("result").to_string_lossy().into_owned(),
+    ];
+    args.extend(opts.option_args());
+    args.extend(all);
+    let json = run_nix(args, opts.build_timeout, "nix build")
+        .await
+        .map_err(|e| match e {
+            NixError::EvalFailed(msg) => NixError::BuildFailed(msg),
+            other => other,
+        })?;
+    let built: serde_json::Value =
+        serde_json::from_str(&json).map_err(|e| NixError::ParseError(e.to_string()))?;
+    resolve_built(installables, &built)
+}
+
+/// Map each service's installables to store paths using `nix build --json`
+/// output, matching derivation outputs by `drvPath` rather than position.
+fn resolve_built(
+    installables: &BTreeMap<String, Vec<String>>,
+    built: &serde_json::Value,
+) -> Result<BTreeMap<String, Vec<String>>, NixError> {
+    let mut outputs: HashMap<&str, &serde_json::Map<String, serde_json::Value>> = HashMap::new();
+    for entry in built.as_array().into_iter().flatten() {
+        if let (Some(drv), Some(outs)) = (entry["drvPath"].as_str(), entry["outputs"].as_object()) {
+            outputs.insert(drv, outs);
+        }
+    }
+    let missing = |i: &str| NixError::ParseError(format!("nix build reported no output for {i}"));
+    let mut result = BTreeMap::new();
+    for (service, list) in installables {
+        let mut paths = Vec::new();
+        for installable in list {
+            match installable.split_once('^') {
+                None => paths.push(installable.clone()),
+                Some((drv, wanted)) => {
+                    let outs = outputs.get(drv).ok_or_else(|| missing(installable))?;
+                    if wanted == "*" {
+                        paths.extend(outs.values().filter_map(|v| v.as_str()).map(String::from));
+                    } else {
+                        for name in wanted.split(',') {
+                            let path = outs
+                                .get(name)
+                                .and_then(|v| v.as_str())
+                                .ok_or_else(|| missing(installable))?;
+                            paths.push(path.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        paths.sort();
+        paths.dedup();
+        result.insert(service.clone(), paths);
+    }
+    Ok(result)
+}
+
 /// Build a Nix derivation and return the store path.
 pub async fn build(flake_ref: &str) -> Result<String, NixError> {
     let opts = options();
@@ -336,6 +448,74 @@ pub async fn copy_closure(store_path: &str, target_host: &str) -> Result<(), Nix
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn built_outputs_are_matched_by_derivation() {
+        let installables: BTreeMap<String, Vec<String>> = [
+            (
+                "web".to_string(),
+                vec![
+                    "/nix/store/b-hello.drv^out".to_string(),
+                    "/nix/store/c-src".to_string(),
+                ],
+            ),
+            (
+                "multi".to_string(),
+                vec!["/nix/store/d-x.drv^*".to_string()],
+            ),
+            ("plain".to_string(), vec![]),
+        ]
+        .into();
+        // nix prints the entries in its own order.
+        let built = serde_json::json!([
+            {"drvPath": "/nix/store/d-x.drv", "outputs": {"out": "/nix/store/d-out", "dev": "/nix/store/d-dev"}},
+            "/nix/store/c-src",
+            {"drvPath": "/nix/store/b-hello.drv", "outputs": {"out": "/nix/store/b-out"}},
+        ]);
+        let paths = resolve_built(&installables, &built).unwrap();
+        assert_eq!(paths["web"], ["/nix/store/b-out", "/nix/store/c-src"]);
+        assert_eq!(paths["multi"], ["/nix/store/d-dev", "/nix/store/d-out"]);
+        assert!(paths["plain"].is_empty());
+
+        let unbuilt: BTreeMap<String, Vec<String>> =
+            [("x".to_string(), vec!["/nix/store/e.drv^out".to_string()])].into();
+        assert!(resolve_built(&unbuilt, &built).is_err());
+    }
+
+    /// Evaluate the installables expression against a real (non-flake)
+    /// fleet value. Skipped without nix.
+    #[tokio::test]
+    async fn installables_follow_string_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("page.html");
+        std::fs::write(&src, "hi").unwrap();
+        let expr = format!(
+            r#"let drv = derivation {{ name = "svc"; system = builtins.currentSystem; builder = "/bin/sh"; args = [ "-c" "echo > $out" ]; }};
+               fleet = {{ services = {{
+                 web = {{ command = "${{drv}}/bin/web"; environment.PAGE = "${{{src}}}"; }};
+                 bare = {{ command = "/bin/true"; }};
+               }}; }};
+            in ({SERVICE_INSTALLABLES}) fleet"#,
+            src = src.display()
+        );
+        let Ok(out) = tokio::process::Command::new("nix-instantiate")
+            .args(["--eval", "--strict", "--json", "--expr", &expr])
+            .output()
+            .await
+        else {
+            return;
+        };
+        if !out.status.success() {
+            eprintln!("skipping: {}", String::from_utf8_lossy(&out.stderr));
+            return;
+        }
+        let map: BTreeMap<String, Vec<String>> = serde_json::from_slice(&out.stdout).unwrap();
+        assert!(map["bare"].is_empty());
+        let web = &map["web"];
+        assert_eq!(web.len(), 2, "{web:?}");
+        assert!(web.iter().any(|i| i.ends_with("-svc.drv^out")), "{web:?}");
+        assert!(web.iter().any(|i| i.ends_with("-page.html")), "{web:?}");
+    }
 
     #[test]
     fn default_options_have_no_passthrough() {

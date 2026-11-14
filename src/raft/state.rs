@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
@@ -108,11 +108,21 @@ pub struct ConfigRevision {
     pub applied_by: String,
     /// Set when this revision re-applies an earlier one.
     pub rollback_of: Option<u64>,
+    /// Store paths each service needs, built by the server at apply time.
+    #[serde(default)]
+    pub closures: BTreeMap<String, Vec<String>>,
 }
 
 impl ConfigRevision {
+    /// The recorded configuration with each service's built store paths.
     pub fn config(&self) -> Result<crate::config::FleetConfig, serde_json::Error> {
-        serde_json::from_str(&self.config_json)
+        let mut config: crate::config::FleetConfig = serde_json::from_str(&self.config_json)?;
+        for (name, service) in &mut config.services {
+            if let Some(paths) = self.closures.get(name) {
+                service.store_paths = paths.clone();
+            }
+        }
+        Ok(config)
     }
 }
 
@@ -166,6 +176,8 @@ pub enum Command {
         applied_at: u64,
         applied_by: String,
         rollback_of: Option<u64>,
+        #[serde(default)]
+        closures: BTreeMap<String, Vec<String>>,
     },
     Deploy {
         service_name: String,
@@ -468,6 +480,7 @@ impl FleetStateMachine {
                 applied_at,
                 applied_by,
                 rollback_of,
+                closures,
             } => {
                 let revision = state.config_revisions.last().map_or(1, |r| r.revision + 1);
                 state.config_revisions.push(ConfigRevision {
@@ -477,6 +490,7 @@ impl FleetStateMachine {
                     applied_at,
                     applied_by,
                     rollback_of,
+                    closures,
                 });
                 let excess = state
                     .config_revisions
@@ -868,6 +882,7 @@ mod tests {
             applied_at: 1,
             applied_by: "tester".into(),
             rollback_of,
+            closures: BTreeMap::new(),
         }
     }
 

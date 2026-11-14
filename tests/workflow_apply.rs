@@ -20,9 +20,9 @@ use ekafleet::proto::agent_message::Payload;
 use ekafleet::proto::fleet_control_client::FleetControlClient;
 use ekafleet::proto::server_message::Payload as ServerPayload;
 use ekafleet::proto::{
-    AgentMessage, ApplyRequest, ApplyStatus, CreateAclTokenRequest, CreateJoinTokenRequest,
-    HealthReport, HealthStatus, Heartbeat, ListConfigRevisionsRequest, PlanRequest,
-    RollbackRequest, ServiceHealth,
+    AgentMessage, ApplyRequest, ApplyStatus, CacheNarInfoRequest, CacheNarRequest,
+    CreateAclTokenRequest, CreateJoinTokenRequest, HealthReport, HealthStatus, Heartbeat,
+    ListConfigRevisionsRequest, PlanRequest, RollbackRequest, ServiceHealth, ServiceSpec,
 };
 use tokio::sync::mpsc;
 use tonic::transport::{Channel, Endpoint, Identity};
@@ -178,7 +178,8 @@ fn commit(flake: &Path) {
 /// A joined agent that reports every service it is told to run as healthy
 /// and forwards the `web` command of each `DesiredState` it receives.
 struct Agent {
-    commands: mpsc::UnboundedReceiver<String>,
+    /// Each `web` spec received, with the `DesiredState`'s cache key.
+    commands: mpsc::UnboundedReceiver<(ServiceSpec, String)>,
 }
 
 async fn join_agent(server: &Server, dir: &Path, agent_dir: &Path) -> Identity {
@@ -235,7 +236,7 @@ async fn connect_agent(server: &Server, dir: &Path, identity: Identity) -> Agent
                     if let Some(ServerPayload::DesiredState(ds)) = msg.payload {
                         services = ds.services.iter().map(|s| s.name.clone()).collect();
                         if let Some(web) = ds.services.iter().find(|s| s.name == "web") {
-                            let _ = commands_tx.send(web.command.clone());
+                            let _ = commands_tx.send((web.clone(), ds.cache_public_key.clone()));
                         }
                     }
                 }
@@ -267,18 +268,19 @@ async fn connect_agent(server: &Server, dir: &Path, identity: Identity) -> Agent
 }
 
 impl Agent {
-    /// The next `web` command the server assigns that equals `want`.
-    async fn expect_command(&mut self, want: &str) {
+    /// The next `web` spec the server assigns whose command equals `want`,
+    /// with the binary cache key.
+    async fn expect_command(&mut self, want: &str) -> (ServiceSpec, String) {
         tokio::time::timeout(Duration::from_secs(60), async {
-            while let Some(command) = self.commands.recv().await {
-                if command == want {
-                    return;
+            while let Some((spec, key)) = self.commands.recv().await {
+                if spec.command == want {
+                    return (spec, key);
                 }
             }
             panic!("agent stream closed");
         })
         .await
-        .unwrap_or_else(|_| panic!("agent never received {want}"));
+        .unwrap_or_else(|_| panic!("agent never received {want}"))
     }
 }
 
@@ -453,4 +455,217 @@ async fn viewers_cannot_apply_or_roll_back() {
             .await
             .is_ok()
     );
+}
+
+/// A flake whose `web` service refers to a derivation and a source file, so
+/// the server has a closure to build and serve.
+fn write_closure_fleet(flake: &Path, nonce: &str) -> String {
+    write_fleet(flake, "placeholder");
+    let system = format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS);
+    std::fs::write(
+        flake.join("flake.nix"),
+        format!(
+            r#"{{ outputs = _: let
+  fleet = builtins.fromJSON (builtins.readFile ./fleet.json);
+  web = derivation {{ name = "cache-test-web"; system = "{system}"; builder = "/bin/sh"; args = [ "-c" "echo {nonce} > $out" ]; }};
+  page = builtins.toFile "page.html" "{nonce}";
+in {{ fleet = fleet // {{ services.web = fleet.services.web // {{ command = "${{web}}"; environment.PAGE = "${{page}}"; }}; }}; }}; }}
+"#
+        ),
+    )
+    .unwrap();
+    commit(flake);
+    nonce.to_string()
+}
+
+fn narinfo_field<'a>(narinfo: &'a str, field: &str) -> &'a str {
+    narinfo
+        .lines()
+        .find_map(|l| l.strip_prefix(&format!("{field}: ")))
+        .unwrap_or_else(|| panic!("narinfo has no {field}:\n{narinfo}"))
+}
+
+#[tokio::test]
+async fn apply_builds_closures_and_serves_them_to_the_assigned_agent() {
+    if !nix_available() {
+        return;
+    }
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD;
+
+    let dir = tempfile::tempdir().unwrap();
+    let flake = dir.path().join("fleet");
+    let server = start(dir.path()).await;
+    let mut admin = client(&server, dir.path(), ADMIN_TOKEN).await;
+    let identity = join_agent(&server, dir.path(), &dir.path().join("agent")).await;
+    let mut agent = connect_agent(&server, dir.path(), identity.clone()).await;
+
+    let nonce = uuid::Uuid::new_v4().to_string();
+    write_closure_fleet(&flake, &nonce);
+    let (status, _, messages) = apply(&mut admin, &flake).await;
+    assert_eq!(status, ApplyStatus::ApplySucceeded, "{messages:?}");
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.starts_with("Building 2 store paths")),
+        "{messages:?}"
+    );
+
+    // The agent is told which store paths `web` needs and how to verify them.
+    let (spec, key) = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let (spec, key) = agent.commands.recv().await.expect("agent stream closed");
+            if !spec.store_paths.is_empty() {
+                return (spec, key);
+            }
+        }
+    })
+    .await
+    .expect("no store paths assigned");
+    assert_eq!(spec.store_paths.len(), 2, "{:?}", spec.store_paths);
+    let web = spec
+        .store_paths
+        .iter()
+        .find(|p| p.ends_with("-cache-test-web"))
+        .expect("derivation output")
+        .clone();
+    assert!(spec.store_paths.iter().any(|p| p.ends_with("-page.html")));
+    assert_eq!(spec.command, web);
+    let (key_name, public) = key.split_once(':').expect("name:key");
+    assert!(key_name.starts_with("ekafleet-"), "{key}");
+
+    // The server keeps the built closures rooted.
+    let roots: Vec<_> = std::fs::read_dir(dir.path().join("data/gcroots"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(roots.len(), 1, "{roots:?}");
+    assert_eq!(std::fs::read_dir(&roots[0]).unwrap().count(), 2);
+
+    // The agent fetches the narinfo and NAR over its mTLS identity.
+    let mut as_agent = FleetControlClient::new(channel(&server, dir.path(), Some(identity)).await);
+    let hash = web.strip_prefix("/nix/store/").unwrap()[..32].to_string();
+    let info = as_agent
+        .cache_nar_info(CacheNarInfoRequest {
+            hash_part: hash.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(info.found);
+    let narinfo = info.narinfo;
+    assert_eq!(narinfo_field(&narinfo, "StorePath"), web);
+    assert_eq!(narinfo_field(&narinfo, "URL"), format!("nar/{hash}.nar"));
+    let nar_hash = narinfo_field(&narinfo, "NarHash").to_string();
+    let nar_size: u64 = narinfo_field(&narinfo, "NarSize").parse().unwrap();
+    let refs: Vec<String> = narinfo_field(&narinfo, "References")
+        .split_whitespace()
+        .map(|r| format!("/nix/store/{r}"))
+        .collect();
+    let sig = narinfo_field(&narinfo, "Sig")
+        .strip_prefix(&format!("{key_name}:"))
+        .expect("signed with the advertised key");
+    let fingerprint = format!("1;{web};{nar_hash};{nar_size};{}", refs.join(","));
+    ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, b64.decode(public).unwrap())
+        .verify(fingerprint.as_bytes(), &b64.decode(sig).unwrap())
+        .expect("narinfo signature verifies");
+
+    let mut stream = as_agent
+        .cache_nar(CacheNarRequest {
+            hash_part: hash.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let mut nar = Vec::new();
+    while let Some(chunk) = stream.message().await.unwrap() {
+        nar.extend(chunk.data);
+    }
+    assert_eq!(nar.len() as u64, nar_size);
+    let digest = ring::digest::digest(&ring::digest::SHA256, &nar);
+    assert_eq!(
+        format!("sha256:{}", ekafleet::server::cache::nix32(digest.as_ref())),
+        nar_hash
+    );
+
+    // Paths outside the assigned closures are refused, e.g. the derivation.
+    let deriver = narinfo_field(&narinfo, "Deriver");
+    let drv_hash = deriver[..32].to_string();
+    let info = as_agent
+        .cache_nar_info(CacheNarInfoRequest {
+            hash_part: drv_hash.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!info.found);
+    let err = as_agent
+        .cache_nar(CacheNarRequest {
+            hash_part: drv_hash,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::NotFound);
+
+    // Viewers cannot use the cache at all.
+    let viewer = admin
+        .create_acl_token(CreateAclTokenRequest {
+            role: "viewer".into(),
+            description: "read-only".into(),
+            namespace: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .token;
+    let err = client(&server, dir.path(), &viewer)
+        .await
+        .cache_nar_info(CacheNarInfoRequest { hash_part: hash })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+    // Rolling back to a configuration without closures keeps the rooted
+    // closures of the retained revision.
+    write_fleet(&flake, "/bin/plain");
+    commit_again(&flake);
+    let (status, _, messages) = apply(&mut admin, &flake).await;
+    assert_eq!(status, ApplyStatus::ApplySucceeded, "{messages:?}");
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("data/gcroots"))
+            .unwrap()
+            .count(),
+        1
+    );
+    let rollback = admin
+        .rollback(RollbackRequest { to_revision: 1 })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(rollback.success, "{}", rollback.message);
+    let (spec, _) = agent.expect_command(&web).await;
+    assert_eq!(spec.store_paths.len(), 2);
+}
+
+/// Commit changes to an existing flake repository.
+fn commit_again(flake: &Path) {
+    for args in [
+        &["add", "."][..],
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "update",
+        ],
+    ] {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(flake)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    }
 }
