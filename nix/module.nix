@@ -518,5 +518,58 @@ in
         environment.RUST_LOG = "info";
       };
     })
+
+    # ── Server and agent on one host ─────────────────────────────────
+    #
+    # The local agent joins over loopback with the fleet CA, and is handed
+    # a fresh join token whenever it starts without a valid node SVID.
+    (lib.mkIf (cfg.server.enable && cfg.agent.enable) (
+      let
+        grpcPort = lib.last (lib.splitString ":" cfg.server.grpcListen);
+        joinTokenFile = "/run/ekafleet/join-token";
+        provisionJoinToken = pkgs.writeShellScript "ekafleet-agent-join-token" ''
+          set -eu
+          token_file=${joinTokenFile}
+          rm -f "$token_file" "$token_file.tmp"
+          svid=${cfg.agent.dataDir}/node-svid.pem
+          if [ -f "$svid" ] && ${pkgs.openssl}/bin/openssl x509 -checkend 300 -noout -in "$svid" >/dev/null; then
+            exit 0
+          fi
+          EKAFLEET_TOKEN=$(cat "$CREDENTIALS_DIRECTORY/admin-token")
+          EKAFLEET_SERVER=127.0.0.1:${grpcPort}
+          EKAFLEET_CA_CERT=${cfg.agent.caCert}
+          export EKAFLEET_TOKEN EKAFLEET_SERVER EKAFLEET_CA_CERT
+          umask 077
+          # The server may still be starting.
+          for _ in $(seq 60); do
+            if ${cfg.agent.package}/bin/ekafleet token create --type agent \
+                --node ${lib.escapeShellArg cfg.agent.nodeName} --ttl 10m >"$token_file.tmp"; then
+              mv "$token_file.tmp" "$token_file"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "cannot create a join token for the local agent" >&2
+          exit 1
+        '';
+      in
+      {
+        services.ekafleet.agent = {
+          serverAddr = lib.mkDefault "127.0.0.1:${grpcPort}";
+          caCert = lib.mkDefault "/var/lib/ekafleet-ca/ca-cert.pem";
+          joinTokenFile = lib.mkDefault joinTokenFile;
+          domain = lib.mkDefault cfg.server.domain;
+        };
+
+        systemd.services.ekafleet-agent = {
+          after = [ "ekafleet-server.service" ];
+          wants = [ "ekafleet-server.service" ];
+          serviceConfig = {
+            LoadCredential = [ "admin-token:${cfg.server.tokenFile}" ];
+            ExecStartPre = lib.mkIf (cfg.agent.joinTokenFile == joinTokenFile) provisionJoinToken;
+          };
+        };
+      }
+    ))
   ];
 }
