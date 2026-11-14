@@ -78,10 +78,11 @@ For development and quick bootstrapping, `ekafleet server` (without `--ca-socket
 
 ## Node Attestation
 
-The server handles SPIFFE-style node attestation via the `Attest` RPC:
-- **Join token**: One-time-use tokens registered via `ekafleet token create`; consumed on attestation and cannot be replayed
-- After attestation, the server issues a node SVID and the agent connects via mTLS
-- The `Attest` RPC requires `Attest` permission (granted to Operator and Admin roles)
+The server handles SPIFFE-style node attestation via the separate `FleetBootstrap.Attest` RPC, which sits outside the authentication interceptor because the join token is the credential:
+- **Join token**: created on the server by an admin (`ekafleet token create --type agent --node <name>`, `CreateJoinToken` RPC, `ManageTokens` permission). Tokens are bound to a node name, expire (default 1h, max 7d), are stored as SHA-256 hashes in `<data-dir>/join_tokens.json`, and are consumed on first use and cannot be replayed
+- The CSR is validated before the token is consumed, a name mismatch does not consume the token, a CA failure releases it, and failed attempts are rate-limited per source IP
+- The server issues a 24-hour node SVID (`spiffe://<domain>/agent/<name>`) and the agent connects via mTLS, renewing it over the control stream (`CertificateRequest` with `NODE_CERT`, accepted only on mTLS streams)
+- gRPC TLS requests but does not require client certificates: the CLI uses a bearer token; agents must present a node SVID outside `ekafleet dev`
 
 ## Fleet Encryption Key
 
@@ -129,8 +130,7 @@ Every gRPC handler enforces RBAC via `require_permission()`:
 | Scale | Admin, Operator | scale |
 | Drain | Admin, Operator | drain |
 | AgentConnect | Admin, Operator | stream_control |
-| Attest | Admin, Operator | attest |
-| ManageTokens | Admin only | create/revoke/list_acl_tokens, rotate_fleet_key |
+| ManageTokens | Admin only | create/revoke/list_acl_tokens, create_join_token, rotate_fleet_key |
 
 Client-supplied `x-ekafleet-mtls` and `x-ekafleet-attest` metadata headers are stripped at the interceptor boundary to prevent spoofing.
 

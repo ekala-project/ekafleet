@@ -22,9 +22,14 @@ pkgs.testers.nixosTest {
       imports = [ ../module.nix ];
       nixpkgs.overlays = [ (import ../overlay.nix) ];
 
+      environment.etc."ekafleet-admin-token" = {
+        text = "lifecycle-token";
+        mode = "0400";
+      };
+
       services.ekafleet.server = {
         enable = true;
-        token = "lifecycle-token";
+        tokenFile = "/etc/ekafleet-admin-token";
       };
 
       networking.firewall.allowedTCPPorts = [
@@ -49,7 +54,6 @@ pkgs.testers.nixosTest {
     };
 
   testScript = ''
-    import json
 
     AUTH = "-H 'Authorization: Bearer lifecycle-token'"
     BASE = "http://server:7402"

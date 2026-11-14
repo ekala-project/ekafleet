@@ -399,12 +399,18 @@ impl ScalingActuator {
         cloud_config: &CloudProviderConfig,
         provider: &dyn super::CloudProviderDyn,
     ) -> Result<String, anyhow::Error> {
-        // Generate a one-time join token for this instance
-        let token = generate_join_token();
-        self.join_tokens.register(&token).await;
+        // The server names the node up front and binds a one-time join
+        // token to that name, so the token is useless for any other node.
+        let node_name = cloud_node_name(pool_name);
+        let (token, _expires_at) = self
+            .join_tokens
+            .create(&node_name, None)
+            .await
+            .map_err(|e| anyhow::anyhow!("join token for {node_name}: {e}"))?;
 
         // Generate user-data bootstrap script
-        let user_data = bootstrap::generate_user_data(&self.server_addr, &token, &self.ca_cert_pem);
+        let user_data =
+            bootstrap::generate_user_data(&self.server_addr, &node_name, &token, &self.ca_cert_pem);
 
         // image_id must be resolved by the time we create instances
         let image_id = cloud_config
@@ -496,13 +502,13 @@ impl ScalingActuator {
     }
 }
 
-/// Generate a cryptographically random join token (64 hex chars = 256 bits).
-fn generate_join_token() -> String {
-    use ring::rand::{SecureRandom, SystemRandom};
-    let rng = SystemRandom::new();
-    let mut bytes = [0u8; 32];
-    rng.fill(&mut bytes).expect("system RNG failure");
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+/// A fresh node name for a cloud instance in `pool_name`: the pool name
+/// plus 8 random hex characters (truncated so the result stays a valid
+/// identity name).
+fn cloud_node_name(pool_name: &str) -> String {
+    let suffix = &crate::attestation::join_token::generate_token()[..8];
+    let prefix: String = pool_name.chars().take(54).collect();
+    format!("{prefix}-{suffix}")
 }
 
 #[cfg(test)]
@@ -674,21 +680,18 @@ mod tests {
         let instance_id = result.unwrap();
         assert!(instance_id.starts_with("mock-"));
 
-        // Should be tracked
+        // Should be tracked, with a join token bound to its node name
         assert_eq!(tracker.active_count_for_pool("workers").await, 1);
+        assert_eq!(join_tokens.count().await, 1);
     }
 
     #[test]
-    fn generate_join_token_is_64_hex_chars() {
-        let token = generate_join_token();
-        assert_eq!(token.len(), 64);
-        assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
-    }
-
-    #[test]
-    fn generate_join_token_is_unique() {
-        let a = generate_join_token();
-        let b = generate_join_token();
+    fn cloud_node_names_are_unique_valid_identities() {
+        let a = cloud_node_name("workers");
+        let b = cloud_node_name("workers");
         assert_ne!(a, b);
+        assert!(a.starts_with("workers-") && a.len() == "workers-".len() + 8);
+        crate::ca::validate_identity_name(&a).unwrap();
+        crate::ca::validate_identity_name(&cloud_node_name(&"p".repeat(100))).unwrap();
     }
 }

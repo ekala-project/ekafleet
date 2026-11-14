@@ -2,6 +2,7 @@ mod agent_msg;
 pub mod api;
 mod api_system;
 pub mod audit;
+pub mod bootstrap;
 pub mod cloud;
 pub mod deployer;
 pub mod events;
@@ -44,6 +45,9 @@ pub struct ServerConfig {
     /// Path to a CA signer Unix socket. When set, the server connects to
     /// an external `ca-signer` daemon instead of loading the CA key in-process.
     pub ca_socket: Option<PathBuf>,
+    /// Accept agents authenticated by a bearer token instead of a node SVID.
+    /// Only `ekafleet dev` sets this.
+    pub allow_bearer_agents: bool,
 }
 
 pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
@@ -175,6 +179,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         instance_tracker: instance_tracker.clone(),
         event_store: event_store.clone(),
         data_dir: config.data_dir.clone(),
+        allow_bearer_agents: config.allow_bearer_agents,
     };
 
     let grpc_shutdown = shutdown.clone();
@@ -342,8 +347,8 @@ async fn housekeeping_loop(deps: HousekeepingDeps, shutdown: CancellationToken) 
 
         tick_count += 1;
 
-        // 1. Expire join tokens older than 1 hour
-        join_tokens.expire_old(3600).await;
+        // 1. Drop expired join tokens
+        join_tokens.expire().await;
 
         // 2. Evict nodes with no heartbeat for 5 minutes
         let evicted = fleet_state.evict_dead_nodes(300).await;

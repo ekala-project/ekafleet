@@ -1,66 +1,75 @@
+//! One-time join tokens for node attestation.
+//!
+//! An operator (or the cloud actuator) creates a token for a specific node
+//! name with `ekafleet token create --type agent --node <name>`. The new
+//! node presents it once, together with a CSR, to `FleetBootstrap.Attest`
+//! and receives the node SVID `spiffe://<domain>/agent/<name>`. The token
+//! is the only credential on that call, so it is:
+//!
+//! - 256 bits from the system RNG, and stored only as its SHA-256 hash
+//!   (a leaked `join_tokens.json` reveals no usable token);
+//! - bound to one node name: presenting it for any other name fails and
+//!   leaves it unconsumed;
+//! - short-lived (default [`DEFAULT_TTL`], at most [`MAX_TTL`]);
+//! - consumed on first use, with a consumption record kept until the token
+//!   would have expired anyway, so replays are reported as such;
+//! - guarded by a per-source failure rate limit.
+
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use super::{AttestationError, AttestationResult};
 
-/// Max failed consume attempts allowed within `RATE_LIMIT_WINDOW_SECS` before
-/// further attempts are rejected outright. Protects against brute-forcing the
-/// token namespace.
-const RATE_LIMIT_MAX_FAILURES: u32 = 20;
+/// Lifetime of a join token when none is requested.
+pub const DEFAULT_TTL: Duration = Duration::from_secs(3600);
+/// Longest lifetime a join token may be given.
+pub const MAX_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
+
+/// Failed attempts allowed per source address within `RATE_LIMIT_WINDOW_SECS`.
+const RATE_LIMIT_MAX_FAILURES: usize = 20;
 /// Sliding window (seconds) over which failed attempts are counted.
 const RATE_LIMIT_WINDOW_SECS: u64 = 60;
+/// Bound on the number of source addresses tracked for rate limiting.
+const RATE_LIMIT_MAX_SOURCES: usize = 4096;
 
-/// Server-side store for one-time join tokens.
-///
-/// Tokens are registered via `ekafleet token create --type agent` and consumed
-/// exactly once during node attestation. After successful attestation, the
-/// token is deleted and an audit record of the consumption is retained so the
-/// event survives a restart and cannot be silently replayed against a fresh
-/// (empty) in-memory store.
-///
-/// A token may optionally be *bound* to a specific node ID at registration
-/// time. A bound token will only attest for that exact node; a mismatching
-/// node_id is rejected even if the token string is correct. This ties a token
-/// to an out-of-band identity (e.g. a cloud instance ID) so a leaked token is
-/// useless outside its intended host.
 #[derive(Clone)]
 pub struct JoinTokenStore {
     inner: Arc<RwLock<State>>,
     persist_path: Option<PathBuf>,
+    /// Serializes writes of the persisted file.
+    persist_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
 struct State {
-    /// Live, unconsumed tokens keyed by token string.
+    /// Live tokens keyed by the hex SHA-256 of the token.
     tokens: HashMap<String, TokenEntry>,
-    /// Audit trail of consumed tokens keyed by token string. Retained so a
-    /// consumed token cannot be replayed after a restart.
+    /// Consumed tokens (by hash), kept until they would have expired.
     consumed: HashMap<String, ConsumedRecord>,
-    /// Recent failed-attempt timestamps (epoch secs) for rate limiting. Not
-    /// persisted — reset on restart is acceptable and desirable.
+    /// Recent failure timestamps per source address. Not persisted.
     #[serde(skip)]
-    failures: Vec<u64>,
+    failures: HashMap<Option<IpAddr>, Vec<u64>>,
 }
 
 #[derive(Serialize, Deserialize)]
 struct TokenEntry {
-    /// Optional node ID this token is bound to. If `Some`, attestation must
-    /// present a matching node_id.
-    bound_node_id: Option<String>,
-    /// When this token was registered (epoch seconds).
+    /// The only node name this token can attest.
+    node_name: String,
     created_at: u64,
+    expires_at: u64,
 }
 
 #[derive(Serialize, Deserialize)]
 struct ConsumedRecord {
-    /// Node ID that consumed the token.
-    node_id: String,
-    /// When the token was consumed (epoch seconds).
+    node_name: String,
     consumed_at: u64,
+    expires_at: u64,
 }
 
 impl Default for JoinTokenStore {
@@ -69,169 +78,229 @@ impl Default for JoinTokenStore {
     }
 }
 
+/// Generate a 256-bit random token as 64 hex characters.
+pub fn generate_token() -> String {
+    use ring::rand::{SecureRandom, SystemRandom};
+    let mut bytes = zeroize::Zeroizing::new([0u8; 32]);
+    SystemRandom::new()
+        .fill(bytes.as_mut())
+        .expect("system RNG failure");
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn token_hash(token: &str) -> String {
+    ring::digest::digest(&ring::digest::SHA256, token.as_bytes())
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 impl JoinTokenStore {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(State::default())),
             persist_path: None,
+            persist_lock: Arc::new(Mutex::new(())),
         }
     }
 
-    /// Create a token store that persists live tokens and the consumed-token
-    /// audit trail to `join_tokens.json` under the given data directory.
+    /// A store persisted to `join_tokens.json` under `data_dir`.
     pub fn with_persistence(data_dir: &std::path::Path) -> Self {
         Self {
-            inner: Arc::new(RwLock::new(State::default())),
             persist_path: Some(data_dir.join("join_tokens.json")),
+            ..Self::new()
         }
     }
 
-    /// Load persisted tokens and audit trail from disk, if configured.
+    /// Load persisted tokens, if configured and present.
     pub async fn load(&self) -> anyhow::Result<()> {
         let Some(path) = &self.persist_path else {
             return Ok(());
         };
-        if !path.exists() {
-            return Ok(());
-        }
-        let data = tokio::fs::read_to_string(path).await?;
+        let data = match tokio::fs::read_to_string(path).await {
+            Ok(data) => data,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
         let loaded: State = serde_json::from_str(&data)?;
         let mut state = self.inner.write().await;
-        let live = loaded.tokens.len();
-        let consumed = loaded.consumed.len();
         state.tokens = loaded.tokens;
         state.consumed = loaded.consumed;
-        tracing::info!(live, consumed, "Loaded persisted join tokens");
+        tracing::info!(
+            live = state.tokens.len(),
+            consumed = state.consumed.len(),
+            "Loaded persisted join tokens"
+        );
         Ok(())
     }
 
-    /// Persist current state to disk. Caller must hold the write lock's data;
-    /// this takes a read snapshot internally.
     async fn persist(&self) {
         let Some(path) = &self.persist_path else {
             return;
         };
-        let state = self.inner.read().await;
-        match serde_json::to_string_pretty(&*state) {
+        let _guard = self.persist_lock.lock().await;
+        let data = {
+            let state = self.inner.read().await;
+            serde_json::to_vec_pretty(&*state)
+        };
+        match data {
             Ok(data) => {
-                if let Err(e) = tokio::fs::write(path, data).await {
+                if let Err(e) = crate::fsutil::write_atomic(path, &data, 0o600).await {
                     tracing::warn!(error = %e, "Failed to persist join tokens");
                 }
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to serialize join tokens");
-            }
+            Err(e) => tracing::warn!(error = %e, "Failed to serialize join tokens"),
         }
     }
 
-    /// Register a new unbound join token.
-    pub async fn register(&self, token: &str) {
-        self.register_bound(token, None).await;
-    }
-
-    /// Register a join token bound to a specific node ID. Attestation with any
-    /// other node_id will be rejected.
-    pub async fn register_bound(&self, token: &str, bound_node_id: Option<String>) {
-        {
-            let mut state = self.inner.write().await;
-            state.tokens.insert(
-                token.to_string(),
-                TokenEntry {
-                    bound_node_id,
-                    created_at: now_epoch(),
-                },
-            );
+    /// Create a token that can attest exactly `node_name` within `ttl`
+    /// (default [`DEFAULT_TTL`]). Returns the token and its expiry.
+    pub async fn create(
+        &self,
+        node_name: &str,
+        ttl: Option<Duration>,
+    ) -> Result<(String, u64), AttestationError> {
+        crate::ca::validate_identity_name(node_name)
+            .map_err(|e| AttestationError::InvalidData(format!("invalid node name: {e}")))?;
+        let ttl = ttl.unwrap_or(DEFAULT_TTL);
+        if ttl.is_zero() || ttl > MAX_TTL {
+            return Err(AttestationError::InvalidData(format!(
+                "join token TTL must be between 1s and {}s",
+                MAX_TTL.as_secs()
+            )));
         }
-        tracing::info!("Join token registered");
+        let token = generate_token();
+        let now = now_epoch();
+        let expires_at = now + ttl.as_secs();
+        self.inner.write().await.tokens.insert(
+            token_hash(&token),
+            TokenEntry {
+                node_name: node_name.to_string(),
+                created_at: now,
+                expires_at,
+            },
+        );
+        tracing::info!(node = %node_name, expires_at, "Join token created");
         self.persist().await;
+        Ok((token, expires_at))
     }
 
-    /// Remove tokens older than `max_age_secs`. Returns the number removed.
-    pub async fn expire_old(&self, max_age_secs: u64) -> usize {
-        let cutoff = now_epoch().saturating_sub(max_age_secs);
-        let removed = {
+    /// Drop expired tokens and consumption records. Returns how many live
+    /// tokens expired.
+    pub async fn expire(&self) -> usize {
+        let now = now_epoch();
+        let (removed, changed) = {
             let mut state = self.inner.write().await;
-            let before = state.tokens.len();
-            state.tokens.retain(|_, entry| entry.created_at >= cutoff);
-            before - state.tokens.len()
+            let tokens = state.tokens.len();
+            let consumed = state.consumed.len();
+            state.tokens.retain(|_, e| e.expires_at > now);
+            state.consumed.retain(|_, c| c.expires_at > now);
+            let removed = tokens - state.tokens.len();
+            (removed, removed > 0 || consumed != state.consumed.len())
         };
         if removed > 0 {
-            tracing::info!(removed, "Expired stale join tokens");
+            tracing::info!(removed, "Expired unused join tokens");
+        }
+        if changed {
             self.persist().await;
         }
         removed
     }
 
-    /// Attempt to consume a join token for `node_id`. Returns Ok if valid, Err
-    /// if unknown, already used, bound to a different node, or rate limited.
-    async fn consume(&self, token: &str, node_id: &str) -> Result<(), AttestationError> {
+    /// Consume `token` for `node_name`. `source` is the caller's address,
+    /// used to rate-limit failures.
+    async fn consume(
+        &self,
+        token: &str,
+        node_name: &str,
+        source: Option<IpAddr>,
+    ) -> Result<(), AttestationError> {
         let now = now_epoch();
+        let hash = token_hash(token);
         let mut state = self.inner.write().await;
 
-        // Rate limit: prune the failure window, then reject if over threshold.
         let window_start = now.saturating_sub(RATE_LIMIT_WINDOW_SECS);
-        state.failures.retain(|&t| t >= window_start);
-        if state.failures.len() as u32 >= RATE_LIMIT_MAX_FAILURES {
-            tracing::warn!(
-                failures = state.failures.len(),
-                "Join token attestation rate limit exceeded"
-            );
-            return Err(AttestationError::Failed(
-                "too many failed attestation attempts; try again later".into(),
-            ));
+        if let Some(recent) = state.failures.get_mut(&source) {
+            recent.retain(|&t| t >= window_start);
+            if recent.len() >= RATE_LIMIT_MAX_FAILURES {
+                tracing::warn!(source = ?source, "Join token attestation rate limit exceeded");
+                return Err(AttestationError::Failed(
+                    "too many failed attestation attempts; try again later".into(),
+                ));
+            }
         }
 
-        // Detect replay of an already-consumed token via the audit trail.
-        if state.consumed.contains_key(token) {
-            state.failures.push(now);
-            drop(state);
-            self.persist().await;
-            return Err(AttestationError::Failed(
-                "join token already consumed".into(),
-            ));
-        }
-
-        let Some(entry) = state.tokens.get(token) else {
-            state.failures.push(now);
-            drop(state);
-            self.persist().await;
-            return Err(AttestationError::Failed(
-                "unknown or already-used join token".into(),
-            ));
+        let failure = match state.tokens.get(&hash) {
+            _ if state.consumed.contains_key(&hash) => "join token already used",
+            None => "unknown join token",
+            Some(entry) if entry.expires_at <= now => "join token expired",
+            Some(entry) if entry.node_name != node_name => {
+                tracing::warn!(
+                    bound = %entry.node_name,
+                    presented = %node_name,
+                    "Join token presented for a different node name"
+                );
+                "join token is bound to a different node name"
+            }
+            Some(_) => "",
         };
-
-        // Enforce node binding if present.
-        if let Some(bound) = &entry.bound_node_id
-            && bound != node_id
-        {
-            tracing::warn!(
-                expected = %bound,
-                actual = %node_id,
-                "Join token presented with mismatched bound node_id"
-            );
-            state.failures.push(now);
-            drop(state);
-            self.persist().await;
-            return Err(AttestationError::Failed(
-                "join token is bound to a different node".into(),
-            ));
+        if !failure.is_empty() {
+            if state.failures.len() >= RATE_LIMIT_MAX_SOURCES {
+                state
+                    .failures
+                    .retain(|_, recent| recent.iter().any(|&t| t >= window_start));
+                if state.failures.len() >= RATE_LIMIT_MAX_SOURCES {
+                    state.failures.clear();
+                }
+            }
+            state.failures.entry(source).or_default().push(now);
+            return Err(AttestationError::Failed(failure.into()));
         }
 
-        state.tokens.remove(token);
+        let entry = state.tokens.remove(&hash).expect("checked above");
         state.consumed.insert(
-            token.to_string(),
+            hash,
             ConsumedRecord {
-                node_id: node_id.to_string(),
+                node_name: node_name.to_string(),
                 consumed_at: now,
+                expires_at: entry.expires_at,
             },
         );
         drop(state);
-        tracing::info!("Join token consumed (one-time use)");
+        tracing::info!(node = %node_name, "Join token consumed");
         self.persist().await;
         Ok(())
     }
 
-    /// Check how many live tokens are registered (for diagnostics).
+    /// Undo a successful [`attest`] whose SVID could not be issued (e.g. the
+    /// CA signer was unreachable), so the node can retry with the same
+    /// token. Only a consumed, unexpired token is restored.
+    pub async fn release(&self, token: &str) {
+        let hash = token_hash(token.trim());
+        let restored = {
+            let mut state = self.inner.write().await;
+            match state.consumed.remove(&hash) {
+                Some(record) if record.expires_at > now_epoch() => {
+                    state.tokens.insert(
+                        hash,
+                        TokenEntry {
+                            node_name: record.node_name,
+                            created_at: record.consumed_at,
+                            expires_at: record.expires_at,
+                        },
+                    );
+                    true
+                }
+                _ => false,
+            }
+        };
+        if restored {
+            self.persist().await;
+        }
+    }
+
+    /// Number of live (unconsumed) tokens.
     pub async fn count(&self) -> usize {
         self.inner.read().await.tokens.len()
     }
@@ -244,44 +313,30 @@ fn now_epoch() -> u64 {
         .as_secs()
 }
 
-/// Validate a join token attestation request.
-///
-/// The `attestation_data` is the raw token bytes. On success, returns an
-/// `AttestationResult` with the node_id and selectors describing how the node
-/// was attested (attestation type, token binding, consumption time).
+/// Attest `node_name` with the join token in `attestation_data`.
 pub async fn attest(
     store: &JoinTokenStore,
     attestation_data: &[u8],
-    node_id: &str,
+    node_name: &str,
+    source: Option<IpAddr>,
 ) -> Result<AttestationResult, AttestationError> {
-    let token = String::from_utf8(attestation_data.to_vec())
-        .map_err(|_| AttestationError::InvalidData("token must be valid UTF-8".into()))?;
-
+    crate::ca::validate_identity_name(node_name)
+        .map_err(|e| AttestationError::InvalidData(format!("invalid node name: {e}")))?;
+    let token = std::str::from_utf8(attestation_data)
+        .map_err(|_| AttestationError::InvalidData("token must be valid UTF-8".into()))?
+        .trim();
     if token.is_empty() {
         return Err(AttestationError::InvalidData("empty token".into()));
     }
 
-    // Capture whether the token is bound before consuming (consume removes it).
-    let was_bound = {
-        let state = store.inner.read().await;
-        state
-            .tokens
-            .get(&token)
-            .map(|e| e.bound_node_id.is_some())
-            .unwrap_or(false)
-    };
-
-    store.consume(&token, node_id).await?;
-
-    let mut selectors = vec![
-        ("attestation_type".to_string(), "join_token".to_string()),
-        ("join_token:bound".to_string(), was_bound.to_string()),
-    ];
-    selectors.push(("node_id".to_string(), node_id.to_string()));
+    store.consume(token, node_name, source).await?;
 
     Ok(AttestationResult {
-        node_id: node_id.to_string(),
-        selectors,
+        node_id: node_name.to_string(),
+        selectors: vec![
+            ("attestation_type".to_string(), "join_token".to_string()),
+            ("node_name".to_string(), node_name.to_string()),
+        ],
     })
 }
 
@@ -289,197 +344,147 @@ pub async fn attest(
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn valid_token_consumed_once() {
-        let store = JoinTokenStore::new();
-        store.register("abc123").await;
+    const SRC: Option<IpAddr> = Some(IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)));
 
+    #[tokio::test]
+    async fn token_attests_its_node_once() {
+        let store = JoinTokenStore::new();
+        let (token, expires_at) = store.create("web-1", None).await.unwrap();
+        assert_eq!(token.len(), 64);
+        assert!(expires_at > now_epoch());
         assert_eq!(store.count().await, 1);
 
-        let result = attest(&store, b"abc123", "node-1").await;
-        assert!(result.is_ok());
-
-        // Token should be consumed
+        let result = attest(&store, token.as_bytes(), "web-1", SRC)
+            .await
+            .unwrap();
+        assert_eq!(result.node_id, "web-1");
         assert_eq!(store.count().await, 0);
 
-        // Replay should fail
-        let replay = attest(&store, b"abc123", "node-1").await;
-        assert!(matches!(replay, Err(AttestationError::Failed(_))));
+        let replay = attest(&store, token.as_bytes(), "web-1", SRC).await;
+        assert!(matches!(replay, Err(AttestationError::Failed(e)) if e.contains("already used")));
     }
 
     #[tokio::test]
-    async fn unknown_token_rejected() {
+    async fn token_is_bound_to_its_node_name() {
         let store = JoinTokenStore::new();
-
-        let result = attest(&store, b"nonexistent", "node-1").await;
-        assert!(matches!(result, Err(AttestationError::Failed(_))));
+        let (token, _) = store.create("web-1", None).await.unwrap();
+        let wrong = attest(&store, token.as_bytes(), "web-2", SRC).await;
+        assert!(matches!(wrong, Err(AttestationError::Failed(e)) if e.contains("different node")));
+        // A mismatch does not burn the token for its rightful node.
+        attest(&store, token.as_bytes(), "web-1", SRC)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
-    async fn empty_token_rejected() {
+    async fn invalid_input_is_rejected() {
         let store = JoinTokenStore::new();
-
-        let result = attest(&store, b"", "node-1").await;
-        assert!(matches!(result, Err(AttestationError::InvalidData(_))));
-    }
-
-    #[tokio::test]
-    async fn multiple_tokens_independent() {
-        let store = JoinTokenStore::new();
-        store.register("token-a").await;
-        store.register("token-b").await;
-
-        assert_eq!(store.count().await, 2);
-
-        // Consume token-a
-        attest(&store, b"token-a", "node-a").await.unwrap();
-        assert_eq!(store.count().await, 1);
-
-        // token-b should still work
-        attest(&store, b"token-b", "node-b").await.unwrap();
-        assert_eq!(store.count().await, 0);
-    }
-
-    #[tokio::test]
-    async fn attestation_result_has_correct_node_id_and_selectors() {
-        let store = JoinTokenStore::new();
-        store.register("test-token").await;
-
-        let result = attest(&store, b"test-token", "my-node-uuid").await.unwrap();
-        assert_eq!(result.node_id, "my-node-uuid");
+        assert!(matches!(
+            attest(&store, b"", "web-1", SRC).await,
+            Err(AttestationError::InvalidData(_))
+        ));
+        assert!(matches!(
+            attest(&store, b"nope", "web-1", SRC).await,
+            Err(AttestationError::Failed(_))
+        ));
+        for bad in ["", "../server/x", "a/b"] {
+            assert!(store.create(bad, None).await.is_err(), "{bad:?}");
+            assert!(matches!(
+                attest(&store, b"tok", bad, SRC).await,
+                Err(AttestationError::InvalidData(_))
+            ));
+        }
+        assert!(store.create("web-1", Some(Duration::ZERO)).await.is_err());
         assert!(
-            result
-                .selectors
-                .contains(&("attestation_type".to_string(), "join_token".to_string()))
-        );
-        assert!(
-            result
-                .selectors
-                .contains(&("join_token:bound".to_string(), "false".to_string()))
-        );
-        assert!(
-            result
-                .selectors
-                .contains(&("node_id".to_string(), "my-node-uuid".to_string()))
+            store
+                .create("web-1", Some(MAX_TTL + Duration::from_secs(1)))
+                .await
+                .is_err()
         );
     }
 
     #[tokio::test]
-    async fn bound_token_rejects_mismatched_node() {
+    async fn expired_tokens_are_refused_and_dropped() {
         let store = JoinTokenStore::new();
+        let (token, _) = store.create("web-1", None).await.unwrap();
+        let (fresh, _) = store.create("web-2", None).await.unwrap();
         store
-            .register_bound("bound-tok", Some("node-expected".to_string()))
-            .await;
+            .inner
+            .write()
+            .await
+            .tokens
+            .get_mut(&token_hash(&token))
+            .unwrap()
+            .expires_at = now_epoch() - 1;
 
-        // Wrong node_id is rejected and the token is NOT consumed.
-        let wrong = attest(&store, b"bound-tok", "node-attacker").await;
-        assert!(matches!(wrong, Err(AttestationError::Failed(_))));
+        let expired = attest(&store, token.as_bytes(), "web-1", SRC).await;
+        assert!(matches!(expired, Err(AttestationError::Failed(e)) if e.contains("expired")));
+        assert_eq!(store.expire().await, 1);
         assert_eq!(store.count().await, 1);
+        attest(&store, fresh.as_bytes(), "web-2", SRC)
+            .await
+            .unwrap();
+    }
 
-        // Correct node_id succeeds and marks the binding in selectors.
-        let ok = attest(&store, b"bound-tok", "node-expected").await.unwrap();
-        assert!(
-            ok.selectors
-                .contains(&("join_token:bound".to_string(), "true".to_string()))
-        );
+    #[tokio::test]
+    async fn failures_are_rate_limited_per_source() {
+        let store = JoinTokenStore::new();
+        let other = Some(IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 2)));
+        for _ in 0..RATE_LIMIT_MAX_FAILURES {
+            let _ = attest(&store, b"nope", "web-1", SRC).await;
+        }
+        let (token, _) = store.create("web-1", None).await.unwrap();
+        let blocked = attest(&store, token.as_bytes(), "web-1", SRC).await;
+        assert!(matches!(blocked, Err(AttestationError::Failed(e)) if e.contains("too many")));
+        assert_eq!(store.count().await, 1);
+        // Another source is unaffected.
+        attest(&store, token.as_bytes(), "web-1", other)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn released_token_can_be_retried() {
+        let store = JoinTokenStore::new();
+        let (token, _) = store.create("web-1", None).await.unwrap();
+        attest(&store, token.as_bytes(), "web-1", SRC)
+            .await
+            .unwrap();
+        store.release(&token).await;
+        assert_eq!(store.count().await, 1);
+        attest(&store, token.as_bytes(), "web-1", SRC)
+            .await
+            .unwrap();
+        // Releasing an unknown token is a no-op.
+        store.release("unknown").await;
         assert_eq!(store.count().await, 0);
     }
 
     #[tokio::test]
-    async fn consumed_token_replay_rejected_via_audit() {
-        let store = JoinTokenStore::new();
-        store.register("once").await;
-        attest(&store, b"once", "node-1").await.unwrap();
-
-        // The audit trail must reject a replay even though the live token map
-        // no longer contains it.
-        let replay = attest(&store, b"once", "node-1").await;
-        assert!(matches!(replay, Err(AttestationError::Failed(_))));
-    }
-
-    #[tokio::test]
-    async fn rate_limit_blocks_after_too_many_failures() {
-        let store = JoinTokenStore::new();
-
-        // Exhaust the failure budget with unknown tokens.
-        for _ in 0..RATE_LIMIT_MAX_FAILURES {
-            let _ = attest(&store, b"nope", "node-1").await;
-        }
-
-        // A valid token now also gets rejected due to rate limiting.
-        store.register("valid").await;
-        let blocked = attest(&store, b"valid", "node-1").await;
-        assert!(matches!(blocked, Err(AttestationError::Failed(_))));
-        // Token was not consumed because the request was rate limited.
-        assert_eq!(store.count().await, 1);
-    }
-
-    #[tokio::test]
-    async fn expire_old_removes_stale_tokens() {
-        let store = JoinTokenStore::new();
-        store.register("fresh-token").await;
-
-        // With a large max_age, nothing should expire
-        let removed = store.expire_old(3600).await;
-        assert_eq!(removed, 0);
-        assert_eq!(store.count().await, 1);
-
-        // Manually insert a token with an old created_at to simulate aging
-        {
-            let mut state = store.inner.write().await;
-            state.tokens.insert(
-                "old-token".to_string(),
-                TokenEntry {
-                    bound_node_id: None,
-                    created_at: 1000, // epoch second 1000 — very old
-                },
-            );
-        }
-        assert_eq!(store.count().await, 2);
-
-        // Expire tokens older than 1 hour — only old-token should be removed
-        let removed = store.expire_old(3600).await;
-        assert_eq!(removed, 1);
-        assert_eq!(store.count().await, 1);
-
-        // The fresh token should still be consumable
-        attest(&store, b"fresh-token", "node-1").await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn expire_old_preserves_fresh_tokens() {
-        let store = JoinTokenStore::new();
-        store.register("token-a").await;
-        store.register("token-b").await;
-
-        // Both tokens just created — nothing should expire with 1h TTL
-        let removed = store.expire_old(3600).await;
-        assert_eq!(removed, 0);
-        assert_eq!(store.count().await, 2);
-    }
-
-    #[tokio::test]
-    async fn persistence_roundtrip() {
+    async fn persisted_file_holds_hashes_only() {
         let dir = tempfile::tempdir().unwrap();
         let store = JoinTokenStore::with_persistence(dir.path());
-        store.register("live-tok").await;
-        store
-            .register_bound("bound-tok", Some("node-x".to_string()))
-            .await;
-        attest(&store, b"live-tok", "node-1").await.unwrap();
+        let (used, _) = store.create("web-1", None).await.unwrap();
+        let (live, _) = store.create("web-2", None).await.unwrap();
+        attest(&store, used.as_bytes(), "web-1", SRC).await.unwrap();
 
-        // Reload from disk: bound-tok should still be live, live-tok in audit.
-        let store2 = JoinTokenStore::with_persistence(dir.path());
-        store2.load().await.unwrap();
-        assert_eq!(store2.count().await, 1);
+        let path = dir.path().join("join_tokens.json");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains(&used) && !raw.contains(&live));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
 
-        // Replaying the consumed token must fail via the loaded audit trail.
-        let replay = attest(&store2, b"live-tok", "node-1").await;
-        assert!(matches!(replay, Err(AttestationError::Failed(_))));
-
-        // The surviving bound token still enforces its binding.
-        let wrong = attest(&store2, b"bound-tok", "node-y").await;
-        assert!(matches!(wrong, Err(AttestationError::Failed(_))));
-        attest(&store2, b"bound-tok", "node-x").await.unwrap();
+        let reloaded = JoinTokenStore::with_persistence(dir.path());
+        reloaded.load().await.unwrap();
+        assert_eq!(reloaded.count().await, 1);
+        let replay = attest(&reloaded, used.as_bytes(), "web-1", SRC).await;
+        assert!(matches!(replay, Err(AttestationError::Failed(e)) if e.contains("already used")));
+        attest(&reloaded, live.as_bytes(), "web-2", SRC)
+            .await
+            .unwrap();
     }
 }

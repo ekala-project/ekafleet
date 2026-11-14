@@ -13,27 +13,28 @@ use super::rbac::{PeerIdentity, Permission, TokenStore, extract_bearer_token, re
 use super::state::FleetState;
 use crate::attestation::join_token::JoinTokenStore;
 use crate::ca::CaSigner;
-use crate::ca::csr;
 use crate::ca::issuer::CertIssuer;
 use crate::metrics::aggregator::MetricsAggregator;
 use crate::proto::agent_message::Payload;
+use crate::proto::fleet_bootstrap_server::FleetBootstrapServer;
 use crate::proto::fleet_control_server::{FleetControl, FleetControlServer};
 use crate::proto::server_message::Payload as ServerPayload;
 use crate::proto::{
     AgentMessage, ApplyEvent, ApplyRequest, CreateAclTokenRequest, CreateAclTokenResponse,
-    DiffGenerationsRequest, DiffGenerationsResponse, DrainRequest, DrainResponse, EventsRequest,
-    EventsResponse, ExecRequest, ExecResponse, FailDeploymentRequest, FailDeploymentResponse,
-    FleetStatus, GetNodeRequest, InspectServiceRequest, InspectServiceResponse,
-    ListAclTokensRequest, ListAclTokensResponse, ListDeploymentsRequest, ListDeploymentsResponse,
-    ListGenerationsRequest, ListGenerationsResponse, ListNodesRequest, ListNodesResponse,
-    LogsChunk, LogsRequest, NodeAttestationRequest, NodeAttestationResult, NodeDetail,
-    OperationType, PlanRequest, PlanResponse, PlannedOperation, PromoteRequest, PromoteResponse,
-    RestoreRequest, RestoreResponse, RevokeAclTokenRequest, RevokeAclTokenResponse,
-    RollbackRequest, RollbackResponse, RotateFleetKeyRequest, RotateFleetKeyResponse, ScaleRequest,
-    ScaleResponse, ServerMessage, SnapshotRequest, SnapshotResponse, StatusRequest,
-    SwitchGenerationRequest, SwitchGenerationResponse, SystemGcRequest, SystemGcResponse,
-    SystemRebootRequest, SystemRebootResponse, SystemRebuildRequest, SystemRebuildResponse,
-    TopRequest, TopResponse, TrustBundleUpdate, UpdateNodeRequest, UpdateNodeResponse,
+    CreateJoinTokenRequest, CreateJoinTokenResponse, DiffGenerationsRequest,
+    DiffGenerationsResponse, DrainRequest, DrainResponse, EventsRequest, EventsResponse,
+    ExecRequest, ExecResponse, FailDeploymentRequest, FailDeploymentResponse, FleetStatus,
+    GetNodeRequest, InspectServiceRequest, InspectServiceResponse, ListAclTokensRequest,
+    ListAclTokensResponse, ListDeploymentsRequest, ListDeploymentsResponse, ListGenerationsRequest,
+    ListGenerationsResponse, ListNodesRequest, ListNodesResponse, LogsChunk, LogsRequest,
+    NodeDetail, OperationType, PlanRequest, PlanResponse, PlannedOperation, PromoteRequest,
+    PromoteResponse, RestoreRequest, RestoreResponse, RevokeAclTokenRequest,
+    RevokeAclTokenResponse, RollbackRequest, RollbackResponse, RotateFleetKeyRequest,
+    RotateFleetKeyResponse, ScaleRequest, ScaleResponse, ServerMessage, SnapshotRequest,
+    SnapshotResponse, StatusRequest, SwitchGenerationRequest, SwitchGenerationResponse,
+    SystemGcRequest, SystemGcResponse, SystemRebootRequest, SystemRebootResponse,
+    SystemRebuildRequest, SystemRebuildResponse, TopRequest, TopResponse, TrustBundleUpdate,
+    UpdateNodeRequest, UpdateNodeResponse,
 };
 use crate::raft::state::FleetStateMachine;
 use crate::secrets::store::SecretStore;
@@ -72,6 +73,9 @@ pub struct FleetControlService {
     pub(super) token_store: TokenStore,
     /// Append-only audit log recording which principal performed each action.
     pub(super) audit_log: super::audit::AuditLog,
+    /// Accept agent streams authenticated by a bearer token instead of a
+    /// node SVID. Only `ekafleet dev` enables this.
+    pub(super) allow_bearer_agents: bool,
 }
 
 impl FleetControlService {
@@ -108,7 +112,14 @@ impl FleetControlService {
             event_store,
             token_store,
             audit_log: super::audit::AuditLog::new(),
+            allow_bearer_agents: false,
         }
+    }
+
+    /// Accept bearer-token agent streams (development only).
+    pub fn with_bearer_agents(mut self, allow: bool) -> Self {
+        self.allow_bearer_agents = allow;
+        self
     }
 
     /// Record an audit-log entry, attributing it to the principal that issued
@@ -201,7 +212,14 @@ impl FleetControl for FleetControlService {
                     })?
                     .to_string(),
             ),
-            None => None,
+            None if self.allow_bearer_agents => None,
+            None => {
+                return Err(Status::permission_denied(
+                    "agents must authenticate with a node SVID; \
+                     join with `ekafleet agent --join-token-file` \
+                     (bearer-token agents are only accepted by `ekafleet dev`)",
+                ));
+            }
         };
         let remote = request
             .remote_addr()
@@ -308,7 +326,8 @@ impl FleetControl for FleetControlService {
         }
 
         // Process the first message
-        self.process_message(&node_id, first_msg).await;
+        let mtls = authenticated_node.is_some();
+        self.process_message(&node_id, first_msg, mtls).await;
 
         // Spawn task to process remaining inbound messages
         let state = self.state.clone();
@@ -325,6 +344,7 @@ impl FleetControl for FleetControlService {
                             msg,
                             issuer.as_ref(),
                             &metrics,
+                            mtls,
                         )
                         .await;
                     }
@@ -730,103 +750,30 @@ impl FleetControl for FleetControlService {
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 
-    async fn attest(
+    async fn create_join_token(
         &self,
-        request: Request<NodeAttestationRequest>,
-    ) -> Result<Response<NodeAttestationResult>, Status> {
-        require_permission(&request, Permission::Attest)?;
-        let req = request.into_inner();
-        tracing::info!(
-            attestation_type = %req.attestation_type,
-            csr_len = req.csr.len(),
-            "Node attestation request received"
-        );
-
-        // Extract node_id from the CSR's CN (or generate one)
-        let node_id = if req.csr.len() > 1 && req.csr[0] == 0x30 {
-            // Try to extract from CSR DN
-            uuid::Uuid::new_v4().to_string()
-        } else {
-            uuid::Uuid::new_v4().to_string()
-        };
-
-        // Dispatch attestation based on type
-        let attest_result = match req.attestation_type.as_str() {
-            "join_token" => {
-                crate::attestation::join_token::attest(
-                    &self.join_token_store,
-                    &req.attestation_data,
-                    &node_id,
-                )
-                .await
-            }
-            other => {
-                return Ok(Response::new(NodeAttestationResult {
-                    success: false,
-                    error_message: format!("unknown attestation type: {other}"),
-                    ..Default::default()
-                }));
-            }
-        };
-
-        match attest_result {
-            Ok(result) => {
-                let ca = self
-                    .ca
-                    .as_ref()
-                    .ok_or_else(|| Status::internal("CA not configured for node SVID issuance"))?;
-
-                // Generate a node CSR on behalf of the attested node and issue a node SVID
-                let spiffe_id = format!("spiffe://{}/agent/{}", self.domain, result.node_id);
-
-                let node_csr = csr::generate_node_csr(&self.domain, &result.node_id)
-                    .map_err(|e| Status::internal(format!("node CSR generation: {e}")))?;
-
-                let (cert_pem, _chain_pem, _expires_at) = ca
-                    .sign_csr(
-                        &node_csr.csr_der,
-                        &crate::ca::SvidSubject::Agent(result.node_id.clone()),
-                        None,
-                    )
-                    .await
-                    .map_err(|e| Status::internal(format!("node SVID issuance: {e}")))?;
-
-                // Combine cert with the locally generated key
-                let key_pem = node_csr.keypair.serialize_pem();
-                let mut node_cert = cert_pem;
-                node_cert.push(b'\n');
-                node_cert.extend_from_slice(key_pem.as_bytes());
-
-                let trust_bundle = self
-                    .trust_bundle_pem
-                    .as_ref()
-                    .map(|s| s.as_bytes().to_vec())
-                    .unwrap_or_default();
-
-                tracing::info!(
-                    node_id = %result.node_id,
-                    spiffe_id = %spiffe_id,
-                    "Node attestation successful — SVID issued"
-                );
-
-                Ok(Response::new(NodeAttestationResult {
-                    success: true,
-                    node_spiffe_id: spiffe_id,
-                    node_certificate: node_cert,
-                    trust_bundle,
-                    error_message: String::new(),
-                    trust_domain: self.domain.clone(),
-                }))
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "Node attestation failed");
-                Ok(Response::new(NodeAttestationResult {
-                    success: false,
-                    error_message: e.to_string(),
-                    ..Default::default()
-                }))
-            }
-        }
+        request: Request<CreateJoinTokenRequest>,
+    ) -> Result<Response<CreateJoinTokenResponse>, Status> {
+        require_permission(&request, Permission::ManageTokens)?;
+        let req = request.get_ref();
+        let ttl = (req.ttl_secs > 0).then(|| Duration::from_secs(req.ttl_secs));
+        let (token, expires_at) = self
+            .join_token_store
+            .create(&req.node_name, ttl)
+            .await
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        self.audit(
+            &request,
+            super::audit::AuditAction::TokenCreate,
+            &format!("join-token/{}", req.node_name),
+            &format!(
+                "join token for node {} (expires {expires_at})",
+                req.node_name
+            ),
+            super::audit::AuditOutcome::Success,
+        )
+        .await;
+        Ok(Response::new(CreateJoinTokenResponse { token, expires_at }))
     }
 
     async fn status(
@@ -1933,13 +1880,14 @@ impl FleetControl for FleetControlService {
 }
 
 impl FleetControlService {
-    async fn process_message(&self, node_id: &str, msg: AgentMessage) {
+    async fn process_message(&self, node_id: &str, msg: AgentMessage, mtls: bool) {
         super::agent_msg::process_agent_message(
             &self.state,
             node_id,
             msg,
             self.cert_issuer.as_ref(),
             &self.metrics,
+            mtls,
         )
         .await;
     }
@@ -1993,6 +1941,8 @@ pub struct GrpcServerConfig {
     pub instance_tracker: InstanceTracker,
     pub event_store: EventStore,
     pub data_dir: std::path::PathBuf,
+    /// Accept bearer-token agent streams (`ekafleet dev` only).
+    pub allow_bearer_agents: bool,
 }
 
 /// Start the gRPC server with TLS and RBAC-based authentication.
@@ -2016,6 +1966,7 @@ pub async fn serve_grpc(
         instance_tracker,
         event_store,
         data_dir,
+        allow_bearer_agents,
     } = config;
 
     tracing::info!(%addr, domain = %domain, "gRPC server listening (TLS + RBAC + SPIFFE)");
@@ -2092,12 +2043,14 @@ pub async fn serve_grpc(
     };
 
     let identity = Identity::from_pem(&tls.cert_pem, &tls.cert_pem);
-    // Enable optional client certificate verification for mTLS.
-    // Agents with a node SVID present their client cert; legacy agents
-    // continue using bearer token auth.
+    // Client certificates are optional at the TLS layer: agents present
+    // their node SVID, while the CLI (bearer token) and joining agents
+    // (FleetBootstrap.Attest) have none. A certificate that is presented
+    // must chain to the fleet CA; authorization is per RPC.
     let tls_config = ServerTlsConfig::new()
         .identity(identity)
-        .client_ca_root(Certificate::from_pem(&tls.ca_cert_pem));
+        .client_ca_root(Certificate::from_pem(&tls.ca_cert_pem))
+        .client_auth_optional(true);
 
     let addr_str = addr.to_string();
     let service = FleetControlService::new(
@@ -2111,15 +2064,27 @@ pub async fn serve_grpc(
         service_token_store,
         data_dir,
     )
-    .with_cert_issuer(cert_issuer, trust_bundle_pem, jwt_bundle)
-    .with_ca(ca)
-    .with_fleet_key(fleet_key);
+    .with_cert_issuer(cert_issuer, trust_bundle_pem.clone(), jwt_bundle)
+    .with_ca(ca.clone())
+    .with_fleet_key(fleet_key)
+    .with_bearer_agents(allow_bearer_agents);
+    if allow_bearer_agents {
+        tracing::warn!("Accepting bearer-token agents (development mode)");
+    }
+    let bootstrap = super::bootstrap::FleetBootstrapService::new(
+        service.join_token_store.clone(),
+        ca,
+        &domain,
+        trust_bundle_pem,
+        service.audit_log.clone(),
+    );
 
     tonic::transport::Server::builder()
         .tls_config(tls_config)?
         .http2_keepalive_interval(Some(Duration::from_secs(20)))
         .http2_keepalive_timeout(Some(Duration::from_secs(10)))
         .tcp_keepalive(Some(Duration::from_secs(60)))
+        .add_service(FleetBootstrapServer::new(bootstrap))
         .add_service(FleetControlServer::with_interceptor(service, interceptor))
         .serve_with_shutdown(addr, shutdown.cancelled())
         .await?;

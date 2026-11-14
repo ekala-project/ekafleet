@@ -9,9 +9,14 @@ pkgs.testers.nixosTest {
       imports = [ ../module.nix ];
       nixpkgs.overlays = [ (import ../overlay.nix) ];
 
+      environment.etc."ekafleet-admin-token" = {
+        text = "test-token-12345";
+        mode = "0400";
+      };
+
       services.ekafleet.server = {
         enable = true;
-        token = "test-token-12345";
+        tokenFile = "/etc/ekafleet-admin-token";
         sealPassphraseFile = "/etc/ekafleet-seal";
       };
 

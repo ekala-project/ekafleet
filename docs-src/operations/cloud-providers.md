@@ -265,9 +265,10 @@ Instances that fail to have their agent join within `joinTimeoutSeconds` are aut
 When the actuator provisions a VM, it generates a cloud-init user-data script that:
 
 1. Writes the server's CA certificate to `/etc/ekafleet/ca.pem`
-2. Starts the ekafleet agent with `--join <server-addr> --join-token <token> --ca-cert /etc/ekafleet/ca.pem`
+2. Writes the join token to `/etc/ekafleet/join-token` (mode 0600)
+3. Starts the ekafleet agent with `--join <server-addr> --node-name <pool>-<random> --join-token-file /etc/ekafleet/join-token --ca-cert /etc/ekafleet/ca.pem`
 
-The join token is a one-time-use SPIFFE attestation token generated per instance. After the agent connects and attests, it receives a node SVID and communicates via mTLS.
+The join token is a one-time-use SPIFFE attestation token generated per instance and bound to its generated node name. After the agent connects and attests, it receives a node SVID and communicates via mTLS.
 
 ## Instance Tracking
 

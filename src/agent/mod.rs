@@ -10,6 +10,7 @@ pub mod storage;
 pub mod supervisor;
 pub mod template;
 
+pub mod bootstrap;
 mod handlers;
 mod helpers;
 mod types;
@@ -57,57 +58,71 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
     let node_id = config.node_name.clone();
     tracing::info!(node_id = %node_id, "Agent identity established");
 
-    // Load or prepare node SVID for mTLS
-    let node_identity = Arc::new(RwLock::new(NodeIdentity::new(&config.data_dir)));
-    {
-        let mut ni = node_identity.write().await;
-        if ni.load().await {
-            // A persisted SVID for a different name means the node was
-            // renamed (or the data dir copied); never present it under a
-            // name it does not certify.
-            let certified_path = ni
-                .spiffe_id
-                .as_deref()
-                .and_then(|id| id.strip_prefix("spiffe://"))
-                .and_then(|rest| rest.split_once('/'))
-                .map(|(_, path)| path.to_string());
-            if certified_path.as_deref() != Some(format!("agent/{node_id}").as_str()) {
-                anyhow::bail!(
-                    "persisted node SVID {} does not match node name '{node_id}'; \
-                     remove {}/node-svid*.pem and re-join with a join token",
-                    ni.spiffe_id.as_deref().unwrap_or("<no SPIFFE ID>"),
-                    config.data_dir.display()
-                );
+    // Establish the node identity: a persisted node SVID for this name, or
+    // a fresh one obtained with the join token.
+    let mut identity = NodeIdentity::new(&config.data_dir);
+    let loaded = identity.load().await;
+    if loaded && !identity.certifies_node(&node_id) {
+        // Renamed node or copied data dir: never present an SVID under a
+        // name it does not certify.
+        let certified = identity.spiffe_id.clone().unwrap_or_default();
+        if config.join_token.is_none() {
+            anyhow::bail!(
+                "persisted node SVID {certified} does not match node name '{node_id}'; \
+                 re-join with a join token for '{node_id}'"
+            );
+        }
+        tracing::warn!(%certified, "Persisted node SVID is for another name; re-joining");
+    }
+    if loaded && identity.certifies_node(&node_id) && identity.has_valid_svid() {
+        if config.join_token.is_some() {
+            tracing::info!("Node SVID present; the join token is not needed and was not used");
+        }
+    } else {
+        let join_hint = format!(
+            "create a join token with `ekafleet token create --type agent --node {node_id}` \
+             and start the agent with --join-token-file"
+        );
+        match (&config.join_token, &config.ca_cert_pem) {
+            (Some(join_token), Some(ca_pem)) => {
+                bootstrap::join(
+                    &config.server_addr,
+                    ca_pem,
+                    &node_id,
+                    join_token,
+                    &mut identity,
+                )
+                .await?;
             }
-            tracing::info!("Node SVID loaded from disk");
-        } else {
-            tracing::info!("No persisted node SVID — will use bearer token auth");
+            (Some(_), None) => anyhow::bail!("--ca-cert is required to join the fleet"),
+            (None, _) if config.token.is_some() => tracing::warn!(
+                "No valid node SVID; authenticating with a bearer token \
+                 (accepted only by `ekafleet dev`)"
+            ),
+            (None, _) if loaded => anyhow::bail!(
+                "node SVID expired at {} (Unix time); {join_hint}",
+                identity.expires_at
+            ),
+            (None, _) => {
+                anyhow::bail!("no node SVID in {}; {join_hint}", config.data_dir.display())
+            }
         }
     }
-
-    // Determine authentication mode: mTLS (node SVID) or bearer token
-    let ni = node_identity.read().await;
-    let use_mtls = ni.has_valid_svid();
-    let node_cert_pem = ni.cert_pem.clone();
-    let node_key_pem = ni.key_pem.clone();
-    drop(ni);
+    let use_mtls = identity.has_valid_svid();
+    let node_identity = Arc::new(RwLock::new(identity));
 
     let channel = if let Some(ca_pem) = &config.ca_cert_pem {
         let endpoint = format!("https://{}", config.server_addr);
-        let ca_cert = tonic::transport::Certificate::from_pem(ca_pem);
-        let mut tls_config = tonic::transport::ClientTlsConfig::new().ca_certificate(ca_cert);
-
-        // When connecting by IP address, override TLS hostname verification.
-        // The CA cert already validates the server's identity chain.
-        if config.server_addr.starts_with(|c: char| c.is_ascii_digit()) {
-            tls_config = tls_config.domain_name("ekafleet");
-        }
-
-        // Use node SVID for mTLS if available
-        if use_mtls && let (Some(cert), Some(key)) = (&node_cert_pem, &node_key_pem) {
-            tracing::info!("Using node SVID for mTLS authentication");
-            let identity = tonic::transport::Identity::from_pem(cert.as_bytes(), key.as_bytes());
-            tls_config = tls_config.identity(identity);
+        let mut tls_config = bootstrap::tls_config(&config.server_addr, ca_pem);
+        if use_mtls {
+            let ni = node_identity.read().await;
+            if let (Some(cert), Some(key)) = (&ni.cert_pem, &ni.key_pem) {
+                tracing::info!("Using node SVID for mTLS authentication");
+                tls_config = tls_config.identity(tonic::transport::Identity::from_pem(
+                    cert.as_bytes(),
+                    key.as_bytes(),
+                ));
+            }
         }
 
         tonic::transport::Endpoint::from_shared(endpoint)?
@@ -129,21 +144,17 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
             .await?
     };
 
-    // Attach authentication metadata to all outgoing requests.
-    //
-    // When an mTLS node SVID is in use, authentication is carried by the TLS
-    // client certificate itself — the server derives identity from the verified
-    // peer cert, so no metadata marker is sent (and any such marker would be
-    // stripped server-side). Without an SVID we fall back to bearer token auth,
-    // which is also how an agent bootstraps using its one-time join token.
-    let token: tonic::metadata::MetadataValue<_> = format!("Bearer {}", config.token).parse()?;
-    let mtls_flag = use_mtls;
+    // With a node SVID, authentication is the TLS client certificate and no
+    // metadata is sent. Without one (dev only) the bearer token is attached.
+    let bearer: Option<tonic::metadata::MetadataValue<_>> = match &config.token {
+        Some(token) if !use_mtls => Some(format!("Bearer {}", token.as_str()).parse()?),
+        _ => None,
+    };
     #[allow(clippy::result_large_err)]
     let mut client =
         FleetControlClient::with_interceptor(channel, move |mut req: tonic::Request<()>| {
-            if !mtls_flag {
-                // Legacy bearer token / join-token bootstrap auth.
-                req.metadata_mut().insert("authorization", token.clone());
+            if let Some(bearer) = &bearer {
+                req.metadata_mut().insert("authorization", bearer.clone());
             }
             Ok(req)
         });
@@ -304,12 +315,17 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
     let renewal_mgr = workload_mgr.clone();
     let renewal_keys = pending_keys.clone();
     let renewal_shutdown = shutdown.child_token();
+    let renewal_identity = node_identity.clone();
+    let renewal_mtls = use_mtls;
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         loop {
             tokio::select! {
                 _ = renewal_shutdown.cancelled() => break,
                 _ = interval.tick() => {}
+            }
+            if renewal_mtls && renewal_identity.read().await.needs_renewal() {
+                helpers::request_node_svid(&renewal_keys, &renewal_tx, &renewal_node_id).await;
             }
             let renewals = renewal_mgr.needs_renewal().await;
             for service_name in renewals {
@@ -370,6 +386,7 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
                                 &local_state,
                                 &workload_mgr,
                                 &pending_keys,
+                                &node_identity,
                                 &secret_injector,
                                 &dns_resolver,
                                 &peer_manager,

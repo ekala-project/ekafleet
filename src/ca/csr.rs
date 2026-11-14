@@ -61,12 +61,12 @@ pub fn generate_service_csr(trust_domain: &str, service_name: &str) -> Result<Cs
 
 /// Generate a PKCS#10 Certificate Signing Request for a node SVID.
 ///
-/// The node SVID uses SPIFFE URI `spiffe://<trust_domain>/agent/<node_id>`.
-pub fn generate_node_csr(trust_domain: &str, node_id: &str) -> Result<CsrOutput, CaError> {
+/// The CA assigns the identity (`spiffe://<domain>/agent/<node_id>`) from
+/// the authenticated request, never from the CSR, so the SPIFFE URI SAN is
+/// optional: a joining agent does not know the trust domain yet.
+pub fn generate_node_csr(trust_domain: Option<&str>, node_id: &str) -> Result<CsrOutput, CaError> {
     let keypair = KeyPair::generate()
         .map_err(|e| CaError::KeyGeneration(format!("node CSR keypair generation: {e}")))?;
-
-    let spiffe_uri = format!("spiffe://{trust_domain}/agent/{node_id}");
 
     let mut params = CertificateParams::new(vec![])
         .map_err(|e| CaError::KeyGeneration(format!("node CSR params: {e}")))?;
@@ -76,11 +76,14 @@ pub fn generate_node_csr(trust_domain: &str, node_id: &str) -> Result<CsrOutput,
     params
         .distinguished_name
         .push(DnType::OrganizationName, "ekafleet");
-    params.subject_alt_names.push(SanType::URI(
-        spiffe_uri
-            .try_into()
-            .map_err(|e| CaError::KeyGeneration(format!("invalid SPIFFE URI: {e}")))?,
-    ));
+    if let Some(trust_domain) = trust_domain {
+        let spiffe_uri = format!("spiffe://{trust_domain}/agent/{node_id}");
+        params.subject_alt_names.push(SanType::URI(
+            spiffe_uri
+                .try_into()
+                .map_err(|e| CaError::KeyGeneration(format!("invalid SPIFFE URI: {e}")))?,
+        ));
+    }
     params
         .extended_key_usages
         .push(ExtendedKeyUsagePurpose::ClientAuth);
@@ -118,7 +121,7 @@ mod tests {
 
     #[test]
     fn generate_node_csr_produces_valid_der() {
-        let output = generate_node_csr("test.internal", "node-abc-123").unwrap();
+        let output = generate_node_csr(Some("test.internal"), "node-abc-123").unwrap();
 
         assert!(!output.csr_der.is_empty());
         assert_eq!(output.csr_der[0], 0x30);

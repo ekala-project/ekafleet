@@ -42,7 +42,8 @@ ekafleet server [OPTIONS]
 | `--peers` | | Comma-separated peer server addresses for HA |
 | `--listen` | `0.0.0.0:7400` | gRPC listen address |
 | `--http-listen` | `0.0.0.0:7402` | HTTP API listen address |
-| `--token` | *(required)* | Bearer token for agent authentication (also reads `EKAFLEET_TOKEN` env) |
+| `--token` | | Initial admin bearer token (`EKAFLEET_TOKEN`); prefer `--token-file` |
+| `--token-file` | | File holding the admin token (`EKAFLEET_TOKEN_FILE`); one of `--token`/`--token-file` is required |
 | `--domain` | `fleet.internal` | SPIFFE trust domain for fleet identities |
 | `--ca-socket` | | Path to CA signer Unix socket (uses external ca-signer daemon) |
 
@@ -57,10 +58,17 @@ ekafleet agent [OPTIONS]
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--join` | *(required)* | Server address to join (host:port) |
-| `--token` | | Legacy bearer token for authentication |
-| `--join-token` | | One-time join token for SPIFFE node attestation (preferred) |
+| `--node-name` | hostname | Fleet node name; the SVID is `spiffe://<domain>/agent/<name>` |
+| `--join-token` | | One-time join token (`EKAFLEET_JOIN_TOKEN`); prefer `--join-token-file` |
+| `--join-token-file` | | File holding the join token (`EKAFLEET_JOIN_TOKEN_FILE`); a missing file is ignored once the node has an SVID |
+| `--token` / `--token-file` | | Bearer token; only accepted by `ekafleet dev` |
 | `--data-dir` | `/var/lib/ekafleet` | Data directory for local state |
-| `--ca-cert` | | Path to CA certificate PEM for TLS verification |
+| `--ca-cert` | | Path to CA certificate PEM for TLS verification (required to join) |
+
+With no valid node SVID in `--data-dir`, the agent generates a key, exchanges
+the join token for a 24-hour node SVID via `FleetBootstrap.Attest`, and then
+connects with mTLS. The SVID is renewed over the control stream at half-life
+and reused across restarts.
 
 ### `ekafleet ca-signer`
 
@@ -419,11 +427,11 @@ ekafleet uses role-based access control (RBAC). Each bearer token maps to a role
 | `operator` | Operational access: deploy, drain, scale, agent connections, read everything |
 | `viewer` | Read-only: status, services, capacity, logs, drift, events |
 
-The `--token` passed at server startup is registered as an `admin` token. Additional tokens with specific roles can be registered via the token store.
+The token passed at server startup (`--token` or `--token-file`) is registered as an `admin` token. Additional tokens with specific roles can be registered via the token store.
 
 ### `ekafleet token create`
 
-Generate a cryptographically random join token (256-bit, hex-encoded).
+Generate a token (256-bit, hex-encoded) and print it to stdout.
 
 ```
 ekafleet token create [OPTIONS]
@@ -431,9 +439,13 @@ ekafleet token create [OPTIONS]
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--type` | `agent` | Token type: `agent` or `server` |
+| `--type` | `server` | `server`: a random admin bearer token, generated locally. `agent`: a join token created by the server |
+| `--node` | | Node name the join token is bound to (required with `--type agent`) |
+| `--ttl` | `1h` | Join token lifetime (`30m`, `12h`, `7d`; max `7d`) |
+| `--server` | `127.0.0.1:7400` | Server to create the join token on (uses the CLI's `EKAFLEET_TOKEN`/`EKAFLEET_CA_CERT`) |
 
-Output: 64-character hex string to stdout.
+Join tokens need the `admin` role, can be used once, and only by an agent
+joining under the bound name. The server stores only their SHA-256 hashes.
 
 ### REST API Authentication
 

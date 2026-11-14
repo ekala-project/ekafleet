@@ -141,6 +141,7 @@ pub async fn cmd_dev(data_dir: PathBuf, http_listen: String, listen: String) -> 
         token: dev_token.to_string(),
         domain: "dev.local".to_string(),
         ca_socket: None,
+        allow_bearer_agents: true,
     };
 
     server::run(config).await?;
@@ -195,25 +196,69 @@ pub async fn cmd_server(
         token,
         domain,
         ca_socket,
+        allow_bearer_agents: false,
     };
 
     server::run(config).await?;
     Ok(())
 }
 
-pub async fn cmd_agent(
-    join: String,
-    token: String,
-    join_token: Option<String>,
-    node_name: Option<String>,
-    data_dir: PathBuf,
-    ca_cert: Option<PathBuf>,
-) -> anyhow::Result<()> {
-    let ca_cert_pem = match ca_cert {
-        Some(path) => Some(std::fs::read_to_string(&path)?),
+/// Read a secret given inline or as a file (trailing whitespace dropped).
+/// An empty result is treated as absent.
+pub fn secret_arg(
+    value: Option<String>,
+    file: Option<PathBuf>,
+) -> anyhow::Result<Option<zeroize::Zeroizing<String>>> {
+    read_secret(value, file, false)
+}
+
+/// Like [`secret_arg`], but a missing file is treated as absent: a join
+/// token file is commonly removed once the node has joined.
+pub fn join_token_arg(
+    value: Option<String>,
+    file: Option<PathBuf>,
+) -> anyhow::Result<Option<zeroize::Zeroizing<String>>> {
+    read_secret(value, file, true)
+}
+
+fn read_secret(
+    value: Option<String>,
+    file: Option<PathBuf>,
+    missing_ok: bool,
+) -> anyhow::Result<Option<zeroize::Zeroizing<String>>> {
+    let secret = match (value, file) {
+        (Some(value), _) => zeroize::Zeroizing::new(value),
+        (None, Some(path)) => {
+            let raw = match std::fs::read_to_string(&path) {
+                Ok(raw) => zeroize::Zeroizing::new(raw),
+                Err(e) if missing_ok && e.kind() == std::io::ErrorKind::NotFound => {
+                    tracing::debug!(path = %path.display(), "Secret file absent");
+                    return Ok(None);
+                }
+                Err(e) => anyhow::bail!("read {}: {e}", path.display()),
+            };
+            zeroize::Zeroizing::new(raw.trim_end().to_string())
+        }
+        (None, None) => return Ok(None),
+    };
+    Ok((!secret.is_empty()).then_some(secret))
+}
+
+pub struct AgentArgs {
+    pub join: String,
+    pub token: Option<zeroize::Zeroizing<String>>,
+    pub join_token: Option<zeroize::Zeroizing<String>>,
+    pub node_name: Option<String>,
+    pub data_dir: PathBuf,
+    pub ca_cert: Option<PathBuf>,
+}
+
+pub async fn cmd_agent(args: AgentArgs) -> anyhow::Result<()> {
+    let ca_cert_pem = match &args.ca_cert {
+        Some(path) => Some(std::fs::read_to_string(path)?),
         None => None,
     };
-    let node_name = match node_name {
+    let node_name = match args.node_name {
         Some(name) => name,
         None => agent::system_hostname()?,
     };
@@ -221,11 +266,11 @@ pub async fn cmd_agent(
         .map_err(|e| anyhow::anyhow!("invalid node name: {e} (set --node-name)"))?;
 
     let config = agent::AgentConfig {
-        server_addr: join,
-        token,
-        join_token,
+        server_addr: args.join,
+        token: args.token,
+        join_token: args.join_token,
         node_name,
-        data_dir,
+        data_dir: args.data_dir,
         ca_cert_pem,
     };
 
@@ -530,10 +575,56 @@ pub async fn cmd_scale(service: String, count: u32, server: String) -> anyhow::R
     Ok(())
 }
 
-pub async fn cmd_token_create(type_str: String) -> anyhow::Result<()> {
-    tracing::info!(token_type = %type_str, "Creating token");
-    let token = generate_token();
-    println!("{token}");
+/// Parse a duration like `90`, `30s`, `15m`, `1h` or `7d`.
+pub fn parse_duration(text: &str) -> anyhow::Result<std::time::Duration> {
+    let text = text.trim();
+    let (digits, unit) = text.split_at(
+        text.find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(text.len()),
+    );
+    let n: u64 = digits
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid duration '{text}' (e.g. 30m, 1h, 7d)"))?;
+    let scale = match unit {
+        "" | "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86400,
+        _ => anyhow::bail!("invalid duration unit in '{text}' (use s, m, h or d)"),
+    };
+    n.checked_mul(scale)
+        .map(std::time::Duration::from_secs)
+        .ok_or_else(|| anyhow::anyhow!("duration '{text}' is too large"))
+}
+
+pub async fn cmd_token_create(
+    type_str: String,
+    node: Option<String>,
+    ttl: Option<String>,
+    server: String,
+) -> anyhow::Result<()> {
+    if type_str != "agent" {
+        if node.is_some() || ttl.is_some() {
+            anyhow::bail!("--node and --ttl only apply to --type agent");
+        }
+        println!("{}", generate_token());
+        return Ok(());
+    }
+    let node_name = node.ok_or_else(|| anyhow::anyhow!("--type agent requires --node <name>"))?;
+    let ttl_secs = match ttl {
+        Some(ttl) => parse_duration(&ttl)?.as_secs(),
+        None => 0,
+    };
+    let mut client = connect_server(&server).await?;
+    let resp = client
+        .create_join_token(ekafleet::proto::CreateJoinTokenRequest {
+            node_name: node_name.clone(),
+            ttl_secs,
+        })
+        .await?
+        .into_inner();
+    tracing::info!(node = %node_name, expires_at = resp.expires_at, "Join token created");
+    println!("{}", resp.token);
     Ok(())
 }
 

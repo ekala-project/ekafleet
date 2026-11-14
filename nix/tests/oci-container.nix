@@ -15,9 +15,14 @@ pkgs.testers.nixosTest {
       imports = [ ../module.nix ];
       nixpkgs.overlays = [ (import ../overlay.nix) ];
 
+      environment.etc."ekafleet-admin-token" = {
+        text = "oci-test-token";
+        mode = "0400";
+      };
+
       services.ekafleet.server = {
         enable = true;
-        token = "oci-test-token";
+        tokenFile = "/etc/ekafleet-admin-token";
       };
 
       networking.firewall.allowedTCPPorts = [
