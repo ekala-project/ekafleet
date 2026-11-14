@@ -21,8 +21,10 @@ use ekafleet::proto::fleet_control_client::FleetControlClient;
 use ekafleet::proto::server_message::Payload as ServerPayload;
 use ekafleet::proto::{
     AgentMessage, ApplyRequest, ApplyStatus, CacheNarInfoRequest, CacheNarRequest,
-    CreateAclTokenRequest, CreateJoinTokenRequest, HealthReport, HealthStatus, Heartbeat,
-    ListConfigRevisionsRequest, PlanRequest, RollbackRequest, ServiceHealth, ServiceSpec,
+    CreateAclTokenRequest, CreateJoinTokenRequest, DrainRequest, EventsRequest, HealthReport,
+    HealthStatus, Heartbeat, ListConfigRevisionsRequest, ListDeploymentsRequest, ListNodesRequest,
+    LogsRequest, PlanRequest, RollbackRequest, ScaleRequest, ServiceHealth, ServiceInstance,
+    ServiceSpec, ServiceState, SnapshotRequest, StatusReport, StatusRequest,
 };
 use tokio::sync::mpsc;
 use tonic::transport::{Channel, Endpoint, Identity};
@@ -105,12 +107,20 @@ async fn channel(server: &Server, dir: &Path, identity: Option<Identity>) -> Cha
         .unwrap()
 }
 
+type Ascii = tonic::metadata::MetadataValue<tonic::metadata::Ascii>;
+
+/// Bearer token, and the namespace the request is for (as the CLI's
+/// `--namespace` sends it).
 #[derive(Clone)]
-struct Bearer(tonic::metadata::MetadataValue<tonic::metadata::Ascii>);
+struct Bearer(Ascii, Option<Ascii>);
 
 impl tonic::service::Interceptor for Bearer {
     fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
         req.metadata_mut().insert("authorization", self.0.clone());
+        if let Some(ns) = &self.1 {
+            req.metadata_mut()
+                .insert("x-ekafleet-namespace", ns.clone());
+        }
         Ok(req)
     }
 }
@@ -118,13 +128,40 @@ impl tonic::service::Interceptor for Bearer {
 type Client = FleetControlClient<tonic::service::interceptor::InterceptedService<Channel, Bearer>>;
 
 async fn client(server: &Server, dir: &Path, token: &str) -> Client {
+    namespaced_client(server, dir, token, None).await
+}
+
+async fn namespaced_client(
+    server: &Server,
+    dir: &Path,
+    token: &str,
+    namespace: Option<&str>,
+) -> Client {
     let header = format!("Bearer {token}").parse().unwrap();
-    FleetControlClient::with_interceptor(channel(server, dir, None).await, Bearer(header))
+    let ns = namespace.map(|ns| ns.parse().unwrap());
+    FleetControlClient::with_interceptor(channel(server, dir, None).await, Bearer(header, ns))
 }
 
 /// Write a flake whose `fleet` output runs `web` (with `command`) on one
 /// machine, `web-1`.
 fn write_fleet(flake: &Path, command: &str) {
+    write_fleet_services(
+        flake,
+        serde_json::json!({
+            "web": {
+                "command": command,
+                "resources": { "cpu": { "request": 100 }, "memory": { "request": 64 } },
+                "scheduling": {
+                    "replicas": 1,
+                    "update": { "minHealthyTime": 0, "healthyDeadline": 30 }
+                }
+            }
+        }),
+    );
+}
+
+/// Write a flake whose `fleet` output runs `services` on `web-1`.
+fn write_fleet_services(flake: &Path, services: serde_json::Value) {
     std::fs::create_dir_all(flake).unwrap();
     std::fs::write(
         flake.join("flake.nix"),
@@ -137,16 +174,7 @@ fn write_fleet(flake: &Path, command: &str) {
         "machines": {
             NODE: { "targetHost": "127.0.0.1", "capacity": { "cpu": 4000, "memory": 4096 } }
         },
-        "services": {
-            "web": {
-                "command": command,
-                "resources": { "cpu": { "request": 100 }, "memory": { "request": 64 } },
-                "scheduling": {
-                    "replicas": 1,
-                    "update": { "minHealthyTime": 0, "healthyDeadline": 30 }
-                }
-            }
-        }
+        "services": services,
     });
     std::fs::write(flake.join("fleet.json"), fleet.to_string()).unwrap();
 }
@@ -257,7 +285,22 @@ async fn connect_agent(server: &Server, dir: &Path, identity: Identity) -> Agent
                                 .collect(),
                         })),
                     };
-                    if tx.send(report).await.is_err() {
+                    let running = AgentMessage {
+                        payload: Some(Payload::Status(StatusReport {
+                            node_id: NODE.into(),
+                            running_services: services
+                                .iter()
+                                .map(|name| ServiceInstance {
+                                    service_name: name.clone(),
+                                    instance_id: format!("{name}-0"),
+                                    store_path: String::new(),
+                                    state: ServiceState::ServiceRunning as i32,
+                                })
+                                .collect(),
+                            current_system_path: String::new(),
+                        })),
+                    };
+                    if tx.send(report).await.is_err() || tx.send(running).await.is_err() {
                         return;
                     }
                 }
@@ -668,4 +711,160 @@ fn commit_again(flake: &Path) {
             .unwrap();
         assert!(status.success(), "git {args:?}");
     }
+}
+
+#[tokio::test]
+async fn namespace_tokens_reach_only_their_own_services() {
+    if !nix_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let flake = dir.path().join("fleet");
+    let server = start(dir.path()).await;
+    let mut admin = client(&server, dir.path(), ADMIN_TOKEN).await;
+    let identity = join_agent(&server, dir.path(), &dir.path().join("agent")).await;
+    let mut agent = connect_agent(&server, dir.path(), identity).await;
+
+    let service = |command: &str, namespace: &str| {
+        serde_json::json!({
+            "command": command,
+            "namespace": namespace,
+            "resources": { "cpu": { "request": 100 }, "memory": { "request": 64 } },
+            "scheduling": {
+                "replicas": 1,
+                "update": { "minHealthyTime": 0, "healthyDeadline": 30 }
+            }
+        })
+    };
+    write_fleet_services(
+        &flake,
+        serde_json::json!({
+            "web": service("/bin/web", "team-a"),
+            "db": service("/bin/db", "team-b"),
+        }),
+    );
+    commit(&flake);
+    let (status, _, messages) = apply(&mut admin, &flake).await;
+    assert_eq!(status, ApplyStatus::ApplySucceeded, "{messages:?}");
+    agent.expect_command("/bin/web").await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let status = admin.status(StatusRequest {}).await.unwrap().into_inner();
+            if status.services.len() == 2 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("both services reported");
+
+    let token = admin
+        .create_acl_token(CreateAclTokenRequest {
+            role: "operator".into(),
+            description: "team a".into(),
+            namespace: "team-a".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .token;
+    let denied = |r: Result<_, tonic::Status>| match r {
+        Err(e) => assert_eq!(e.code(), tonic::Code::PermissionDenied, "{e}"),
+        Ok(_) => panic!("namespace token was allowed"),
+    };
+
+    // The token only works for requests made in its namespace.
+    let mut elsewhere = namespaced_client(&server, dir.path(), &token, Some("team-b")).await;
+    denied(elsewhere.status(StatusRequest {}).await.map(drop));
+    let mut team = namespaced_client(&server, dir.path(), &token, Some("team-a")).await;
+
+    // Its own services, without the nodes they run on.
+    let status = team.status(StatusRequest {}).await.unwrap().into_inner();
+    let names: Vec<_> = status.services.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, ["web"]);
+    assert!(status.nodes.is_empty() && status.pools.is_empty());
+    let deployments = team
+        .list_deployments(ListDeploymentsRequest::default())
+        .await
+        .unwrap()
+        .into_inner()
+        .deployments;
+    assert!(deployments.iter().all(|d| d.service_name == "web"));
+    let events = team
+        .events(EventsRequest::default())
+        .await
+        .unwrap()
+        .into_inner()
+        .events;
+    assert!(events.iter().all(|e| e.service == "web"), "{events:?}");
+
+    // Service operations reach its services only.
+    let scaled = team
+        .scale(ScaleRequest {
+            service_name: "web".into(),
+            desired_count: 1,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(scaled.success);
+    for name in ["db", "no-such-service"] {
+        denied(
+            team.scale(ScaleRequest {
+                service_name: name.into(),
+                desired_count: 3,
+            })
+            .await
+            .map(drop),
+        );
+        denied(
+            team.logs(LogsRequest {
+                service_name: name.into(),
+                ..Default::default()
+            })
+            .await
+            .map(drop),
+        );
+    }
+
+    // Fleet-wide operations are refused regardless of role.
+    denied(team.list_nodes(ListNodesRequest {}).await.map(drop));
+    denied(team.snapshot(SnapshotRequest {}).await.map(drop));
+    denied(
+        team.drain(DrainRequest {
+            machine: NODE.into(),
+            deadline_seconds: 0,
+        })
+        .await
+        .map(drop),
+    );
+    denied(
+        team.list_config_revisions(ListConfigRevisionsRequest {})
+            .await
+            .map(drop),
+    );
+    denied(
+        team.plan(PlanRequest {
+            flake_ref: flake.display().to_string(),
+        })
+        .await
+        .map(drop),
+    );
+    denied(
+        team.apply(ApplyRequest {
+            flake_ref: flake.display().to_string(),
+            follow: false,
+        })
+        .await
+        .map(drop),
+    );
+    denied(
+        team.create_join_token(CreateJoinTokenRequest {
+            node_name: "rogue".into(),
+            ttl_secs: 0,
+        })
+        .await
+        .map(drop),
+    );
 }
