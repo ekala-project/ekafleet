@@ -51,7 +51,22 @@ pub struct ServerConfig {
     /// Accept agents authenticated by a bearer token instead of a node SVID.
     /// Only `ekafleet dev` sets this.
     pub allow_bearer_agents: bool,
+    /// Also run an agent for this host in-process.
+    pub embedded_agent: Option<EmbeddedAgentConfig>,
 }
+
+/// The in-process agent of `ekafleet server --embedded-agent` and
+/// `ekafleet dev`. It joins its own server over loopback like any other
+/// node: the server mints a short-lived join token for it when it has no
+/// valid node SVID, and it then authenticates with that SVID over mTLS.
+pub struct EmbeddedAgentConfig {
+    pub node_name: String,
+    pub data_dir: PathBuf,
+    pub mesh: crate::mesh::peers::MeshSettings,
+}
+
+/// How long the embedded agent's join token stays valid.
+const EMBEDDED_JOIN_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
 pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     tracing::info!(
@@ -175,6 +190,8 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     // Create a cancellation token for graceful shutdown
     let shutdown = CancellationToken::new();
 
+    let agent_ca_pem = trust_bundle_pem.clone();
+
     // Start gRPC and HTTP servers concurrently
     let grpc_config = api::GrpcServerConfig {
         addr: grpc_addr,
@@ -211,6 +228,17 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         housekeeping_loop(hk_deps, hk_shutdown).await;
     });
 
+    if let Some(agent) = config.embedded_agent {
+        spawn_embedded_agent(
+            agent,
+            grpc_addr,
+            agent_ca_pem,
+            grpc_config.join_token_store.clone(),
+            shutdown.child_token(),
+        )
+        .await?;
+    }
+
     let http_raft_state = grpc_config.raft_state.clone();
     tokio::select! {
         result = api::serve_grpc(grpc_config, fleet_state.clone(), token_store.clone(), grpc_shutdown) => {
@@ -237,6 +265,61 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Start the in-process agent once the gRPC listener accepts connections.
+async fn spawn_embedded_agent(
+    agent: EmbeddedAgentConfig,
+    grpc_addr: std::net::SocketAddr,
+    ca_cert_pem: String,
+    join_tokens: JoinTokenStore,
+    stop: CancellationToken,
+) -> anyhow::Result<()> {
+    // Dial the listener on loopback when it is bound to every address.
+    let ip = match grpc_addr.ip() {
+        std::net::IpAddr::V4(ip) if ip.is_unspecified() => std::net::Ipv4Addr::LOCALHOST.into(),
+        std::net::IpAddr::V6(ip) if ip.is_unspecified() => std::net::Ipv6Addr::LOCALHOST.into(),
+        ip => ip,
+    };
+    let server_addr = std::net::SocketAddr::new(ip, grpc_addr.port());
+
+    let mut identity = crate::agent::NodeIdentity::new(&agent.data_dir);
+    let joined = identity.load().await
+        && identity.certifies_node(&agent.node_name)
+        && identity.has_valid_svid();
+    let join_token = if joined {
+        None
+    } else {
+        let (token, _) = join_tokens
+            .create(&agent.node_name, Some(EMBEDDED_JOIN_TTL))
+            .await
+            .map_err(|e| anyhow::anyhow!("join token for the embedded agent: {e}"))?;
+        Some(Zeroizing::new(token))
+    };
+
+    let config = crate::agent::AgentConfig {
+        server_addr: server_addr.to_string(),
+        token: None,
+        join_token,
+        node_name: agent.node_name.clone(),
+        data_dir: agent.data_dir,
+        ca_cert_pem: Some(ca_cert_pem),
+        mesh: agent.mesh,
+    };
+    tracing::info!(node = %agent.node_name, server = %server_addr, "Starting embedded agent");
+    tokio::spawn(async move {
+        // The gRPC server is started right after this; joining needs it up.
+        for _ in 0..100 {
+            if stop.is_cancelled() || tokio::net::TcpStream::connect(server_addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        if let Err(e) = crate::agent::run_until(config, stop).await {
+            tracing::error!(error = %e, "Embedded agent stopped");
+        }
+    });
     Ok(())
 }
 

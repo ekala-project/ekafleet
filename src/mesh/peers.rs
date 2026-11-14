@@ -113,7 +113,7 @@ impl PeerManager {
 
         let endpoint_ip = match self.settings.advertise_addr {
             Some(addr) => addr,
-            None => local_addr_towards(&self.server_addr)?,
+            None => default_advertise_addr(&self.server_addr)?,
         };
         let endpoint = SocketAddr::new(endpoint_ip, self.wg.listen_port()).to_string();
 
@@ -274,6 +274,25 @@ fn pkcs8_der(pem: &str) -> Option<Zeroizing<Vec<u8>>> {
         }
         _ => None,
     }
+}
+
+/// The address to advertise when none is configured: the local address on
+/// the route to the server, or, when that is loopback (an agent embedded in
+/// its server), the source address of the default route.
+fn default_advertise_addr(server_addr: &str) -> Result<IpAddr, WgError> {
+    let ip = local_addr_towards(server_addr)?;
+    if !ip.is_loopback() {
+        return Ok(ip);
+    }
+    // Documentation addresses: only a route lookup, nothing is sent.
+    let probe = if ip.is_ipv4() {
+        "192.0.2.1:9"
+    } else {
+        "[2001:db8::1]:9"
+    };
+    local_addr_towards(probe).map_err(|_| {
+        WgError::Assignment("no default route; set --advertise-addr for the mesh".into())
+    })
 }
 
 /// The local address the kernel would use to reach `server_addr` (no

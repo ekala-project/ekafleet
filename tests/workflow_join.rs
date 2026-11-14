@@ -36,6 +36,12 @@ struct Server {
 
 /// Boot `ekafleet server` in-process and wait until it serves TLS.
 async fn start_server() -> Server {
+    start_server_with(None).await
+}
+
+async fn start_server_with(
+    embedded_agent: Option<ekafleet::server::EmbeddedAgentConfig>,
+) -> Server {
     let dir = tempfile::tempdir().unwrap();
     let grpc = free_addr();
     let config = ekafleet::server::ServerConfig {
@@ -47,6 +53,7 @@ async fn start_server() -> Server {
         domain: DOMAIN.into(),
         ca_socket: None,
         allow_bearer_agents: false,
+        embedded_agent,
     };
     tokio::spawn(async move {
         if let Err(e) = ekafleet::server::run(config).await {
@@ -342,5 +349,40 @@ async fn joined_agent_streams_over_mtls_and_renews_its_svid() {
     assert_eq!(
         parsed.public_key().subject_public_key.data.as_ref(),
         renewal.keypair.public_key_raw()
+    );
+}
+
+#[tokio::test]
+async fn embedded_agent_joins_its_own_server_with_a_node_svid() {
+    let agent_dir = tempfile::tempdir().unwrap();
+    let server = start_server_with(Some(ekafleet::server::EmbeddedAgentConfig {
+        node_name: "embedded".into(),
+        data_dir: agent_dir.path().to_path_buf(),
+        mesh: ekafleet::mesh::peers::MeshSettings {
+            enabled: false,
+            ..Default::default()
+        },
+    }))
+    .await;
+
+    let mut admin = server.admin().await;
+    let mut connected = false;
+    for _ in 0..100 {
+        let status = admin.status(StatusRequest {}).await.unwrap().into_inner();
+        if status.nodes.iter().any(|n| n.node_id == "embedded") {
+            connected = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(connected, "the embedded agent never connected");
+
+    // It joined with a node SVID for its name, persisted for restarts.
+    let cert = std::fs::read_to_string(agent_dir.path().join("node-svid.pem")).unwrap();
+    let mut reader = std::io::BufReader::new(cert.as_bytes());
+    let der = rustls_pemfile::certs(&mut reader).next().unwrap().unwrap();
+    assert_eq!(
+        ekafleet::proxy::mtls::SpiffeAuthorizer::extract_spiffe_id_from_der(&der).as_deref(),
+        Some(format!("spiffe://{DOMAIN}/agent/embedded").as_str())
     );
 }
