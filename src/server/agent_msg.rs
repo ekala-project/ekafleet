@@ -59,17 +59,19 @@ async fn issue_jwt_svid(
 }
 
 /// Handle one message from the control stream of `node_id`, the stream's
-/// authenticated node. Node ids inside payloads are ignored. `mtls` says
-/// whether the stream was authenticated with the node's own SVID; only
-/// such streams may renew it.
+/// authenticated node. Node ids inside payloads are ignored. `stream_cert`
+/// is the DER node SVID the stream authenticated with, if it used mTLS;
+/// only such streams may renew it or advertise a mesh peer.
 pub(super) async fn process_agent_message(
     state: &FleetState,
     node_id: &str,
     msg: AgentMessage,
     cert_issuer: Option<&CertIssuer>,
     metrics: &MetricsAggregator,
-    mtls: bool,
+    mesh: &super::mesh::MeshRegistry,
+    stream_cert: Option<&[u8]>,
 ) {
+    let mtls = stream_cert.is_some();
     match msg.payload {
         Some(Payload::Heartbeat(hb)) => {
             check_claimed_node(node_id, &hb.node_id, "heartbeat");
@@ -77,11 +79,9 @@ pub(super) async fn process_agent_message(
             state
                 .update_heartbeat(node_id, hb.available_resources)
                 .await;
-            if !hb.mesh_ip.is_empty()
-                && let Ok(ip) = hb.mesh_ip.parse::<std::net::Ipv4Addr>()
-            {
-                state.update_mesh_ip(node_id, ip).await;
-            }
+        }
+        Some(Payload::MeshAdvert(peer)) => {
+            mesh.handle_advert(state, node_id, peer, stream_cert).await;
         }
         Some(Payload::Health(report)) => {
             check_claimed_node(node_id, &report.node_id, "health");

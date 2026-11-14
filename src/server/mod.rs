@@ -9,6 +9,7 @@ pub mod controller;
 pub mod deployer;
 pub mod events;
 pub mod federation;
+pub mod mesh;
 pub mod namespace;
 pub mod nix;
 pub mod policy;
