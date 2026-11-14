@@ -119,6 +119,22 @@ impl CertIssuer {
         self.ca.sign_csr(csr_der, &subject, None).await
     }
 
+    /// Renew the node SVID of the authenticated node `node_id` from its CSR.
+    /// The caller must have authenticated the stream with that node's
+    /// current SVID; a bearer token is never enough to mint an agent identity.
+    pub async fn issue_node_svid(
+        &self,
+        node_id: &str,
+        csr_der: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>, u64), CaError> {
+        if csr_der.is_empty() {
+            return Err(CaError::InvalidCsr("empty CSR".into()));
+        }
+        let subject = SvidSubject::Agent(node_id.to_string());
+        subject.validate()?;
+        self.ca.sign_csr(csr_der, &subject, None).await
+    }
+
     /// Issue a JWT-SVID for `service_name` on behalf of the authenticated
     /// node `node_id`, under the same rule as X.509-SVIDs: only for a
     /// service currently assigned to that node.
@@ -344,7 +360,7 @@ mod tests {
 
         // A CSR whose SAN claims a server identity must still yield a cert
         // for the assigned service only.
-        let forged = crate::ca::csr::generate_node_csr("test.internal", "x").unwrap();
+        let forged = crate::ca::csr::generate_node_csr(Some("test.internal"), "x").unwrap();
         let (cert, _, _) = issuer
             .process_request("node-1", "web", &forged.csr_der)
             .await

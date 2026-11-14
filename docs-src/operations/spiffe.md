@@ -173,27 +173,32 @@ Agents bootstrap their identity using SPIFFE-style node attestation, replacing s
 The simplest attestation method. An admin generates a one-time join token, and the agent presents it during bootstrap:
 
 ```bash
-# Admin generates a one-time token on the server
-ekafleet token create --type agent
+# Admin asks the server for a token bound to the node name (default TTL 1h, max 7d)
+ekafleet token create --type agent --node web-1 --ttl 1h
 # Output: a0b1c2d3e4f5...
 
 # Agent uses the token to bootstrap (one-time use)
-ekafleet agent --join server:7400 --join-token a0b1c2d3e4f5... --ca-cert /path/to/ca.pem
+ekafleet agent --join server:7400 --node-name web-1 \
+  --join-token-file /etc/ekafleet/join-token --ca-cert /path/to/ca.pem
 ```
 
 After successful attestation:
-1. The token is consumed and deleted (cannot be replayed)
-2. The agent receives a node SVID (`spiffe://<domain>/agent/<node-id>`)
-3. The node SVID is persisted to disk
-4. All subsequent connections use mTLS with the node SVID
+1. The token is consumed and cannot be replayed (the server keeps only SHA-256 hashes)
+2. The agent receives a 24-hour node SVID (`spiffe://<domain>/agent/<node-name>`) for a key it generated itself
+3. The node SVID is persisted to disk (key mode 0400)
+4. All subsequent connections use mTLS with the node SVID, which is renewed over the control stream at half-life
+
+A token bound to a different name is refused without being consumed, as are
+malformed CSRs; if the CA fails to sign, the token is released for a retry.
+Failed attempts are rate-limited per source address.
 
 ### Attestation Flow
 
 ```text
-Admin:     ekafleet token create --type agent  ->  prints "abc123..."
-Agent:     boots, calls Attest RPC with join token + CSR
-Server:    validates token (one-time use), deletes it
-Server:    issues node SVID signed by fleet CA
+Admin:     ekafleet token create --type agent --node web-1  ->  prints "abc123..."
+Agent:     boots, calls FleetBootstrap.Attest (TLS, no client cert) with token + name + CSR
+Server:    validates the CSR and the name binding, consumes the token
+Server:    issues a 24h node SVID signed by fleet CA
 Agent:     receives node SVID, persists to disk
 Agent:     connects via mTLS using node SVID (no bearer token needed)
 ```
@@ -211,7 +216,9 @@ After attestation, agents authenticate to the server using mutual TLS:
 - **Server presents**: Server SVID (`spiffe://<domain>/server/<server-id>`)
 - **Both verify**: Against the fleet CA trust bundle
 
-Legacy bearer token authentication is still supported for migration.
+The CLI connects with server-authenticated TLS and a bearer token (no client
+certificate). Agents must use a node SVID; bearer-token agents are only
+accepted by `ekafleet dev`.
 
 ## Trust Bundle
 
@@ -265,7 +272,7 @@ Services experience zero downtime during renewal -- the new certificate is writt
 The trust domain is configurable via the `--domain` flag on the server (default: `fleet.internal`). The domain flows to all components:
 
 ```bash
-ekafleet server --domain my-org.internal --token $TOKEN
+ekafleet server --domain my-org.internal --token-file /etc/ekafleet/admin-token
 ```
 
 Agents receive the authoritative trust domain from the server's `TrustBundleUpdate` message.

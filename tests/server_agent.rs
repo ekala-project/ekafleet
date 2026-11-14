@@ -69,7 +69,9 @@ async fn start_server() -> (SocketAddr, SocketAddr, String, String) {
     )
     // Exercise the production builder inside the runtime (it once blocked on
     // a tokio lock here and panicked).
-    .with_fleet_key(zeroize::Zeroizing::new(vec![7u8; 32]));
+    .with_fleet_key(zeroize::Zeroizing::new(vec![7u8; 32]))
+    // This harness stands in for `ekafleet dev`, which accepts bearer agents.
+    .with_bearer_agents(true);
 
     let expected_token = format!("Bearer {token}");
     #[allow(clippy::result_large_err)]

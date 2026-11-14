@@ -9,6 +9,10 @@ pub mod signer;
 
 use root::CaError;
 
+/// Lifetime of a node SVID (`/agent/<name>`). Agents renew at half-life
+/// over the control stream; a node offline for longer must re-join.
+pub const NODE_SVID_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
 /// The identity an X.509 SVID is issued for.
 ///
 /// The CA derives every identity-bearing field of the issued certificate (the

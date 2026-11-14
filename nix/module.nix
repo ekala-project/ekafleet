@@ -28,9 +28,15 @@ in
         description = "The ekafleet package to use.";
       };
 
-      token = lib.mkOption {
+      tokenFile = lib.mkOption {
         type = lib.types.str;
-        description = "Authentication token for cluster communication.";
+        example = "/run/keys/ekafleet-admin-token";
+        description = ''
+          File holding the initial admin bearer token (e.g. from
+          `ekafleet token create`). Passed to the server with systemd
+          `LoadCredential`, so it may be readable by root only; it never
+          appears in the Nix store or on the command line.
+        '';
       };
 
       dataDir = lib.mkOption {
@@ -158,10 +164,16 @@ in
         '';
       };
 
-      token = lib.mkOption {
-        type = lib.types.str;
-        default = "";
-        description = "Authentication token (legacy).";
+      joinTokenFile = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "/run/keys/ekafleet-join-token";
+        description = ''
+          File holding a one-time join token for this node, created with
+          `ekafleet token create --type agent --node <nodeName>`. Used only
+          while the agent has no valid node SVID; it may be deleted after
+          the first successful start. Requires `caCert`.
+        '';
       };
 
       dataDir = lib.mkOption {
@@ -227,6 +239,9 @@ in
         sealEnv = lib.optionalAttrs (cfg.server.sealPassphraseFile != null) {
           EKAFLEET_SEAL_PASSPHRASE_FILE = "%d/seal-passphrase";
         };
+        sealCredentials = lib.optional (
+          cfg.server.sealPassphraseFile != null
+        ) "seal-passphrase:${cfg.server.sealPassphraseFile}";
       in
       {
         assertions = [
@@ -318,7 +333,7 @@ in
               Restart = "on-failure";
               RestartSec = 5;
 
-              ExecStart = "${cfg.server.package}/bin/ekafleet server --data-dir ${cfg.server.dataDir} --token ${cfg.server.token} --listen ${cfg.server.grpcListen} --http-listen ${cfg.server.httpListen} --domain ${cfg.server.domain} --ca-socket ${cfg.server.caSocketPath} ${peersArg}";
+              ExecStart = "${cfg.server.package}/bin/ekafleet server --data-dir ${cfg.server.dataDir} --listen ${cfg.server.grpcListen} --http-listen ${cfg.server.httpListen} --domain ${cfg.server.domain} --ca-socket ${cfg.server.caSocketPath} ${peersArg}";
 
               # The control plane does not hold the CA key (that's in ca-signer).
               User = "ekafleet";
@@ -335,11 +350,12 @@ in
               MemoryDenyWriteExecute = true;
               RestrictNamespaces = true;
               RestrictRealtime = true;
-            }
-            // sealCredential;
+              LoadCredential = [ "admin-token:${cfg.server.tokenFile}" ] ++ sealCredentials;
+            };
 
           environment = {
             RUST_LOG = "info";
+            EKAFLEET_TOKEN_FILE = "%d/admin-token";
             EKAFLEET_NIX_EVAL_TIMEOUT = toString cfg.server.nixEvalTimeout;
             EKAFLEET_NIX_BUILD_TIMEOUT = toString cfg.server.nixBuildTimeout;
             EKAFLEET_NIX_COPY_TIMEOUT = toString cfg.server.nixCopyTimeout;
@@ -356,6 +372,13 @@ in
 
     # ── Agent-side: agent (incl. SPIFFE Workload API) + proxy ────────
     (lib.mkIf cfg.agent.enable {
+      assertions = [
+        {
+          assertion = cfg.agent.joinTokenFile == null || cfg.agent.caCert != null;
+          message = "services.ekafleet.agent.joinTokenFile requires services.ekafleet.agent.caCert.";
+        }
+      ];
+
       systemd.services.ekafleet-agent = {
         description = "ekafleet data plane agent";
         wantedBy = [ "multi-user.target" ];
@@ -365,14 +388,18 @@ in
         serviceConfig =
           let
             caCertArg = lib.optionalString (cfg.agent.caCert != null) "--ca-cert ${cfg.agent.caCert}";
-            tokenArg = lib.optionalString (cfg.agent.token != "") "--token ${cfg.agent.token}";
+            # A path, not LoadCredential: the file is typically removed once
+            # the node has joined, and a missing credential would fail the unit.
+            joinTokenArg = lib.optionalString (
+              cfg.agent.joinTokenFile != null
+            ) "--join-token-file ${lib.escapeShellArg cfg.agent.joinTokenFile}";
           in
           {
             Type = "simple";
             Restart = "on-failure";
             RestartSec = 5;
 
-            ExecStart = "${cfg.agent.package}/bin/ekafleet agent --join ${cfg.agent.serverAddr} --node-name ${lib.escapeShellArg cfg.agent.nodeName} --data-dir ${cfg.agent.dataDir} ${tokenArg} ${caCertArg}";
+            ExecStart = "${cfg.agent.package}/bin/ekafleet agent --join ${cfg.agent.serverAddr} --node-name ${lib.escapeShellArg cfg.agent.nodeName} --data-dir ${cfg.agent.dataDir} ${joinTokenArg} ${caCertArg}";
 
             # The agent requires root for systemd unit management,
             # WireGuard, nftables, and systemd-nspawn containers. It also

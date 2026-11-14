@@ -1,6 +1,6 @@
 # Agent Mode
 
-Start with `ekafleet agent --join <server>:7400 --join-token <TOKEN> --ca-cert <CA>`. The agent runs the data plane on each fleet machine. In production, the NixOS module deploys the agent (which also serves the SPIFFE Workload API) alongside an isolated, unprivileged `ekafleet-proxy` process for the service mesh.
+Start with `ekafleet agent --join <server>:7400 --node-name <NAME> --join-token-file <FILE> --ca-cert <CA>`. The agent runs the data plane on each fleet machine. In production, the NixOS module deploys the agent (which also serves the SPIFFE Workload API) alongside an isolated, unprivileged `ekafleet-proxy` process for the service mesh.
 
 ## Responsibilities
 
@@ -23,9 +23,9 @@ Start with `ekafleet agent --join <server>:7400 --join-token <TOKEN> --ca-cert <
 ## Connection Lifecycle
 
 1. Agent validates server address and generates a persistent node ID (`<data-dir>/node-id`)
-2. Loads persisted node SVID if available (from previous attestation)
-3. If no node SVID and `--join-token` provided: calls `Attest` RPC to bootstrap SPIFFE identity
-4. Opens a mTLS gRPC connection using node SVID as client certificate (or falls back to bearer token with `--token`)
+2. Loads the persisted node SVID if it is still valid and names `--node-name` (default: hostname)
+3. Otherwise, with a join token: generates a key and calls `FleetBootstrap.Attest` (TLS, no client certificate) with the token and a CSR, receiving a 24-hour node SVID. Without a valid SVID or join token, the agent exits with instructions to create one
+4. Opens a mTLS gRPC connection using the node SVID as client certificate (bearer-token agents are only accepted by `ekafleet dev`) and renews the SVID over the stream at half-life
 5. Sends initial heartbeat to identify itself
 6. Receives trust bundle (CA certificate) and fleet encryption key from server
 7. Starts SPIFFE Workload API socket at `/run/ekafleet/workload-api.sock`

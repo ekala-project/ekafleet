@@ -4,7 +4,7 @@
 
 | Port | Protocol | Used By | Purpose |
 |------|----------|---------|---------|
-| 7400 | TCP (gRPC) | Server + Agent | Server API, agent ↔ server communication, Attest RPC |
+| 7400 | TCP (gRPC) | Server + Agent | Server API, agent ↔ server communication, node join (`FleetBootstrap`) |
 | 7401 | UDP | Server + Agent | Gossip (SWIM membership protocol) |
 | 7402 | TCP (HTTP) | Server | HTTP API (health, metrics) |
 | 53 | UDP/TCP | Server + Agent | DNS (authority on server, resolver on agent) |

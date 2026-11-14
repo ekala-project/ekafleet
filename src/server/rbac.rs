@@ -162,8 +162,6 @@ pub enum Permission {
     ManageTokens,
     /// Stream control (agent connections)
     AgentConnect,
-    /// Node attestation
-    Attest,
 }
 
 impl Role {
@@ -178,7 +176,6 @@ impl Role {
                     | Permission::Scale
                     | Permission::Drain
                     | Permission::AgentConnect
-                    | Permission::Attest
             ),
             Role::Viewer => matches!(permission, Permission::Read),
             Role::Agent => matches!(permission, Permission::AgentConnect),
@@ -456,7 +453,6 @@ mod tests {
         assert!(Role::Admin.has_permission(Permission::Drain));
         assert!(Role::Admin.has_permission(Permission::ManageTokens));
         assert!(Role::Admin.has_permission(Permission::AgentConnect));
-        assert!(Role::Admin.has_permission(Permission::Attest));
     }
 
     #[test]
@@ -621,7 +617,6 @@ mod tests {
             Permission::Scale,
             Permission::Drain,
             Permission::ManageTokens,
-            Permission::Attest,
         ] {
             assert!(!Role::Agent.has_permission(perm), "{perm:?}");
         }

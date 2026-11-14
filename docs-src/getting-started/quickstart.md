@@ -33,7 +33,7 @@ ekafleet server --data-dir /var/lib/ekafleet --domain fleet.internal
 ```
 
 By default, the server listens on:
-- `0.0.0.0:7400` — gRPC (agent connections + Attest RPC)
+- `0.0.0.0:7400` — gRPC (`FleetControl` for the CLI and agents, `FleetBootstrap` for node joins)
 - `0.0.0.0:7402` — HTTP API (health, metrics)
 
 The `--domain` flag sets the SPIFFE trust domain (default: `fleet.internal`). The server generates a persistent identity and SPIFFE SVID (`spiffe://<domain>/server/<server-id>`).
@@ -50,30 +50,35 @@ ekafleet server --data-dir /var/lib/ekafleet-server --ca-socket /run/ekafleet-ca
 
 ## 2. Create a Join Token
 
-Generate a one-time join token for SPIFFE node attestation:
+Ask the server for a one-time join token bound to the new node's name (the CLI
+authenticates with the admin token via `EKAFLEET_TOKEN`):
 
 ```bash
-ekafleet token create --type=agent
+ekafleet token create --type agent --node web-1 --ttl 1h > join-token
 ```
 
-This token can only be used once. After successful attestation, it is consumed and cannot be replayed.
+The token can be used once, only by an agent joining as `web-1`, and expires
+after `--ttl` (default 1h, maximum 7d). The server stores only its SHA-256 hash.
 
 ## 3. Join an Agent
 
 On another machine, start the agent with the join token:
 
 ```bash
-ekafleet agent --join server-ip:7400 --join-token <TOKEN> --ca-cert /path/to/ca.pem
+ekafleet agent --join server-ip:7400 --node-name web-1 \
+  --join-token-file ./join-token --ca-cert /path/to/ca.pem
 ```
 
-The agent will:
-- Call the `Attest` RPC with the join token to bootstrap its SPIFFE identity
-- Receive a node SVID (`spiffe://<domain>/agent/<node-id>`) and persist it to disk
-- Establish a mTLS gRPC connection using the node SVID as client certificate
+`--node-name` defaults to the hostname. The agent will:
+- Generate a key locally and call `FleetBootstrap.Attest` with the join token and a CSR
+- Receive a 24-hour node SVID (`spiffe://<domain>/agent/<node-name>`) and persist it to disk (key mode 0400)
+- Establish a mTLS gRPC connection using the node SVID as client certificate, renewing the SVID over that connection at half-life
 - Start the SPIFFE Workload API socket at `/run/ekafleet/workload-api.sock`
 - Begin sending heartbeats every 5 seconds and reporting status every 10 seconds
 
-Legacy bearer token auth is still supported via `--token` for migration.
+Restarts reuse the persisted SVID; the join token is no longer needed. An agent
+offline for longer than 24 hours needs a new join token. Bearer-token agents
+(`--token`) are only accepted by `ekafleet dev`.
 
 ## 4. Write Fleet Configuration
 
