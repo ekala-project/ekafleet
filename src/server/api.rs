@@ -165,7 +165,7 @@ impl FleetControlService {
 
     /// For a namespace-scoped caller, the services of its namespace in the
     /// current configuration; `None` for fleet-wide callers.
-    async fn visible_services<T>(
+    pub(super) async fn visible_services<T>(
         &self,
         request: &Request<T>,
     ) -> Option<std::collections::HashSet<String>> {
@@ -190,7 +190,7 @@ impl FleetControlService {
     /// namespace. Unknown services are refused the same way, so a scoped
     /// caller cannot probe other namespaces.
     #[allow(clippy::result_large_err)]
-    async fn require_service_access<T>(
+    pub(super) async fn require_service_access<T>(
         &self,
         request: &Request<T>,
         service: &str,
@@ -494,6 +494,7 @@ impl FleetControl for FleetControlService {
                 payload: Some(ServerPayload::DesiredState(desired)),
             };
             let _ = self.state.send_to_agent(&node_id, msg).await;
+            self.state.assignments_changed().trigger();
         }
 
         // Process the first message
@@ -628,9 +629,11 @@ impl FleetControl for FleetControlService {
             });
         }
 
+        let warnings = super::secrets::missing_secret_warnings(&desired, &self.raft_state).await;
         Ok(Response::new(PlanResponse {
             operations,
             has_changes: plan.has_changes,
+            warnings,
         }))
     }
 
@@ -691,6 +694,11 @@ impl FleetControl for FleetControlService {
                 )
                 .await;
                 return;
+            }
+            for warning in
+                super::secrets::missing_secret_warnings(&evaluated.config, &raft_state).await
+            {
+                send(0, ApplyInProgress, format!("Warning: {warning}")).await;
             }
 
             let closures =
@@ -1846,76 +1854,28 @@ impl FleetControl for FleetControlService {
         request: Request<RotateFleetKeyRequest>,
     ) -> Result<Response<RotateFleetKeyResponse>, Status> {
         require_fleet_permission(&request, Permission::ManageTokens)?;
-        tracing::info!("Fleet key rotation requested");
+        self.handle_rotate_fleet_key().await.map(Response::new)
+    }
 
-        // Generate a new 256-bit key
-        use ring::rand::{SecureRandom, SystemRandom};
-        let rng = SystemRandom::new();
-        let mut new_key = [0u8; 32];
-        rng.fill(&mut new_key)
-            .map_err(|_| Status::internal("RNG failure during key generation"))?;
+    async fn set_secret(
+        &self,
+        request: Request<crate::proto::SetSecretRequest>,
+    ) -> Result<Response<crate::proto::SetSecretResponse>, Status> {
+        self.handle_set_secret(request).await.map(Response::new)
+    }
 
-        // Re-encrypt all secrets in the store with the new key
-        {
-            let mut store = self.secret_store.write().await;
-            store
-                .rekey(&new_key)
-                .await
-                .map_err(|e| Status::internal(format!("failed to re-encrypt secrets: {e}")))?;
-        }
+    async fn list_secrets(
+        &self,
+        request: Request<crate::proto::ListSecretsRequest>,
+    ) -> Result<Response<crate::proto::ListSecretsResponse>, Status> {
+        self.handle_list_secrets(request).await.map(Response::new)
+    }
 
-        // Update the fleet key state and bump the version
-        let (prev_version, new_version) = {
-            let mut fk = self.fleet_key.write().await;
-            let prev = fk.version;
-            fk.version += 1;
-            fk.key = zeroize::Zeroizing::new(new_key.to_vec());
-            (prev, fk.version)
-        };
-
-        // Persist the new key to disk, sealed at rest when configured.
-        let key_path = self.data_dir.join("fleet-key");
-        let hex: String = new_key.iter().map(|b| format!("{b:02x}")).collect();
-        super::seal::write_maybe_sealed(&key_path, hex.as_bytes(), "fleet encryption key")
-            .await
-            .map_err(|e| Status::internal(format!("failed to persist rotated key: {e}")))?;
-
-        // Push the new per-agent derived key to all connected agents
-        let node_ids = self.state.connected_nodes().await;
-        let mut notified: u32 = 0;
-        for nid in &node_ids {
-            let agent_spiffe_id = format!("spiffe://{}/agent/{}", self.domain, nid);
-            let derived =
-                crate::secrets::key_derivation::derive_agent_key(&new_key, &agent_spiffe_id);
-            let key_msg = ServerMessage {
-                payload: Some(ServerPayload::FleetKey(crate::proto::FleetKeyUpdate {
-                    encrypted_key: derived.to_vec(),
-                    version: new_version,
-                })),
-            };
-            if self.state.send_to_agent(nid, key_msg).await {
-                notified += 1;
-            }
-        }
-
-        tracing::info!(
-            prev_version,
-            new_version,
-            notified,
-            total_agents = node_ids.len(),
-            "Fleet key rotated successfully"
-        );
-
-        Ok(Response::new(RotateFleetKeyResponse {
-            success: true,
-            previous_version: prev_version,
-            new_version,
-            agents_notified: notified,
-            message: format!(
-                "Fleet key rotated from v{prev_version} to v{new_version}, {notified}/{} agents notified",
-                node_ids.len()
-            ),
-        }))
+    async fn delete_secret(
+        &self,
+        request: Request<crate::proto::DeleteSecretRequest>,
+    ) -> Result<Response<crate::proto::DeleteSecretResponse>, Status> {
+        self.handle_delete_secret(request).await.map(Response::new)
     }
 }
 
@@ -2121,6 +2081,7 @@ pub async fn serve_grpc(
         super::controller::RECONCILE_INTERVAL,
         shutdown.clone(),
     );
+    service.secret_publisher().spawn(shutdown.clone());
     if allow_bearer_agents {
         tracing::warn!("Accepting bearer-token agents (development mode)");
     }

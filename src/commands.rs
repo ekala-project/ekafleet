@@ -337,6 +337,9 @@ pub async fn cmd_plan(flake: String, server: String) -> anyhow::Result<()> {
 }
 
 fn print_plan(plan: &ekafleet::proto::PlanResponse) {
+    for warning in &plan.warnings {
+        eprintln!("warning: {warning}");
+    }
     if !plan.has_changes {
         println!("No changes detected.");
     } else {
@@ -1348,6 +1351,98 @@ pub async fn cmd_acl_token_create(
     println!("Role:      {}", result.role);
     if !namespace.is_empty() {
         println!("Namespace: {namespace}");
+    }
+    Ok(())
+}
+
+pub async fn cmd_secret_set(
+    service: String,
+    name: String,
+    file: Option<std::path::PathBuf>,
+    server: String,
+) -> anyhow::Result<()> {
+    use std::io::{IsTerminal, Read};
+    let mut value = zeroize::Zeroizing::new(Vec::new());
+    match &file {
+        Some(path) => {
+            *value = std::fs::read(path)
+                .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?
+        }
+        None => {
+            if std::io::stdin().is_terminal() {
+                eprintln!("Enter the value for {service}/{name}, then press Ctrl-D:");
+            }
+            std::io::stdin().read_to_end(&mut value)?;
+        }
+    }
+    if value.is_empty() {
+        anyhow::bail!("refusing to set an empty secret");
+    }
+    let mut client = connect_server(&server).await?;
+    let resp = client
+        .set_secret(ekafleet::proto::SetSecretRequest {
+            service_name: service.clone(),
+            secret_name: name.clone(),
+            value: std::mem::take(&mut *value),
+        })
+        .await?
+        .into_inner();
+    println!("Secret {service}/{name} set (version {})", resp.version);
+    Ok(())
+}
+
+pub async fn cmd_secret_list(service: Option<String>, server: String) -> anyhow::Result<()> {
+    let mut client = connect_server(&server).await?;
+    let resp = client
+        .list_secrets(ekafleet::proto::ListSecretsRequest {
+            service_name: service.unwrap_or_default(),
+        })
+        .await?
+        .into_inner();
+    if resp.secrets.is_empty() {
+        println!("No secrets.");
+        return Ok(());
+    }
+    println!(
+        "{:<24}  {:<24}  {:>7}  STATUS",
+        "SERVICE", "SECRET", "VERSION"
+    );
+    for s in &resp.secrets {
+        let status = match (s.version, s.declared) {
+            (0, _) => "missing",
+            (_, true) => "set",
+            (_, false) => "set, not declared",
+        };
+        let version = if s.version == 0 {
+            "-".to_string()
+        } else {
+            s.version.to_string()
+        };
+        println!(
+            "{:<24}  {:<24}  {:>7}  {status}",
+            s.service_name, s.secret_name, version
+        );
+    }
+    Ok(())
+}
+
+pub async fn cmd_secret_delete(
+    service: String,
+    name: String,
+    server: String,
+) -> anyhow::Result<()> {
+    let mut client = connect_server(&server).await?;
+    let resp = client
+        .delete_secret(ekafleet::proto::DeleteSecretRequest {
+            service_name: service.clone(),
+            secret_name: name.clone(),
+        })
+        .await?
+        .into_inner();
+    if resp.deleted {
+        println!("Secret {service}/{name} deleted");
+    } else {
+        println!("Secret {service}/{name} had no value");
     }
     Ok(())
 }

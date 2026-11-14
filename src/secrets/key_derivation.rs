@@ -42,11 +42,12 @@ pub fn reencrypt(
     let nonce = Nonce::try_assume_unique_for_key(nonce_bytes).map_err(|_| ReencryptError)?;
     let src_unbound = UnboundKey::new(&AES_256_GCM, src_key).map_err(|_| ReencryptError)?;
     let src_aead = LessSafeKey::new(src_unbound);
-    let mut in_out = ciphertext_and_tag.to_vec();
-    let plaintext = src_aead
+    let mut in_out = zeroize::Zeroizing::new(ciphertext_and_tag.to_vec());
+    let len = src_aead
         .open_in_place(nonce, Aad::from(aad), &mut in_out)
-        .map_err(|_| ReencryptError)?;
-    let plaintext = plaintext.to_vec();
+        .map_err(|_| ReencryptError)?
+        .len();
+    in_out.truncate(len);
 
     // Re-encrypt with destination key (same AAD preserves context binding)
     let rng = SystemRandom::new();
@@ -55,7 +56,10 @@ pub fn reencrypt(
     let new_nonce = Nonce::assume_unique_for_key(new_nonce_bytes);
     let dst_unbound = UnboundKey::new(&AES_256_GCM, dst_key).map_err(|_| ReencryptError)?;
     let dst_aead = LessSafeKey::new(dst_unbound);
-    let mut out = plaintext;
+    // Sealed in place: room for the tag up front so the plaintext is never
+    // left behind in a reallocated buffer.
+    let mut out = Vec::with_capacity(len + AES_256_GCM.tag_len());
+    out.extend_from_slice(&in_out);
     dst_aead
         .seal_in_place_append_tag(new_nonce, Aad::from(aad), &mut out)
         .map_err(|_| ReencryptError)?;

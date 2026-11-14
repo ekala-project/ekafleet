@@ -465,6 +465,12 @@ enum Command {
         action: AclAction,
     },
 
+    /// Static secrets of services (delivered at /run/secrets/<name>)
+    Secret {
+        #[command(subcommand)]
+        action: SecretAction,
+    },
+
     /// Execute a command in a service's context
     Exec {
         /// Service name
@@ -675,6 +681,41 @@ enum DeploymentAction {
     Fail {
         /// Service name
         service: String,
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum SecretAction {
+    /// Set a secret's value, read from stdin (or --file); never from argv
+    Set {
+        /// Service the secret belongs to
+        service: String,
+        /// Secret name, as declared in the service's `secrets`
+        name: String,
+        /// Read the value from this file instead of stdin
+        #[arg(long)]
+        file: Option<std::path::PathBuf>,
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+    /// List secret names and versions (never values)
+    List {
+        /// Only this service's secrets
+        service: Option<String>,
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+    /// Delete a secret's value
+    Delete {
+        /// Service the secret belongs to
+        service: String,
+        /// Secret name
+        name: String,
         /// Server address
         #[arg(long, default_value = "127.0.0.1:7400")]
         server: String,
@@ -1160,6 +1201,23 @@ async fn main() -> anyhow::Result<()> {
             DeploymentAction::Fail { service, server } => {
                 commands::cmd_deployment_fail(service, server).await?
             }
+        },
+
+        Command::Secret { action } => match action {
+            SecretAction::Set {
+                service,
+                name,
+                file,
+                server,
+            } => commands::cmd_secret_set(service, name, file, server).await?,
+            SecretAction::List { service, server } => {
+                commands::cmd_secret_list(service, server).await?
+            }
+            SecretAction::Delete {
+                service,
+                name,
+                server,
+            } => commands::cmd_secret_delete(service, name, server).await?,
         },
 
         Command::Acl { action } => match action {
