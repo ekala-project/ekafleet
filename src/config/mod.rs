@@ -286,8 +286,8 @@ pub struct ServiceConfig {
     pub scheduling: SchedulingConfig,
     #[serde(default)]
     pub environment: HashMap<String, String>,
-    /// Configuration file templates to render and inject into the service.
-    /// Keys are destination paths, values are template definitions.
+    /// Configuration file templates rendered by the agent and bind-mounted
+    /// read-only into the service at their `destPath`, by name.
     #[serde(default)]
     pub templates: HashMap<String, TemplateConfig>,
     /// Lifecycle hooks and shutdown configuration.
@@ -389,8 +389,8 @@ pub enum VolumeAccessMode {
     ReadWriteMany,
 }
 
-/// A configuration file template that gets rendered with fleet context
-/// (service discovery, secrets, metadata) and written to a destination path.
+/// A configuration file template rendered with fleet context (service
+/// discovery, secrets, metadata) and visible to the service at `dest_path`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct TemplateConfig {
@@ -401,13 +401,21 @@ pub struct TemplateConfig {
     /// File permissions (octal, e.g., "0644"). Defaults to "0644".
     #[serde(default = "default_file_perms")]
     pub perms: String,
-    /// If true, signal the service to reload after rendering (SIGHUP).
+    /// Signal sent to the service when the rendered file changes (e.g.
+    /// `SIGHUP`); unset restarts the service instead.
     #[serde(default)]
     pub change_signal: Option<String>,
 }
 
 fn default_file_perms() -> String {
     "0644".to_string()
+}
+
+/// A template's octal `perms` as permission bits.
+pub fn template_mode(perms: &str) -> Option<u32> {
+    u32::from_str_radix(perms.trim_start_matches("0o"), 8)
+        .ok()
+        .filter(|mode| *mode <= 0o777)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -902,6 +910,32 @@ pub fn validate(config: &FleetConfig) -> Result<(), Vec<String>> {
     }
 
     for (name, service) in &config.services {
+        let mut dests = std::collections::HashSet::new();
+        let mut templates: Vec<_> = service.templates.iter().collect();
+        templates.sort_by_key(|(key, _)| key.as_str());
+        for (key, template) in templates {
+            if let Err(e) = crate::agent::templates::validate_dest(&template.dest_path) {
+                errors.push(format!("service '{name}' template '{key}': {e}"));
+            }
+            if !dests.insert(template.dest_path.as_str()) {
+                errors.push(format!(
+                    "service '{name}' template '{key}': destination '{}' is used twice",
+                    template.dest_path
+                ));
+            }
+            if template_mode(&template.perms).is_none() {
+                errors.push(format!(
+                    "service '{name}' template '{key}': invalid perms '{}' (octal, at most 0777)",
+                    template.perms
+                ));
+            }
+            if let Some(signal) = &template.change_signal
+                && let Err(e) = crate::agent::templates::validate_signal(signal)
+            {
+                errors.push(format!("service '{name}' template '{key}': {e}"));
+            }
+        }
+
         if let Some(ref pool) = service.scheduling.pool
             && !config.node_pools.contains_key(pool)
         {
@@ -1131,6 +1165,43 @@ mod nix_module_tests {
         assert_eq!(svc.scheduling.job_type, JobType::Service);
         assert_eq!(svc.scheduling.update.strategy, UpdateStrategy::Rolling);
         assert_eq!(svc.ports["http"].port, 8080);
+    }
+
+    #[test]
+    fn templates_are_validated() {
+        let config = |templates: serde_json::Value| -> FleetConfig {
+            serde_json::from_value(serde_json::json!({
+                "name": "t",
+                "domain": "fleet.test",
+                "services": {"api": {"command": "/bin/api", "templates": templates}},
+            }))
+            .unwrap()
+        };
+        let ok = config(serde_json::json!({
+            "conf": {"source": "x", "destPath": "/etc/api.conf", "perms": "0600", "changeSignal": "SIGHUP"},
+        }));
+        assert!(validate(&ok).is_ok(), "{:?}", validate(&ok));
+        assert_eq!(template_mode("0600"), Some(0o600));
+
+        let bad = config(serde_json::json!({
+            "a": {"source": "x", "destPath": "relative"},
+            "b": {"source": "x", "destPath": "/etc/x", "perms": "0999"},
+            "c": {"source": "x", "destPath": "/etc/x", "changeSignal": "HUP; reboot"},
+        }));
+        let errors = validate(&bad).unwrap_err().join("\n");
+        assert!(
+            errors.contains("template 'a': invalid template destination"),
+            "{errors}"
+        );
+        assert!(
+            errors.contains("template 'b': invalid perms '0999'"),
+            "{errors}"
+        );
+        assert!(
+            errors.contains("template 'c': destination '/etc/x' is used twice"),
+            "{errors}"
+        );
+        assert!(errors.contains("template 'c': invalid signal"), "{errors}");
     }
 
     #[test]

@@ -9,6 +9,7 @@ pub mod snapshot;
 pub mod storage;
 pub mod supervisor;
 pub mod template;
+pub mod templates;
 
 pub mod bootstrap;
 pub mod closures;
@@ -147,6 +148,11 @@ pub async fn run_until(config: AgentConfig, stop: CancellationToken) -> anyhow::
     )));
     let health_checker = HealthChecker::new();
     let dns = Arc::new(AgentDns::start(&config.dns, stop.child_token()).await);
+    let templates = Arc::new(templates::TemplateManager::new(
+        std::path::PathBuf::from(templates::TEMPLATES_DIR),
+        config.data_dir.join("secrets"),
+        &node_id,
+    ));
     if let Some(domain) = node_identity
         .read()
         .await
@@ -189,6 +195,7 @@ pub async fn run_until(config: AgentConfig, stop: CancellationToken) -> anyhow::
         secret_injector,
         health_checker,
         dns,
+        templates,
         peer_manager,
         policy_enforcer,
         netns_manager,
@@ -265,6 +272,7 @@ struct Components {
     secret_injector: Arc<RwLock<SecretInjector>>,
     health_checker: HealthChecker,
     dns: Arc<AgentDns>,
+    templates: Arc<templates::TemplateManager>,
     peer_manager: Arc<RwLock<PeerManager>>,
     policy_enforcer: Arc<PolicyEnforcer>,
     netns_manager: Arc<netns::NamespaceNetworkManager>,
@@ -290,6 +298,7 @@ impl Components {
             secret_injector,
             health_checker,
             dns,
+            templates,
             peer_manager,
             policy_enforcer,
             netns_manager,
@@ -523,6 +532,7 @@ impl Components {
                                     node_identity,
                                     secret_injector,
                                     dns,
+                                    templates,
                                     peer_manager,
                                     policy_enforcer,
                                     health_checker,

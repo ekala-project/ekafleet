@@ -9,6 +9,7 @@ use super::netns::NamespaceNetworkManager;
 use super::supervisor;
 use super::types::{LocalState, NodeIdentity, PendingKeyStore};
 use crate::agent::health::HealthChecker;
+use crate::agent::templates::{self, TemplateManager};
 use crate::dns::agent::AgentDns;
 use crate::mesh::peers::PeerManager;
 use crate::policy::nftables::PolicyEnforcer;
@@ -61,6 +62,7 @@ pub(super) async fn handle_server_message(
     node_identity: &Arc<RwLock<NodeIdentity>>,
     secret_injector: &Arc<RwLock<SecretInjector>>,
     dns: &Arc<AgentDns>,
+    templates: &Arc<TemplateManager>,
     peer_manager: &Arc<RwLock<PeerManager>>,
     policy_enforcer: &Arc<PolicyEnforcer>,
     health_checker: &HealthChecker,
@@ -301,10 +303,22 @@ pub(super) async fn handle_server_message(
             let state = local_state.read().await;
             let desired = state.desired_services.clone();
             drop(state);
+            // Render before (re)starting, so new services find their files.
+            templates.set_services(desired.values()).await;
+            let template_changes = templates.render_all(dns.resolver()).await;
             match supervisor.write().await.reconcile(&desired).await {
                 Ok(actions) => {
                     for action in &actions {
                         tracing::info!(?action, "Supervisor action");
+                    }
+                    for (service, change) in &template_changes {
+                        let fresh = actions.iter().any(|a| {
+                            matches!(a, supervisor::SupervisorAction::Started(s)
+                                | supervisor::SupervisorAction::Restarted(s) if s == service)
+                        });
+                        if !fresh {
+                            templates::notify(service, change).await;
+                        }
                     }
                 }
                 Err(e) => tracing::error!(error = %e, "Service reconciliation failed"),
@@ -349,13 +363,24 @@ pub(super) async fn handle_server_message(
                 )
                 .await
             {
-                Ok(path) => tracing::info!(path = %path.display(), "Secret injected"),
+                Ok(path) => {
+                    tracing::info!(path = %path.display(), "Secret injected");
+                    if let Some(change) = templates
+                        .render_service(&update.service_name, dns.resolver())
+                        .await
+                    {
+                        templates::notify(&update.service_name, &change).await;
+                    }
+                }
                 Err(e) => tracing::error!(error = %e, "Secret injection failed"),
             }
         }
         ServerPayload::Dns(update) => {
             tracing::debug!(records = update.records.len(), "Received DNS records");
             dns.resolver().replace(&update.records).await;
+            for (service, change) in templates.render_all(dns.resolver()).await {
+                templates::notify(&service, &change).await;
+            }
         }
         ServerPayload::Cert(response) => {
             tracing::info!(

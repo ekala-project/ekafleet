@@ -503,6 +503,22 @@ message ServiceSpec {
   // to), built by the server at apply time. The agent fetches their
   // closures from the server's binary cache before starting the service.
   repeated string store_paths = 17;
+
+  // Config files rendered by the agent and bind-mounted read-only into the
+  // service at their destination path.
+  repeated TemplateSpec templates = 18;
+}
+
+message TemplateSpec {
+  // Absolute path inside the service.
+  string dest_path = 1;
+  // Template source with {{ }} placeholders.
+  string source = 2;
+  // File mode (permission bits); 0 = 0644.
+  uint32 mode = 3;
+  // Signal sent to the service when the rendered file changes; empty =
+  // restart the service instead.
+  string change_signal = 4;
 }
 
 message VolumeMount {

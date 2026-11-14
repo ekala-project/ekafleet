@@ -1,6 +1,6 @@
 { pkgs, lib }:
 
-# Fleet DNS on two mesh nodes:
+# Fleet DNS and config templates on two mesh nodes:
 #
 #   the server turns assignments, replica status and mesh addresses into a
 #   record snapshot per node → each agent answers on 127.0.0.1:53 (the host's
@@ -28,6 +28,12 @@ let
           services.web = {
             command = "${coreutils}/bin/sleep infinity";
             ports.http.port = 8080;
+            # SIGCONT: a reload signal sleep(1) survives.
+            templates.peers = {
+              destPath = "/etc/web/peers";
+              source = "peers={{ services \"web\" }} node={{ meta.node }}";
+              changeSignal = "SIGCONT";
+            };
             resources = { cpu.request = 100; memory.request = 64; };
             scheduling = {
               replicas = 2;
@@ -200,6 +206,21 @@ pkgs.testers.nixosTest {
               # Namespaced services are invisible on the host.
               assert rcode(machine, "db.service.fleet.internal") == "status: NXDOMAIN"
 
+      def rendered(machine, service, dest):
+          pid = machine.succeed(f"systemctl show -p MainPID --value ekafleet-{service}.service").strip()
+          return pid, machine.succeed(f"cat /proc/{pid}/root{dest}").strip()
+
+      both = ",".join(f"{ips[n]}:8080" for n in sorted(ips))
+      with subtest("templates render service addresses into the service only"):
+          for name, machine in AGENTS.items():
+              machine.wait_until_succeeds(
+                  "pid=$(systemctl show -p MainPID --value ekafleet-web.service); "
+                  f"grep -qx 'peers={both} node={name}' /proc/$pid/root/etc/web/peers",
+                  timeout=60,
+              )
+              # The host's own /etc is not written (at most an empty mount point).
+              machine.succeed("test ! -s /etc/web/peers")
+
       with subtest("services in a namespace resolve against its gateway"):
           gateway = db_node.succeed(
               "ip netns exec ekafleet-acme ip -4 -o addr "
@@ -219,11 +240,25 @@ pkgs.testers.nixosTest {
           pid = db_node.succeed("systemctl show -p MainPID --value ekafleet-db.service").strip()
           db_node.succeed(f"grep -q 'nameserver {gateway}' /proc/{pid}/root/etc/resolv.conf")
 
-      with subtest("records follow the replicas"):
+      with subtest("records and templates follow the replicas"):
+          pids = {n: rendered(m, "web", "/etc/web/peers")[0] for n, m in AGENTS.items()}
           server.succeed(f"{CLI} scale web 1 --server {SERVER}")
           alpha.wait_until_succeeds(
               "test $(dig +short @127.0.0.1 web.service.fleet.internal | wc -l) = 1",
               timeout=90,
           )
+          survivor = next(
+              n for n, m in AGENTS.items()
+              if m.execute("systemctl is-active ekafleet-web.service")[0] == 0
+          )
+          machine = AGENTS[survivor]
+          machine.wait_until_succeeds(
+              "pid=$(systemctl show -p MainPID --value ekafleet-web.service); "
+              f"grep -qx 'peers={ips[survivor]}:8080 node={survivor}' /proc/$pid/root/etc/web/peers",
+              timeout=60,
+          )
+          # The change was signalled, not restarted.
+          assert rendered(machine, "web", "/etc/web/peers")[0] == pids[survivor]
+          machine.succeed("journalctl -u ekafleet-agent -o cat | grep -q 'Service notified of template change'")
     '';
 }
