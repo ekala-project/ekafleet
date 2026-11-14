@@ -252,6 +252,7 @@ mod tests {
             volumes: Vec::new(),
             sidecars: Vec::new(),
             namespace: String::new(),
+            store_paths: vec![],
         }
     }
 

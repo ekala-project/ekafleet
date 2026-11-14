@@ -303,6 +303,10 @@ pub struct ServiceConfig {
     /// networking. Non-default namespaces get isolated network namespaces.
     #[serde(default)]
     pub namespace: String,
+    /// Store paths the service needs, built by the server at apply time.
+    /// Never read from the fleet configuration itself.
+    #[serde(skip)]
+    pub store_paths: Vec<String>,
 }
 
 /// OCI container configuration for a service.

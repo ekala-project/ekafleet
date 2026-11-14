@@ -11,6 +11,7 @@ pub mod supervisor;
 pub mod template;
 
 pub mod bootstrap;
+pub mod closures;
 mod handlers;
 mod helpers;
 mod types;
@@ -150,14 +151,8 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
         Some(token) if !use_mtls => Some(format!("Bearer {}", token.as_str()).parse()?),
         _ => None,
     };
-    #[allow(clippy::result_large_err)]
-    let mut client =
-        FleetControlClient::with_interceptor(channel, move |mut req: tonic::Request<()>| {
-            if let Some(bearer) = &bearer {
-                req.metadata_mut().insert("authorization", bearer.clone());
-            }
-            Ok(req)
-        });
+    let mut client: closures::AgentClient =
+        FleetControlClient::with_interceptor(channel, closures::AgentAuth { bearer });
 
     let local_state = Arc::new(RwLock::new(LocalState::default()));
     // Trust domain starts as default; updated when TrustBundleUpdate is received from server.
@@ -395,6 +390,7 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
                                 &netns_manager,
                                 &tx,
                                 &node_id,
+                                &client,
                             )
                             .await;
                         }

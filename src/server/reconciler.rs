@@ -498,6 +498,7 @@ fn service_config_to_spec(name: &str, cfg: &config::ServiceConfig) -> crate::pro
         container_image,
         namespace: cfg.namespace.clone(),
         namespace_ip: String::new(), // populated below from Raft IP allocations
+        store_paths: cfg.store_paths.clone(),
     }
 }
 
@@ -727,6 +728,7 @@ async fn send_desired_state(
             services,
             system_path: previous_system_paths.remove(node).unwrap_or_default(),
             namespace_networks,
+            cache_public_key: String::new(), // stamped by assign_desired_state
         };
         if !state.assign_desired_state(node, desired_state).await {
             tracing::warn!(
@@ -1427,6 +1429,7 @@ mod tests {
                 volumes: vec![],
                 sidecars: vec![],
                 namespace: String::new(),
+                store_paths: vec![],
             },
         );
         // Policy: requires at least 2 replicas.
@@ -1458,6 +1461,7 @@ mod tests {
             volumes: vec![],
             sidecars: vec![],
             namespace: String::new(),
+            store_paths: vec![],
         }
     }
 

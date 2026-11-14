@@ -49,6 +49,9 @@ pub struct FleetState {
     /// Node → assigned service names, consulted by the certificate issuer.
     /// Kept in sync with `FleetStateInner::assigned`.
     service_assignments: crate::ca::issuer::ServiceAssignments,
+    /// Public key of the server's binary cache, stamped into every
+    /// `DesiredState` so agents can verify fetched closures.
+    cache_public_key: Arc<std::sync::OnceLock<String>>,
 }
 
 struct FleetStateInner {
@@ -112,7 +115,33 @@ impl FleetState {
             reconcile: ReconcileTrigger::new(),
             pending_canaries: super::deployer::PendingCanaryStore::new(),
             service_assignments: crate::ca::issuer::ServiceAssignments::new(),
+            cache_public_key: Arc::default(),
         }
+    }
+
+    /// Record the binary cache's public key (once, at startup).
+    pub fn set_cache_public_key(&self, key: String) {
+        let _ = self.cache_public_key.set(key);
+    }
+
+    /// Store paths assigned to `node_id` across its services, i.e. the roots
+    /// of everything it may fetch from the binary cache. `None` covers
+    /// every node (bearer-token agents in `ekafleet dev`).
+    pub async fn assigned_store_paths(&self, node_id: Option<&str>) -> Vec<String> {
+        let state = self.inner.read().await;
+        let mut paths: Vec<String> = state
+            .assigned
+            .iter()
+            .filter(|(node, _)| node_id.is_none_or(|n| n == node.as_str()))
+            .flat_map(|(_, ds)| {
+                ds.services
+                    .iter()
+                    .flat_map(|s| s.store_paths.iter().cloned())
+            })
+            .collect();
+        paths.sort();
+        paths.dedup();
+        paths
     }
 
     /// Shared node → service assignment table for the certificate issuer.
@@ -128,8 +157,11 @@ impl FleetState {
     pub async fn assign_desired_state(
         &self,
         node_id: &str,
-        desired: crate::proto::DesiredState,
+        mut desired: crate::proto::DesiredState,
     ) -> bool {
+        if let Some(key) = self.cache_public_key.get() {
+            desired.cache_public_key = key.clone();
+        }
         let names = desired.services.iter().map(|s| s.name.clone()).collect();
         self.service_assignments.set(node_id, names).await;
         let tx = {

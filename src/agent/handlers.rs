@@ -19,6 +19,38 @@ use crate::proto::{AgentCommandResponse, AgentMessage, CertRequestType};
 use crate::secrets::injector::SecretInjector;
 use crate::spiffe::workload_api::WorkloadManager;
 
+/// Fetch each service's closure from the server's cache. A service whose
+/// closure cannot be fetched keeps its `previous` spec if it had one and is
+/// left out otherwise.
+async fn fetch_service_closures(
+    client: &super::closures::AgentClient,
+    services: Vec<crate::proto::ServiceSpec>,
+    public_key: &str,
+    previous: &std::collections::HashMap<String, crate::proto::ServiceSpec>,
+) -> Vec<crate::proto::ServiceSpec> {
+    let mut kept = Vec::with_capacity(services.len());
+    for svc in services {
+        if svc.store_paths.is_empty() {
+            kept.push(svc);
+            continue;
+        }
+        match super::closures::ensure_closures(client, &svc.store_paths, public_key).await {
+            Ok(()) => kept.push(svc),
+            Err(e) => {
+                tracing::error!(
+                    service = %svc.name,
+                    error = %e,
+                    "Cannot fetch service closure; keeping the current version"
+                );
+                if let Some(prev) = previous.get(&svc.name) {
+                    kept.push(prev.clone());
+                }
+            }
+        }
+    }
+    kept
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_server_message(
     payload: ServerPayload,
@@ -35,9 +67,10 @@ pub(super) async fn handle_server_message(
     netns_manager: &Arc<NamespaceNetworkManager>,
     tx: &mpsc::Sender<AgentMessage>,
     node_id: &str,
+    client: &super::closures::AgentClient,
 ) {
     match payload {
-        ServerPayload::DesiredState(ds) => {
+        ServerPayload::DesiredState(mut ds) => {
             tracing::info!(
                 correlation_id = %ds.correlation_id,
                 services = ds.services.len(),
@@ -45,6 +78,17 @@ pub(super) async fn handle_server_message(
                 namespace_networks = ds.namespace_networks.len(),
                 "Received desired state"
             );
+
+            // Fetch the closures services need before touching anything else,
+            // so a service whose closure cannot be fetched keeps running its
+            // current version instead of being restarted into a missing one.
+            ds.services = fetch_service_closures(
+                client,
+                ds.services,
+                &ds.cache_public_key,
+                &local_state.read().await.desired_services,
+            )
+            .await;
 
             // Activate EkaOS system closure if a new system_path is provided
             if !ds.system_path.is_empty() {
