@@ -42,7 +42,7 @@ pkgs.testers.nixosTest {
 
     # No auth → 401
     machine.succeed(
-        "curl -s -o /dev/null -w '%{http_code}' http://localhost:7402/v1/status | grep -q '401'"
+        "curl -s -o /dev/null -w '%{http_code}' http://localhost:7402/v1/status | grep >/dev/null '401'"
     )
 
     # Wrong token → 401
@@ -84,7 +84,7 @@ pkgs.testers.nixosTest {
 
     # GET the key back — verify value is present
     machine.succeed(
-        f"curl -sf {AUTH} http://localhost:7402/v1/kv/test-key | grep -q 'hello-world'"
+        f"curl -sf {AUTH} http://localhost:7402/v1/kv/test-key | grep >/dev/null 'hello-world'"
     )
 
     # DELETE the key
@@ -151,14 +151,14 @@ pkgs.testers.nixosTest {
 
     # /ui/ returns HTML containing ekafleet
     machine.succeed(
-        f"curl -sf {AUTH} http://localhost:7402/ui/ | grep -qi 'ekafleet'"
+        f"curl -sf {AUTH} http://localhost:7402/ui/ | grep -i >/dev/null 'ekafleet'"
     )
 
     # ── Prometheus metrics ──
 
     # /metrics returns 200 with correct content type
     machine.succeed(
-        f"curl -sf {AUTH} -o /dev/null -w '%{{http_code}}' http://localhost:7402/metrics | grep -q '200'"
+        f"curl -sf {AUTH} -o /dev/null -w '%{{http_code}}' http://localhost:7402/metrics | grep >/dev/null '200'"
     )
   '';
 }
