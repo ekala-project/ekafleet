@@ -4,7 +4,8 @@ use crate::metrics::aggregator::MetricsAggregator;
 use crate::proto::agent_message::Payload;
 use crate::proto::server_message::Payload as ServerPayload;
 use crate::proto::{
-    AgentMessage, CertificateResponse, JwtSvidRequest, JwtSvidResponse, ServerMessage,
+    AgentMessage, CertRequestType, CertificateResponse, JwtSvidRequest, JwtSvidResponse,
+    ServerMessage,
 };
 
 /// Note when a message's self-reported node id disagrees with the stream's
@@ -58,13 +59,16 @@ async fn issue_jwt_svid(
 }
 
 /// Handle one message from the control stream of `node_id`, the stream's
-/// authenticated node. Node ids inside payloads are ignored.
+/// authenticated node. Node ids inside payloads are ignored. `mtls` says
+/// whether the stream was authenticated with the node's own SVID; only
+/// such streams may renew it.
 pub(super) async fn process_agent_message(
     state: &FleetState,
     node_id: &str,
     msg: AgentMessage,
     cert_issuer: Option<&CertIssuer>,
     metrics: &MetricsAggregator,
+    mtls: bool,
 ) {
     match msg.payload {
         Some(Payload::Heartbeat(hb)) => {
@@ -105,24 +109,42 @@ pub(super) async fn process_agent_message(
                 "Certificate request received"
             );
 
+            let node_cert = req.request_type == CertRequestType::NodeCert as i32;
+            if node_cert && !mtls {
+                tracing::warn!(
+                    node_id = %node_id,
+                    "Node SVID renewal refused: stream is not authenticated by a node SVID"
+                );
+                return;
+            }
             if let Some(issuer) = cert_issuer {
-                match issuer
-                    .process_request(node_id, &req.service_name, &req.csr)
-                    .await
-                {
+                let issued = if node_cert {
+                    issuer.issue_node_svid(node_id, &req.csr).await
+                } else {
+                    issuer
+                        .process_request(node_id, &req.service_name, &req.csr)
+                        .await
+                };
+                match issued {
                     Ok((cert, chain, expires_at)) => {
                         let response = ServerMessage {
                             payload: Some(ServerPayload::Cert(CertificateResponse {
                                 certificate: cert,
                                 chain,
                                 expires_at,
-                                service_name: req.service_name.clone(),
+                                service_name: if node_cert {
+                                    String::new()
+                                } else {
+                                    req.service_name.clone()
+                                },
+                                request_type: req.request_type,
                             })),
                         };
                         state.send_to_agent(node_id, response).await;
                         tracing::info!(
                             node_id = %node_id,
                             service = %req.service_name,
+                            node_cert,
                             "SVID issued"
                         );
                     }

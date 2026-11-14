@@ -62,8 +62,8 @@ service FleetControl {
   rpc Apply(ApplyRequest) returns (stream ApplyEvent);
   rpc Status(StatusRequest) returns (FleetStatus);
 
-  // Node attestation (requires Attest permission)
-  rpc Attest(NodeAttestationRequest) returns (NodeAttestationResult);
+  // One-time, name-bound join tokens (requires ManageTokens)
+  rpc CreateJoinToken(CreateJoinTokenRequest) returns (CreateJoinTokenResponse);
 
   // Cluster operations
   rpc Rollback(RollbackRequest) returns (RollbackResponse);
@@ -106,9 +106,14 @@ service FleetControl {
   // Key management
   rpc RotateFleetKey(RotateFleetKeyRequest) returns (RotateFleetKeyResponse);
 }
+
+// Unauthenticated: the join token is the credential.
+service FleetBootstrap {
+  rpc Attest(NodeAttestationRequest) returns (NodeAttestationResult);
+}
 ```
 
-All RPCs enforce RBAC via `require_permission()`. The `Attest` RPC requires `Attest` permission (granted to Operator and Admin). Authentication is via bearer token or mTLS (the SPIFFE ID is extracted from the verified peer cert and mapped to a role).
+All `FleetControl` RPCs enforce RBAC via `require_permission()`. Authentication is via bearer token or mTLS (the SPIFFE ID is extracted from the verified peer cert and mapped to a role). Client certificates are optional at the TLS layer; `StreamControl` requires a node SVID except under `ekafleet dev`. `FleetBootstrap.Attest` exchanges a one-time join token and a CSR for a node SVID.
 
 ### SPIFFE Workload API (Unix Socket)
 

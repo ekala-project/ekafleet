@@ -6,9 +6,9 @@ Quick reference for all ekafleet commands. All commands accept `--output json` f
 
 ```bash
 ekafleet dev                                    # Dev mode (server + agent, no TLS)
-ekafleet server --token $TOKEN --domain fleet.internal  # Production server
-ekafleet agent --join server:7400 --join-token $TOKEN    # Join agent to fleet
-ekafleet token create --type agent              # Generate join token
+ekafleet server --token-file /run/keys/admin-token --domain fleet.internal  # Production server
+ekafleet token create --type agent --node web-1 > jt  # Name-bound one-time join token
+ekafleet agent --join server:7400 --node-name web-1 --join-token-file jt --ca-cert ca.pem  # Join
 ```
 
 ## Deploy
@@ -160,7 +160,8 @@ ekafleet completions fish > ~/.config/fish/completions/ekafleet.fish
 
 | Variable | Description |
 |----------|-------------|
-| `EKAFLEET_TOKEN` | Server authentication token (alternative to `--token`) |
+| `EKAFLEET_TOKEN` / `EKAFLEET_TOKEN_FILE` | Admin bearer token for the server and CLI (alternative to `--token`/`--token-file`) |
+| `EKAFLEET_JOIN_TOKEN` / `EKAFLEET_JOIN_TOKEN_FILE` | Agent join token (alternative to `--join-token`/`--join-token-file`) |
 | `RUST_LOG` | Log level filter (e.g., `info`, `debug`, `ekafleet=trace`) |
 
 ## Event Categories

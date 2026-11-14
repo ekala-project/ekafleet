@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
-use super::types::PendingKeyStore;
+use super::types::{NODE_CERT_KEY, NodeIdentity, PendingKeyStore};
 use crate::proto::NodeResources;
 use crate::spiffe::workload_api::WorkloadManager;
 
@@ -51,8 +51,76 @@ pub(super) async fn install_received_svid(
     Ok(())
 }
 
+/// Ask the server to renew this node's SVID (sent on the mTLS stream, so the
+/// server signs only for the stream's own node), unless a renewal is already
+/// in flight. The new key never leaves the agent.
+pub(super) async fn request_node_svid(
+    pending_keys: &Arc<RwLock<PendingKeyStore>>,
+    tx: &tokio::sync::mpsc::Sender<crate::proto::AgentMessage>,
+    node_id: &str,
+) {
+    if pending_keys.read().await.in_flight(NODE_CERT_KEY) {
+        return;
+    }
+    match crate::ca::csr::generate_node_csr(None, node_id) {
+        Ok(csr) => {
+            pending_keys.write().await.store(NODE_CERT_KEY, csr.keypair);
+            tracing::info!("Requesting node SVID renewal");
+            let _ = tx
+                .send(crate::proto::AgentMessage {
+                    payload: Some(crate::proto::agent_message::Payload::CertRequest(
+                        crate::proto::CertificateRequest {
+                            node_id: node_id.to_string(),
+                            service_name: String::new(),
+                            csr: csr.csr_der,
+                            request_type: crate::proto::CertRequestType::NodeCert as i32,
+                        },
+                    )),
+                })
+                .await;
+        }
+        Err(e) => tracing::error!(error = %e, "Node CSR generation failed"),
+    }
+}
+
+/// Install a renewed node SVID. It must certify the pending renewal key and
+/// carry the same SPIFFE ID as the current node SVID. The new certificate
+/// is used from the next connection on.
+pub(super) async fn install_node_svid(
+    identity: &Arc<RwLock<NodeIdentity>>,
+    pending_keys: &Arc<RwLock<PendingKeyStore>>,
+    response: &crate::proto::CertificateResponse,
+) -> Result<(), std::io::Error> {
+    let invalid = |msg: String| std::io::Error::new(std::io::ErrorKind::InvalidData, msg);
+    let keypair = pending_keys
+        .write()
+        .await
+        .take(NODE_CERT_KEY)
+        .ok_or_else(|| invalid("no pending node SVID renewal".into()))?;
+    let cert_pem =
+        String::from_utf8(response.certificate.clone()).map_err(|e| invalid(e.to_string()))?;
+    if !cert_certifies_key(&cert_pem, &keypair) {
+        return Err(invalid(
+            "renewed node SVID does not match the pending key".into(),
+        ));
+    }
+    let mut identity = identity.write().await;
+    let renewed = crate::proxy::mtls::SpiffeAuthorizer::extract_spiffe_id_from_pem(&cert_pem);
+    if renewed.is_none() || renewed != identity.spiffe_id {
+        return Err(invalid(format!(
+            "renewed node SVID is for {renewed:?}, not {:?}",
+            identity.spiffe_id
+        )));
+    }
+    let chain = String::from_utf8(response.chain.clone()).map_err(|e| invalid(e.to_string()))?;
+    let key_pem = zeroize::Zeroizing::new(keypair.serialize_pem());
+    identity
+        .install(format!("{}\n{chain}", cert_pem.trim_end()), key_pem)
+        .await
+}
+
 /// Whether the first certificate in `cert_pem` certifies `keypair`'s public key.
-fn cert_certifies_key(cert_pem: &str, keypair: &rcgen::KeyPair) -> bool {
+pub(super) fn cert_certifies_key(cert_pem: &str, keypair: &rcgen::KeyPair) -> bool {
     let mut reader = std::io::BufReader::new(cert_pem.as_bytes());
     let Some(Ok(der)) = rustls_pemfile::certs(&mut reader).next() else {
         return false;

@@ -111,9 +111,14 @@ enum Command {
         #[arg(long, default_value = "0.0.0.0:7402")]
         http_listen: String,
 
-        /// Bearer token required for agent authentication
-        #[arg(long, env = "EKAFLEET_TOKEN")]
-        token: String,
+        /// Admin bearer token for the API. Prefer --token-file: argv is
+        /// readable by every local user.
+        #[arg(long, env = "EKAFLEET_TOKEN", required_unless_present = "token_file")]
+        token: Option<String>,
+
+        /// File holding the admin bearer token
+        #[arg(long, env = "EKAFLEET_TOKEN_FILE", conflicts_with = "token")]
+        token_file: Option<PathBuf>,
 
         /// SPIFFE trust domain for fleet identities
         #[arg(long, default_value = "fleet.internal")]
@@ -130,13 +135,24 @@ enum Command {
         #[arg(long)]
         join: String,
 
-        /// Authentication token (legacy — use --join-token for SPIFFE attestation)
-        #[arg(long, default_value = "")]
-        token: String,
+        /// Bearer token; only accepted by `ekafleet dev`. Real servers
+        /// require a node SVID obtained with a join token.
+        #[arg(long, env = "EKAFLEET_TOKEN", conflicts_with = "token_file")]
+        token: Option<String>,
 
-        /// One-time join token for SPIFFE node attestation (replaces --token)
-        #[arg(long)]
+        /// File holding the bearer token (dev only)
+        #[arg(long, env = "EKAFLEET_TOKEN_FILE")]
+        token_file: Option<PathBuf>,
+
+        /// One-time join token (from `ekafleet token create --type agent
+        /// --node <name>`), exchanged for a node SVID on first start.
+        /// Prefer --join-token-file: argv is readable by every local user.
+        #[arg(long, env = "EKAFLEET_JOIN_TOKEN", conflicts_with = "join_token_file")]
         join_token: Option<String>,
+
+        /// File holding the one-time join token
+        #[arg(long, env = "EKAFLEET_JOIN_TOKEN_FILE")]
+        join_token_file: Option<PathBuf>,
 
         /// This node's name; must match its `machines.<name>` entry in the
         /// fleet config. Defaults to the short system hostname.
@@ -475,11 +491,25 @@ enum ContextAction {
 
 #[derive(Subcommand)]
 enum TokenAction {
-    /// Create a new join token
+    /// Create a token. `--type server` (default) prints a random 256-bit
+    /// token for `ekafleet server --token-file`; `--type agent` asks the
+    /// server for a one-time join token bound to `--node`.
     Create {
-        /// Token type (agent or server)
-        #[arg(long, default_value = "agent")]
+        /// Token type (server or agent)
+        #[arg(long, default_value = "server", value_parser = ["server", "agent"])]
         r#type: String,
+
+        /// Node name the join token is bound to (`--type agent`)
+        #[arg(long, required_if_eq("type", "agent"))]
+        node: Option<String>,
+
+        /// Join token lifetime, e.g. 30m, 1h, 7d (default 1h, max 7d)
+        #[arg(long)]
+        ttl: Option<String>,
+
+        /// Server address (`--type agent`)
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
     },
 }
 
@@ -784,6 +814,8 @@ enum ImagesAction {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
+        // No color escapes in the journal or other non-terminal sinks.
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
@@ -832,6 +864,7 @@ async fn main() -> anyhow::Result<()> {
             listen,
             http_listen,
             token,
+            token_file,
             domain,
             ca_socket,
         } => {
@@ -840,7 +873,9 @@ async fn main() -> anyhow::Result<()> {
                 peers,
                 listen,
                 http_listen,
-                token,
+                commands::secret_arg(token, token_file)?
+                    .ok_or_else(|| anyhow::anyhow!("--token or --token-file is required"))?
+                    .to_string(),
                 domain,
                 ca_socket,
             )
@@ -850,11 +885,23 @@ async fn main() -> anyhow::Result<()> {
         Command::Agent {
             join,
             token,
+            token_file,
             join_token,
+            join_token_file,
             node_name,
             data_dir,
             ca_cert,
-        } => commands::cmd_agent(join, token, join_token, node_name, data_dir, ca_cert).await?,
+        } => {
+            commands::cmd_agent(commands::AgentArgs {
+                join,
+                token: commands::secret_arg(token, token_file)?,
+                join_token: commands::join_token_arg(join_token, join_token_file)?,
+                node_name,
+                data_dir,
+                ca_cert,
+            })
+            .await?
+        }
 
         Command::Plan { config, server } => commands::cmd_plan(config, server).await?,
 
@@ -901,8 +948,14 @@ async fn main() -> anyhow::Result<()> {
         } => commands::cmd_scale(service, count, server).await?,
 
         Command::Token {
-            action: TokenAction::Create { r#type },
-        } => commands::cmd_token_create(r#type).await?,
+            action:
+                TokenAction::Create {
+                    r#type,
+                    node,
+                    ttl,
+                    server,
+                },
+        } => commands::cmd_token_create(r#type, node, ttl, server).await?,
 
         Command::Logs {
             service,

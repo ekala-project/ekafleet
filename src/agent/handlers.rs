@@ -4,10 +4,10 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::sync::{RwLock, mpsc};
 
-use super::helpers::install_received_svid;
+use super::helpers::{install_node_svid, install_received_svid};
 use super::netns::NamespaceNetworkManager;
 use super::supervisor;
-use super::types::{LocalState, PendingKeyStore};
+use super::types::{LocalState, NodeIdentity, PendingKeyStore};
 use crate::agent::health::HealthChecker;
 use crate::dns::resolver::DnsResolver;
 use crate::mesh::peers::PeerManager;
@@ -15,7 +15,7 @@ use crate::policy::nftables::PolicyEnforcer;
 use crate::proto::agent_command_response::Result as CmdResult;
 use crate::proto::agent_message::Payload;
 use crate::proto::server_message::Payload as ServerPayload;
-use crate::proto::{AgentCommandResponse, AgentMessage};
+use crate::proto::{AgentCommandResponse, AgentMessage, CertRequestType};
 use crate::secrets::injector::SecretInjector;
 use crate::spiffe::workload_api::WorkloadManager;
 
@@ -26,6 +26,7 @@ pub(super) async fn handle_server_message(
     local_state: &Arc<RwLock<LocalState>>,
     workload_mgr: &Arc<WorkloadManager>,
     pending_keys: &Arc<RwLock<PendingKeyStore>>,
+    node_identity: &Arc<RwLock<NodeIdentity>>,
     secret_injector: &Arc<RwLock<SecretInjector>>,
     dns_resolver: &Arc<DnsResolver>,
     peer_manager: &Arc<RwLock<PeerManager>>,
@@ -324,7 +325,12 @@ pub(super) async fn handle_server_message(
                 service = %response.service_name,
                 "Received SVID certificate"
             );
-            if let Err(e) = install_received_svid(workload_mgr, pending_keys, &response).await {
+            let result = if response.request_type == CertRequestType::NodeCert as i32 {
+                install_node_svid(node_identity, pending_keys, &response).await
+            } else {
+                install_received_svid(workload_mgr, pending_keys, &response).await
+            };
+            if let Err(e) = result {
                 tracing::error!(error = %e, "Failed to install SVID");
             }
         }

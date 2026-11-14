@@ -18,7 +18,7 @@ Enable `services.ekafleet.server` to deploy the control plane. This creates two 
 
   services.ekafleet.server = {
     enable = true;
-    token = "fleet-admin-token";
+    tokenFile = "/run/keys/ekafleet-admin-token"; # e.g. from sops-nix/agenix
     domain = "fleet.internal";
     peers = [ "10.0.0.2:7400" "10.0.0.3:7400" ];
   };
@@ -30,7 +30,7 @@ Enable `services.ekafleet.server` to deploy the control plane. This creates two 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `enable` | bool | `false` | Enable the control plane |
-| `token` | string | *(required)* | Authentication token |
+| `tokenFile` | string | *(required)* | File holding the initial admin bearer token; delivered via `LoadCredential` (may be root-only, never in the Nix store or argv) |
 | `dataDir` | path | `/var/lib/ekafleet-server` | Control-plane state directory (must be under `/var/lib/`) |
 | `sealPassphraseFile` | null or string | `null` | Passphrase file that seals key material at rest, delivered to both units via `LoadCredential` (may be root-only) |
 | `peers` | list of string | `[]` | Peer server addresses for HA |
@@ -63,10 +63,18 @@ Enable `services.ekafleet.agent` to deploy the data plane. This creates two syst
   services.ekafleet.agent = {
     enable = true;
     serverAddr = "10.0.0.1:7400";
-    token = "agent-token";
+    caCert = "/etc/ekafleet/ca.pem";
+    joinTokenFile = "/run/keys/ekafleet-join-token";
   };
 }
 ```
+
+The join token comes from `ekafleet token create --type agent --node <nodeName>`
+(one-time, bound to the name, default TTL 1h, max 7d). On first start the agent
+exchanges it for a 24-hour node SVID stored in `dataDir` and connects with mTLS
+from then on, renewing the SVID over the control stream at half-life. The token
+file may be deleted after the first successful start; a node offline for more
+than 24 hours needs a new token.
 
 ### Agent Options
 
@@ -74,7 +82,8 @@ Enable `services.ekafleet.agent` to deploy the data plane. This creates two syst
 |--------|------|---------|-------------|
 | `enable` | bool | `false` | Enable the data plane |
 | `serverAddr` | string | *(required)* | Server address to join |
-| `token` | string | `""` | Authentication token (legacy) |
+| `nodeName` | string | `networking.hostName` | Fleet node name; the `<name>` in `spiffe://<domain>/agent/<name>` |
+| `joinTokenFile` | null or string | `null` | One-time join token file, used only while the agent has no valid node SVID (requires `caCert`) |
 | `dataDir` | path | `/var/lib/ekafleet` | Data directory for persistent state |
 | `domain` | string | `fleet.internal` | SPIFFE trust domain |
 | `caCert` | path or null | `null` | CA certificate PEM for TLS verification |
@@ -87,11 +96,13 @@ A server that also runs workloads enables both:
 ```nix
 services.ekafleet.server = {
   enable = true;
-  token = "fleet-admin-token";
+  tokenFile = "/run/keys/ekafleet-admin-token";
 };
 services.ekafleet.agent = {
   enable = true;
   serverAddr = "127.0.0.1:7400";
+  caCert = "/var/lib/ekafleet-ca/ca-cert.pem";
+  joinTokenFile = "/run/keys/ekafleet-join-token";
 };
 ```
 
@@ -126,7 +137,7 @@ This creates all five systemd services on the same machine.
         {
           services.ekafleet.server = {
             enable = true;
-            token = "token-from-vault-or-sops";
+            tokenFile = "/run/secrets/ekafleet-admin-token";
           };
         }
       ];
@@ -139,7 +150,8 @@ This creates all five systemd services on the same machine.
           services.ekafleet.agent = {
             enable = true;
             serverAddr = "server-1.fleet.internal:7400";
-            token = "token-from-vault-or-sops";
+            caCert = ./fleet-ca.pem;
+            joinTokenFile = "/run/secrets/ekafleet-join-token";
           };
         }
       ];

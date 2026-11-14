@@ -352,7 +352,13 @@ impl RootCa {
             .map_err(|e| CaError::InvalidCsr(format!("failed to parse CSR: {e}")))?;
 
         let spiffe_uri = subject.spiffe_id(&state.domain);
-        let expires_at = unix_now() + state.default_ttl.as_secs();
+        // Node SVIDs outlive service SVIDs so a node can be offline for a
+        // while (reboot, maintenance) and still reconnect to renew.
+        let ttl = match subject {
+            crate::ca::SvidSubject::Agent(_) => crate::ca::NODE_SVID_TTL,
+            crate::ca::SvidSubject::Service(_) => state.default_ttl,
+        };
+        let expires_at = unix_now() + ttl.as_secs();
 
         // Replace every requested attribute with CA-chosen values; only the
         // CSR's public key survives.
@@ -380,8 +386,8 @@ impl RootCa {
             ExtendedKeyUsagePurpose::ServerAuth,
             ExtendedKeyUsagePurpose::ClientAuth,
         ];
-        params.not_after = time::OffsetDateTime::now_utc()
-            + time::Duration::seconds(state.default_ttl.as_secs() as i64);
+        params.not_after =
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(ttl.as_secs() as i64);
         params.serial_number = Some(generate_serial()?);
         csr_params.params = params;
 
@@ -393,7 +399,7 @@ impl RootCa {
         tracing::info!(
             subject = %subject.spiffe_path(),
             spiffe = %spiffe_uri,
-            ttl = ?state.default_ttl,
+            ttl = ?ttl,
             "Certificate issued from CSR"
         );
 
