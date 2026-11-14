@@ -140,7 +140,7 @@ services.customer-b-app = {
 
 **How it works:**
 
-- **Same node**: Services in the same namespace share a bridge (`10.200.{ns}.0/24`). The server assigns globally unique IPs via Raft so there are no conflicts.
+- **Same node**: Services in the same namespace share a bridge (`10.200.{ns}.0/24`). The server allocates each namespace its own subnet (also its VXLAN VNI) and each replica its own IP, recorded in Raft so there are no conflicts. Addresses are released when a replica goes away; a namespace's subnet is released with its last address. Each namespace holds up to 253 replicas and the fleet up to 254 namespaces.
 - **Cross node**: When a namespace spans multiple nodes, VXLAN tunnels carry traffic through the WireGuard mesh (`10.100.0.0/16`). The server populates tunnel endpoints automatically from agent heartbeats.
 - **DNS**: Namespace-scoped DNS records ensure `web.service.fleet.internal` resolves to the correct IP within each namespace. Fleet-wide records remain visible to all.
 - **Default namespace**: Services without a `namespace` field (or `namespace = "default"`) use host networking, preserving backward compatibility for infrastructure services.
