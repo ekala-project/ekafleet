@@ -387,6 +387,19 @@ pub async fn compute_plan(
     }
 }
 
+/// The port whose health checks a service's probes come from: the first,
+/// by name, that declares any.
+fn probe_port(cfg: &config::ServiceConfig) -> Option<&config::PortConfig> {
+    let mut ports: Vec<_> = cfg.ports.iter().collect();
+    ports.sort_by_key(|(name, _)| name.as_str());
+    ports.into_iter().map(|(_, port)| port).find(|p| {
+        p.health_check.is_some()
+            || p.liveness.is_some()
+            || p.readiness.is_some()
+            || p.startup.is_some()
+    })
+}
+
 /// Convert a fleet `ServiceConfig` to a proto `ServiceSpec` for sending to agents.
 fn service_config_to_spec(name: &str, cfg: &config::ServiceConfig) -> crate::proto::ServiceSpec {
     let health_check_to_proto = |hc: &config::HealthCheckConfig| -> crate::proto::HealthCheckSpec {
@@ -404,8 +417,7 @@ fn service_config_to_spec(name: &str, cfg: &config::ServiceConfig) -> crate::pro
         }
     };
 
-    // Find the first port's health checks for the unified field and separate probes.
-    let first_port = cfg.ports.values().next();
+    let first_port = probe_port(cfg);
 
     let health_check = first_port
         .and_then(|p| p.health_check.as_ref())
@@ -1005,6 +1017,9 @@ async fn apply_plan(
                     disruption_budget: service_cfg.scheduling.disruption_budget.clone(),
                     total_replicas: service_cfg.scheduling.replicas,
                     previous_store_path,
+                    // The agent probes the unified health check only.
+                    health_checked: probe_port(service_cfg)
+                        .is_some_and(|p| p.health_check.is_some()),
                 };
                 let store_path = deploy_plan.store_path.clone();
 

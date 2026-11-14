@@ -430,7 +430,9 @@ impl FleetState {
                     .map(|(name, _)| name.clone())
                     .collect();
 
-                node.services.clear();
+                // Health arrives in separate reports: keep the last known
+                // health of a replica still running the same version.
+                let previous = std::mem::take(&mut node.services);
                 for svc in services {
                     let svc_state =
                         ServiceState::try_from(svc.state).unwrap_or(ServiceState::Unknown);
@@ -439,13 +441,20 @@ impl FleetState {
                     {
                         newly_failed = true;
                     }
+                    let health = previous
+                        .get(&svc.service_name)
+                        .filter(|prev| {
+                            prev.store_path == svc.store_path
+                                && svc_state == ServiceState::ServiceRunning
+                        })
+                        .map_or(HealthStatus::HealthUnknown, |prev| prev.health);
                     node.services.insert(
                         svc.service_name.clone(),
                         AgentServiceInfo {
                             instance_id: svc.instance_id,
                             store_path: svc.store_path,
                             state: svc_state,
-                            health: HealthStatus::HealthUnknown,
+                            health,
                         },
                     );
                 }
@@ -762,6 +771,52 @@ mod tests {
             store_path: "/nix/store/x".into(),
             state: state as i32,
         }
+    }
+
+    #[tokio::test]
+    async fn status_reports_keep_health_until_the_version_changes() {
+        let state = FleetState::new();
+        let (_conn, _rx) = state
+            .register_agent_connection("node-1", "10.0.0.1:1".into(), "default".into())
+            .await;
+        let health = |status: HealthStatus| {
+            vec![ServiceHealth {
+                service_name: "web".into(),
+                status: status as i32,
+                ..Default::default()
+            }]
+        };
+        let web_health = || async {
+            let (_, services, _) = state.fleet_status().await;
+            services
+                .iter()
+                .find(|s| s.name == "web")
+                .map(|s| s.instances[0].health)
+                .unwrap()
+        };
+
+        state
+            .update_status(
+                "node-1",
+                vec![instance("web", ServiceState::ServiceRunning)],
+            )
+            .await;
+        state
+            .update_health("node-1", health(HealthStatus::Healthy))
+            .await;
+        state
+            .update_status(
+                "node-1",
+                vec![instance("web", ServiceState::ServiceRunning)],
+            )
+            .await;
+        assert_eq!(web_health().await, HealthStatus::Healthy as i32);
+
+        // A new version starts out unknown.
+        let mut upgraded = instance("web", ServiceState::ServiceRunning);
+        upgraded.store_path = "/nix/store/y".into();
+        state.update_status("node-1", vec![upgraded]).await;
+        assert_eq!(web_health().await, HealthStatus::HealthUnknown as i32);
     }
 
     #[tokio::test]

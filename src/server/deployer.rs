@@ -34,6 +34,7 @@ pub struct PendingCanary {
     pub total_replicas: u32,
     /// Previous version for rollback on fail.
     pub previous_store_path: Option<String>,
+    pub health_checked: bool,
 }
 
 /// Registry of canary deployments awaiting manual promotion, keyed by service
@@ -103,6 +104,9 @@ pub struct DeploymentPlan {
     /// nodes that received the new version will be rolled back to this path
     /// on deployment failure.
     pub previous_store_path: Option<String>,
+    /// Whether the agent probes this service's health. Without probes a
+    /// running replica passes the health gate.
+    pub health_checked: bool,
 }
 
 /// Execute a deployment plan against the fleet.
@@ -352,6 +356,7 @@ async fn execute_rolling(
             wait_healthy(
                 state,
                 &plan.service_name,
+                plan.health_checked,
                 batch,
                 plan.min_healthy_time,
                 plan.healthy_deadline,
@@ -403,6 +408,7 @@ async fn execute_canary(
     wait_healthy(
         state,
         &plan.service_name,
+        plan.health_checked,
         canary,
         plan.min_healthy_time,
         plan.healthy_deadline,
@@ -442,6 +448,7 @@ async fn execute_canary(
                 disruption_budget: plan.disruption_budget.clone(),
                 total_replicas: plan.total_replicas,
                 previous_store_path: plan.previous_store_path.clone(),
+                health_checked: plan.health_checked,
             })
             .await;
         return Err(DeployError::AwaitingPromotion(deployment_id.to_string()));
@@ -464,6 +471,7 @@ async fn execute_canary(
             disruption_budget: plan.disruption_budget.clone(),
             total_replicas: plan.total_replicas,
             previous_store_path: plan.previous_store_path.clone(),
+            health_checked: plan.health_checked,
         };
         execute_rolling(state, deployment_id, &remaining_plan).await?;
     }
@@ -511,6 +519,7 @@ pub async fn promote_canary(
         disruption_budget: pending.disruption_budget.clone(),
         total_replicas: pending.total_replicas,
         previous_store_path: pending.previous_store_path.clone(),
+        health_checked: pending.health_checked,
     };
 
     let result = execute_rolling(state, &pending.deployment_id, &remaining_plan).await;
@@ -635,6 +644,7 @@ async fn execute_blue_green(
     if let Err(e) = wait_healthy(
         state,
         &plan.service_name,
+        plan.health_checked,
         &plan.placements,
         plan.min_healthy_time,
         plan.healthy_deadline,
@@ -691,6 +701,7 @@ async fn abort_blue_green(
 async fn wait_healthy(
     state: &FleetState,
     service_name: &str,
+    health_checked: bool,
     placements: &[Placement],
     min_healthy_time: Duration,
     deadline: Duration,
@@ -720,7 +731,12 @@ async fn wait_healthy(
         let all_healthy = if let Some(svc) = svc_status {
             nodes.iter().all(|node| {
                 svc.instances.iter().any(|i| {
-                    i.node_id == *node && i.health == crate::proto::HealthStatus::Healthy as i32
+                    i.node_id == *node
+                        && if health_checked {
+                            i.health == crate::proto::HealthStatus::Healthy as i32
+                        } else {
+                            i.state == crate::proto::ServiceState::ServiceRunning as i32
+                        }
                 })
             })
         } else {
@@ -884,6 +900,7 @@ mod tests {
             disruption_budget: None,
             total_replicas: 3,
             previous_store_path: Some("/nix/store/old".to_string()),
+            health_checked: true,
         }
     }
 
@@ -952,7 +969,41 @@ mod tests {
             progress_deadline: None,
             disruption_budget: None,
             previous_store_path: Some("/nix/store/blue".to_string()),
+            health_checked: true,
         }
+    }
+
+    #[tokio::test]
+    async fn running_replicas_pass_the_gate_only_without_probes() {
+        let state = FleetState::new();
+        let (_conn, _rx) = state
+            .register_agent_connection("n1", "10.0.0.1:1".into(), "default".into())
+            .await;
+        state
+            .update_status(
+                "n1",
+                vec![crate::proto::ServiceInstance {
+                    service_name: "web".into(),
+                    instance_id: "web-0".into(),
+                    store_path: "/nix/store/web".into(),
+                    state: crate::proto::ServiceState::ServiceRunning as i32,
+                }],
+            )
+            .await;
+        let placements = [placement("web", "web-0", "n1")];
+        let gate = |health_checked| {
+            wait_healthy(
+                &state,
+                "web",
+                health_checked,
+                &placements,
+                Duration::ZERO,
+                Duration::from_millis(1500),
+            )
+        };
+        // Running and never probed: unknown health only blocks probed services.
+        assert!(gate(false).await.is_ok());
+        assert!(matches!(gate(true).await, Err(DeployError::HealthTimeout)));
     }
 
     #[tokio::test]
