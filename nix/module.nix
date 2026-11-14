@@ -220,6 +220,40 @@ in
           both bounds.
         '';
       };
+
+      mesh = {
+        enable = lib.mkOption {
+          type = lib.types.bool;
+          default = true;
+          description = ''
+            Join the fleet's WireGuard mesh: the server assigns this node an
+            address in 10.100.0.0/16 and distributes signed peer
+            advertisements between nodes.
+          '';
+        };
+
+        advertiseAddr = lib.mkOption {
+          type = lib.types.nullOr lib.types.str;
+          default = null;
+          example = "203.0.113.10";
+          description = ''
+            Address other nodes reach this node's mesh port on. Defaults to
+            the local address the agent uses to reach the server.
+          '';
+        };
+
+        port = lib.mkOption {
+          type = lib.types.port;
+          default = 51820;
+          description = "UDP port of the WireGuard mesh interface.";
+        };
+
+        openFirewall = lib.mkOption {
+          type = lib.types.bool;
+          default = true;
+          description = "Open the mesh port in the firewall.";
+        };
+      };
     };
   };
 
@@ -381,6 +415,10 @@ in
 
     # ── Agent-side: agent (incl. SPIFFE Workload API) + proxy ────────
     (lib.mkIf cfg.agent.enable {
+      networking.firewall.allowedUDPPorts = lib.mkIf (
+        cfg.agent.mesh.enable && cfg.agent.mesh.openFirewall
+      ) [ cfg.agent.mesh.port ];
+
       assertions = [
         {
           assertion = cfg.agent.joinTokenFile == null || cfg.agent.caCert != null;
@@ -393,8 +431,12 @@ in
         wantedBy = [ "multi-user.target" ];
         after = [ "network-online.target" ];
         wants = [ "network-online.target" ];
-        # Fetches and roots service closures.
-        path = [ config.nix.package ];
+        # Fetches and roots service closures; manages the mesh interface.
+        path = [
+          config.nix.package
+          pkgs.iproute2
+          pkgs.wireguard-tools
+        ];
 
         serviceConfig =
           let
@@ -404,13 +446,21 @@ in
             joinTokenArg = lib.optionalString (
               cfg.agent.joinTokenFile != null
             ) "--join-token-file ${lib.escapeShellArg cfg.agent.joinTokenFile}";
+            meshArgs =
+              if cfg.agent.mesh.enable then
+                "--mesh-port ${toString cfg.agent.mesh.port}"
+                + lib.optionalString (
+                  cfg.agent.mesh.advertiseAddr != null
+                ) " --advertise-addr ${lib.escapeShellArg cfg.agent.mesh.advertiseAddr}"
+              else
+                "--no-mesh";
           in
           {
             Type = "simple";
             Restart = "on-failure";
             RestartSec = 5;
 
-            ExecStart = "${cfg.agent.package}/bin/ekafleet agent --join ${cfg.agent.serverAddr} --node-name ${lib.escapeShellArg cfg.agent.nodeName} --data-dir ${cfg.agent.dataDir} ${joinTokenArg} ${caCertArg}";
+            ExecStart = "${cfg.agent.package}/bin/ekafleet agent --join ${cfg.agent.serverAddr} --node-name ${lib.escapeShellArg cfg.agent.nodeName} --data-dir ${cfg.agent.dataDir} ${joinTokenArg} ${caCertArg} ${meshArgs}";
 
             # The agent requires root for systemd unit management,
             # WireGuard, nftables, and systemd-nspawn containers. It also

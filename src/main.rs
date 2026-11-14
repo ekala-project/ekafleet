@@ -166,6 +166,20 @@ enum Command {
         /// Path to CA certificate PEM for TLS verification
         #[arg(long)]
         ca_cert: Option<PathBuf>,
+
+        /// Address other nodes reach this node's WireGuard mesh port on.
+        /// Defaults to the local address used to reach the server.
+        #[arg(long, env = "EKAFLEET_ADVERTISE_ADDR")]
+        advertise_addr: Option<std::net::IpAddr>,
+
+        /// UDP port of the WireGuard mesh interface
+        #[arg(long, env = "EKAFLEET_MESH_PORT", default_value_t = 51820)]
+        mesh_port: u16,
+
+        /// Do not join the WireGuard mesh (it is also skipped when the agent
+        /// is not root or `wg`/`ip` are missing)
+        #[arg(long, env = "EKAFLEET_NO_MESH")]
+        no_mesh: bool,
     },
 
     /// Show desired-vs-actual diff
@@ -894,6 +908,9 @@ async fn main() -> anyhow::Result<()> {
             node_name,
             data_dir,
             ca_cert,
+            advertise_addr,
+            mesh_port,
+            no_mesh,
         } => {
             commands::cmd_agent(commands::AgentArgs {
                 join,
@@ -902,6 +919,11 @@ async fn main() -> anyhow::Result<()> {
                 node_name,
                 data_dir,
                 ca_cert,
+                mesh: ekafleet::mesh::peers::MeshSettings {
+                    enabled: !no_mesh,
+                    advertise_addr,
+                    listen_port: mesh_port,
+                },
             })
             .await?
         }

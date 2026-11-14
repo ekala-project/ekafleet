@@ -251,6 +251,7 @@ pub struct AgentArgs {
     pub node_name: Option<String>,
     pub data_dir: PathBuf,
     pub ca_cert: Option<PathBuf>,
+    pub mesh: ekafleet::mesh::peers::MeshSettings,
 }
 
 pub async fn cmd_agent(args: AgentArgs) -> anyhow::Result<()> {
@@ -272,6 +273,7 @@ pub async fn cmd_agent(args: AgentArgs) -> anyhow::Result<()> {
         node_name,
         data_dir: args.data_dir,
         ca_cert_pem,
+        mesh: args.mesh,
     };
 
     agent::run(config).await?;
