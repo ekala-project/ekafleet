@@ -184,6 +184,87 @@ pub async fn eval_fleet(config_path: &Path) -> Result<FleetConfig, NixError> {
     Ok(config)
 }
 
+/// A fleet configuration evaluated from a flake.
+#[derive(Debug, Clone)]
+pub struct EvaluatedFleet {
+    pub config: FleetConfig,
+    /// The configuration as `nix eval --json` printed it.
+    pub json: String,
+    /// The locked flake reference (with revision or NAR hash) that was
+    /// evaluated, including the attribute.
+    pub locked_ref: String,
+}
+
+/// Split `flake_ref` into the flake and the attribute (default `fleet`).
+fn split_flake_ref(flake_ref: &str) -> (&str, &str) {
+    match flake_ref.split_once('#') {
+        Some((flake, attr)) if !attr.is_empty() => (flake, attr),
+        Some((flake, _)) => (flake, "fleet"),
+        None => (flake_ref, "fleet"),
+    }
+}
+
+async fn run_nix(args: Vec<String>, timeout: Duration, what: &str) -> Result<String, NixError> {
+    let fut = tokio::process::Command::new("nix")
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output();
+    let output = tokio::time::timeout(timeout, fut).await.map_err(|_| {
+        NixError::Timeout(format!("{what} timed out after {}s", timeout.as_secs()))
+    })??;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(NixError::EvalFailed(format!("{what}: {}", stderr.trim())));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Lock `flake_ref`, then evaluate its fleet attribute from the locked
+/// reference, so the recorded reference names exactly what was evaluated
+/// even if a branch moves in between.
+pub async fn eval_flake(flake_ref: &str) -> Result<EvaluatedFleet, NixError> {
+    let (flake, attr) = split_flake_ref(flake_ref);
+    if flake.is_empty() {
+        return Err(NixError::EvalFailed("empty flake reference".into()));
+    }
+    let opts = options();
+    let mut args = vec![
+        "flake".to_string(),
+        "metadata".to_string(),
+        "--json".to_string(),
+        flake.to_string(),
+    ];
+    args.extend(opts.option_args());
+    let metadata = run_nix(args, opts.eval_timeout, "nix flake metadata").await?;
+    let metadata: serde_json::Value =
+        serde_json::from_str(&metadata).map_err(|e| NixError::ParseError(e.to_string()))?;
+    let locked = metadata["url"]
+        .as_str()
+        .ok_or_else(|| NixError::ParseError("nix flake metadata printed no url".into()))?;
+    let locked_ref = format!("{locked}#{attr}");
+
+    let mut args = vec!["eval".to_string(), "--json".to_string(), locked_ref.clone()];
+    args.extend(opts.option_args());
+    let json = run_nix(args, opts.eval_timeout, "nix eval").await?;
+    let json = json.trim().to_string();
+    let config: FleetConfig =
+        serde_json::from_str(&json).map_err(|e| NixError::ParseError(e.to_string()))?;
+    tracing::info!(
+        flake_ref = %locked_ref,
+        fleet = %config.name,
+        services = config.services.len(),
+        machines = config.machines.len(),
+        "Fleet configuration evaluated"
+    );
+    Ok(EvaluatedFleet {
+        config,
+        json,
+        locked_ref,
+    })
+}
+
 /// Build a Nix derivation and return the store path.
 pub async fn build(flake_ref: &str) -> Result<String, NixError> {
     let opts = options();

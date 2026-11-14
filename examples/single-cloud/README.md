@@ -27,9 +27,11 @@ A hybrid fleet with two static controller machines and an autoscaled AWS worker 
 
 ## Try it locally
 
+`<your-fleet-flake>` is a flake that exposes this `fleet.nix` as its `fleet` output (see the quickstart, step 4); the server evaluates it.
+
 ```bash
 ekafleet dev
-ekafleet plan --config examples/single-cloud/fleet.nix --server 127.0.0.1:7400
+ekafleet plan --flake <your-fleet-flake> --server 127.0.0.1:7400
 ```
 
 Cloud autoscaling is a no-op in dev mode, but the configuration validates normally.
@@ -45,5 +47,5 @@ TOKEN=$(ekafleet token create --type=agent)
 ekafleet agent --join ctrl-1:7400 --join-token $TOKEN --ca-cert /path/to/ca.pem
 
 # Apply with --watch to enable continuous reconciliation and cloud autoscaling
-ekafleet apply --config examples/single-cloud/fleet.nix --watch
+ekafleet apply --flake <your-fleet-flake> --watch
 ```

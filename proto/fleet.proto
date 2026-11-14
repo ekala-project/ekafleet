@@ -15,10 +15,12 @@ service FleetControl {
   // Long-lived bidirectional stream for agent ↔ server communication.
   rpc StreamControl(stream AgentMessage) returns (stream ServerMessage);
 
-  // Request a deployment plan (dry-run).
+  // Evaluate a flake and show what applying it would change (dry-run).
   rpc Plan(PlanRequest) returns (PlanResponse);
 
-  // Execute a deployment plan.
+  // Evaluate a flake, record it as the new desired configuration revision,
+  // and stream the result of reconciling it (and, with `follow`, every
+  // later reconcile that changes or fails).
   rpc Apply(ApplyRequest) returns (stream ApplyEvent);
 
   // Query fleet status.
@@ -27,8 +29,11 @@ service FleetControl {
   // Register a one-time join token bound to a node name (ManageTokens).
   rpc CreateJoinToken(CreateJoinTokenRequest) returns (CreateJoinTokenResponse);
 
-  // Rollback a machine (or all machines) to a previous deployment generation.
+  // Re-apply an earlier configuration revision as a new revision.
   rpc Rollback(RollbackRequest) returns (RollbackResponse);
+
+  // List retained configuration revisions (oldest first).
+  rpc ListConfigRevisions(ListConfigRevisionsRequest) returns (ListConfigRevisionsResponse);
 
   // Drain a node — mark unschedulable and reschedule its services elsewhere.
   rpc Drain(DrainRequest) returns (DrainResponse);
@@ -676,7 +681,9 @@ message FleetKeyUpdate {
 // --- Plan / Apply / Status RPCs ---
 
 message PlanRequest {
-  string config_path = 1;
+  // Flake reference evaluated on the server, e.g. `github:org/fleet#fleet`
+  // or `/srv/fleet`. The attribute defaults to `fleet`.
+  string flake_ref = 1;
 }
 
 message PlanResponse {
@@ -699,16 +706,17 @@ enum OperationType {
 }
 
 message ApplyRequest {
-  string config_path = 1;
-  bool auto_approve = 2;
-  // If true, continue watching for changes and run scaling actuator.
-  bool watch = 3;
+  string flake_ref = 1;
+  // Keep streaming later reconciles that change something or fail.
+  bool follow = 2;
 }
 
 message ApplyEvent {
   string operation_id = 1;
   ApplyStatus status = 2;
   string message = 3;
+  // Configuration revision the event belongs to (0 before one is recorded).
+  uint64 revision = 4;
 }
 
 enum ApplyStatus {
@@ -765,14 +773,29 @@ message InstanceStatus {
 // --- Rollback ---
 
 message RollbackRequest {
-  string machine = 1;     // empty = all (when `all` is true)
-  bool all = 2;
-  uint64 to_generation = 3; // 0 = previous generation
+  uint64 to_revision = 1; // 0 = the revision before the current one
 }
 
 message RollbackResponse {
   bool success = 1;
   string message = 2;
+  // The new revision that re-applies the target.
+  uint64 revision = 3;
+}
+
+message ListConfigRevisionsRequest {}
+
+message ListConfigRevisionsResponse {
+  repeated ConfigRevisionInfo revisions = 1;
+}
+
+message ConfigRevisionInfo {
+  uint64 revision = 1;
+  string flake_ref = 2;
+  uint64 applied_at = 3;
+  string applied_by = 4;
+  uint64 rollback_of = 5; // 0 = not a rollback
+  bool current = 6;
 }
 
 // --- Drain ---

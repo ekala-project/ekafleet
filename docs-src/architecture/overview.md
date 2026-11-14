@@ -93,9 +93,9 @@ ekafleet follows a Terraform-inspired reconciliation loop:
 └─────────────┘     └──────────┘     └──────────┘     └──────────┘
 ```
 
-1. **Evaluate** — `nix eval --json .#fleet` produces the desired state as JSON
+1. **Evaluate** — on `ekafleet apply`, the server resolves the flake reference (git flakes to a commit) and runs `nix eval --json <ref>#fleet`. The result is recorded in Raft as a configuration revision
 2. **Refresh** — Query agents for current running services and health
-3. **Plan** — Diff desired vs actual, compute placement and operations
+3. **Plan** — Diff the current revision against actual state, compute placement and operations
 4. **Apply** — Execute operations with health gates and rollback on failure
 
-In continuous mode (`ekafleet apply --watch`), this loop runs every 30 seconds.
+Steps 2–4 run in a single server-owned controller loop every 30 seconds and whenever a fleet event (node join/leave, eviction, service failure) or a new revision triggers it. The loop reconciles the revision stored in Raft, so it carries on after a server restart with no client connected. `ekafleet rollback` records an earlier revision's configuration as a new revision.

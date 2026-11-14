@@ -22,6 +22,7 @@ Start with `ekafleet server`. The server runs the control plane and can optional
 The server maintains a persistent state machine backed by an encrypted write-ahead log and snapshots (AES-256-GCM). Every change is appended to the log (atomically, mode 0600) before it is applied, so an acknowledged write survives a crash. On startup the server loads the latest snapshot and replays the log entries after it. If any file cannot be read (wrong key, corruption), the server **refuses to start** rather than continuing with empty state; restore the data directory from backup or move `raft/` aside explicitly. Multi-node consensus (`--peers`) is parsed but not yet wired; today a single server is authoritative.
 
 The state machine stores:
+- Configuration revisions: the last 10 applied fleet configurations (locked flake reference, evaluated JSON, who applied it and when). The last one is what the controller reconciles toward
 - Deployments: per service, the current store path, placements, a generation number (bumped when the store path changes) and the last 10 revisions. The reconciler records a deployment after a successful rollout and removes it when the service leaves the config
 - Runtime replica overrides (`ekafleet scale`)
 - The REST KV store (under an internal `user/` prefix)

@@ -4,6 +4,7 @@ mod api_system;
 pub mod audit;
 pub mod bootstrap;
 pub mod cloud;
+pub mod controller;
 pub mod deployer;
 pub mod events;
 pub mod federation;

@@ -102,7 +102,7 @@ ekafleet proxy [OPTIONS]
 
 ### `ekafleet plan`
 
-Show desired-vs-actual diff without making changes. Connects to the server and displays planned operations.
+Evaluate a flake on the server and show what applying it would change, without changing anything.
 
 ```
 ekafleet plan [OPTIONS]
@@ -110,12 +110,12 @@ ekafleet plan [OPTIONS]
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--config` | `fleet.nix` | Path to fleet configuration |
+| `--flake` (alias `--config`) | `.` | Flake reference; the attribute defaults to `fleet`. Local paths are made absolute |
 | `--server` | `127.0.0.1:7400` | Server address |
 
 ### `ekafleet apply`
 
-Execute a deployment plan. Streams operation progress in real-time. In watch mode, runs continuous reconciliation and starts the cloud scaling actuator for pools with cloud provider configuration.
+Show the plan, ask for confirmation, then have the server lock and evaluate the flake and record the result as a new configuration revision in Raft. The server reconciles toward the current revision on its own: every 30 seconds, on fleet events (node join/leave, eviction, service failure) and after restarts, including running the cloud scaling actuator for pools with a cloud provider. The command returns after the first reconcile of the new revision and exits non-zero if it failed.
 
 ```
 ekafleet apply [OPTIONS]
@@ -123,24 +123,29 @@ ekafleet apply [OPTIONS]
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--config` | `fleet.nix` | Path to fleet configuration |
-| `--auto-approve` | `false` | Skip confirmation prompt |
-| `--watch` | `false` | Continuous reconciliation + cloud autoscaling |
+| `--flake` (alias `--config`) | `.` | Flake reference evaluated by the server |
+| `--auto-approve` | `false` | Skip the plan and confirmation prompt (required when stdin is not a terminal) |
+| `--follow` (alias `--watch`) | `false` | Keep streaming later reconciles that change something or fail |
 | `--server` | `127.0.0.1:7400` | Server address |
+
+### `ekafleet history`
+
+List the retained configuration revisions (the last 10), newest first: revision, age, who applied it, the locked flake reference, and which revision a rollback re-applied. `*` marks the current revision. Supports `--output json`.
 
 ### `ekafleet rollback`
 
-Revert to a previous generation.
+Re-apply an earlier configuration revision (its whole evaluated configuration) as a new revision, then wait for its first reconcile.
 
 ```
-ekafleet rollback [MACHINE] [OPTIONS]
+ekafleet rollback [OPTIONS]
 ```
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--all` | `false` | Rollback all machines |
-| `--to` | | Target generation number |
+| `--to` | previous revision | Revision to re-apply (see `ekafleet history`) |
 | `--server` | `127.0.0.1:7400` | Server address |
+
+To roll back a machine's operating system, use `ekafleet generation switch`.
 
 ## Operations
 
