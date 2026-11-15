@@ -8,15 +8,121 @@
 use std::collections::HashMap;
 
 use serde::Deserialize;
+use zeroize::Zeroizing;
 
 /// Credentials for authenticating with an OCI registry.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub enum Credentials {
     /// No authentication (anonymous access).
     #[default]
     Anonymous,
     /// HTTP Basic authentication (username + password/token).
-    Basic { username: String, password: String },
+    Basic {
+        username: String,
+        password: Zeroizing<String>,
+    },
+    /// An OAuth2 refresh token (`identitytoken` in a Docker config),
+    /// exchanged at the registry's token endpoint.
+    IdentityToken(Zeroizing<String>),
+}
+
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Anonymous => f.write_str("Anonymous"),
+            Self::Basic { username, .. } => write!(f, "Basic({username})"),
+            Self::IdentityToken(_) => f.write_str("IdentityToken"),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AuthError {
+    #[error("registry credentials are not a valid Docker config.json: {0}")]
+    InvalidConfig(String),
+}
+
+/// Pick the credentials for `registry` from a Docker `config.json` (as
+/// written by `docker login`): `auths` keyed by registry host, each with
+/// `auth` (base64 `user:password`), `username`/`password`, or
+/// `identitytoken`. Registries without an entry are accessed anonymously.
+pub fn docker_config_credentials(json: &[u8], registry: &str) -> Result<Credentials, AuthError> {
+    use base64::Engine;
+
+    #[derive(Deserialize)]
+    struct Config {
+        #[serde(default)]
+        auths: HashMap<String, Entry>,
+    }
+    #[derive(Deserialize, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
+    struct Entry {
+        #[serde(default)]
+        auth: Option<String>,
+        #[serde(default)]
+        username: Option<String>,
+        #[serde(default)]
+        password: Option<String>,
+        #[serde(default)]
+        identitytoken: Option<String>,
+    }
+
+    let config: Config =
+        serde_json::from_slice(json).map_err(|e| AuthError::InvalidConfig(e.to_string()))?;
+    // Docker Hub's entry is keyed by its legacy index URL.
+    let hub = matches!(
+        registry,
+        "docker.io" | "index.docker.io" | "registry-1.docker.io"
+    );
+    let entry = config.auths.iter().find_map(|(key, entry)| {
+        let host = key
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .split('/')
+            .next()
+            .unwrap_or_default();
+        let matches = host == registry
+            || (hub
+                && matches!(
+                    host,
+                    "docker.io" | "index.docker.io" | "registry-1.docker.io"
+                ));
+        matches.then_some(entry)
+    });
+    let Some(entry) = entry else {
+        return Ok(Credentials::Anonymous);
+    };
+    if let Some(token) = &entry.identitytoken
+        && !token.is_empty()
+    {
+        return Ok(Credentials::IdentityToken(Zeroizing::new(token.clone())));
+    }
+    if let Some(auth) = &entry.auth
+        && !auth.is_empty()
+    {
+        let decoded = Zeroizing::new(
+            base64::engine::general_purpose::STANDARD
+                .decode(auth.trim())
+                .map_err(|e| AuthError::InvalidConfig(format!("auth for {registry}: {e}")))?,
+        );
+        let decoded = std::str::from_utf8(&decoded)
+            .map_err(|_| AuthError::InvalidConfig(format!("auth for {registry} is not UTF-8")))?;
+        let (username, password) = decoded.split_once(':').ok_or_else(|| {
+            AuthError::InvalidConfig(format!("auth for {registry} is not user:password"))
+        })?;
+        return Ok(Credentials::Basic {
+            username: username.to_string(),
+            password: Zeroizing::new(password.to_string()),
+        });
+    }
+    match (&entry.username, &entry.password) {
+        (Some(username), Some(password)) => Ok(Credentials::Basic {
+            username: username.clone(),
+            password: Zeroizing::new(password.clone()),
+        }),
+        _ => Err(AuthError::InvalidConfig(format!(
+            "entry for {registry} has no auth, username/password or identitytoken"
+        ))),
+    }
 }
 
 /// Parsed `Www-Authenticate: Bearer` challenge from a 401 response.
@@ -170,6 +276,42 @@ mod tests {
         let params = parse_params(r#"realm="https://example.com",service="svc""#);
         assert_eq!(params.get("realm").unwrap(), "https://example.com");
         assert_eq!(params.get("service").unwrap(), "svc");
+    }
+
+    #[test]
+    fn docker_config_entries_are_matched_by_host() {
+        let json = br#"{"auths": {
+            "https://index.docker.io/v1/": {"auth": "aHViOnNlY3JldA=="},
+            "registry.internal:5000": {"username": "u", "password": "p"},
+            "acr.example.com": {"identitytoken": "refresh"}
+        }}"#;
+        let basic = |c: Credentials| match c {
+            Credentials::Basic { username, password } => (username, password.to_string()),
+            other => panic!("expected basic credentials, got {other:?}"),
+        };
+        assert_eq!(
+            basic(docker_config_credentials(json, "docker.io").unwrap()),
+            ("hub".into(), "secret".into())
+        );
+        assert_eq!(
+            basic(docker_config_credentials(json, "registry.internal:5000").unwrap()),
+            ("u".into(), "p".into())
+        );
+        assert!(matches!(
+            docker_config_credentials(json, "acr.example.com").unwrap(),
+            Credentials::IdentityToken(t) if t.as_str() == "refresh"
+        ));
+        assert!(matches!(
+            docker_config_credentials(json, "ghcr.io").unwrap(),
+            Credentials::Anonymous
+        ));
+        assert!(docker_config_credentials(b"user:pass", "ghcr.io").is_err());
+        // Debug output never shows the secret.
+        let shown = format!(
+            "{:?}",
+            docker_config_credentials(json, "docker.io").unwrap()
+        );
+        assert!(!shown.contains("secret"), "{shown}");
     }
 
     #[test]

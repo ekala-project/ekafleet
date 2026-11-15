@@ -489,6 +489,9 @@ message DesiredState {
   // Public key (`name:base64`) that signs the server's binary cache, used
   // to verify fetched closures.
   string cache_public_key = 5;
+  // The fleet's image signature policy (SignaturePolicyConfig as JSON),
+  // checked again by the agent before pulling an image. Empty for none.
+  string signature_policy_json = 6;
 }
 
 // Network configuration for a namespace on this agent.
@@ -576,6 +579,33 @@ message ServiceSpec {
   // files read-only at /run/secrets/<name> and starts the service only once
   // every one has arrived.
   repeated string secrets = 19;
+
+  // How to run container_image (unset for native services).
+  ContainerOptions container = 20;
+}
+
+// A list that can be absent, unlike a repeated field.
+message StringList {
+  repeated string items = 1;
+}
+
+message ContainerOptions {
+  // Replaces the image ENTRYPOINT (and drops its CMD unless args is set).
+  StringList entrypoint = 1;
+  // Replaces the image CMD.
+  StringList args = 2;
+  // Replaces the image working directory when non-empty.
+  string working_dir = 3;
+  repeated ContainerBindMount bind_mounts = 4;
+  // A static secret of the service holding a Docker config.json with the
+  // credentials for the image's registry.
+  string registry_auth_secret = 5;
+}
+
+message ContainerBindMount {
+  string host_path = 1;
+  string container_path = 2;
+  bool read_only = 3;
 }
 
 message TemplateSpec {

@@ -5,8 +5,8 @@
 //! the conventional cosign tag `<repo>:sha256-<hex>.sig` and verified
 //! against a configured public key.
 //!
-//! Only static key verification (ECDSA P-256, Ed25519) is supported.
-//! Keyless (Fulcio/Rekor) verification is out of scope.
+//! Static keys (ECDSA P-256, Ed25519) and sigstore keyless signatures
+//! (a Fulcio certificate, logged in Rekor) are supported.
 
 use ring::signature;
 use serde::Deserialize;
@@ -90,10 +90,11 @@ pub struct KeylessPolicy {
     /// Accepted signer identities. A signing certificate must match at least
     /// one of these (SAN identity + OIDC issuer).
     pub identities: Vec<KeylessIdentity>,
-    /// Rekor transparency-log public key (DER SPKI, ECDSA P-256). When present,
-    /// the signature bundle's Rekor Signed Entry Timestamp is verified against
-    /// this key. When absent, transparency-log verification is skipped.
-    pub rekor_public_key: Option<Vec<u8>>,
+    /// Rekor transparency-log public key (the raw ECDSA P-256 point). The
+    /// signature's Rekor bundle must carry a Signed Entry Timestamp by this
+    /// key: Fulcio certificates live for minutes, so the time Rekor logged
+    /// the signature is what proves the certificate was valid when used.
+    pub rekor_public_key: Vec<u8>,
 }
 
 /// An accepted keyless signer identity. Both fields must match the values
@@ -133,7 +134,7 @@ pub enum SignatureError {
     CertificateParse(String),
     #[error("signing certificate does not chain to a trusted Fulcio root")]
     UntrustedCertificate,
-    #[error("signing certificate is not valid at the current time")]
+    #[error("signing certificate was not valid when the signature was logged")]
     CertificateExpired,
     #[error("signer identity {subject:?} (issuer {issuer:?}) does not match any allowed identity")]
     IdentityMismatch { subject: String, issuer: String },
@@ -224,13 +225,14 @@ fn verify_static_key(
 ///
 /// For each candidate signature that carries a Fulcio certificate, this:
 ///   1. Confirms the payload references the expected manifest digest.
-///   2. Parses the signing certificate and checks its validity window.
-///   3. Confirms the certificate chains to a trusted Fulcio root.
-///   4. Extracts the signer's SAN identity and OIDC issuer and requires them
+///   2. Confirms the certificate chains to a trusted Fulcio root.
+///   3. Extracts the signer's SAN identity and OIDC issuer and requires them
 ///      to match an allowed identity in the policy.
-///   5. Verifies the cosign signature over the payload using the certificate's
+///   4. Verifies the cosign signature over the payload using the certificate's
 ///      public key.
-///   6. Optionally verifies the Rekor Signed Entry Timestamp.
+///   5. Verifies the Rekor Signed Entry Timestamp, that the logged entry is
+///      this signature over this payload, and that the certificate was valid
+///      at the logged time.
 fn verify_keyless(
     policy: &KeylessPolicy,
     signatures: &[CosignSignature],
@@ -290,18 +292,13 @@ fn verify_keyless_signature(
         .parse_x509()
         .map_err(|e| SignatureError::CertificateParse(format!("X.509 parse: {e}")))?;
 
-    // 1. Validity window.
-    if !leaf.validity().is_valid() {
-        return Err(SignatureError::CertificateExpired);
-    }
-
-    // 2. Chain to a trusted Fulcio root: the leaf's signature must verify under
+    // 1. Chain to a trusted Fulcio root: the leaf's signature must verify under
     //    at least one configured root's public key.
     if !leaf_chains_to_root(&leaf, &policy.fulcio_roots) {
         return Err(SignatureError::UntrustedCertificate);
     }
 
-    // 3. Signer identity: SAN + OIDC issuer must match an allowed identity.
+    // 2. Signer identity: SAN + OIDC issuer must match an allowed identity.
     let subjects = extract_san_identities(&leaf);
     let issuer = extract_oidc_issuer(&leaf);
     let identity_ok = policy.identities.iter().any(|allowed| {
@@ -315,23 +312,26 @@ fn verify_keyless_signature(
         });
     }
 
-    // 4. Verify the signature over the payload using the certificate's key.
+    // 3. Verify the signature over the payload using the certificate's key.
     //    ring's ASN.1 ECDSA verifier expects the raw uncompressed public-key
     //    point (0x04 || X || Y), which is the SPKI subjectPublicKey bit string.
     let raw_point = leaf.public_key().subject_public_key.data.to_vec();
     let key = SigningKey::EcdsaP256(raw_point);
     verify_signature(&key, &sig.payload, &sig.signature)?;
 
-    // 5. Optional Rekor transparency-log verification.
-    if let Some(rekor_key) = &policy.rekor_public_key {
-        verify_rekor_bundle(
-            rekor_key,
-            sig.bundle_json.as_deref(),
-            &sig.payload,
-            &sig.signature,
-            manifest_digest,
-        )?;
+    // 4. Rekor: the entry is logged, and the certificate (valid for minutes)
+    //    was valid at the time it was.
+    let logged_at = verify_rekor_bundle(
+        &policy.rekor_public_key,
+        sig.bundle_json.as_deref(),
+        &sig.payload,
+        &sig.signature,
+    )?;
+    let validity = leaf.validity();
+    if logged_at < validity.not_before.timestamp() || logged_at > validity.not_after.timestamp() {
+        return Err(SignatureError::CertificateExpired);
     }
+    tracing::debug!(digest = %manifest_digest, logged_at, "Rekor entry verified");
 
     Ok(())
 }
@@ -409,18 +409,20 @@ fn decode_der_utf8_string(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).to_string()
 }
 
-/// Verify the Rekor Signed Entry Timestamp (SET) from a cosign bundle.
+/// Verify the Rekor Signed Entry Timestamp (SET) from a cosign bundle and
+/// return the time the entry was logged.
 ///
 /// The bundle's `SignedEntryTimestamp` is an ECDSA signature (by Rekor) over
 /// the canonicalized `Payload` object. We reconstruct the canonical form and
-/// verify it against the configured Rekor public key.
+/// verify it against the configured Rekor public key, then require the logged
+/// entry to be a `hashedrekord` of exactly this signature over this payload,
+/// so a timestamp for some other entry cannot be replayed.
 fn verify_rekor_bundle(
-    rekor_key_der: &[u8],
+    rekor_key: &[u8],
     bundle_json: Option<&str>,
-    _payload: &[u8],
-    _signature: &[u8],
-    _manifest_digest: &Digest,
-) -> Result<(), SignatureError> {
+    payload: &[u8],
+    signature: &[u8],
+) -> Result<i64, SignatureError> {
     let bundle_json = bundle_json.ok_or_else(|| {
         SignatureError::RekorVerification(
             "keyless policy requires Rekor bundle but none present".into(),
@@ -439,11 +441,84 @@ fn verify_rekor_bundle(
     let canonical = canonical_json(&bundle.payload)
         .map_err(|e| SignatureError::RekorVerification(format!("canonicalize: {e}")))?;
 
-    let key = SigningKey::EcdsaP256(rekor_key_der.to_vec());
+    let key = SigningKey::EcdsaP256(rekor_key.to_vec());
     verify_signature(&key, &canonical, &set)
         .map_err(|_| SignatureError::RekorVerification("SET signature invalid".into()))?;
 
-    Ok(())
+    let entry: RekorEntryPayload = serde_json::from_value(bundle.payload)
+        .map_err(|e| SignatureError::RekorVerification(format!("bundle payload: {e}")))?;
+    let body = base64_decode(&entry.body)
+        .map_err(|e| SignatureError::RekorVerification(format!("entry body base64: {e}")))?;
+    let body: HashedRekord = serde_json::from_slice(&body)
+        .map_err(|e| SignatureError::RekorVerification(format!("entry body: {e}")))?;
+    if body.kind != "hashedrekord" {
+        return Err(SignatureError::RekorVerification(format!(
+            "unsupported entry kind {:?}",
+            body.kind
+        )));
+    }
+    let hash = &body.spec.data.hash;
+    let payload_hash = hex_lower(ring::digest::digest(&ring::digest::SHA256, payload).as_ref());
+    if hash.algorithm != "sha256" || !hash.value.eq_ignore_ascii_case(&payload_hash) {
+        return Err(SignatureError::RekorVerification(
+            "logged entry is for a different payload".into(),
+        ));
+    }
+    let logged_signature = base64_decode(&body.spec.signature.content)
+        .map_err(|e| SignatureError::RekorVerification(format!("entry signature: {e}")))?;
+    if logged_signature != signature {
+        return Err(SignatureError::RekorVerification(
+            "logged entry is for a different signature".into(),
+        ));
+    }
+    Ok(entry.integrated_time)
+}
+
+/// The fields of a Rekor bundle payload used for verification.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RekorEntryPayload {
+    /// Base64 of the canonical entry body.
+    body: String,
+    /// Unix time the entry was logged.
+    integrated_time: i64,
+}
+
+/// A Rekor `hashedrekord` entry body.
+#[derive(Debug, Deserialize)]
+struct HashedRekord {
+    kind: String,
+    spec: HashedRekordSpec,
+}
+
+#[derive(Debug, Deserialize)]
+struct HashedRekordSpec {
+    data: HashedRekordData,
+    signature: HashedRekordSignature,
+}
+
+#[derive(Debug, Deserialize)]
+struct HashedRekordData {
+    hash: HashedRekordHash,
+}
+
+#[derive(Debug, Deserialize)]
+struct HashedRekordHash {
+    algorithm: String,
+    value: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct HashedRekordSignature {
+    content: String,
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    bytes.iter().fold(String::new(), |mut out, b| {
+        let _ = write!(out, "{b:02x}");
+        out
+    })
 }
 
 /// A cosign Rekor bundle as embedded in the `dev.sigstore.cosign/bundle`
@@ -534,11 +609,18 @@ async fn fetch_cosign_signatures(
     extract_signatures(client, image, &manifest).await
 }
 
+/// Most signatures read from one signature manifest.
+const MAX_SIGNATURES: usize = 16;
+
+/// Largest signature payload fetched (simplesigning payloads are tiny).
+const MAX_SIGNATURE_PAYLOAD: u64 = 1 << 20;
+
 /// Extract signature payloads and signatures from a cosign signature manifest.
 ///
-/// In cosign's format, each layer contains the signature bytes and the
-/// corresponding payload is stored as a base64-encoded annotation on
-/// the layer descriptor.
+/// Each layer of a cosign signature manifest is a simplesigning payload (the
+/// signed message); its descriptor carries the base64 signature in the
+/// `dev.cosignproject.cosign/signature` annotation and, for keyless
+/// signatures, the Fulcio certificate and Rekor bundle.
 async fn extract_signatures(
     client: &RegistryClient,
     image: &ImageReference,
@@ -546,70 +628,38 @@ async fn extract_signatures(
 ) -> Result<Vec<CosignSignature>, SignatureError> {
     let mut signatures = Vec::new();
 
-    for layer in &manifest.layers {
-        // Fetch the signature blob (DER-encoded signature)
-        let sig_blob = match client.fetch_blob(image, &layer.digest).await {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(digest = %layer.digest, err = %e, "Failed to fetch signature blob");
-                continue;
-            }
+    for layer in manifest.layers.iter().take(MAX_SIGNATURES) {
+        let Some(annotations) = &layer.annotations else {
+            continue;
         };
-
-        // The payload is stored as a base64-encoded annotation
-        // on the layer descriptor under the key
-        // "dev.cosignproject.cosign/signature"
-        // But in the simplesigning format, the config blob IS the payload.
-        // We need to fetch the config blob to get the payload.
-        let config_blob = match client.fetch_blob(image, &manifest.config.digest).await {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(
-                    digest = %manifest.config.digest,
-                    err = %e,
-                    "Failed to fetch signature config"
-                );
-                continue;
-            }
+        let Some(encoded) = annotations.get("dev.cosignproject.cosign/signature") else {
+            continue;
         };
-
-        // In cosign simplesigning, the config blob contains an empty JSON
-        // config, and the actual signed payload is base64-encoded in the
-        // layer annotations. Parse from the layer annotations if available.
-        // The layer data itself is the raw signature bytes.
-        //
-        // For static-key cosign, the convention is:
-        // - Layer data = base64(signature)
-        // - Annotations["dev.cosignproject.cosign/signature"] on the layer
-        //   descriptor is also the base64 signature
-        // - The payload (signed message) is in the config blob or annotations
-
-        // Try annotations-based payload first
-        // In practice, cosign stores the payload in the config blob's "data"
-        // or the layer itself depending on the version.
-        // The most reliable approach: the config blob IS the payload for
-        // simplesigning format.
-        let payload = config_blob.data;
-        let sig_bytes = sig_blob.data;
-
-        // For keyless signatures, cosign attaches the Fulcio certificate and
-        // Rekor bundle as layer-descriptor annotations.
-        let (certificate_pem, bundle_json) = match &layer.annotations {
-            Some(ann) => (
-                ann.get("dev.sigstore.cosign/certificate").cloned(),
-                ann.get("dev.sigstore.cosign/bundle").cloned(),
-            ),
-            None => (None, None),
-        };
-
-        if !payload.is_empty() && !sig_bytes.is_empty() {
-            signatures.push(CosignSignature {
-                payload,
-                signature: sig_bytes,
-                certificate_pem,
-                bundle_json,
-            });
+        if layer.size > MAX_SIGNATURE_PAYLOAD {
+            tracing::warn!(digest = %layer.digest, size = layer.size, "Skipping oversized signature payload");
+            continue;
         }
+        let signature = match base64_decode(encoded) {
+            Ok(sig) if !sig.is_empty() => sig,
+            _ => {
+                tracing::warn!(digest = %layer.digest, "Skipping malformed signature annotation");
+                continue;
+            }
+        };
+        // fetch_blob verifies the payload against its descriptor digest.
+        let payload = match client.fetch_blob(image, &layer.digest).await {
+            Ok(b) => b.data,
+            Err(e) => {
+                tracing::warn!(digest = %layer.digest, err = %e, "Failed to fetch signature payload");
+                continue;
+            }
+        };
+        signatures.push(CosignSignature {
+            payload,
+            signature,
+            certificate_pem: annotations.get("dev.sigstore.cosign/certificate").cloned(),
+            bundle_json: annotations.get("dev.sigstore.cosign/bundle").cloned(),
+        });
     }
 
     Ok(signatures)
@@ -643,42 +693,49 @@ fn verify_signature(
 
 /// Parse a PEM-encoded public key into a SigningKey.
 ///
-/// Supports ECDSA P-256 and Ed25519 keys in SubjectPublicKeyInfo (SPKI) format.
+/// Supports ECDSA P-256 and Ed25519 keys in SubjectPublicKeyInfo (SPKI)
+/// format (`-----BEGIN PUBLIC KEY-----`, as written by `cosign generate-key-pair`).
+/// The key is reduced to the raw public key ring verifies with.
 pub fn parse_public_key_pem(pem_data: &str) -> Result<SigningKey, SignatureError> {
-    let pem_data = pem_data.trim();
+    use x509_parser::prelude::FromDer;
 
-    // Strip PEM headers
-    let base64_content = pem_data
-        .lines()
-        .filter(|line| !line.starts_with("-----"))
-        .collect::<String>();
-
-    let der = base64_decode(&base64_content)
-        .map_err(|e| SignatureError::InvalidKey(format!("base64 decode error: {e}")))?;
-
-    // Parse the SPKI structure to determine the algorithm
-    // ECDSA P-256 OID: 1.2.840.10045.3.1.7
-    // Ed25519 OID: 1.3.101.112
-    let ecdsa_p256_oid: &[u8] = &[0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
-    let ed25519_oid: &[u8] = &[0x06, 0x03, 0x2b, 0x65, 0x70];
-
-    if contains_subsequence(&der, ecdsa_p256_oid) {
-        // For ring, pass the entire SPKI DER for ECDSA
-        Ok(SigningKey::EcdsaP256(der))
-    } else if contains_subsequence(&der, ed25519_oid) {
-        // For ring Ed25519, pass the entire SPKI DER
-        Ok(SigningKey::Ed25519(der))
-    } else {
-        Err(SignatureError::InvalidKey(
-            "unsupported key algorithm (expected ECDSA P-256 or Ed25519)".into(),
-        ))
+    let (_, pem) = x509_parser::pem::parse_x509_pem(pem_data.trim().as_bytes())
+        .map_err(|e| SignatureError::InvalidKey(format!("PEM parse: {e}")))?;
+    if pem.label != "PUBLIC KEY" {
+        return Err(SignatureError::InvalidKey(format!(
+            "expected a PUBLIC KEY PEM block, found {:?}",
+            pem.label
+        )));
     }
-}
-
-fn contains_subsequence(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack
-        .windows(needle.len())
-        .any(|window| window == needle)
+    let (rest, spki) = x509_parser::x509::SubjectPublicKeyInfo::from_der(&pem.contents)
+        .map_err(|e| SignatureError::InvalidKey(format!("SPKI parse: {e}")))?;
+    if !rest.is_empty() {
+        return Err(SignatureError::InvalidKey(
+            "trailing data after SPKI".into(),
+        ));
+    }
+    let key = spki.subject_public_key.data.to_vec();
+    match spki.algorithm.algorithm.to_id_string().as_str() {
+        // id-ecPublicKey, on prime256v1 only.
+        "1.2.840.10045.2.1" => {
+            let curve = spki
+                .algorithm
+                .parameters
+                .as_ref()
+                .and_then(|p| p.as_oid().ok())
+                .map(|oid| oid.to_id_string());
+            if curve.as_deref() != Some("1.2.840.10045.3.1.7") {
+                return Err(SignatureError::InvalidKey(
+                    "unsupported EC curve (expected P-256)".into(),
+                ));
+            }
+            Ok(SigningKey::EcdsaP256(key))
+        }
+        "1.3.101.112" => Ok(SigningKey::Ed25519(key)),
+        _ => Err(SignatureError::InvalidKey(
+            "unsupported key algorithm (expected ECDSA P-256 or Ed25519)".into(),
+        )),
+    }
 }
 
 /// Minimal base64 decoder.
@@ -980,34 +1037,145 @@ mod tests {
     }
 
     #[test]
-    fn contains_subsequence_found() {
-        assert!(contains_subsequence(b"hello world", b"world"));
-        assert!(contains_subsequence(b"hello world", b"hello"));
-        assert!(contains_subsequence(b"abc", b"abc"));
+    fn public_keys_parse_to_raw_keys() {
+        let ec = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        match parse_public_key_pem(&ec.public_key_pem()).unwrap() {
+            SigningKey::EcdsaP256(raw) => assert_eq!(raw, ec.public_key_raw()),
+            other => panic!("unexpected key {other:?}"),
+        }
+        let ed = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        match parse_public_key_pem(&ed.public_key_pem()).unwrap() {
+            SigningKey::Ed25519(raw) => assert_eq!(raw, ed.public_key_raw()),
+            other => panic!("unexpected key {other:?}"),
+        }
+        // P-384 and private keys are refused.
+        let p384 = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
+        assert!(parse_public_key_pem(&p384.public_key_pem()).is_err());
+        assert!(parse_public_key_pem(&ec.serialize_pem()).is_err());
     }
 
     #[test]
-    fn contains_subsequence_not_found() {
-        assert!(!contains_subsequence(b"hello", b"world"));
-        assert!(!contains_subsequence(b"ab", b"abc"));
-        assert!(!contains_subsequence(b"", b"a"));
+    fn static_key_signatures_verify_against_a_pem_key() {
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let digest = Digest::from_bytes(b"image");
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "critical": {
+                "identity": {"docker-reference": "registry/app"},
+                "image": {"docker-manifest-digest": digest.to_string()},
+                "type": "cosign container image signature"
+            },
+            "optional": null
+        }))
+        .unwrap();
+        let rng = ring::rand::SystemRandom::new();
+        let signer = ring::signature::EcdsaKeyPair::from_pkcs8(
+            &signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+            &key.serialize_der(),
+            &rng,
+        )
+        .unwrap();
+        let sig = CosignSignature {
+            payload: payload.clone(),
+            signature: signer.sign(&rng, &payload).unwrap().as_ref().to_vec(),
+            certificate_pem: None,
+            bundle_json: None,
+        };
+        let parsed = parse_public_key_pem(&key.public_key_pem()).unwrap();
+        verify_static_key(&parsed, std::slice::from_ref(&sig), &digest).unwrap();
+        // The same signature does not vouch for another digest.
+        assert!(verify_static_key(&parsed, &[sig], &Digest::from_bytes(b"other")).is_err());
     }
 
     // -- Keyless (Fulcio/Rekor) verification tests ---------------------------
 
+    /// When the fixture's leaf certificate is valid: a ten-minute window,
+    /// long past, like a real Fulcio certificate.
+    const LEAF_NOT_BEFORE: i64 = 1_600_000_000;
+    const LEAF_NOT_AFTER: i64 = LEAF_NOT_BEFORE + 600;
+
     /// A Fulcio-style keyless test fixture: a self-signed root CA, a leaf
     /// certificate issued by that root carrying a SAN identity and OIDC issuer
-    /// extension, and a cosign signature over a payload produced with the
-    /// leaf's private key.
+    /// extension, a cosign signature over a payload produced with the leaf's
+    /// private key, and a Rekor bundle logging it at `logged_at`.
     struct KeylessFixture {
         root_der: Vec<u8>,
+        rekor_key: Vec<u8>,
         signature: CosignSignature,
         manifest_digest: Digest,
         subject: String,
         issuer: String,
     }
 
-    fn build_keyless_fixture(subject: &str, issuer: &str) -> KeylessFixture {
+    impl KeylessFixture {
+        fn policy(&self) -> KeylessPolicy {
+            KeylessPolicy {
+                fulcio_roots: vec![self.root_der.clone()],
+                identities: vec![KeylessIdentity {
+                    subject: self.subject.clone(),
+                    issuer: self.issuer.clone(),
+                }],
+                rekor_public_key: self.rekor_key.clone(),
+            }
+        }
+
+        fn verify(&self, policy: &KeylessPolicy) -> Result<(), SignatureError> {
+            verify_keyless(
+                policy,
+                std::slice::from_ref(&self.signature),
+                &self.manifest_digest,
+            )
+        }
+    }
+
+    fn ecdsa_signer(pkcs8: &[u8]) -> ring::signature::EcdsaKeyPair {
+        ring::signature::EcdsaKeyPair::from_pkcs8(
+            &signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+            pkcs8,
+            &ring::rand::SystemRandom::new(),
+        )
+        .unwrap()
+    }
+
+    /// A Rekor bundle logging a hashedrekord of `signature` over `payload`.
+    fn rekor_bundle(
+        rekor: &ring::signature::EcdsaKeyPair,
+        payload: &[u8],
+        signature: &[u8],
+        logged_at: i64,
+    ) -> String {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let body = serde_json::json!({
+            "apiVersion": "0.0.1",
+            "kind": "hashedrekord",
+            "spec": {
+                "data": {"hash": {
+                    "algorithm": "sha256",
+                    "value": hex_lower(ring::digest::digest(&ring::digest::SHA256, payload).as_ref()),
+                }},
+                "signature": {"content": b64.encode(signature), "publicKey": {"content": ""}},
+            },
+        });
+        let entry = serde_json::json!({
+            "body": b64.encode(serde_json::to_vec(&body).unwrap()),
+            "integratedTime": logged_at,
+            "logIndex": 7,
+            "logID": "c0ffee",
+        });
+        let set = rekor
+            .sign(
+                &ring::rand::SystemRandom::new(),
+                &canonical_json(&entry).unwrap(),
+            )
+            .unwrap();
+        serde_json::json!({
+            "SignedEntryTimestamp": b64.encode(set.as_ref()),
+            "Payload": entry,
+        })
+        .to_string()
+    }
+
+    fn build_keyless_fixture(subject: &str, issuer: &str, logged_at: i64) -> KeylessFixture {
         use rcgen::{BasicConstraints, CertificateParams, CustomExtension, IsCa, KeyPair, SanType};
 
         // Root CA.
@@ -1023,6 +1191,9 @@ mod tests {
         // Leaf key (also used to sign the cosign payload).
         let leaf_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
         let mut leaf_params = CertificateParams::new(vec![]).unwrap();
+        leaf_params.not_before =
+            time::OffsetDateTime::from_unix_timestamp(LEAF_NOT_BEFORE).unwrap();
+        leaf_params.not_after = time::OffsetDateTime::from_unix_timestamp(LEAF_NOT_AFTER).unwrap();
         leaf_params
             .subject_alt_names
             .push(SanType::Rfc822Name(subject.to_string().try_into().unwrap()));
@@ -1036,38 +1207,41 @@ mod tests {
         let leaf_cert = leaf_params
             .signed_by(&leaf_key, &root_cert, &root_key)
             .unwrap();
-        let leaf_pem = leaf_cert.pem();
 
         // Build a cosign payload referencing a manifest digest.
         let manifest_digest = Digest::from_bytes(b"keyless-test-image");
-        let payload = serde_json::json!({
+        let payload = serde_json::to_vec(&serde_json::json!({
             "critical": {
                 "identity": {"docker-reference": "registry/app"},
                 "image": {"docker-manifest-digest": manifest_digest.to_string()},
                 "type": "cosign container image signature"
             },
             "optional": null
-        });
-        let payload_bytes = serde_json::to_vec(&payload).unwrap();
-
-        // Sign the payload with the leaf private key using ring (ASN.1 ECDSA).
-        let pkcs8 = leaf_key.serialize_der();
+        }))
+        .unwrap();
         let rng = ring::rand::SystemRandom::new();
-        let signing = ring::signature::EcdsaKeyPair::from_pkcs8(
+        let sig = ecdsa_signer(&leaf_key.serialize_der())
+            .sign(&rng, &payload)
+            .unwrap()
+            .as_ref()
+            .to_vec();
+
+        let rekor_pkcs8 = ring::signature::EcdsaKeyPair::generate_pkcs8(
             &signature::ECDSA_P256_SHA256_ASN1_SIGNING,
-            &pkcs8,
             &rng,
         )
         .unwrap();
-        let sig = signing.sign(&rng, &payload_bytes).unwrap();
+        let rekor = ecdsa_signer(rekor_pkcs8.as_ref());
+        let bundle = rekor_bundle(&rekor, &payload, &sig, logged_at);
 
         KeylessFixture {
             root_der,
+            rekor_key: rekor.public_key().as_ref().to_vec(),
             signature: CosignSignature {
-                payload: payload_bytes,
-                signature: sig.as_ref().to_vec(),
-                certificate_pem: Some(leaf_pem),
-                bundle_json: None,
+                payload,
+                signature: sig,
+                certificate_pem: Some(leaf_cert.pem()),
+                bundle_json: Some(bundle),
             },
             manifest_digest,
             subject: subject.to_string(),
@@ -1075,104 +1249,86 @@ mod tests {
         }
     }
 
+    const SUBJECT: &str = "ci@example.com";
+    const ISSUER: &str = "https://accounts.example.com";
+
     #[test]
     fn keyless_verifies_matching_identity() {
-        let subject = "ci@example.com";
-        let issuer = "https://accounts.example.com";
-        let fx = build_keyless_fixture(subject, issuer);
+        // The certificate expired long ago; it was valid when logged.
+        let fx = build_keyless_fixture(SUBJECT, ISSUER, LEAF_NOT_BEFORE + 60);
+        fx.verify(&fx.policy())
+            .expect("keyless verification must succeed for a matching identity");
+    }
 
-        let policy = KeylessPolicy {
-            fulcio_roots: vec![fx.root_der.clone()],
-            identities: vec![KeylessIdentity {
-                subject: subject.to_string(),
-                issuer: issuer.to_string(),
-            }],
-            rekor_public_key: None,
-        };
+    #[test]
+    fn keyless_rejects_signatures_logged_outside_the_certificate_validity() {
+        let fx = build_keyless_fixture(SUBJECT, ISSUER, LEAF_NOT_AFTER + 1);
+        assert!(matches!(
+            fx.verify(&fx.policy()),
+            Err(SignatureError::CertificateExpired)
+        ));
+    }
 
-        verify_keyless(
-            &policy,
-            std::slice::from_ref(&fx.signature),
-            &fx.manifest_digest,
-        )
-        .expect("keyless verification must succeed for a matching identity");
+    #[test]
+    fn keyless_requires_a_rekor_entry_for_this_signature() {
+        let mut fx = build_keyless_fixture(SUBJECT, ISSUER, LEAF_NOT_BEFORE + 60);
+        let policy = fx.policy();
+
+        // An entry signed by another log is refused.
+        let other = build_keyless_fixture(SUBJECT, ISSUER, LEAF_NOT_BEFORE + 60);
+        let mut foreign = policy.clone();
+        foreign.rekor_public_key = other.rekor_key.clone();
+        assert!(matches!(
+            fx.verify(&foreign),
+            Err(SignatureError::RekorVerification(_))
+        ));
+
+        // A genuine entry for a different signature is not replayable.
+        fx.signature.bundle_json = other.signature.bundle_json.clone();
+        let mut replayed = policy.clone();
+        replayed.rekor_public_key = other.rekor_key.clone();
+        assert!(matches!(
+            fx.verify(&replayed),
+            Err(SignatureError::RekorVerification(_))
+        ));
+
+        fx.signature.bundle_json = None;
+        assert!(matches!(
+            fx.verify(&policy),
+            Err(SignatureError::RekorVerification(_))
+        ));
     }
 
     #[test]
     fn keyless_rejects_wrong_identity() {
-        let fx = build_keyless_fixture("ci@example.com", "https://accounts.example.com");
-
-        let policy = KeylessPolicy {
-            fulcio_roots: vec![fx.root_der.clone()],
-            identities: vec![KeylessIdentity {
-                subject: "attacker@evil.com".to_string(),
-                issuer: fx.issuer.clone(),
-            }],
-            rekor_public_key: None,
-        };
-
-        let err = verify_keyless(
-            &policy,
-            std::slice::from_ref(&fx.signature),
-            &fx.manifest_digest,
-        )
-        .unwrap_err();
-        assert!(matches!(err, SignatureError::IdentityMismatch { .. }));
+        let fx = build_keyless_fixture(SUBJECT, ISSUER, LEAF_NOT_BEFORE + 60);
+        let mut policy = fx.policy();
+        policy.identities[0].subject = "attacker@evil.com".to_string();
+        assert!(matches!(
+            fx.verify(&policy),
+            Err(SignatureError::IdentityMismatch { .. })
+        ));
     }
 
     #[test]
     fn keyless_rejects_untrusted_root() {
-        let fx = build_keyless_fixture("ci@example.com", "https://accounts.example.com");
+        let fx = build_keyless_fixture(SUBJECT, ISSUER, LEAF_NOT_BEFORE + 60);
         // A different, unrelated CA that did not issue the leaf.
-        let other = build_keyless_fixture("other@example.com", "https://accounts.example.com");
-
-        let policy = KeylessPolicy {
-            fulcio_roots: vec![other.root_der.clone()],
-            identities: vec![KeylessIdentity {
-                subject: fx.subject.clone(),
-                issuer: fx.issuer.clone(),
-            }],
-            rekor_public_key: None,
-        };
-
-        let err = verify_keyless(
-            &policy,
-            std::slice::from_ref(&fx.signature),
-            &fx.manifest_digest,
-        )
-        .unwrap_err();
-        assert!(matches!(err, SignatureError::UntrustedCertificate));
+        let other = build_keyless_fixture("other@example.com", ISSUER, LEAF_NOT_BEFORE + 60);
+        let mut policy = fx.policy();
+        policy.fulcio_roots = vec![other.root_der.clone()];
+        assert!(matches!(
+            fx.verify(&policy),
+            Err(SignatureError::UntrustedCertificate)
+        ));
     }
 
     #[test]
     fn keyless_rejects_tampered_payload_signature() {
-        let fx = build_keyless_fixture("ci@example.com", "https://accounts.example.com");
-        let mut tampered = CosignSignature {
-            payload: fx.signature.payload.clone(),
-            signature: fx.signature.signature.clone(),
-            certificate_pem: fx.signature.certificate_pem.clone(),
-            bundle_json: None,
-        };
+        let mut fx = build_keyless_fixture(SUBJECT, ISSUER, LEAF_NOT_BEFORE + 60);
         // Flip a byte in the signature so cryptographic verification fails.
-        tampered.signature[10] ^= 0xff;
-
-        let policy = KeylessPolicy {
-            fulcio_roots: vec![fx.root_der.clone()],
-            identities: vec![KeylessIdentity {
-                subject: fx.subject.clone(),
-                issuer: fx.issuer.clone(),
-            }],
-            rekor_public_key: None,
-        };
-
-        assert!(
-            verify_keyless(
-                &policy,
-                std::slice::from_ref(&tampered),
-                &fx.manifest_digest
-            )
-            .is_err()
-        );
+        fx.signature.signature[10] ^= 0xff;
+        assert!(fx.verify(&fx.policy()).is_err());
     }
 
     #[test]

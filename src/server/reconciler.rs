@@ -510,6 +510,30 @@ fn service_config_to_spec(name: &str, cfg: &config::ServiceConfig) -> crate::pro
         .as_ref()
         .map(|c| c.image.clone())
         .unwrap_or_default();
+    let container = cfg.container.as_ref().map(|c| {
+        let list = |items: &Option<Vec<String>>| {
+            items.as_ref().map(|items| crate::proto::StringList {
+                items: items.clone(),
+            })
+        };
+        crate::proto::ContainerOptions {
+            entrypoint: list(&c.entrypoint),
+            args: list(&c.args),
+            working_dir: c.working_dir.clone().unwrap_or_default(),
+            // Validated at apply.
+            bind_mounts: c
+                .parsed_bind_mounts()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|m| crate::proto::ContainerBindMount {
+                    host_path: m.host_path,
+                    container_path: m.container_path,
+                    read_only: m.read_only,
+                })
+                .collect(),
+            registry_auth_secret: c.registry_auth_secret.clone().unwrap_or_default(),
+        }
+    });
 
     crate::proto::ServiceSpec {
         name: name.to_string(),
@@ -544,6 +568,7 @@ fn service_config_to_spec(name: &str, cfg: &config::ServiceConfig) -> crate::pro
             templates
         },
         secrets: config::static_secrets(cfg),
+        container,
     }
 }
 
@@ -774,6 +799,11 @@ async fn send_desired_state(
             system_path: previous_system_paths.remove(node).unwrap_or_default(),
             namespace_networks,
             cache_public_key: String::new(), // stamped by assign_desired_state
+            signature_policy_json: desired
+                .signature_policy
+                .as_ref()
+                .and_then(|p| serde_json::to_string(p).ok())
+                .unwrap_or_default(),
         };
         if !state.assign_desired_state(node, desired_state).await {
             tracing::warn!(

@@ -119,6 +119,9 @@ pub struct ConfigRevision {
     /// Store paths each service needs, built by the server at apply time.
     #[serde(default)]
     pub closures: BTreeMap<String, Vec<String>>,
+    /// Container image of each service, pinned to a digest at apply time.
+    #[serde(default)]
+    pub images: BTreeMap<String, String>,
 }
 
 impl ConfigRevision {
@@ -128,6 +131,11 @@ impl ConfigRevision {
         for (name, service) in &mut config.services {
             if let Some(paths) = self.closures.get(name) {
                 service.store_paths = paths.clone();
+            }
+            if let (Some(image), Some(container)) =
+                (self.images.get(name), service.container.as_mut())
+            {
+                container.image = image.clone();
             }
         }
         Ok(config)
@@ -186,6 +194,8 @@ pub enum Command {
         rollback_of: Option<u64>,
         #[serde(default)]
         closures: BTreeMap<String, Vec<String>>,
+        #[serde(default)]
+        images: BTreeMap<String, String>,
     },
     Deploy {
         service_name: String,
@@ -525,6 +535,7 @@ impl FleetStateMachine {
                 applied_by,
                 rollback_of,
                 closures,
+                images,
             } => {
                 let revision = state.config_revisions.last().map_or(1, |r| r.revision + 1);
                 state.config_revisions.push(ConfigRevision {
@@ -535,6 +546,7 @@ impl FleetStateMachine {
                     applied_by,
                     rollback_of,
                     closures,
+                    images,
                 });
                 let excess = state
                     .config_revisions
@@ -1122,6 +1134,7 @@ mod tests {
             applied_by: "tester".into(),
             rollback_of,
             closures: BTreeMap::new(),
+            images: BTreeMap::new(),
         }
     }
 

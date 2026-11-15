@@ -12,6 +12,7 @@
   secrets = import ./secrets.nix { inherit pkgs lib; };
   volumes = import ./volumes.nix { inherit pkgs lib; };
   oci-container = import ./oci-container.nix { inherit pkgs lib; };
+  oci-registry = import ./oci-registry.nix { inherit pkgs lib; };
   lifecycle = import ./lifecycle.nix { inherit pkgs lib; };
   fleet-module = import ./fleet-module.nix { inherit pkgs lib; };
 }

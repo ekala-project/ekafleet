@@ -182,12 +182,15 @@ impl RegistryClient {
         let reference = image.api_reference();
         let url = format!(
             "https://{}/v2/{}/manifests/{reference}",
-            image.registry, image.repository
+            image.api_host(),
+            image.repository
         );
         let scope = format!("repository:{}:pull", image.repository);
 
         let accept = ACCEPT_MANIFESTS.join(", ");
-        let body = self.authenticated_get(&url, &scope, Some(&accept)).await?;
+        let body = self
+            .authenticated_get(&url, &scope, Some(&accept), MAX_MANIFEST_BYTES)
+            .await?;
 
         let media_type = body.media_type.clone();
         let raw = body.data;
@@ -222,11 +225,15 @@ impl RegistryClient {
     ) -> Result<BlobResponse, RegistryError> {
         let url = format!(
             "https://{}/v2/{}/blobs/{}",
-            image.registry, image.repository, expected_digest
+            image.api_host(),
+            image.repository,
+            expected_digest
         );
         let scope = format!("repository:{}:pull", image.repository);
 
-        let body = self.authenticated_get(&url, &scope, None).await?;
+        let body = self
+            .authenticated_get(&url, &scope, None, MAX_BLOB_BYTES)
+            .await?;
 
         // Verify digest
         let mut verifier = DigestVerifier::new(expected_digest.clone());
@@ -252,11 +259,12 @@ impl RegistryClient {
         let reference = image.api_reference();
         let url = format!(
             "https://{}/v2/{}/manifests/{reference}",
-            image.registry, image.repository
+            image.api_host(),
+            image.repository
         );
         let scope = format!("repository:{}:pull", image.repository);
 
-        let token = self.get_token(&image.registry, &scope).await?;
+        let token = self.get_token(image.api_host(), &scope).await?;
 
         let accept = ACCEPT_MANIFESTS.join(", ");
         let req = hyper::Request::builder()
@@ -307,10 +315,11 @@ impl RegistryClient {
         url: &str,
         scope: &str,
         accept: Option<&str>,
+        limit: usize,
     ) -> Result<AuthenticatedResponse, RegistryError> {
         // Try with cached token first
         let token = self.get_token_cached(scope).await;
-        let resp = self.do_get(url, token.as_deref(), accept).await?;
+        let resp = self.do_get(url, token.as_deref(), accept, limit).await?;
 
         if resp.status == 401 {
             // Parse Www-Authenticate and exchange for a token
@@ -331,7 +340,7 @@ impl RegistryClient {
                 .insert(scope.to_string(), token.clone());
 
             // Retry with new token
-            let resp = self.do_get(url, Some(&token), accept).await?;
+            let resp = self.do_get(url, Some(&token), accept, limit).await?;
 
             if resp.status != 200 {
                 return Err(RegistryError::Status {
@@ -357,70 +366,133 @@ impl RegistryClient {
         url: &str,
         bearer_token: Option<&str>,
         accept: Option<&str>,
+        limit: usize,
     ) -> Result<AuthenticatedResponse, RegistryError> {
-        let mut builder = hyper::Request::builder().method("GET").uri(url);
+        let origin = url_host(url).to_string();
+        let mut url = url.to_string();
+        // Registries commonly redirect blob downloads to a CDN or object
+        // store; credentials are only ever sent to the registry itself.
+        for _ in 0..=MAX_REDIRECTS {
+            let same_host = url_host(&url) == origin;
+            let mut builder = hyper::Request::builder().method("GET").uri(&url);
+            if let Some(accept) = accept {
+                builder = builder.header("Accept", accept);
+            }
+            if same_host {
+                if let Some(token) = bearer_token {
+                    builder = builder.header("Authorization", format!("Bearer {token}"));
+                } else if let Some(basic) = self.basic_auth() {
+                    builder = builder.header("Authorization", basic.as_str());
+                }
+            }
 
-        if let Some(accept) = accept {
-            builder = builder.header("Accept", accept);
+            let req = builder
+                .body(http_body_util::Full::new(Bytes::new()))
+                .map_err(|e| RegistryError::Http(e.to_string()))?;
+
+            let resp = self.send(req).await?;
+
+            let status = resp.status().as_u16();
+            if matches!(status, 301 | 302 | 303 | 307 | 308) {
+                let location = resp
+                    .headers()
+                    .get("location")
+                    .and_then(|v| v.to_str().ok())
+                    .ok_or_else(|| {
+                        RegistryError::Http(format!("HTTP {status} without a Location"))
+                    })?;
+                url = resolve_location(&url, location)?;
+                continue;
+            }
+            let www_auth = resp
+                .headers()
+                .get("www-authenticate")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            let media_type = resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("application/octet-stream")
+                .to_string();
+
+            let limited = http_body_util::Limited::new(resp.into_body(), limit);
+            let body = http_body_util::BodyExt::collect(limited)
+                .await
+                .map_err(|e| RegistryError::Body(e.to_string()))?
+                .to_bytes()
+                .to_vec();
+
+            return Ok(AuthenticatedResponse {
+                status,
+                data: body,
+                www_authenticate: www_auth,
+                media_type,
+            });
         }
-        if let Some(token) = bearer_token {
-            builder = builder.header("Authorization", format!("Bearer {token}"));
-        } else if let Credentials::Basic { username, password } = &self.credentials {
-            let encoded = base64_encode(&format!("{username}:{password}"));
-            builder = builder.header("Authorization", format!("Basic {encoded}"));
-        }
-
-        let req = builder
-            .body(http_body_util::Full::new(Bytes::new()))
-            .map_err(|e| RegistryError::Http(e.to_string()))?;
-
-        let resp = self.send(req).await?;
-
-        let status = resp.status().as_u16();
-        let www_auth = resp
-            .headers()
-            .get("www-authenticate")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-        let media_type = resp
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("application/octet-stream")
-            .to_string();
-
-        let body = http_body_util::BodyExt::collect(resp.into_body())
-            .await
-            .map_err(|e| RegistryError::Body(e.to_string()))?
-            .to_bytes()
-            .to_vec();
-
-        Ok(AuthenticatedResponse {
-            status,
-            data: body,
-            www_authenticate: www_auth,
-            media_type,
-        })
+        Err(RegistryError::Http(format!(
+            "more than {MAX_REDIRECTS} redirects fetching {url}"
+        )))
     }
 
-    /// Exchange credentials for a bearer token at the token endpoint.
+    /// The `Authorization` value for Basic credentials, if configured.
+    fn basic_auth(&self) -> Option<zeroize::Zeroizing<String>> {
+        match &self.credentials {
+            Credentials::Basic { username, password } => {
+                let pair = zeroize::Zeroizing::new(format!("{username}:{}", password.as_str()));
+                Some(zeroize::Zeroizing::new(format!(
+                    "Basic {}",
+                    base64_encode(&pair)
+                )))
+            }
+            _ => None,
+        }
+    }
+
+    /// Exchange credentials for a bearer token at the token endpoint: a GET
+    /// (with Basic credentials, if any), or for an identity token the
+    /// OAuth2 refresh-token POST.
     async fn exchange_token(
         &self,
         challenge: &BearerChallenge,
         scope: Option<&str>,
     ) -> Result<String, RegistryError> {
-        let url = challenge.token_url(scope);
-
-        let mut builder = hyper::Request::builder().method("GET").uri(&url);
-
-        if let Credentials::Basic { username, password } = &self.credentials {
-            let encoded = base64_encode(&format!("{username}:{password}"));
-            builder = builder.header("Authorization", format!("Basic {encoded}"));
+        let req = if let Credentials::IdentityToken(refresh) = &self.credentials {
+            let mut pairs: Vec<(&str, &str)> = vec![
+                ("grant_type", "refresh_token"),
+                ("client_id", "ekafleet"),
+                ("refresh_token", refresh.as_str()),
+            ];
+            if let Some(service) = &challenge.service {
+                pairs.push(("service", service));
+            }
+            if let Some(scope) = scope.or(challenge.scope.as_deref()) {
+                pairs.push(("scope", scope));
+            }
+            let form = zeroize::Zeroizing::new(
+                pairs
+                    .iter()
+                    .map(|(k, v)| format!("{k}={}", form_encode(v).as_str()))
+                    .collect::<Vec<_>>()
+                    .join("&"),
+            );
+            hyper::Request::builder()
+                .method("POST")
+                .uri(&challenge.realm)
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .body(http_body_util::Full::new(Bytes::from(
+                    form.as_bytes().to_vec(),
+                )))
+        } else {
+            let mut builder = hyper::Request::builder()
+                .method("GET")
+                .uri(challenge.token_url(scope));
+            if let Some(basic) = self.basic_auth() {
+                builder = builder.header("Authorization", basic.as_str());
+            }
+            builder.body(http_body_util::Full::new(Bytes::new()))
         }
-
-        let req = builder
-            .body(http_body_util::Full::new(Bytes::new()))
-            .map_err(|e| RegistryError::Http(e.to_string()))?;
+        .map_err(|e| RegistryError::Http(e.to_string()))?;
 
         let resp = self.send(req).await?;
 
@@ -431,7 +503,8 @@ impl RegistryClient {
             )));
         }
 
-        let body = http_body_util::BodyExt::collect(resp.into_body())
+        let limited = http_body_util::Limited::new(resp.into_body(), MAX_MANIFEST_BYTES);
+        let body = http_body_util::BodyExt::collect(limited)
             .await
             .map_err(|e| RegistryError::Body(e.to_string()))?
             .to_bytes();
@@ -455,7 +528,9 @@ impl RegistryClient {
 
         // Probe the registry to get the auth challenge
         let probe_url = format!("https://{registry}/v2/");
-        let resp = self.do_get(&probe_url, None, None).await?;
+        let resp = self
+            .do_get(&probe_url, None, None, MAX_MANIFEST_BYTES)
+            .await?;
 
         if resp.status == 200 {
             // No auth needed
@@ -489,6 +564,56 @@ struct AuthenticatedResponse {
     data: Vec<u8>,
     www_authenticate: Option<String>,
     media_type: String,
+}
+
+/// `application/x-www-form-urlencoded` encoding of one value.
+fn form_encode(value: &str) -> zeroize::Zeroizing<String> {
+    let mut out = zeroize::Zeroizing::new(String::with_capacity(value.len()));
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'*' => {
+                out.push(byte as char)
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+/// Redirects followed per request.
+const MAX_REDIRECTS: usize = 5;
+
+/// Largest manifest (or error/probe body) accepted from a registry.
+const MAX_MANIFEST_BYTES: usize = 4 << 20;
+
+/// Largest blob accepted from a registry; blobs are held in memory.
+const MAX_BLOB_BYTES: usize = 4 << 30;
+
+/// The `host[:port]` of an absolute URL.
+fn url_host(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    rest.split(['/', '?', '#']).next().unwrap_or_default()
+}
+
+/// Resolve a `Location` header against the URL that returned it. Only
+/// HTTPS targets are followed.
+fn resolve_location(base: &str, location: &str) -> Result<String, RegistryError> {
+    let target = if location.contains("://") {
+        location.to_string()
+    } else if location.starts_with('/') {
+        format!("https://{}{location}", url_host(base))
+    } else {
+        return Err(RegistryError::Http(format!(
+            "unsupported redirect target {location}"
+        )));
+    };
+    if !target.starts_with("https://") {
+        return Err(RegistryError::Http(format!(
+            "refusing to follow a redirect to {target}"
+        )));
+    }
+    Ok(target)
 }
 
 /// Minimal base64 encoder (standard alphabet, with padding).
@@ -538,6 +663,30 @@ mod tests {
     }
 
     #[test]
+    fn form_values_are_percent_encoded() {
+        assert_eq!(
+            form_encode("repository:a/b:pull x").as_str(),
+            "repository%3Aa%2Fb%3Apull+x"
+        );
+    }
+
+    #[test]
+    fn redirects_resolve_to_https_only() {
+        assert_eq!(url_host("https://ghcr.io/v2/x/blobs/sha256:1"), "ghcr.io");
+        assert_eq!(url_host("https://reg:5000/v2/"), "reg:5000");
+        assert_eq!(
+            resolve_location("https://reg:5000/v2/a/blobs/b", "/store/b?sig=1").unwrap(),
+            "https://reg:5000/store/b?sig=1"
+        );
+        assert_eq!(
+            resolve_location("https://ghcr.io/v2/a", "https://cdn.example/b").unwrap(),
+            "https://cdn.example/b"
+        );
+        assert!(resolve_location("https://ghcr.io/v2/a", "http://cdn.example/b").is_err());
+        assert!(resolve_location("https://ghcr.io/v2/a", "relative/b").is_err());
+    }
+
+    #[test]
     fn creates_with_anonymous() {
         let _client = RegistryClient::new(Credentials::Anonymous);
     }
@@ -546,7 +695,7 @@ mod tests {
     fn creates_with_basic() {
         let _client = RegistryClient::new(Credentials::Basic {
             username: "user".to_string(),
-            password: "pass".to_string(),
+            password: zeroize::Zeroizing::new("pass".to_string()),
         });
     }
 

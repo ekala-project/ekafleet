@@ -1,10 +1,13 @@
 //! Content-addressable OCI blob store on the local filesystem.
 //!
-//! Stores blobs (layers, configs, manifests) by digest under:
-//!   `<root>/blobs/sha256/<hex>`
+//! Layout under the store root:
+//!   `blobs/sha256/<hex>`            layers and configs, by digest
+//!   `manifests/<hex>`               the image manifest run for a pinned digest
+//!   `bundles/<service>/<hex>/`      an unpacked bundle: `rootfs/`,
+//!                                   `image-config.json`, `config.json`
 //!
-//! Stores unpacked OCI bundles under:
-//!   `<root>/bundles/<service_name>/rootfs/`
+//! A bundle directory appears only once complete: it is assembled under a
+//! hidden staging name and renamed into place.
 
 use std::path::{Path, PathBuf};
 
@@ -23,6 +26,9 @@ pub enum StoreError {
     NotFound(Digest),
 }
 
+/// The image config copied into every complete bundle.
+pub const IMAGE_CONFIG_FILE: &str = "image-config.json";
+
 impl ImageStore {
     /// Create a new store rooted at the given directory.
     pub fn new(root: impl Into<PathBuf>) -> Self {
@@ -34,8 +40,12 @@ impl ImageStore {
         tokio::fs::create_dir_all(self.blobs_dir()).await?;
         tokio::fs::create_dir_all(self.bundles_dir()).await?;
         tokio::fs::create_dir_all(self.manifests_dir()).await?;
-        tokio::fs::create_dir_all(self.history_dir()).await?;
         Ok(())
+    }
+
+    /// Return the store root.
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     // -- Blob operations --
@@ -47,214 +57,118 @@ impl ImageStore {
 
     /// Check whether a blob exists locally.
     pub async fn has_blob(&self, digest: &Digest) -> bool {
-        self.blob_path(digest).exists()
+        tokio::fs::try_exists(self.blob_path(digest))
+            .await
+            .unwrap_or(false)
     }
 
     /// Write a blob to the store. The caller is responsible for
     /// verifying the digest before calling this.
     pub async fn put_blob(&self, digest: &Digest, data: &[u8]) -> Result<(), StoreError> {
         let path = self.blob_path(digest);
-        tokio::fs::create_dir_all(path.parent().unwrap()).await?;
-        tokio::fs::write(&path, data).await?;
+        write_atomic(&path, data).await?;
         tracing::debug!(digest = %digest, size = data.len(), "Stored blob");
         Ok(())
     }
 
     /// Read a blob from the store.
     pub async fn get_blob(&self, digest: &Digest) -> Result<Vec<u8>, StoreError> {
-        let path = self.blob_path(digest);
-        if !path.exists() {
-            return Err(StoreError::NotFound(digest.clone()));
+        match tokio::fs::read(self.blob_path(digest)).await {
+            Ok(data) => Ok(data),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(StoreError::NotFound(digest.clone()))
+            }
+            Err(e) => Err(e.into()),
         }
-        Ok(tokio::fs::read(&path).await?)
     }
 
     /// Remove a blob from the store.
     pub async fn remove_blob(&self, digest: &Digest) -> Result<(), StoreError> {
-        let path = self.blob_path(digest);
-        if path.exists() {
-            tokio::fs::remove_file(&path).await?;
-        }
-        Ok(())
+        remove_file(&self.blob_path(digest)).await
+    }
+
+    /// List all blob digests in the store.
+    pub async fn list_blobs(&self) -> Result<Vec<Digest>, StoreError> {
+        Ok(list_names(&self.blobs_dir())
+            .await?
+            .into_iter()
+            .filter_map(|hex| format!("sha256:{hex}").parse().ok())
+            .collect())
     }
 
     // -- Manifest operations --
 
-    /// Store a manifest (keyed by a stable identifier, not necessarily its digest).
+    /// Store the image manifest run for a pinned digest (by its hex).
     pub async fn put_manifest(&self, key: &str, data: &[u8]) -> Result<(), StoreError> {
-        let path = self.manifests_dir().join(key);
-        tokio::fs::write(&path, data).await?;
+        write_atomic(&self.manifests_dir().join(key), data).await?;
         Ok(())
     }
 
     /// Read a stored manifest.
     pub async fn get_manifest(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
-        let path = self.manifests_dir().join(key);
-        if !path.exists() {
-            return Ok(None);
+        match tokio::fs::read(self.manifests_dir().join(key)).await {
+            Ok(data) => Ok(Some(data)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
         }
-        Ok(Some(tokio::fs::read(&path).await?))
+    }
+
+    /// Remove a stored manifest.
+    pub async fn remove_manifest(&self, key: &str) -> Result<(), StoreError> {
+        remove_file(&self.manifests_dir().join(key)).await
+    }
+
+    /// List the keys of all stored manifests.
+    pub async fn list_manifests(&self) -> Result<Vec<String>, StoreError> {
+        list_names(&self.manifests_dir()).await
     }
 
     // -- Bundle operations --
 
-    /// Root path for a service's unpacked bundle.
-    pub fn bundle_path(&self, service_name: &str) -> PathBuf {
-        self.bundles_dir().join(service_name)
+    /// A service's bundle for a pinned image digest (by its hex).
+    pub fn bundle_path(&self, service: &str, hex: &str) -> PathBuf {
+        self.bundles_dir().join(service).join(hex)
     }
 
-    /// Rootfs path for a service's unpacked bundle.
-    pub fn rootfs_path(&self, service_name: &str) -> PathBuf {
-        self.bundle_path(service_name).join("rootfs")
+    /// Rootfs of a service's bundle.
+    pub fn rootfs_path(&self, service: &str, hex: &str) -> PathBuf {
+        self.bundle_path(service, hex).join("rootfs")
     }
 
-    /// Check whether a bundle exists for a service.
-    pub async fn has_bundle(&self, service_name: &str) -> bool {
-        self.rootfs_path(service_name).exists()
+    /// Where a bundle is assembled before being renamed into place.
+    pub fn staging_path(&self, service: &str, hex: &str) -> PathBuf {
+        self.bundles_dir()
+            .join(service)
+            .join(format!(".{hex}.partial"))
     }
 
-    /// Remove a service's unpacked bundle.
-    pub async fn remove_bundle(&self, service_name: &str) -> Result<(), StoreError> {
-        let path = self.bundle_path(service_name);
-        if path.exists() {
-            tokio::fs::remove_dir_all(&path).await?;
-        }
-        Ok(())
+    /// Whether a complete bundle exists.
+    pub async fn has_bundle(&self, service: &str, hex: &str) -> bool {
+        tokio::fs::try_exists(self.bundle_path(service, hex).join(IMAGE_CONFIG_FILE))
+            .await
+            .unwrap_or(false)
     }
 
-    // -- Manifest history operations --
-
-    /// Save a manifest to the history for a service.
-    ///
-    /// Each service maintains a rolling history of previous manifests,
-    /// enabling rollback without re-pulling from the registry.
-    /// History entries are named `<service>.<generation>` where generation
-    /// is an incrementing counter.
-    pub async fn put_history(&self, service_name: &str, data: &[u8]) -> Result<(), StoreError> {
-        let next = self.next_history_generation(service_name).await;
-        let key = format!("{service_name}.{next}");
-        let path = self.history_dir().join(&key);
-        tokio::fs::write(&path, data).await?;
-        tracing::debug!(
-            service = service_name,
-            generation = next,
-            "Saved manifest history"
-        );
-        Ok(())
+    /// Remove one bundle (or a leftover staging directory).
+    pub async fn remove_bundle(&self, service: &str, hex: &str) -> Result<(), StoreError> {
+        remove_dir(&self.bundle_path(service, hex)).await
     }
 
-    /// List all history manifests for a service, sorted by generation (newest first).
-    pub async fn list_history(
-        &self,
-        service_name: &str,
-    ) -> Result<Vec<(u64, Vec<u8>)>, StoreError> {
-        let dir = self.history_dir();
-        if !dir.exists() {
-            return Ok(Vec::new());
-        }
-
-        let prefix = format!("{service_name}.");
-        let mut entries = Vec::new();
-        let mut dir_entries = tokio::fs::read_dir(&dir).await?;
-        while let Some(entry) = dir_entries.next_entry().await? {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if let Some(gen_str) = name.strip_prefix(&prefix)
-                && let Ok(generation) = gen_str.parse::<u64>()
-            {
-                let data = tokio::fs::read(entry.path()).await?;
-                entries.push((generation, data));
+    /// Every bundle directory as `(service, name)`; names of incomplete
+    /// bundles are their staging names.
+    pub async fn list_bundles(&self) -> Result<Vec<(String, String)>, StoreError> {
+        let mut out = Vec::new();
+        for service in list_names(&self.bundles_dir()).await? {
+            for name in list_names(&self.bundles_dir().join(&service)).await? {
+                out.push((service.clone(), name));
             }
         }
-
-        // Sort newest first
-        entries.sort_by_key(|e| std::cmp::Reverse(e.0));
-        Ok(entries)
+        Ok(out)
     }
 
-    /// Prune history entries for a service, keeping only `retain` most recent.
-    pub async fn prune_history(
-        &self,
-        service_name: &str,
-        retain: usize,
-    ) -> Result<usize, StoreError> {
-        let entries = self.list_history(service_name).await?;
-        let mut pruned = 0;
-        for (generation, _) in entries.iter().skip(retain) {
-            let key = format!("{service_name}.{generation}");
-            let path = self.history_dir().join(&key);
-            if path.exists() {
-                tokio::fs::remove_file(&path).await?;
-                pruned += 1;
-            }
-        }
-        if pruned > 0 {
-            tracing::debug!(service = service_name, pruned, "Pruned manifest history");
-        }
-        Ok(pruned)
-    }
-
-    /// Remove all history entries for a service.
-    pub async fn remove_history(&self, service_name: &str) -> Result<(), StoreError> {
-        let dir = self.history_dir();
-        if !dir.exists() {
-            return Ok(());
-        }
-
-        let prefix = format!("{service_name}.");
-        let mut entries = tokio::fs::read_dir(&dir).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with(&prefix) {
-                tokio::fs::remove_file(entry.path()).await?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Find the next generation number for a service's history.
-    async fn next_history_generation(&self, service_name: &str) -> u64 {
-        match self.list_history(service_name).await {
-            Ok(entries) => entries.first().map(|(g, _)| g + 1).unwrap_or(1),
-            Err(_) => 1,
-        }
-    }
-
-    // -- Listing --
-
-    /// List all blob digests in the store.
-    pub async fn list_blobs(&self) -> Result<Vec<Digest>, StoreError> {
-        let dir = self.blobs_dir();
-        if !dir.exists() {
-            return Ok(Vec::new());
-        }
-
-        let mut digests = Vec::new();
-        let mut entries = tokio::fs::read_dir(&dir).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            let name = entry.file_name();
-            let hex = name.to_string_lossy();
-            if let Ok(digest) = format!("sha256:{hex}").parse() {
-                digests.push(digest);
-            }
-        }
-        Ok(digests)
-    }
-
-    /// List all service bundles.
-    pub async fn list_bundles(&self) -> Result<Vec<String>, StoreError> {
-        let dir = self.bundles_dir();
-        if !dir.exists() {
-            return Ok(Vec::new());
-        }
-
-        let mut names = Vec::new();
-        let mut entries = tokio::fs::read_dir(&dir).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            if entry.file_type().await?.is_dir() {
-                names.push(entry.file_name().to_string_lossy().into_owned());
-            }
-        }
-        Ok(names)
+    /// Remove a service's directory once it holds no bundles.
+    pub async fn remove_service_dir_if_empty(&self, service: &str) {
+        let _ = tokio::fs::remove_dir(self.bundles_dir().join(service)).await;
     }
 
     // -- Internal paths --
@@ -270,17 +184,49 @@ impl ImageStore {
     fn bundles_dir(&self) -> PathBuf {
         self.root.join("bundles")
     }
+}
 
-    fn history_dir(&self) -> PathBuf {
-        self.root.join("history")
+/// Write a file via a temporary sibling, so readers never see a partial one.
+async fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    tokio::fs::write(&tmp, data).await?;
+    tokio::fs::rename(&tmp, path).await
+}
+
+async fn remove_file(path: &Path) -> Result<(), StoreError> {
+    match tokio::fs::remove_file(path).await {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
     }
 }
 
-impl ImageStore {
-    /// Return the store root for use in cleanup/GC operations.
-    pub fn root(&self) -> &Path {
-        &self.root
+async fn remove_dir(path: &Path) -> Result<(), StoreError> {
+    match tokio::fs::remove_dir_all(path).await {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
     }
+}
+
+/// Names of the entries of a directory (none if it does not exist),
+/// skipping temporary files.
+async fn list_names(dir: &Path) -> Result<Vec<String>, StoreError> {
+    let mut entries = match tokio::fs::read_dir(dir).await {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut names = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.ends_with(".tmp") {
+            names.push(name);
+        }
+    }
+    Ok(names)
 }
 
 #[cfg(test)]
@@ -365,157 +311,25 @@ mod tests {
         let store = ImageStore::new(dir.path().join("oci"));
         store.init().await.unwrap();
 
-        let svc = "test-svc";
-        assert!(!store.has_bundle(svc).await);
+        let (svc, hex) = ("test-svc", "ab".repeat(32));
+        assert!(!store.has_bundle(svc, &hex).await);
 
-        // Create a fake bundle
-        let rootfs = store.rootfs_path(svc);
+        // A bundle is complete once its image config is in place.
+        let rootfs = store.rootfs_path(svc, &hex);
         tokio::fs::create_dir_all(&rootfs).await.unwrap();
-        tokio::fs::write(rootfs.join("hello"), b"world")
+        assert!(!store.has_bundle(svc, &hex).await);
+        tokio::fs::write(store.bundle_path(svc, &hex).join(IMAGE_CONFIG_FILE), b"{}")
             .await
             .unwrap();
-        assert!(store.has_bundle(svc).await);
+        assert!(store.has_bundle(svc, &hex).await);
+        assert_eq!(
+            store.list_bundles().await.unwrap(),
+            vec![(svc.to_string(), hex.clone())]
+        );
 
-        store.remove_bundle(svc).await.unwrap();
-        assert!(!store.has_bundle(svc).await);
-    }
-
-    #[tokio::test]
-    async fn history_round_trip() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = ImageStore::new(dir.path().join("oci"));
-        store.init().await.unwrap();
-
-        let svc = "my-svc";
-        store.put_history(svc, b"manifest-v1").await.unwrap();
-        store.put_history(svc, b"manifest-v2").await.unwrap();
-
-        let history = store.list_history(svc).await.unwrap();
-        assert_eq!(history.len(), 2);
-        // Newest first
-        assert_eq!(history[0].0, 2);
-        assert_eq!(history[0].1, b"manifest-v2");
-        assert_eq!(history[1].0, 1);
-        assert_eq!(history[1].1, b"manifest-v1");
-    }
-
-    #[tokio::test]
-    async fn history_prune() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = ImageStore::new(dir.path().join("oci"));
-        store.init().await.unwrap();
-
-        let svc = "prune-svc";
-        store.put_history(svc, b"v1").await.unwrap();
-        store.put_history(svc, b"v2").await.unwrap();
-        store.put_history(svc, b"v3").await.unwrap();
-
-        let pruned = store.prune_history(svc, 1).await.unwrap();
-        assert_eq!(pruned, 2);
-
-        let history = store.list_history(svc).await.unwrap();
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0].1, b"v3");
-    }
-
-    #[tokio::test]
-    async fn history_remove_all() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = ImageStore::new(dir.path().join("oci"));
-        store.init().await.unwrap();
-
-        let svc = "remove-svc";
-        store.put_history(svc, b"v1").await.unwrap();
-        store.put_history(svc, b"v2").await.unwrap();
-
-        store.remove_history(svc).await.unwrap();
-        let history = store.list_history(svc).await.unwrap();
-        assert!(history.is_empty());
-    }
-
-    #[tokio::test]
-    async fn history_isolated_between_services() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = ImageStore::new(dir.path().join("oci"));
-        store.init().await.unwrap();
-
-        store.put_history("svc-a", b"a-data").await.unwrap();
-        store.put_history("svc-b", b"b-data").await.unwrap();
-
-        let history_a = store.list_history("svc-a").await.unwrap();
-        let history_b = store.list_history("svc-b").await.unwrap();
-        assert_eq!(history_a.len(), 1);
-        assert_eq!(history_b.len(), 1);
-        assert_eq!(history_a[0].1, b"a-data");
-        assert_eq!(history_b[0].1, b"b-data");
-    }
-
-    #[tokio::test]
-    async fn list_history_nonexistent_service() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = ImageStore::new(dir.path().join("oci"));
-        store.init().await.unwrap();
-
-        let history = store.list_history("no-such-svc").await.unwrap();
-        assert!(history.is_empty());
-    }
-
-    #[tokio::test]
-    async fn prune_history_to_zero() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = ImageStore::new(dir.path().join("oci"));
-        store.init().await.unwrap();
-
-        store.put_history("svc", b"v1").await.unwrap();
-        store.put_history("svc", b"v2").await.unwrap();
-        store.put_history("svc", b"v3").await.unwrap();
-
-        let pruned = store.prune_history("svc", 0).await.unwrap();
-        assert_eq!(pruned, 3);
-
-        let history = store.list_history("svc").await.unwrap();
-        assert!(history.is_empty());
-    }
-
-    #[tokio::test]
-    async fn prune_history_retain_more_than_exists() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = ImageStore::new(dir.path().join("oci"));
-        store.init().await.unwrap();
-
-        store.put_history("svc", b"v1").await.unwrap();
-
-        let pruned = store.prune_history("svc", 10).await.unwrap();
-        assert_eq!(pruned, 0);
-
-        let history = store.list_history("svc").await.unwrap();
-        assert_eq!(history.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn history_generations_increment() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = ImageStore::new(dir.path().join("oci"));
-        store.init().await.unwrap();
-
-        store.put_history("svc", b"v1").await.unwrap();
-        store.put_history("svc", b"v2").await.unwrap();
-        store.put_history("svc", b"v3").await.unwrap();
-
-        let history = store.list_history("svc").await.unwrap();
-        // Generations should be 3, 2, 1 (newest first)
-        assert_eq!(history[0].0, 3);
-        assert_eq!(history[1].0, 2);
-        assert_eq!(history[2].0, 1);
-    }
-
-    #[tokio::test]
-    async fn remove_history_idempotent() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = ImageStore::new(dir.path().join("oci"));
-        store.init().await.unwrap();
-
-        // Should not error even if no history exists
-        store.remove_history("no-such-svc").await.unwrap();
+        store.remove_bundle(svc, &hex).await.unwrap();
+        assert!(!store.has_bundle(svc, &hex).await);
+        store.remove_service_dir_if_empty(svc).await;
+        assert!(store.list_bundles().await.unwrap().is_empty());
     }
 }
