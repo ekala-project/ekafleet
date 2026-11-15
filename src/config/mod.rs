@@ -62,10 +62,10 @@ pub struct KeylessPolicyConfig {
     pub fulcio_roots_pem: String,
     /// Accepted signer identities. A signing certificate must match one.
     pub identities: Vec<KeylessIdentityConfig>,
-    /// PEM-encoded Rekor transparency-log public key. When set, the signature
-    /// bundle's Rekor Signed Entry Timestamp is verified against it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rekor_public_key_pem: Option<String>,
+    /// PEM-encoded Rekor transparency-log public key. A keyless signature
+    /// must carry a Rekor bundle signed by it: the logged time is what proves
+    /// the short-lived signing certificate was valid when used.
+    pub rekor_public_key_pem: String,
 }
 
 /// An accepted keyless signer identity (SAN subject + OIDC issuer).
@@ -97,10 +97,7 @@ impl SignaturePolicyConfig {
             }
             (None, Some(keyless)) => {
                 let fulcio_roots = parse_cert_bundle_pem(&keyless.fulcio_roots_pem)?;
-                let rekor_public_key = match &keyless.rekor_public_key_pem {
-                    Some(pem) => Some(parse_spki_pem(pem)?),
-                    None => None,
-                };
+                let rekor_public_key = parse_rekor_key_pem(&keyless.rekor_public_key_pem)?;
                 let identities = keyless
                     .identities
                     .iter()
@@ -145,73 +142,16 @@ fn parse_cert_bundle_pem(
     Ok(out)
 }
 
-/// Parse a PEM-encoded SPKI public key into its DER bytes (used for the Rekor
-/// transparency-log key).
-fn parse_spki_pem(pem: &str) -> Result<Vec<u8>, crate::agent::oci::signature::SignatureError> {
-    use crate::agent::oci::signature::SignatureError;
-
-    let base64_content: String = pem
-        .lines()
-        .filter(|line| !line.starts_with("-----"))
-        .collect();
-    let decoded = base64_content.trim().replace(['\n', '\r', ' '], "");
-    // Reuse the SPKI algorithm detection to validate it is a supported key,
-    // then return the raw subjectPublicKey point for ECDSA verification.
-    match crate::agent::oci::signature::parse_public_key_pem(pem)? {
-        crate::agent::oci::signature::SigningKey::EcdsaP256(_)
-        | crate::agent::oci::signature::SigningKey::Ed25519(_) => {}
+/// Parse the Rekor transparency-log key (ECDSA P-256 SPKI PEM) into the raw
+/// point the verifier uses.
+fn parse_rekor_key_pem(pem: &str) -> Result<Vec<u8>, crate::agent::oci::signature::SignatureError> {
+    use crate::agent::oci::signature::{SignatureError, SigningKey, parse_public_key_pem};
+    match parse_public_key_pem(pem)? {
+        SigningKey::EcdsaP256(point) => Ok(point),
+        SigningKey::Ed25519(_) => Err(SignatureError::InvalidKey(
+            "the Rekor key must be ECDSA P-256".into(),
+        )),
     }
-    // Rekor keys are ECDSA P-256; return the raw uncompressed point extracted
-    // from the SPKI so it can be used directly by the ring verifier.
-    let der = base64_decode_spki(&decoded)
-        .map_err(|e| SignatureError::InvalidKey(format!("Rekor key base64: {e}")))?;
-    extract_ec_point_from_spki(&der)
-        .ok_or_else(|| SignatureError::InvalidKey("Rekor key is not an EC SPKI".into()))
-}
-
-/// Minimal standalone base64 decoder for SPKI content (standard alphabet).
-fn base64_decode_spki(input: &str) -> Result<Vec<u8>, String> {
-    let mut out = Vec::with_capacity(input.len() * 3 / 4);
-    for chunk in input.as_bytes().chunks(4) {
-        let mut buf = [0u8; 4];
-        let mut len = 0;
-        for (i, &b) in chunk.iter().enumerate() {
-            if b == b'=' {
-                break;
-            }
-            buf[i] = match b {
-                b'A'..=b'Z' => b - b'A',
-                b'a'..=b'z' => b - b'a' + 26,
-                b'0'..=b'9' => b - b'0' + 52,
-                b'+' => 62,
-                b'/' => 63,
-                _ => return Err(format!("invalid base64 char: {b}")),
-            };
-            len = i + 1;
-        }
-        if len >= 2 {
-            out.push((buf[0] << 2) | (buf[1] >> 4));
-        }
-        if len >= 3 {
-            out.push((buf[1] << 4) | (buf[2] >> 2));
-        }
-        if len >= 4 {
-            out.push((buf[2] << 6) | buf[3]);
-        }
-    }
-    Ok(out)
-}
-
-/// Extract the raw uncompressed EC point (0x04 || X || Y) from an SPKI DER by
-/// locating the trailing 65-byte P-256 point.
-fn extract_ec_point_from_spki(spki_der: &[u8]) -> Option<Vec<u8>> {
-    // A P-256 uncompressed point is 65 bytes starting with 0x04. In a standard
-    // SPKI it is the final BIT STRING content, so search from the end.
-    spki_der
-        .windows(65)
-        .rev()
-        .find(|w| w[0] == 0x04)
-        .map(|w| w.to_vec())
 }
 
 /// Script hooks executed at various deployment lifecycle points.
@@ -333,6 +273,60 @@ pub struct ContainerConfig {
     /// Registry credentials secret name (references a secret in the service's secrets).
     #[serde(default)]
     pub registry_auth_secret: Option<String>,
+}
+
+/// A parsed `bindMounts` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindMountSpec {
+    pub host_path: String,
+    pub container_path: String,
+    pub read_only: bool,
+}
+
+impl ContainerConfig {
+    /// Parse `bindMounts` (`/host:/container[:ro|:rw]`).
+    pub fn parsed_bind_mounts(&self) -> Result<Vec<BindMountSpec>, String> {
+        self.bind_mounts
+            .iter()
+            .map(|m| parse_bind_mount(m))
+            .collect()
+    }
+}
+
+fn parse_bind_mount(mount: &str) -> Result<BindMountSpec, String> {
+    let parts: Vec<&str> = mount.split(':').collect();
+    let (host, container, read_only) = match parts.as_slice() {
+        [host, container] | [host, container, "rw"] => (*host, *container, false),
+        [host, container, "ro"] => (*host, *container, true),
+        _ => {
+            return Err(format!(
+                "bind mount '{mount}' must be /host:/container[:ro]"
+            ));
+        }
+    };
+    for path in [host, container] {
+        if !is_plain_bind_path(path) {
+            return Err(format!(
+                "bind mount '{mount}': '{path}' must be an absolute path without '..', spaces or quoting"
+            ));
+        }
+    }
+    Ok(BindMountSpec {
+        host_path: host.to_string(),
+        container_path: container.to_string(),
+        read_only,
+    })
+}
+
+/// Whether `path` can appear in a bind mount: the paths end up on a unit's
+/// ExecStart line, so they must be absolute, without `..`, quoting, escapes,
+/// separators or systemd specifiers.
+pub fn is_plain_bind_path(path: &str) -> bool {
+    path.starts_with('/')
+        && !path.split('/').any(|c| c == "..")
+        && !path.chars().any(|c| {
+            c.is_whitespace() || c.is_control() || matches!(c, ':' | ',' | '%' | '\\' | '"' | '\'')
+        })
 }
 
 /// Pull policy for OCI container images.
@@ -930,8 +924,48 @@ pub fn validate_mount_path(path: &str) -> Result<(), String> {
 }
 
 /// Validate a fleet configuration for consistency.
+fn validate_container(
+    name: &str,
+    service: &ServiceConfig,
+    container: &ContainerConfig,
+    errors: &mut Vec<String>,
+) {
+    match container
+        .image
+        .parse::<crate::agent::oci::reference::ImageReference>()
+    {
+        Ok(image) => {
+            if container.pull_policy == ContainerPullPolicy::Never && image.digest.is_none() {
+                errors.push(format!(
+                    "service '{name}': pullPolicy Never needs an image pinned with @sha256:..."
+                ));
+            }
+        }
+        Err(e) => errors.push(format!(
+            "service '{name}': invalid image '{}': {e}",
+            container.image
+        )),
+    }
+    if let Err(e) = container.parsed_bind_mounts() {
+        errors.push(format!("service '{name}': {e}"));
+    }
+    if let Some(secret) = &container.registry_auth_secret
+        && !static_secrets(service).contains(secret)
+    {
+        errors.push(format!(
+            "service '{name}': registryAuthSecret '{secret}' is not a static secret of the service"
+        ));
+    }
+}
+
 pub fn validate(config: &FleetConfig) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
+
+    if let Some(policy) = &config.signature_policy
+        && let Err(e) = policy.to_runtime_policy()
+    {
+        errors.push(format!("signaturePolicy: {e}"));
+    }
 
     for (name, machine) in &config.machines {
         if machine.pool != "default" && !config.node_pools.contains_key(&machine.pool) {
@@ -1039,6 +1073,10 @@ pub fn validate(config: &FleetConfig) -> Result<(), Vec<String>> {
                 "service '{}' prefers undefined pool '{}'",
                 name, pool
             ));
+        }
+
+        if let Some(container) = &service.container {
+            validate_container(name, service, container, &mut errors);
         }
 
         // Exactly one of command or container must be set
@@ -1301,6 +1339,83 @@ mod nix_module_tests {
     }
 
     #[test]
+    fn containers_are_validated() {
+        let config = |container: serde_json::Value| -> FleetConfig {
+            serde_json::from_value(serde_json::json!({
+                "name": "t",
+                "domain": "fleet.test",
+                "services": {"web": {"container": container, "secrets": {"pull": {}}}},
+            }))
+            .unwrap()
+        };
+        let ok = config(serde_json::json!({
+            "image": "registry.test:5000/team/web:v1",
+            "bindMounts": ["/srv/data:/data", "/etc/ssl/certs:/etc/ssl/certs:ro"],
+            "registryAuthSecret": "pull",
+        }));
+        assert!(validate(&ok).is_ok(), "{:?}", validate(&ok));
+        assert_eq!(
+            ok.services["web"]
+                .container
+                .as_ref()
+                .unwrap()
+                .parsed_bind_mounts()
+                .unwrap()[1],
+            BindMountSpec {
+                host_path: "/etc/ssl/certs".into(),
+                container_path: "/etc/ssl/certs".into(),
+                read_only: true,
+            }
+        );
+
+        for (container, expected) in [
+            (
+                serde_json::json!({"image": "web:v1", "pullPolicy": "Never"}),
+                "pullPolicy Never needs an image pinned",
+            ),
+            (
+                serde_json::json!({"image": "web@sha256:nothex"}),
+                "invalid image",
+            ),
+            (
+                serde_json::json!({"image": "web", "bindMounts": ["relative:/x"]}),
+                "must be an absolute path",
+            ),
+            (
+                serde_json::json!({"image": "web", "bindMounts": ["/a:/b:rw:x"]}),
+                "must be /host:/container",
+            ),
+            (
+                serde_json::json!({"image": "web", "bindMounts": ["/a%n:/b"]}),
+                "without '..', spaces or quoting",
+            ),
+            (
+                serde_json::json!({"image": "web", "registryAuthSecret": "missing"}),
+                "registryAuthSecret 'missing' is not a static secret",
+            ),
+        ] {
+            let errors = validate(&config(container)).unwrap_err().join("\n");
+            assert!(errors.contains(expected), "{expected}: {errors}");
+        }
+    }
+
+    #[test]
+    fn signature_policies_must_parse() {
+        let mut cfg: FleetConfig = serde_json::from_value(serde_json::json!({
+            "name": "t",
+            "domain": "fleet.test",
+            "signaturePolicy": {"publicKeyPem": "garbage"},
+        }))
+        .unwrap();
+        let errors = validate(&cfg).unwrap_err().join("\n");
+        assert!(errors.contains("signaturePolicy:"), "{errors}");
+
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        cfg.signature_policy.as_mut().unwrap().public_key_pem = Some(key.public_key_pem());
+        assert!(validate(&cfg).is_ok(), "{:?}", validate(&cfg));
+    }
+
+    #[test]
     fn secrets_are_validated_and_static_ones_listed() {
         let config = |secrets: serde_json::Value| -> FleetConfig {
             serde_json::from_value(serde_json::json!({
@@ -1402,7 +1517,8 @@ mod nix_module_tests {
                 "fulcioRootsPem": "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----",
                 "identities": [
                     {"subject": "ci@example.com", "issuer": "https://accounts.example.com"}
-                ]
+                ],
+                "rekorPublicKeyPem": "-----BEGIN PUBLIC KEY-----\nMFkw\n-----END PUBLIC KEY-----"
             },
             "enforce": false
         }"#;
@@ -1413,7 +1529,14 @@ mod nix_module_tests {
         let keyless = cfg.keyless.expect("expected keyless mode");
         assert_eq!(keyless.identities.len(), 1);
         assert_eq!(keyless.identities[0].subject, "ci@example.com");
-        assert!(keyless.rekor_public_key_pem.is_none());
+        assert!(keyless.rekor_public_key_pem.contains("PUBLIC KEY"));
+        // The Rekor key is required for keyless verification.
+        let without_rekor = json.replace(
+            r#",
+                "rekorPublicKeyPem": "-----BEGIN PUBLIC KEY-----\nMFkw\n-----END PUBLIC KEY-----""#,
+            "",
+        );
+        assert!(serde_json::from_str::<SignaturePolicyConfig>(&without_rekor).is_err());
     }
 
     #[test]
@@ -1439,7 +1562,7 @@ mod nix_module_tests {
                     subject: "ci@example.com".to_string(),
                     issuer: "https://accounts.example.com".to_string(),
                 }],
-                rekor_public_key_pem: None,
+                rekor_public_key_pem: String::new(),
             }),
             enforce: true,
         };

@@ -663,6 +663,7 @@ impl FleetControl for FleetControlService {
         let raft_state = self.raft_state.clone();
         let controller = self.controller.clone();
         let gcroots = self.data_dir.join("gcroots");
+        let secret_store = self.secret_store.clone();
         tokio::spawn(async move {
             let send = |revision: u64, status: crate::proto::ApplyStatus, message: String| {
                 let tx = tx.clone();
@@ -702,6 +703,32 @@ impl FleetControl for FleetControlService {
                 send(0, ApplyInProgress, format!("Warning: {warning}")).await;
             }
 
+            let pinned = {
+                let previous = raft_state.current_config().await;
+                let secrets = raft_state.secrets().await;
+                let store = secret_store.read().await;
+                super::images::pin_images(
+                    &evaluated.config,
+                    previous.as_ref(),
+                    &secrets,
+                    &store,
+                    |message| send(0, ApplyInProgress, message),
+                )
+                .await
+            };
+            let images = match pinned {
+                Ok(pinned) => {
+                    for warning in pinned.warnings {
+                        send(0, ApplyInProgress, format!("Warning: {warning}")).await;
+                    }
+                    pinned.images
+                }
+                Err(e) => {
+                    send(0, ApplyFailed, format!("Apply failed: {e}")).await;
+                    return;
+                }
+            };
+
             let closures =
                 match build_service_closures(&evaluated.locked_ref, &gcroots, &send).await {
                     Ok(closures) => closures,
@@ -720,6 +747,7 @@ impl FleetControl for FleetControlService {
                     applied_by: actor,
                     rollback_of: None,
                     closures,
+                    images,
                 })
                 .await
             {
@@ -869,6 +897,7 @@ impl FleetControl for FleetControlService {
                 applied_by: actor,
                 rollback_of: Some(wanted),
                 closures: target.closures.clone(),
+                images: target.images.clone(),
             })
             .await
             .map_err(|e| Status::internal(format!("cannot record configuration: {e}")))?;

@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::proto::ServiceSpec;
@@ -30,6 +30,8 @@ pub struct Supervisor {
     gcroot_dir: PathBuf,
     /// Where service volumes live (see `super::storage`).
     volumes_dir: PathBuf,
+    /// The OCI image store (see `super::images`).
+    oci_dir: PathBuf,
     managed_units: HashMap<String, UnitState>,
 }
 
@@ -45,9 +47,6 @@ struct UnitState {
 /// Where unit files are linked for systemd to load.
 const SYSTEMD_RUNTIME_UNIT_DIR: &str = "/run/systemd/system";
 
-/// The path to the OCI bundle store used by the supervisor.
-const OCI_STORE_DIR: &str = "/var/lib/ekafleet/oci";
-
 impl Supervisor {
     pub fn new(data_dir: &Path) -> Self {
         let unit_dir = data_dir.join("units");
@@ -56,6 +55,7 @@ impl Supervisor {
             unit_dir,
             gcroot_dir,
             volumes_dir: super::storage::volumes_dir(data_dir),
+            oci_dir: super::images::oci_dir(data_dir),
             managed_units: HashMap::new(),
         }
     }
@@ -154,9 +154,13 @@ impl Supervisor {
 
     /// Reconcile local services with desired state.
     /// Starts new services, restarts changed ones, stops removed ones.
+    ///
+    /// Services in `keep` that are not desired are left exactly as they are
+    /// (e.g. a container whose new image is still being pulled).
     pub async fn reconcile(
         &mut self,
         desired: &HashMap<String, ServiceSpec>,
+        keep: &HashSet<String>,
     ) -> Result<Vec<SupervisorAction>, SupervisorError> {
         let mut actions = Vec::new();
 
@@ -228,7 +232,7 @@ impl Supervisor {
         let to_remove: Vec<String> = self
             .managed_units
             .keys()
-            .filter(|name| !desired.contains_key(*name))
+            .filter(|name| !desired.contains_key(*name) && !keep.contains(*name))
             .cloned()
             .collect();
 
@@ -246,6 +250,19 @@ impl Supervisor {
         }
 
         Ok(actions)
+    }
+
+    /// The image reference each managed container service runs, as
+    /// `(service, image)`.
+    pub fn container_images(&self) -> Vec<(String, String)> {
+        self.managed_units
+            .iter()
+            .filter_map(|(name, unit)| {
+                let image = unit.version_key.split('#').next()?;
+                // Native services are keyed by store path.
+                (!image.starts_with('/')).then(|| (name.clone(), image.to_string()))
+            })
+            .collect()
     }
 
     /// Generate a systemd unit file from a service spec.
@@ -285,8 +302,11 @@ impl Supervisor {
         spec: &ServiceSpec,
     ) -> Result<(), SupervisorError> {
         tokio::fs::create_dir_all(&self.unit_dir).await?;
-        self.install_unit(unit_name, &container_unit_content(spec, &self.volumes_dir))
-            .await
+        self.install_unit(
+            unit_name,
+            &container_unit_content(spec, &self.volumes_dir, &self.oci_dir),
+        )
+        .await
     }
 
     /// Write unit file to disk and symlink into systemd.
@@ -504,9 +524,12 @@ WantedBy=multi-user.target
 }
 
 /// The unit file of a container service.
-fn container_unit_content(spec: &ServiceSpec, volumes_dir: &Path) -> String {
+fn container_unit_content(spec: &ServiceSpec, volumes_dir: &Path, oci_dir: &Path) -> String {
     let machine_name = format!("ekafleet-{}", spec.name);
-    let bundle_path = format!("{OCI_STORE_DIR}/bundles/{}", spec.name);
+    // Agents only start containers whose pinned bundle is unpacked.
+    let bundle_path = super::images::bundle_path(oci_dir, spec)
+        .unwrap_or_else(|| oci_dir.join("bundles").join(&spec.name).join("unpinned"));
+    let bundle_path = bundle_path.display();
 
     // Build nspawn command with bind mounts
     let spiffe_socket = crate::spiffe::socket::DEFAULT_SOCKET_PATH;
@@ -538,16 +561,16 @@ fn container_unit_content(spec: &ServiceSpec, volumes_dir: &Path) -> String {
         nspawn_args.push(format!("--bind-ro={source}:{dest}"));
     }
 
-    // Add user-specified bind mounts from environment hints
-    for (key, value) in &spec.environment {
-        if key == "EKAFLEET_EXTRA_BINDS" {
-            for bind in value.split(',') {
-                let bind = bind.trim();
-                if !bind.is_empty() {
-                    nspawn_args.push(format!("--bind={bind}"));
-                }
-            }
-        }
+    for mount in container_bind_mounts(spec) {
+        let flag = if mount.read_only {
+            "--bind-ro"
+        } else {
+            "--bind"
+        };
+        nspawn_args.push(format!(
+            "{flag}={}:{}",
+            mount.host_path, mount.container_path
+        ));
     }
 
     let nspawn_cmd = format!("systemd-nspawn {}", nspawn_args.join(" \\\n  "));
@@ -607,6 +630,11 @@ fn version_key_for(spec: &ServiceSpec) -> String {
     if secrets_bind(spec).is_some() {
         key = format!("{key}#secrets={}", spec.secrets.join(","));
     }
+    if is_container_service(spec) {
+        // The container options and environment go into the bundle's
+        // config.json and the nspawn command line: a change restarts it.
+        key = format!("{key}#container={}", container_options_hash(spec));
+    }
     let volumes = volume_binds(spec, Path::new(""));
     if !volumes.is_empty() {
         let mounts: Vec<String> = spec
@@ -618,6 +646,47 @@ fn version_key_for(spec: &ServiceSpec) -> String {
         key = format!("{key}#volumes={}", mounts.join(","));
     }
     key
+}
+
+/// The configured bind mounts of a container service. They are validated with
+/// the fleet config; anything invalid that still arrives is left out.
+fn container_bind_mounts(spec: &ServiceSpec) -> Vec<&crate::proto::ContainerBindMount> {
+    spec.container
+        .iter()
+        .flat_map(|c| &c.bind_mounts)
+        .filter(|m| {
+            let plain = crate::config::is_plain_bind_path(&m.host_path)
+                && crate::config::is_plain_bind_path(&m.container_path);
+            if !plain {
+                tracing::warn!(
+                    service = %spec.name,
+                    host_path = %m.host_path,
+                    container_path = %m.container_path,
+                    "Ignoring invalid bind mount"
+                );
+            }
+            plain
+        })
+        .collect()
+}
+
+/// A short digest of what a container runs besides its image: the container
+/// options and environment.
+fn container_options_hash(spec: &ServiceSpec) -> String {
+    use prost::Message;
+    let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+    ctx.update(&spec.container.clone().unwrap_or_default().encode_to_vec());
+    let mut env: Vec<_> = spec.environment.iter().collect();
+    env.sort();
+    for (k, v) in env {
+        for part in [k.as_bytes(), b"\0", v.as_bytes(), b"\0"] {
+            ctx.update(part);
+        }
+    }
+    ctx.finish().as_ref()[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// (host directory, mount path) of each valid volume of `spec`, by mount
@@ -870,6 +939,7 @@ mod tests {
     use super::*;
 
     const VOLS: &str = "/var/lib/ekafleet/volumes";
+    const OCI: &str = "/var/lib/ekafleet/oci";
 
     fn native_spec(name: &str, command: &str, store_path: &str) -> ServiceSpec {
         ServiceSpec {
@@ -1034,7 +1104,9 @@ mod tests {
     #[test]
     fn version_key_container() {
         let spec = container_spec("api", "ghcr.io/org/api:v1.0@sha256:abcdef");
-        assert_eq!(version_key_for(&spec), "ghcr.io/org/api:v1.0@sha256:abcdef");
+        assert!(
+            version_key_for(&spec).starts_with("ghcr.io/org/api:v1.0@sha256:abcdef#container=")
+        );
     }
 
     #[test]
@@ -1129,100 +1201,71 @@ WantedBy=multi-user.target
         assert!(content.contains("EKAFLEET_SERVICE=web"));
     }
 
-    #[tokio::test]
-    async fn write_container_unit_generates_nspawn() {
-        let dir = tempfile::tempdir().unwrap();
-        let supervisor = Supervisor::new(dir.path());
+    #[test]
+    fn container_units_run_the_pinned_bundle_with_nspawn() {
+        let hex = "ab".repeat(32);
+        let mut spec = container_spec("api", &format!("ghcr.io/org/api:v1.0@sha256:{hex}"));
+        spec.container = Some(crate::proto::ContainerOptions {
+            bind_mounts: vec![
+                crate::proto::ContainerBindMount {
+                    host_path: "/srv/data".into(),
+                    container_path: "/data".into(),
+                    read_only: false,
+                },
+                crate::proto::ContainerBindMount {
+                    host_path: "/etc/ssl".into(),
+                    container_path: "/etc/ssl".into(),
+                    read_only: true,
+                },
+                crate::proto::ContainerBindMount {
+                    host_path: "/srv/%n".into(),
+                    container_path: "/x".into(),
+                    read_only: false,
+                },
+            ],
+            ..Default::default()
+        });
+        let content = container_unit_content(&spec, Path::new(VOLS), Path::new(OCI));
 
-        let spec = container_spec("api", "ghcr.io/org/api:v1.0");
-
-        // Generate the unit content directly (avoid symlinking into /etc)
-        tokio::fs::create_dir_all(&supervisor.unit_dir)
-            .await
-            .unwrap();
-
-        let machine_name = format!("ekafleet-{}", spec.name);
-        let bundle_path = format!("{OCI_STORE_DIR}/bundles/{}", spec.name);
-        let spiffe_socket = crate::spiffe::socket::DEFAULT_SOCKET_PATH;
-        let secrets_dir = format!("/var/lib/ekafleet/secrets/{}", spec.name);
-
-        let nspawn_args = [
-            format!("--oci-bundle={bundle_path}"),
-            format!("--machine={machine_name}"),
-            "--network-namespace-path=/proc/1/ns/net".to_string(),
-            format!("--bind={spiffe_socket}"),
-            format!("--bind-ro={secrets_dir}:/run/secrets"),
-            "--register=yes".to_string(),
-            "--keep-unit".to_string(),
-        ];
-
-        let nspawn_cmd = format!("systemd-nspawn {}", nspawn_args.join(" \\\n  "));
-        let env_lines = build_env_lines(&spec);
-        let extra_lines = build_extra_directives(&spec);
-
-        let unit_content = format!(
-            r#"[Unit]
-Description=ekafleet container: {name}
-After=network.target
-Wants=machines.target
-
-[Service]
-Type=simple
-ExecStart={nspawn_cmd}
-ExecStop=machinectl terminate {machine}
-Restart=on-failure
-RestartSec=5
-KillMode=mixed
-{extra}
-{env}
-
-[Install]
-WantedBy=multi-user.target
-"#,
-            name = spec.name,
-            nspawn_cmd = nspawn_cmd,
-            machine = machine_name,
-            extra = extra_lines,
-            env = env_lines,
-        );
-
-        let path = supervisor.unit_dir.join("ekafleet-api.service");
-        tokio::fs::write(&path, &unit_content).await.unwrap();
-
-        let content = tokio::fs::read_to_string(&path).await.unwrap();
-
-        // Verify nspawn invocation
         assert!(content.contains("systemd-nspawn"));
-        assert!(content.contains(&format!("--oci-bundle={bundle_path}")));
-        assert!(content.contains(&format!("--machine={machine_name}")));
-
-        // Verify host networking
+        assert!(content.contains(&format!("--oci-bundle={OCI}/bundles/api/{hex}")));
+        assert!(content.contains("--machine=ekafleet-api"));
         assert!(content.contains("--network-namespace-path=/proc/1/ns/net"));
-
-        // Verify SPIFFE socket bind mount
-        assert!(content.contains(&format!("--bind={spiffe_socket}")));
-
-        // Verify secrets bind mount
-        assert!(content.contains("--bind-ro=/var/lib/ekafleet/secrets/api:/run/secrets"));
-
-        // Verify machined registration
+        assert!(content.contains(&format!(
+            "--bind={}",
+            crate::spiffe::socket::DEFAULT_SOCKET_PATH
+        )));
+        assert!(content.contains("--bind=/srv/data:/data"));
+        assert!(content.contains("--bind-ro=/etc/ssl:/etc/ssl"));
+        // Specifiers never reach the unit.
+        assert!(!content.contains("%n"));
         assert!(content.contains("--register=yes"));
         assert!(content.contains("--keep-unit"));
-
-        // Verify Type=simple (container managed by systemd directly)
         assert!(content.contains("Type=simple"));
-
-        // Verify machinectl terminate for clean shutdown
         assert!(content.contains("ExecStop=machinectl terminate ekafleet-api"));
-
-        // Verify Wants=machines.target
         assert!(content.contains("Wants=machines.target"));
-
-        // Verify KillMode=mixed (signal main + cgroup cleanup)
         assert!(content.contains("KillMode=mixed"));
-
-        // Verify EKAFLEET_SERVICE is set
         assert!(content.contains("EKAFLEET_SERVICE=api"));
+    }
+
+    #[test]
+    fn container_options_and_environment_are_part_of_the_version() {
+        let mut spec = container_spec("api", "ghcr.io/org/api@sha256:00");
+        let plain = version_key_for(&spec);
+        assert!(plain.starts_with("ghcr.io/org/api@sha256:00#container="));
+        spec.environment.insert("MODE".into(), "prod".into());
+        let with_env = version_key_for(&spec);
+        assert_ne!(plain, with_env);
+        spec.container = Some(crate::proto::ContainerOptions {
+            args: Some(crate::proto::StringList {
+                items: vec!["--serve".into()],
+            }),
+            ..Default::default()
+        });
+        assert_ne!(with_env, version_key_for(&spec));
+        // Native services are unaffected.
+        let native = native_spec("web", "/bin/web", "/nix/store/x");
+        assert_eq!(version_key_for(&native), "/nix/store/x");
     }
 
     #[tokio::test]
@@ -1270,7 +1313,7 @@ WantedBy=multi-user.target
         );
 
         spec.container_image = "ghcr.io/org/web:1".into();
-        let content = container_unit_content(&spec, Path::new(VOLS));
+        let content = container_unit_content(&spec, Path::new(VOLS), Path::new(OCI));
         assert!(content.contains(&format!("--bind-ro={}:/etc/web.conf", rendered.display())));
     }
 
@@ -1290,7 +1333,7 @@ WantedBy=multi-user.target
         );
         spec.container_image = "ghcr.io/org/web:1".into();
         assert!(
-            container_unit_content(&spec, Path::new(VOLS))
+            container_unit_content(&spec, Path::new(VOLS), Path::new(OCI))
                 .contains("--bind-ro=/run/ekafleet/secrets/web:/run/secrets")
         );
     }
@@ -1318,7 +1361,7 @@ WantedBy=multi-user.target
         );
         spec.container_image = "ghcr.io/org/db:1".into();
         assert!(
-            container_unit_content(&spec, Path::new(VOLS))
+            container_unit_content(&spec, Path::new(VOLS), Path::new(OCI))
                 .contains(&format!("--bind={VOLS}/db/data:/var/lib/db"))
         );
     }

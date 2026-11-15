@@ -5,6 +5,7 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::{RwLock, mpsc};
 
 use super::helpers::{install_node_svid, install_received_svid};
+use super::images::{ImageManager, Readiness};
 use super::netns::NamespaceNetworkManager;
 use super::storage::VolumeManager;
 use super::supervisor;
@@ -64,6 +65,7 @@ pub(super) async fn converge_services(
     templates: &Arc<TemplateManager>,
     dns: &Arc<AgentDns>,
     volumes: &Arc<VolumeManager>,
+    images: &Arc<ImageManager>,
 ) {
     let all = local_state.read().await.desired_services.clone();
     if let Err(e) = volumes.provision(all.values()).await {
@@ -71,6 +73,8 @@ pub(super) async fn converge_services(
     }
     volumes.release_unassigned(all.keys().map(String::as_str));
     let mut desired = std::collections::HashMap::new();
+    // Running containers whose new image is not ready yet: left as they are.
+    let mut keep = std::collections::HashSet::new();
     {
         let injector = secret_injector.read().await;
         let declared = all
@@ -91,6 +95,22 @@ pub(super) async fn converge_services(
                 tracing::info!(service = %name, secrets = ?spec.secrets, "Service waits for its secrets");
                 continue;
             }
+            if !spec.container_image.is_empty() {
+                match images.prepare(spec).await {
+                    Readiness::Ready { user } => {
+                        super::images::chown_volumes(&volumes.service_dir(name), spec, &user).await;
+                    }
+                    waiting => {
+                        if supervisor.is_running(name).await {
+                            tracing::info!(service = %name, image = %spec.container_image, state = ?waiting, "Service keeps its current image until the new one is ready");
+                            keep.insert(name.clone());
+                        } else {
+                            tracing::info!(service = %name, image = %spec.container_image, state = ?waiting, "Service waits for its image");
+                        }
+                        continue;
+                    }
+                }
+            }
             desired.insert(name.clone(), spec.clone());
         }
     }
@@ -98,7 +118,7 @@ pub(super) async fn converge_services(
     // Render before (re)starting, so new services find their files.
     templates.set_services(all.values()).await;
     let template_changes = templates.render_all(dns.resolver()).await;
-    match supervisor.write().await.reconcile(&desired).await {
+    match supervisor.write().await.reconcile(&desired, &keep).await {
         Ok(actions) => {
             for action in &actions {
                 tracing::info!(?action, "Supervisor action");
@@ -115,6 +135,26 @@ pub(super) async fn converge_services(
         }
         Err(e) => tracing::error!(error = %e, "Service reconciliation failed"),
     }
+    images.retain_services(&all.keys().map(String::as_str).collect());
+    // The bundles services run and those they switch to stay; the rest go
+    // once no pull is in flight.
+    let mut bundles: std::collections::HashSet<(String, String)> = all
+        .values()
+        .filter_map(|spec| {
+            super::images::pinned_image(spec).map(|(_, hex)| (spec.name.clone(), hex))
+        })
+        .collect();
+    for (service, image) in supervisor.read().await.container_images() {
+        let running = crate::proto::ServiceSpec {
+            name: service,
+            container_image: image,
+            ..Default::default()
+        };
+        if let Some((_, hex)) = super::images::pinned_image(&running) {
+            bundles.insert((running.name, hex));
+        }
+    }
+    images.collect_garbage(&bundles).await;
     // After the supervisor has stopped services no longer assigned here.
     if let Err(e) = volumes.reclaim(all.values()).await {
         tracing::warn!(error = %e, "Cannot reclaim volumes");
@@ -137,12 +177,16 @@ pub(super) async fn handle_server_message(
     health_checker: &HealthChecker,
     netns_manager: &Arc<NamespaceNetworkManager>,
     volumes: &Arc<VolumeManager>,
+    images: &Arc<ImageManager>,
     tx: &mpsc::Sender<AgentMessage>,
     node_id: &str,
     client: &super::closures::AgentClient,
 ) {
     match payload {
         ServerPayload::DesiredState(mut ds) => {
+            if let Err(e) = images.set_signature_policy(&ds.signature_policy_json) {
+                tracing::error!(error = %e, "Refusing to pull images until the signature policy is fixed");
+            }
             tracing::info!(
                 correlation_id = %ds.correlation_id,
                 services = ds.services.len(),
@@ -376,6 +420,7 @@ pub(super) async fn handle_server_message(
                 templates,
                 dns,
                 volumes,
+                images,
             )
             .await;
         }
@@ -401,6 +446,7 @@ pub(super) async fn handle_server_message(
                 templates,
                 dns,
                 volumes,
+                images,
             )
             .await;
         }
@@ -440,6 +486,7 @@ pub(super) async fn handle_server_message(
                         templates,
                         dns,
                         volumes,
+                        images,
                     )
                     .await
                 }
@@ -930,6 +977,7 @@ pub(super) async fn handle_server_message(
                     templates,
                     dns,
                     volumes,
+                    images,
                 )
                 .await;
                 if supervisor.read().await.is_running(service).await {
@@ -951,10 +999,12 @@ pub(super) async fn handle_server_message(
                 templates.clone(),
                 dns.clone(),
                 volumes.clone(),
+                images.clone(),
             );
             let node = node_id.to_string();
             tokio::spawn(async move {
-                let (supervisor, local_state, secret_injector, templates, dns, volumes) = &ctx;
+                let (supervisor, local_state, secret_injector, templates, dns, volumes, images) =
+                    &ctx;
                 let result = volume_snapshot(&cmd, volumes, || async {
                     converge_services(
                         supervisor,
@@ -963,6 +1013,7 @@ pub(super) async fn handle_server_message(
                         templates,
                         dns,
                         volumes,
+                        images,
                     )
                     .await
                 })

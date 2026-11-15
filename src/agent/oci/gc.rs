@@ -1,7 +1,8 @@
 //! Garbage collection for the OCI image store.
 //!
-//! Removes blobs that are not referenced by any active service's manifest
-//! and removes bundles for services that are no longer desired.
+//! Keeps the bundles in use (per service and pinned digest), the manifests
+//! of those digests and the blobs they reference; removes everything else,
+//! including leftover staging directories.
 
 use std::collections::HashSet;
 
@@ -16,66 +17,62 @@ pub struct GcResult {
     pub blobs_removed: usize,
     /// Number of bundles removed.
     pub bundles_removed: usize,
-    /// Total bytes freed (approximate, from blob sizes).
+    /// Total bytes freed by removed blobs.
     pub bytes_freed: u64,
 }
 
-/// Run garbage collection on the image store.
+/// Remove every bundle not in `keep` (as `(service, digest hex)`), and the
+/// manifests and blobs no kept bundle needs.
 ///
-/// `active_services` is the set of service names that are currently desired.
-/// `active_manifests` maps service names to their resolved manifest (used to
-/// determine which blobs are still referenced).
-/// `retained_manifests` are historical manifests kept for rollback — their
-/// referenced blobs are also preserved.
-///
-/// Blobs not referenced by any active or retained manifest are deleted.
-/// Bundles for services not in `active_services` are removed.
+/// Must not run while a pull is writing to the store.
 pub async fn collect(
     store: &ImageStore,
-    active_services: &HashSet<String>,
-    active_manifests: &[(String, ImageManifest)],
-    retained_manifests: &[ImageManifest],
+    keep: &HashSet<(String, String)>,
 ) -> Result<GcResult, StoreError> {
     let mut result = GcResult::default();
 
-    // Build set of all referenced digests (active + retained for rollback)
-    let mut referenced: HashSet<Digest> = HashSet::new();
-    for (_, manifest) in active_manifests {
-        referenced.insert(manifest.config.digest.clone());
-        for layer in &manifest.layers {
-            referenced.insert(layer.digest.clone());
-        }
-    }
-    for manifest in retained_manifests {
-        referenced.insert(manifest.config.digest.clone());
-        for layer in &manifest.layers {
-            referenced.insert(layer.digest.clone());
-        }
-    }
-
-    // Remove unreferenced blobs
-    let all_blobs = store.list_blobs().await?;
-    for digest in &all_blobs {
-        if !referenced.contains(digest) {
-            // Get size before removing
-            if let Ok(data) = store.get_blob(digest).await {
-                result.bytes_freed += data.len() as u64;
-            }
-            store.remove_blob(digest).await?;
-            result.blobs_removed += 1;
-            tracing::debug!(digest = %digest, "Removed unreferenced blob");
-        }
-    }
-
-    // Remove bundles and history for inactive services
-    let all_bundles = store.list_bundles().await?;
-    for name in &all_bundles {
-        if !active_services.contains(name) {
-            store.remove_bundle(name).await?;
-            store.remove_history(name).await?;
+    let mut services = HashSet::new();
+    for (service, name) in store.list_bundles().await? {
+        if !keep.contains(&(service.clone(), name.clone())) {
+            store.remove_bundle(&service, &name).await?;
             result.bundles_removed += 1;
-            tracing::debug!(service = name, "Removed inactive bundle");
+            tracing::debug!(service, bundle = name, "Removed unused bundle");
         }
+        services.insert(service);
+    }
+    for service in services {
+        store.remove_service_dir_if_empty(&service).await;
+    }
+
+    let kept_digests: HashSet<&str> = keep.iter().map(|(_, hex)| hex.as_str()).collect();
+    let mut referenced: HashSet<Digest> = HashSet::new();
+    for key in store.list_manifests().await? {
+        if !kept_digests.contains(key.as_str()) {
+            store.remove_manifest(&key).await?;
+            continue;
+        }
+        let Some(raw) = store.get_manifest(&key).await? else {
+            continue;
+        };
+        match serde_json::from_slice::<ImageManifest>(&raw) {
+            Ok(manifest) => {
+                referenced.insert(manifest.config.digest.clone());
+                referenced.extend(manifest.layers.into_iter().map(|l| l.digest));
+            }
+            // Re-fetched on the next pull of this digest.
+            Err(_) => store.remove_manifest(&key).await?,
+        }
+    }
+
+    for digest in store.list_blobs().await? {
+        if referenced.contains(&digest) {
+            continue;
+        }
+        if let Ok(meta) = tokio::fs::metadata(store.blob_path(&digest)).await {
+            result.bytes_freed += meta.len();
+        }
+        store.remove_blob(&digest).await?;
+        result.blobs_removed += 1;
     }
 
     if result.blobs_removed > 0 || result.bundles_removed > 0 {
@@ -83,10 +80,9 @@ pub async fn collect(
             blobs = result.blobs_removed,
             bundles = result.bundles_removed,
             bytes_freed = result.bytes_freed,
-            "Garbage collection complete"
+            "Image garbage collection complete"
         );
     }
-
     Ok(result)
 }
 
@@ -94,8 +90,9 @@ pub async fn collect(
 mod tests {
     use super::*;
     use crate::agent::oci::manifest::Descriptor;
+    use crate::agent::oci::store::IMAGE_CONFIG_FILE;
 
-    fn make_descriptor(data: &[u8]) -> Descriptor {
+    fn descriptor(data: &[u8]) -> Descriptor {
         Descriptor {
             media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
             digest: Digest::from_bytes(data),
@@ -105,294 +102,100 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn gc_removes_unreferenced_blobs() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = ImageStore::new(dir.path().join("oci"));
-        store.init().await.unwrap();
-
-        // Store some blobs
-        let active_data = b"active layer";
-        let orphan_data = b"orphan layer";
-        let config_data = b"config";
-
-        let active_digest = Digest::from_bytes(active_data);
-        let orphan_digest = Digest::from_bytes(orphan_data);
-        let config_digest = Digest::from_bytes(config_data);
-
-        store.put_blob(&active_digest, active_data).await.unwrap();
-        store.put_blob(&orphan_digest, orphan_data).await.unwrap();
-        store.put_blob(&config_digest, config_data).await.unwrap();
-
-        // Only the active layer and config are referenced
+    /// Store an image (manifest, config and one layer per entry) and a
+    /// complete bundle of it for `service`; returns the digest hex.
+    async fn add_image(store: &ImageStore, service: &str, layers: &[&[u8]]) -> String {
+        let config = format!("config of {service}");
+        store
+            .put_blob(&Digest::from_bytes(config.as_bytes()), config.as_bytes())
+            .await
+            .unwrap();
+        for layer in layers {
+            store
+                .put_blob(&Digest::from_bytes(layer), layer)
+                .await
+                .unwrap();
+        }
         let manifest = ImageManifest {
             schema_version: 2,
             media_type: None,
-            config: Descriptor {
-                media_type: "application/vnd.oci.image.config.v1+json".to_string(),
-                digest: config_digest.clone(),
-                size: config_data.len() as u64,
-                platform: None,
-                annotations: None,
-            },
-            layers: vec![make_descriptor(active_data)],
+            config: descriptor(config.as_bytes()),
+            layers: layers.iter().map(|l| descriptor(l)).collect(),
         };
-
-        let active_services: HashSet<String> = ["test-svc".to_string()].into();
-        let result = collect(
-            &store,
-            &active_services,
-            &[("test-svc".to_string(), manifest)],
-            &[],
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(result.blobs_removed, 1);
-        assert!(store.has_blob(&active_digest).await);
-        assert!(store.has_blob(&config_digest).await);
-        assert!(!store.has_blob(&orphan_digest).await);
+        let raw = serde_json::to_vec(&manifest).unwrap();
+        let hex = Digest::from_bytes(&raw).hex().to_string();
+        store.put_manifest(&hex, &raw).await.unwrap();
+        let bundle = store.bundle_path(service, &hex);
+        tokio::fs::create_dir_all(bundle.join("rootfs"))
+            .await
+            .unwrap();
+        tokio::fs::write(bundle.join(IMAGE_CONFIG_FILE), b"{}")
+            .await
+            .unwrap();
+        hex
     }
 
     #[tokio::test]
-    async fn gc_removes_inactive_bundles() {
+    async fn unused_bundles_and_their_exclusive_blobs_are_removed() {
         let dir = tempfile::tempdir().unwrap();
         let store = ImageStore::new(dir.path().join("oci"));
         store.init().await.unwrap();
 
-        // Create bundles
-        let active_rootfs = store.rootfs_path("active-svc");
-        let inactive_rootfs = store.rootfs_path("inactive-svc");
-        tokio::fs::create_dir_all(&active_rootfs).await.unwrap();
-        tokio::fs::create_dir_all(&inactive_rootfs).await.unwrap();
+        let current = add_image(&store, "web", &[b"base", b"app v2"]).await;
+        let old = add_image(&store, "web", &[b"base", b"app v1"]).await;
+        let gone = add_image(&store, "removed", &[b"other"]).await;
+        tokio::fs::create_dir_all(store.staging_path("web", "abandoned"))
+            .await
+            .unwrap();
 
-        let active_services: HashSet<String> = ["active-svc".to_string()].into();
-        let result = collect(&store, &active_services, &[], &[]).await.unwrap();
+        let keep = HashSet::from([("web".to_string(), current.clone())]);
+        let result = collect(&store, &keep).await.unwrap();
 
-        assert_eq!(result.bundles_removed, 1);
-        assert!(store.has_bundle("active-svc").await);
-        assert!(!store.has_bundle("inactive-svc").await);
+        assert!(store.has_bundle("web", &current).await);
+        assert!(!store.has_bundle("web", &old).await);
+        assert!(!store.has_bundle("removed", &gone).await);
+        assert_eq!(result.bundles_removed, 3);
+        assert_eq!(
+            store.list_bundles().await.unwrap(),
+            vec![("web".to_string(), current.clone())]
+        );
+        assert_eq!(store.list_manifests().await.unwrap(), vec![current]);
+
+        // The shared base layer and config stay; v1 and the removed image's
+        // blobs go.
+        assert!(store.has_blob(&Digest::from_bytes(b"base")).await);
+        assert!(store.has_blob(&Digest::from_bytes(b"app v2")).await);
+        assert!(!store.has_blob(&Digest::from_bytes(b"app v1")).await);
+        assert!(!store.has_blob(&Digest::from_bytes(b"other")).await);
+        assert_eq!(result.blobs_removed, 3);
     }
 
     #[tokio::test]
-    async fn gc_empty_store() {
+    async fn the_same_digest_is_kept_per_service() {
         let dir = tempfile::tempdir().unwrap();
         let store = ImageStore::new(dir.path().join("oci"));
         store.init().await.unwrap();
+        let hex = add_image(&store, "a", &[b"layer"]).await;
+        let bundle_b = store.bundle_path("b", &hex);
+        tokio::fs::create_dir_all(&bundle_b).await.unwrap();
+        tokio::fs::write(bundle_b.join(IMAGE_CONFIG_FILE), b"{}")
+            .await
+            .unwrap();
 
-        let result = collect(&store, &HashSet::new(), &[], &[]).await.unwrap();
+        let keep = HashSet::from([("b".to_string(), hex.clone())]);
+        collect(&store, &keep).await.unwrap();
+        assert!(!store.has_bundle("a", &hex).await);
+        assert!(store.has_bundle("b", &hex).await);
+        assert!(store.has_blob(&Digest::from_bytes(b"layer")).await);
+    }
+
+    #[tokio::test]
+    async fn empty_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(dir.path().join("oci"));
+        store.init().await.unwrap();
+        let result = collect(&store, &HashSet::new()).await.unwrap();
         assert_eq!(result.blobs_removed, 0);
         assert_eq!(result.bundles_removed, 0);
-    }
-
-    #[tokio::test]
-    async fn gc_retains_blobs_from_retained_manifests() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = ImageStore::new(dir.path().join("oci"));
-        store.init().await.unwrap();
-
-        // Store blobs for current and previous image versions
-        let current_layer = b"current layer";
-        let previous_layer = b"previous layer";
-        let config_data = b"config";
-        let prev_config_data = b"prev config";
-
-        let current_digest = Digest::from_bytes(current_layer);
-        let previous_digest = Digest::from_bytes(previous_layer);
-        let config_digest = Digest::from_bytes(config_data);
-        let prev_config_digest = Digest::from_bytes(prev_config_data);
-
-        store
-            .put_blob(&current_digest, current_layer)
-            .await
-            .unwrap();
-        store
-            .put_blob(&previous_digest, previous_layer)
-            .await
-            .unwrap();
-        store.put_blob(&config_digest, config_data).await.unwrap();
-        store
-            .put_blob(&prev_config_digest, prev_config_data)
-            .await
-            .unwrap();
-
-        // Current manifest references current blobs
-        let active_manifest = ImageManifest {
-            schema_version: 2,
-            media_type: None,
-            config: make_descriptor(config_data),
-            layers: vec![make_descriptor(current_layer)],
-        };
-
-        // Previous manifest references previous blobs (retained for rollback)
-        let retained_manifest = ImageManifest {
-            schema_version: 2,
-            media_type: None,
-            config: make_descriptor(prev_config_data),
-            layers: vec![make_descriptor(previous_layer)],
-        };
-
-        let active_services: HashSet<String> = ["test-svc".to_string()].into();
-        let result = collect(
-            &store,
-            &active_services,
-            &[("test-svc".to_string(), active_manifest)],
-            &[retained_manifest],
-        )
-        .await
-        .unwrap();
-
-        // No blobs should be removed — all are referenced
-        assert_eq!(result.blobs_removed, 0);
-        assert!(store.has_blob(&current_digest).await);
-        assert!(store.has_blob(&previous_digest).await);
-        assert!(store.has_blob(&config_digest).await);
-        assert!(store.has_blob(&prev_config_digest).await);
-    }
-
-    #[tokio::test]
-    async fn gc_without_retention_removes_previous() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = ImageStore::new(dir.path().join("oci"));
-        store.init().await.unwrap();
-
-        let current_layer = b"current";
-        let orphan_layer = b"orphan";
-        let config_data = b"cfg";
-
-        let current_digest = Digest::from_bytes(current_layer);
-        let orphan_digest = Digest::from_bytes(orphan_layer);
-        let config_digest = Digest::from_bytes(config_data);
-
-        store
-            .put_blob(&current_digest, current_layer)
-            .await
-            .unwrap();
-        store.put_blob(&orphan_digest, orphan_layer).await.unwrap();
-        store.put_blob(&config_digest, config_data).await.unwrap();
-
-        let active_manifest = ImageManifest {
-            schema_version: 2,
-            media_type: None,
-            config: make_descriptor(config_data),
-            layers: vec![make_descriptor(current_layer)],
-        };
-
-        let active_services: HashSet<String> = ["test-svc".to_string()].into();
-        // Empty retained_manifests — no rollback retention
-        let result = collect(
-            &store,
-            &active_services,
-            &[("test-svc".to_string(), active_manifest)],
-            &[],
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(result.blobs_removed, 1);
-        assert!(store.has_blob(&current_digest).await);
-        assert!(!store.has_blob(&orphan_digest).await);
-    }
-
-    #[tokio::test]
-    async fn gc_shared_layers_between_active_and_retained() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = ImageStore::new(dir.path().join("oci"));
-        store.init().await.unwrap();
-
-        // A shared layer used by both active and retained manifests
-        let shared_layer = b"shared base layer";
-        let active_only_layer = b"active-only layer";
-        let retained_only_layer = b"retained-only layer";
-        let config_data = b"config";
-
-        let shared_digest = Digest::from_bytes(shared_layer);
-        let active_digest = Digest::from_bytes(active_only_layer);
-        let retained_digest = Digest::from_bytes(retained_only_layer);
-        let config_digest = Digest::from_bytes(config_data);
-
-        store.put_blob(&shared_digest, shared_layer).await.unwrap();
-        store
-            .put_blob(&active_digest, active_only_layer)
-            .await
-            .unwrap();
-        store
-            .put_blob(&retained_digest, retained_only_layer)
-            .await
-            .unwrap();
-        store.put_blob(&config_digest, config_data).await.unwrap();
-
-        let active_manifest = ImageManifest {
-            schema_version: 2,
-            media_type: None,
-            config: make_descriptor(config_data),
-            layers: vec![
-                make_descriptor(shared_layer),
-                make_descriptor(active_only_layer),
-            ],
-        };
-
-        let retained_manifest = ImageManifest {
-            schema_version: 2,
-            media_type: None,
-            config: make_descriptor(config_data),
-            layers: vec![
-                make_descriptor(shared_layer),
-                make_descriptor(retained_only_layer),
-            ],
-        };
-
-        let active_services: HashSet<String> = ["test-svc".to_string()].into();
-        let result = collect(
-            &store,
-            &active_services,
-            &[("test-svc".to_string(), active_manifest)],
-            &[retained_manifest],
-        )
-        .await
-        .unwrap();
-
-        // All blobs should be preserved
-        assert_eq!(result.blobs_removed, 0);
-        assert!(store.has_blob(&shared_digest).await);
-        assert!(store.has_blob(&active_digest).await);
-        assert!(store.has_blob(&retained_digest).await);
-    }
-
-    #[tokio::test]
-    async fn gc_cleans_history_for_inactive_services() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = ImageStore::new(dir.path().join("oci"));
-        store.init().await.unwrap();
-
-        // Create bundles and history for two services
-        let active_rootfs = store.rootfs_path("active-svc");
-        let inactive_rootfs = store.rootfs_path("inactive-svc");
-        tokio::fs::create_dir_all(&active_rootfs).await.unwrap();
-        tokio::fs::create_dir_all(&inactive_rootfs).await.unwrap();
-
-        store
-            .put_history("active-svc", b"manifest-v1")
-            .await
-            .unwrap();
-        store
-            .put_history("inactive-svc", b"manifest-v1")
-            .await
-            .unwrap();
-
-        let active_services: HashSet<String> = ["active-svc".to_string()].into();
-        let result = collect(&store, &active_services, &[], &[]).await.unwrap();
-
-        assert_eq!(result.bundles_removed, 1);
-        assert!(store.has_bundle("active-svc").await);
-        assert!(!store.has_bundle("inactive-svc").await);
-
-        // History for inactive service should be removed
-        let inactive_history = store.list_history("inactive-svc").await.unwrap();
-        assert!(inactive_history.is_empty());
-
-        // History for active service should be preserved
-        let active_history = store.list_history("active-svc").await.unwrap();
-        assert_eq!(active_history.len(), 1);
     }
 }

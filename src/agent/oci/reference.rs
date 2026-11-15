@@ -36,6 +36,16 @@ impl ImageReference {
         }
     }
 
+    /// The host serving this registry's API: Docker Hub's `docker.io`
+    /// name is not itself an API endpoint.
+    pub fn api_host(&self) -> &str {
+        if self.registry == "docker.io" {
+            "registry-1.docker.io"
+        } else {
+            &self.registry
+        }
+    }
+
     /// Whether this reference is pinned to a specific digest.
     pub fn is_pinned(&self) -> bool {
         self.digest.is_some()
