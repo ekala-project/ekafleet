@@ -1529,6 +1529,17 @@ mod tests {
             )
             .await;
         let raft = FleetStateMachine::new();
+        // The service was placed on alpha.
+        raft.apply_next(crate::raft::state::Command::Deploy {
+            service_name: "db".into(),
+            store_path: String::new(),
+            placements: vec![crate::raft::state::PlacementRecord {
+                instance_id: "db-0".into(),
+                machine_name: "alpha".into(),
+            }],
+        })
+        .await
+        .unwrap();
 
         // Cordoning keeps the service where it is.
         state.set_schedulable("alpha", false).await;
