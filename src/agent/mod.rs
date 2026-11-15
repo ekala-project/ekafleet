@@ -1,6 +1,7 @@
 pub mod activation;
 pub mod exec;
 pub mod health;
+pub mod images;
 pub mod logs;
 pub mod migrate;
 pub mod netns;
@@ -174,6 +175,10 @@ pub async fn run_until(config: AgentConfig, stop: CancellationToken) -> anyhow::
         &config.data_dir,
         config.ca_cert_pem.clone(),
     ));
+    let images = Arc::new(images::ImageManager::new(
+        &config.data_dir,
+        Path::new(crate::secrets::AGENT_SECRETS_DIR),
+    ));
     // Peers pull the volumes of services moving away from here; transfers
     // need node SVIDs, so there is no listener without a CA.
     if config.ca_cert_pem.is_some() {
@@ -215,6 +220,7 @@ pub async fn run_until(config: AgentConfig, stop: CancellationToken) -> anyhow::
         policy_enforcer,
         netns_manager,
         volumes,
+        images,
         node_identity,
         version,
     };
@@ -293,6 +299,7 @@ struct Components {
     policy_enforcer: Arc<PolicyEnforcer>,
     netns_manager: Arc<netns::NamespaceNetworkManager>,
     volumes: Arc<storage::VolumeManager>,
+    images: Arc<images::ImageManager>,
     node_identity: Arc<RwLock<NodeIdentity>>,
     version: Arc<str>,
 }
@@ -320,6 +327,7 @@ impl Components {
             policy_enforcer,
             netns_manager,
             volumes,
+            images,
             node_identity,
             version,
         } = self;
@@ -547,6 +555,20 @@ impl Components {
                         templates,
                         dns,
                         volumes,
+                        images,
+                    )
+                    .await;
+                }
+                // An image pull finished (or is due for a retry).
+                _ = images.ready() => {
+                    handlers::converge_services(
+                        supervisor,
+                        local_state,
+                        secret_injector,
+                        templates,
+                        dns,
+                        volumes,
+                        images,
                     )
                     .await;
                 }
@@ -569,6 +591,7 @@ impl Components {
                                     health_checker,
                                     netns_manager,
                                     volumes,
+                                    images,
                                     &tx,
                                     node_id,
                                     &client,

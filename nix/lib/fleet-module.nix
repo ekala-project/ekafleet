@@ -224,7 +224,15 @@ let
         "Never"
       ];
       default = "Always";
-      description = "Image pull policy.";
+      description = ''
+        How the server pins the image to a digest at apply time (agents
+        always run the pinned digest, so a moved tag never changes a running
+        service; rollbacks run the digest the earlier revision pinned).
+        `Always` resolves the tag at every apply; `IfNotPresent` keeps the
+        previous revision's digest while the image reference is unchanged;
+        `Never` asks no registry and requires an image pinned with
+        `@sha256:...`.
+      '';
     };
     entrypoint = mkOption {
       type = types.nullOr (types.listOf types.str);
@@ -1013,6 +1021,50 @@ let
       default = 10;
     };
   };
+  # `KeylessIdentityConfig`.
+  keylessIdentity = strictSubmodule {
+    subject = mkOption {
+      type = types.str;
+      description = "Signer SAN identity (email or URI), matched exactly.";
+    };
+    issuer = mkOption {
+      type = types.str;
+      description = "OIDC issuer that authenticated the signer, matched exactly.";
+    };
+  };
+
+  # `SignaturePolicyConfig`.
+  signaturePolicy = strictSubmodule {
+    publicKeyPem = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      description = "Cosign public key (ECDSA P-256 or Ed25519 SPKI PEM). Mutually exclusive with `keyless`.";
+    };
+    keyless = mkOption {
+      type = types.nullOr (strictSubmodule {
+        fulcioRootsPem = mkOption {
+          type = types.str;
+          description = "PEM bundle of trusted Fulcio CA certificates.";
+        };
+        identities = mkOption {
+          type = types.listOf keylessIdentity;
+          description = "Accepted signer identities.";
+        };
+        rekorPublicKeyPem = mkOption {
+          type = types.str;
+          description = "Rekor transparency-log public key (ECDSA P-256 SPKI PEM).";
+        };
+      });
+      default = null;
+      description = "Sigstore keyless verification. Mutually exclusive with `publicKeyPem`.";
+    };
+    enforce = mkOption {
+      type = types.bool;
+      default = true;
+      description = "Refuse unsigned images. When false, failures are only warnings.";
+    };
+  };
+
 in
 {
   options.fleet = {
@@ -1054,6 +1106,15 @@ in
       type = types.listOf (types.attrsOf types.anything);
       default = [ ];
       description = "Organizational policy rules evaluated during plan/apply.";
+    };
+    signaturePolicy = mkOption {
+      type = types.nullOr signaturePolicy;
+      default = null;
+      description = ''
+        Cosign signature policy for every container image. The server verifies
+        it when pinning image digests at apply, and agents verify it again
+        before pulling.
+      '';
     };
   };
 }

@@ -10,6 +10,7 @@ pub mod deployer;
 pub mod dns;
 pub mod events;
 pub mod federation;
+pub mod images;
 pub mod mesh;
 pub mod namespace;
 pub mod nix;

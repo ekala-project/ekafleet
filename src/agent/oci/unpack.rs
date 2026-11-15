@@ -22,24 +22,21 @@ pub enum UnpackError {
     Tar(String),
 }
 
-/// Unpack an image's layers into a rootfs directory for the given service.
-///
-/// Layers are applied in order (bottom-up), handling whiteout files
-/// to remove entries from lower layers.
+/// Unpack an image's layers, in order (bottom-up), into `rootfs`, which must
+/// not exist yet; whiteout files remove entries from lower layers.
 pub async fn unpack_image(
     store: &ImageStore,
-    service_name: &str,
     manifest: &ImageManifest,
-) -> Result<PathBuf, UnpackError> {
-    let rootfs = store.rootfs_path(service_name);
+    rootfs: &Path,
+) -> Result<(), UnpackError> {
+    tokio::fs::create_dir_all(rootfs).await?;
+    // Image files keep their owners when unpacked by root (as the agent
+    // runs); an unprivileged unpack (tests) cannot chown.
+    let as_root = {
+        use std::os::unix::fs::MetadataExt;
+        tokio::fs::metadata(rootfs).await?.uid() == 0
+    };
 
-    // Clean up any previous rootfs
-    if rootfs.exists() {
-        tokio::fs::remove_dir_all(&rootfs).await?;
-    }
-    tokio::fs::create_dir_all(&rootfs).await?;
-
-    // Apply layers in order
     for (i, layer) in manifest.layers.iter().enumerate() {
         let blob = store
             .get_blob(&layer.digest)
@@ -54,28 +51,42 @@ pub async fn unpack_image(
         );
 
         // Layer unpacking is CPU-bound; run on blocking thread pool
-        let rootfs_clone = rootfs.clone();
-        tokio::task::spawn_blocking(move || unpack_layer(&blob, &rootfs_clone))
+        let rootfs = rootfs.to_path_buf();
+        tokio::task::spawn_blocking(move || unpack_layer(&blob, &rootfs, as_root))
             .await
             .map_err(|e| UnpackError::Tar(format!("task join error: {e}")))??;
     }
 
-    tracing::info!(
-        service = service_name,
+    tracing::debug!(
+        rootfs = %rootfs.display(),
         layers = manifest.layers.len(),
         "Image unpacked"
     );
-
-    Ok(rootfs)
+    Ok(())
 }
 
-/// Unpack a single gzipped tar layer into the rootfs, handling whiteouts.
-fn unpack_layer(data: &[u8], rootfs: &Path) -> Result<(), UnpackError> {
-    let decoder = GzDecoder::new(data);
-    let mut archive = Archive::new(decoder);
+/// Unpack a single (optionally gzipped) tar layer into the rootfs, handling
+/// whiteouts.
+///
+/// The layer is untrusted: entries may not escape the rootfs, whiteouts are
+/// only applied through real directories (an earlier layer may have planted
+/// a symlink to a host path), and device nodes are not created.
+fn unpack_layer(data: &[u8], rootfs: &Path, as_root: bool) -> Result<(), UnpackError> {
+    if data.starts_with(&[0x1f, 0x8b]) {
+        unpack_entries(Archive::new(GzDecoder::new(data)), rootfs, as_root)
+    } else {
+        unpack_entries(Archive::new(data), rootfs, as_root)
+    }
+}
+
+fn unpack_entries<R: std::io::Read>(
+    mut archive: Archive<R>,
+    rootfs: &Path,
+    as_root: bool,
+) -> Result<(), UnpackError> {
     archive.set_preserve_permissions(true);
+    archive.set_preserve_ownerships(as_root);
     archive.set_preserve_mtime(true);
-    // Do not unpack outside rootfs
     archive.set_overwrite(true);
 
     for entry_result in archive
@@ -98,6 +109,14 @@ fn unpack_layer(data: &[u8], rootfs: &Path) -> Result<(), UnpackError> {
             continue;
         }
 
+        if matches!(
+            entry.header().entry_type(),
+            tar::EntryType::Char | tar::EntryType::Block
+        ) {
+            tracing::warn!(path = %path.display(), "Skipping device node in image layer");
+            continue;
+        }
+
         let file_name = match path.file_name().and_then(|n| n.to_str()) {
             Some(name) => name.to_string(),
             None => continue,
@@ -106,29 +125,32 @@ fn unpack_layer(data: &[u8], rootfs: &Path) -> Result<(), UnpackError> {
         // Handle OCI whiteout files
         if file_name == ".wh..wh..opq" {
             // Opaque whiteout: delete all existing contents of the parent directory
-            let parent = rootfs.join(path.parent().unwrap_or(Path::new("")));
-            if parent.exists() {
-                remove_dir_contents(&parent)?;
+            match real_parent(rootfs, &path) {
+                Some(dir) => remove_dir_contents(&dir)?,
+                None => {
+                    tracing::debug!(path = %path.display(), "Opaque whiteout of a missing or non-directory path")
+                }
             }
             continue;
         }
 
         if let Some(target) = file_name.strip_prefix(".wh.") {
             // Regular whiteout: delete the named entry
-            let target_path = rootfs
-                .join(path.parent().unwrap_or(Path::new("")))
-                .join(target);
-            if target_path.is_dir() {
-                std::fs::remove_dir_all(&target_path)
-                    .map_err(|e| UnpackError::Tar(format!("whiteout removal failed: {e}")))?;
-            } else if target_path.exists() {
-                std::fs::remove_file(&target_path)
-                    .map_err(|e| UnpackError::Tar(format!("whiteout removal failed: {e}")))?;
+            if target.is_empty() || target == "." || target == ".." {
+                continue;
             }
+            let Some(dir) = real_parent(rootfs, &path) else {
+                tracing::debug!(path = %path.display(), "Whiteout under a missing or non-directory path");
+                continue;
+            };
+            remove_entry(&dir.join(target))
+                .map_err(|e| UnpackError::Tar(format!("whiteout removal failed: {e}")))?;
             continue;
         }
 
-        // Normal entry: unpack into rootfs
+        // Normal entry: unpack_in refuses entries whose parent resolves
+        // outside the rootfs, and replaces (rather than follows) an existing
+        // final component.
         entry
             .unpack_in(rootfs)
             .map_err(|e| UnpackError::Tar(format!("unpack entry {}: {e}", path.display())))?;
@@ -137,16 +159,38 @@ fn unpack_layer(data: &[u8], rootfs: &Path) -> Result<(), UnpackError> {
     Ok(())
 }
 
+/// The directory containing `rel` inside `rootfs`, provided every component
+/// of it is a real directory (never a symlink).
+fn real_parent(rootfs: &Path, rel: &Path) -> Option<PathBuf> {
+    let mut dir = rootfs.to_path_buf();
+    for component in rel.parent()?.components() {
+        match component {
+            std::path::Component::Normal(name) => dir.push(name),
+            std::path::Component::CurDir => continue,
+            _ => return None,
+        }
+        match std::fs::symlink_metadata(&dir) {
+            Ok(meta) if meta.is_dir() => {}
+            _ => return None,
+        }
+    }
+    Some(dir)
+}
+
+/// Remove a file, symlink (not its target) or directory tree.
+fn remove_entry(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(path),
+        Ok(_) => std::fs::remove_file(path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// Remove all contents of a directory without removing the directory itself.
 fn remove_dir_contents(dir: &Path) -> Result<(), UnpackError> {
     for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            std::fs::remove_dir_all(&path)?;
-        } else {
-            std::fs::remove_file(&path)?;
-        }
+        remove_entry(&entry?.path())?;
     }
     Ok(())
 }
@@ -254,7 +298,8 @@ mod tests {
             }],
         };
 
-        let rootfs = unpack_image(&store, "test-svc", &manifest).await.unwrap();
+        let rootfs = dir.path().join("rootfs");
+        unpack_image(&store, &manifest, &rootfs).await.unwrap();
         assert_eq!(
             std::fs::read_to_string(rootfs.join("hello.txt")).unwrap(),
             "world"
@@ -302,7 +347,8 @@ mod tests {
             layers: vec![desc(d1, layer1.len() as u64), desc(d2, layer2.len() as u64)],
         };
 
-        let rootfs = unpack_image(&store, "test-svc", &manifest).await.unwrap();
+        let rootfs = dir.path().join("rootfs");
+        unpack_image(&store, &manifest, &rootfs).await.unwrap();
         assert!(rootfs.join("keep.txt").exists());
         assert!(!rootfs.join("remove.txt").exists());
     }
@@ -351,8 +397,100 @@ mod tests {
             layers: vec![desc(d1, layer1.len() as u64), desc(d2, layer2.len() as u64)],
         };
 
-        let rootfs = unpack_image(&store, "test-svc", &manifest).await.unwrap();
+        let rootfs = dir.path().join("rootfs");
+        unpack_image(&store, &manifest, &rootfs).await.unwrap();
         assert!(!rootfs.join("mydir/old.txt").exists());
         assert!(rootfs.join("mydir/new.txt").exists());
+    }
+
+    fn manifest_for(store_layers: &[(Digest, u64)]) -> ImageManifest {
+        ImageManifest {
+            schema_version: 2,
+            media_type: None,
+            config: super::super::manifest::Descriptor {
+                media_type: "application/vnd.oci.image.config.v1+json".to_string(),
+                digest: Digest::from_bytes(b"config"),
+                size: 0,
+                platform: None,
+                annotations: None,
+            },
+            layers: store_layers
+                .iter()
+                .map(|(digest, size)| super::super::manifest::Descriptor {
+                    media_type: "application/vnd.oci.image.layer.v1.tar".to_string(),
+                    digest: digest.clone(),
+                    size: *size,
+                    platform: None,
+                    annotations: None,
+                })
+                .collect(),
+        }
+    }
+
+    /// An uncompressed layer holding one symlink.
+    fn symlink_layer(path: &str, target: &Path) -> Vec<u8> {
+        let mut ar = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header.set_mode(0o777);
+        ar.append_link(&mut header, path, target).unwrap();
+        ar.into_inner().unwrap()
+    }
+
+    #[tokio::test]
+    async fn whiteouts_never_follow_symlinks_out_of_the_rootfs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(dir.path().join("oci"));
+        store.init().await.unwrap();
+        let host = dir.path().join("host");
+        std::fs::create_dir(&host).unwrap();
+        std::fs::write(host.join("victim"), b"precious").unwrap();
+        std::fs::write(host.join("other"), b"precious").unwrap();
+
+        // Layer 1 plants a symlink to the host directory; layer 2 whites
+        // out entries through it, both singly and opaquely.
+        let layer1 = symlink_layer("evil", &host);
+        let layer2 = make_tar_gz_with_dirs(&[
+            TarEntry::Whiteout("evil/.wh.victim"),
+            TarEntry::Whiteout("evil/.wh..wh..opq"),
+        ]);
+        let (d1, d2) = (Digest::from_bytes(&layer1), Digest::from_bytes(&layer2));
+        store.put_blob(&d1, &layer1).await.unwrap();
+        store.put_blob(&d2, &layer2).await.unwrap();
+        let manifest = manifest_for(&[(d1, layer1.len() as u64), (d2, layer2.len() as u64)]);
+
+        let rootfs = dir.path().join("rootfs");
+        unpack_image(&store, &manifest, &rootfs).await.unwrap();
+        assert!(host.join("victim").exists());
+        assert!(host.join("other").exists());
+        // The symlink itself is image content and stays.
+        assert!(
+            std::fs::symlink_metadata(rootfs.join("evil"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[tokio::test]
+    async fn uncompressed_layers_unpack_and_whiteouts_remove_symlinks_themselves() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(dir.path().join("oci"));
+        store.init().await.unwrap();
+        let host = dir.path().join("host");
+        std::fs::create_dir(&host).unwrap();
+
+        let layer1 = symlink_layer("link", &host);
+        let layer2 = make_tar_gz_with_dirs(&[TarEntry::Whiteout(".wh.link")]);
+        let (d1, d2) = (Digest::from_bytes(&layer1), Digest::from_bytes(&layer2));
+        store.put_blob(&d1, &layer1).await.unwrap();
+        store.put_blob(&d2, &layer2).await.unwrap();
+        let manifest = manifest_for(&[(d1, layer1.len() as u64), (d2, layer2.len() as u64)]);
+
+        let rootfs = dir.path().join("rootfs");
+        unpack_image(&store, &manifest, &rootfs).await.unwrap();
+        assert!(std::fs::symlink_metadata(rootfs.join("link")).is_err());
+        assert!(host.exists());
     }
 }
