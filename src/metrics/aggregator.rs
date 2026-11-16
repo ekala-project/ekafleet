@@ -3,6 +3,16 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
+/// The latest value of one series.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Series {
+    pub metric: String,
+    pub node: String,
+    /// Set for service metrics (one series per service instance).
+    pub service: Option<String>,
+    pub value: f64,
+}
+
 /// Server-side metrics aggregation.
 /// Collects metrics from all agents, computes fleet-wide views,
 /// and provides data for autoscaling decisions.
@@ -34,39 +44,78 @@ impl MetricsAggregator {
         }
     }
 
-    /// Ingest metric points from an agent.
+    /// Ingest one metrics summary from an agent. A summary carries
+    /// everything the node measured, so it replaces the node's earlier
+    /// points: a service that stopped reporting a metric (or moved away)
+    /// stops having a value here.
     pub async fn ingest(&self, node_id: &str, points: Vec<crate::proto::MetricPoint>) {
         let mut state = self.inner.write().await;
 
+        let mut node = HashMap::new();
+        let mut services: HashMap<String, HashMap<String, f64>> = HashMap::new();
         for point in points {
-            // Store node-level metrics
-            if point.name.starts_with("node_") {
-                state
-                    .node_metrics
-                    .entry(node_id.to_string())
-                    .or_default()
-                    .insert(point.name.clone(), point.value);
+            if !point.value.is_finite() {
+                continue;
             }
-
-            // Store service-level metrics
             if let Some(service) = point.labels.get("service") {
-                state
-                    .service_metrics
+                services
                     .entry(service.clone())
                     .or_default()
-                    .entry(point.name.clone())
-                    .or_default()
-                    .retain(|(nid, _)| nid != node_id);
-
-                state
-                    .service_metrics
-                    .entry(service.clone())
-                    .or_default()
-                    .entry(point.name)
-                    .or_default()
-                    .push((node_id.to_string(), point.value));
+                    .insert(point.name, point.value);
+            } else if point.name.starts_with("node_") {
+                node.insert(point.name, point.value);
             }
         }
+
+        state.node_metrics.insert(node_id.to_string(), node);
+        for metrics in state.service_metrics.values_mut() {
+            for values in metrics.values_mut() {
+                values.retain(|(nid, _)| nid != node_id);
+            }
+            metrics.retain(|_, values| !values.is_empty());
+        }
+        state
+            .service_metrics
+            .retain(|_, metrics| !metrics.is_empty());
+        for (service, metrics) in services {
+            let entry = state.service_metrics.entry(service).or_default();
+            for (name, value) in metrics {
+                entry
+                    .entry(name)
+                    .or_default()
+                    .push((node_id.to_string(), value));
+            }
+        }
+    }
+
+    /// Every current series: node metrics per node, service metrics per
+    /// service instance (one per node).
+    pub async fn series(&self) -> Vec<Series> {
+        let state = self.inner.read().await;
+        let mut out = Vec::new();
+        for (node, metrics) in &state.node_metrics {
+            for (metric, value) in metrics {
+                out.push(Series {
+                    metric: metric.clone(),
+                    node: node.clone(),
+                    service: None,
+                    value: *value,
+                });
+            }
+        }
+        for (service, metrics) in &state.service_metrics {
+            for (metric, values) in metrics {
+                for (node, value) in values {
+                    out.push(Series {
+                        metric: metric.clone(),
+                        node: node.clone(),
+                        service: Some(service.clone()),
+                        value: *value,
+                    });
+                }
+            }
+        }
+        out
     }
 
     /// Get average value of a metric across all instances of a service.

@@ -582,6 +582,14 @@ message ServiceSpec {
 
   // How to run container_image (unset for native services).
   ContainerOptions container = 20;
+
+  // A Prometheus endpoint the agent scrapes on the service's loopback.
+  MetricsEndpoint metrics = 21;
+}
+
+message MetricsEndpoint {
+  uint32 port = 1;
+  string path = 2;
 }
 
 // A list that can be absent, unlike a repeated field.

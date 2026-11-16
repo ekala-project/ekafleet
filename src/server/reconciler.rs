@@ -553,6 +553,10 @@ fn service_config_to_spec(name: &str, cfg: &config::ServiceConfig) -> crate::pro
         namespace: cfg.namespace.clone(),
         namespace_ip: String::new(), // populated below from Raft IP allocations
         store_paths: cfg.store_paths.clone(),
+        metrics: cfg.metrics.as_ref().map(|m| crate::proto::MetricsEndpoint {
+            port: u32::from(m.port),
+            path: m.path.clone(),
+        }),
         templates: {
             let mut templates: Vec<_> = cfg
                 .templates
@@ -1301,6 +1305,7 @@ mod tests {
             admission_webhooks: vec![],
             policies: vec![],
             signature_policy: None,
+            alerts: vec![],
         }
     }
 
@@ -1492,6 +1497,7 @@ mod tests {
                 volumes: vec![],
                 sidecars: vec![],
                 namespace: String::new(),
+                metrics: None,
                 store_paths: vec![],
             },
         );
@@ -1613,6 +1619,7 @@ mod tests {
             volumes: vec![],
             sidecars: vec![],
             namespace: String::new(),
+            metrics: None,
             store_paths: vec![],
         }
     }

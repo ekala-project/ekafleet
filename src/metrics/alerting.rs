@@ -1,403 +1,525 @@
-#![allow(dead_code)]
+//! Threshold alerts evaluated per series.
+//!
+//! Rules come from the fleet configuration. Each rule is evaluated against
+//! every series of its metric (per node for `node_*` metrics, per service
+//! instance otherwise), and each breaching series fires and resolves on its
+//! own, labelled with its node and service. Silences are runtime state: an
+//! alert whose labels match an active silence does not fire while it lasts.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
 
 use tokio::sync::RwLock;
 
-/// Alert rule that evaluates collected metrics and fires when thresholds are breached.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct AlertRule {
-    pub name: String,
-    /// Metric name to evaluate.
-    pub metric: String,
-    /// Threshold value. Alert fires when metric exceeds this.
-    pub threshold: f64,
-    /// Comparison operator: "gt", "lt", "gte", "lte", "eq".
-    #[serde(default = "default_op")]
-    pub op: String,
-    /// Duration the condition must hold before firing.
-    #[serde(default = "default_for_duration", rename = "forSeconds")]
-    pub for_seconds: u64,
-    /// Optional service filter.
-    pub service: Option<String>,
-    /// Webhook URL to notify when alert fires.
-    pub webhook_url: Option<String>,
-    /// Severity level.
-    #[serde(default)]
-    pub severity: AlertSeverity,
-    /// Labels for routing (e.g., `{"team": "platform"}`).
-    #[serde(default)]
-    pub labels: HashMap<String, String>,
-    /// Route webhook URL by label match. If set, overrides `webhook_url`
-    /// when the alert's labels match.
-    #[serde(default)]
-    pub route: Option<String>,
-}
+use super::aggregator::Series;
+use crate::config::AlertRuleConfig;
 
-fn default_op() -> String {
-    "gt".to_string()
-}
-fn default_for_duration() -> u64 {
-    60
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AlertSeverity {
-    #[default]
-    Warning,
-    Critical,
-}
-
-/// A silence rule that suppresses alerts matching certain criteria.
+/// A silence suppressing alerts whose labels contain all its matchers.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AlertSilence {
-    /// Label matchers: alert labels must contain all of these key-value pairs.
     #[serde(default)]
     pub matchers: HashMap<String, String>,
-    /// Unix timestamp when the silence starts.
+    /// Unix seconds.
     pub starts_at: u64,
-    /// Unix timestamp when the silence ends.
+    /// Unix seconds.
     pub ends_at: u64,
-    /// Human-readable comment explaining the silence.
     #[serde(default)]
     pub comment: String,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct FiredAlert {
-    pub rule_name: String,
-    pub metric: String,
-    pub current_value: f64,
-    pub threshold: f64,
-    pub severity: AlertSeverity,
-    pub fired_at: u64,
-    /// Whether this alert has been resolved (condition cleared).
-    pub resolved: bool,
-}
-
-/// Evaluates alert rules against collected metrics.
-#[derive(Clone)]
-pub struct AlertEvaluator {
-    rules: Arc<RwLock<Vec<AlertRule>>>,
-    fired: Arc<RwLock<Vec<FiredAlert>>>,
-    /// Tracks how long each rule's condition has been true.
-    pending: Arc<RwLock<HashMap<String, std::time::Instant>>>,
-    /// Silence rules that suppress matching alerts.
-    silences: Arc<RwLock<Vec<AlertSilence>>>,
-    /// Currently active (firing) alerts, keyed by rule name, for deduplication.
-    active_alerts: Arc<RwLock<HashMap<String, FiredAlert>>>,
-}
-
-impl Default for AlertEvaluator {
-    fn default() -> Self {
-        Self::new()
+impl AlertSilence {
+    fn silences(&self, labels: &BTreeMap<String, String>, now: u64) -> bool {
+        (self.starts_at..=self.ends_at).contains(&now)
+            && self.matchers.iter().all(|(k, v)| labels.get(k) == Some(v))
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AlertStatus {
+    Firing,
+    Resolved,
+}
+
+/// One alert of one series.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Alert {
+    pub status: AlertStatus,
+    pub labels: BTreeMap<String, String>,
+    pub annotations: BTreeMap<String, String>,
+    pub value: f64,
+    /// Unix seconds when it fired.
+    pub starts_at: u64,
+    /// Unix seconds when it resolved.
+    pub ends_at: Option<u64>,
+    /// Where notifications go, from the rule.
+    #[serde(skip)]
+    pub webhook_url: Option<String>,
+}
+
+impl Alert {
+    pub fn name(&self) -> &str {
+        self.labels.get("alertname").map_or("", String::as_str)
+    }
+
+    /// Stable identity of the series: a hash of its labels.
+    pub fn fingerprint(&self) -> String {
+        let mut text = String::new();
+        for (k, v) in &self.labels {
+            text.push_str(k);
+            text.push('\u{0}');
+            text.push_str(v);
+            text.push('\u{0}');
+        }
+        let digest = ring::digest::digest(&ring::digest::SHA256, text.as_bytes());
+        digest.as_ref()[..8]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+}
+
+/// (rule name, node, service)
+type SeriesKey = (String, String, Option<String>);
+
+enum SeriesState {
+    /// Breaching since this unix second, not yet for long enough (or
+    /// silenced).
+    Pending(u64),
+    Firing(Alert),
+}
+
+#[derive(Default)]
+struct Inner {
+    rules: Vec<AlertRuleConfig>,
+    /// Configuration revision the rules came from.
+    revision: Option<u64>,
+    states: HashMap<SeriesKey, SeriesState>,
+    silences: Vec<AlertSilence>,
+    /// Firing and resolved transitions, oldest first.
+    history: Vec<Alert>,
+}
+
+/// Evaluates alert rules against the aggregated series.
+#[derive(Clone, Default)]
+pub struct AlertEvaluator {
+    inner: Arc<RwLock<Inner>>,
 }
 
 impl AlertEvaluator {
     pub fn new() -> Self {
-        Self {
-            rules: Arc::new(RwLock::new(Vec::new())),
-            fired: Arc::new(RwLock::new(Vec::new())),
-            pending: Arc::new(RwLock::new(HashMap::new())),
-            silences: Arc::new(RwLock::new(Vec::new())),
-            active_alerts: Arc::new(RwLock::new(HashMap::new())),
-        }
+        Self::default()
     }
 
-    /// Register alert rules.
-    pub async fn set_rules(&self, rules: Vec<AlertRule>) {
-        tracing::info!(count = rules.len(), "Alert rules configured");
-        *self.rules.write().await = rules;
+    /// The configuration revision the current rules came from.
+    pub async fn revision(&self) -> Option<u64> {
+        self.inner.read().await.revision
     }
 
-    /// Evaluate all rules against current metric values.
-    /// Returns newly fired alerts (including "resolved" entries when conditions clear).
-    /// Supports deduplication (only fires on ok→firing transitions) and silencing.
-    pub async fn evaluate(&self, metrics: &HashMap<String, f64>) -> Vec<FiredAlert> {
-        let rules = self.rules.read().await;
-        let mut pending = self.pending.write().await;
-        let mut fired = self.fired.write().await;
-        let silences = self.silences.read().await;
-        let mut active = self.active_alerts.write().await;
-        let mut new_alerts = Vec::new();
-        let now = std::time::Instant::now();
-        let now_unix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+    /// Replace the rules with those of configuration `revision`. Alerts of
+    /// rules that no longer exist resolve on the next evaluation.
+    pub async fn set_rules(&self, rules: Vec<AlertRuleConfig>, revision: Option<u64>) {
+        tracing::info!(count = rules.len(), ?revision, "Alert rules configured");
+        let mut inner = self.inner.write().await;
+        inner.rules = rules;
+        inner.revision = revision;
+    }
 
-        for rule in rules.iter() {
-            let value = match metrics.get(&rule.metric) {
-                Some(v) => *v,
-                None => {
-                    // If the metric is absent and the rule was previously active, resolve it
-                    if let Some(mut prev) = active.remove(&rule.name) {
-                        prev.resolved = true;
-                        tracing::info!(
-                            rule = %rule.name,
-                            "Alert resolved (metric absent)"
-                        );
-                        new_alerts.push(prev.clone());
-                        fired.push(prev);
-                        pending.remove(&rule.name);
+    /// Evaluate every rule against `series` at unix time `now` and return
+    /// the alerts that fired or resolved.
+    pub async fn evaluate(&self, series: &[Series], now: u64) -> Vec<Alert> {
+        let mut guard = self.inner.write().await;
+        let inner = &mut *guard;
+        let mut transitions = Vec::new();
+        let mut seen: HashSet<SeriesKey> = HashSet::new();
+
+        for rule in &inner.rules {
+            let node_metric = rule.metric.starts_with("node_");
+            for s in series.iter().filter(|s| {
+                s.metric == rule.metric
+                    && s.service.is_some() != node_metric
+                    && rule
+                        .service
+                        .as_ref()
+                        .is_none_or(|f| s.service.as_ref() == Some(f))
+                    && rule.node.as_ref().is_none_or(|f| &s.node == f)
+            }) {
+                let key = (rule.name.clone(), s.node.clone(), s.service.clone());
+                seen.insert(key.clone());
+                if !rule.op.holds(s.value, rule.threshold) {
+                    if let Some(SeriesState::Firing(alert)) = inner.states.remove(&key) {
+                        transitions.push(resolve(alert, s.value, now));
                     }
                     continue;
                 }
-            };
-
-            let condition_met = match rule.op.as_str() {
-                "gt" => value > rule.threshold,
-                "gte" => value >= rule.threshold,
-                "lt" => value < rule.threshold,
-                "lte" => value <= rule.threshold,
-                "eq" => (value - rule.threshold).abs() < f64::EPSILON,
-                _ => false,
-            };
-
-            if condition_met {
-                let first_seen = pending.entry(rule.name.clone()).or_insert(now);
-                if first_seen.elapsed() >= Duration::from_secs(rule.for_seconds) {
-                    // Deduplication: only fire on state transition (ok → firing)
-                    if active.contains_key(&rule.name) {
-                        continue;
-                    }
-
-                    // Check silences: skip if any active silence matches
-                    let is_silenced = silences.iter().any(|s| {
-                        if now_unix < s.starts_at || now_unix > s.ends_at {
-                            return false;
+                let state = inner.states.entry(key).or_insert(SeriesState::Pending(now));
+                match state {
+                    SeriesState::Firing(alert) => alert.value = s.value,
+                    SeriesState::Pending(since) => {
+                        if now.saturating_sub(*since) < rule.for_seconds {
+                            continue;
                         }
-                        s.matchers
+                        let alert = fire(rule, s, now);
+                        if inner
+                            .silences
                             .iter()
-                            .all(|(k, v)| rule.labels.get(k) == Some(v))
-                    });
-
-                    if is_silenced {
-                        tracing::debug!(
-                            rule = %rule.name,
-                            "Alert suppressed by silence"
+                            .any(|x| x.silences(&alert.labels, now))
+                        {
+                            tracing::debug!(alert = %rule.name, node = %s.node, "Alert silenced");
+                            continue;
+                        }
+                        tracing::warn!(
+                            alert = %rule.name,
+                            node = %s.node,
+                            service = s.service.as_deref().unwrap_or(""),
+                            value = s.value,
+                            threshold = rule.threshold,
+                            "Alert firing"
                         );
-                        continue;
+                        transitions.push(alert.clone());
+                        *state = SeriesState::Firing(alert);
                     }
-
-                    let alert = FiredAlert {
-                        rule_name: rule.name.clone(),
-                        metric: rule.metric.clone(),
-                        current_value: value,
-                        threshold: rule.threshold,
-                        severity: rule.severity,
-                        fired_at: now_unix,
-                        resolved: false,
-                    };
-                    tracing::warn!(
-                        rule = %rule.name,
-                        metric = %rule.metric,
-                        value,
-                        threshold = rule.threshold,
-                        severity = ?rule.severity,
-                        "Alert fired"
-                    );
-                    active.insert(rule.name.clone(), alert.clone());
-                    new_alerts.push(alert.clone());
-                    fired.push(alert);
-                }
-            } else {
-                pending.remove(&rule.name);
-                // Generate "resolved" entry when condition clears
-                if let Some(mut prev) = active.remove(&rule.name) {
-                    prev.resolved = true;
-                    prev.current_value = value;
-                    tracing::info!(
-                        rule = %rule.name,
-                        metric = %rule.metric,
-                        value,
-                        "Alert resolved"
-                    );
-                    new_alerts.push(prev.clone());
-                    fired.push(prev);
                 }
             }
         }
 
-        new_alerts
+        // Series that disappeared (node gone, service moved, rule removed).
+        let gone: Vec<SeriesKey> = inner
+            .states
+            .keys()
+            .filter(|k| !seen.contains(*k))
+            .cloned()
+            .collect();
+        for key in gone {
+            if let Some(SeriesState::Firing(alert)) = inner.states.remove(&key) {
+                let value = alert.value;
+                transitions.push(resolve(alert, value, now));
+            }
+        }
+
+        for alert in &transitions {
+            if alert.status == AlertStatus::Resolved {
+                tracing::info!(
+                    alert = %alert.name(),
+                    node = alert.labels.get("node").map_or("", String::as_str),
+                    "Alert resolved"
+                );
+            }
+        }
+        inner.history.extend(transitions.iter().cloned());
+        transitions
     }
 
-    /// Get all fired alerts.
-    pub async fn fired_alerts(&self) -> Vec<FiredAlert> {
-        self.fired.read().await.clone()
+    /// Alerts firing now.
+    pub async fn active_alerts(&self) -> Vec<Alert> {
+        let inner = self.inner.read().await;
+        let mut alerts: Vec<Alert> = inner
+            .states
+            .values()
+            .filter_map(|s| match s {
+                SeriesState::Firing(alert) => Some(alert.clone()),
+                SeriesState::Pending(_) => None,
+            })
+            .collect();
+        alerts.sort_by(|a, b| a.labels.cmp(&b.labels));
+        alerts
     }
 
-    /// Add a silence rule to suppress matching alerts.
+    /// Firing and resolved transitions, oldest first.
+    pub async fn fired_alerts(&self) -> Vec<Alert> {
+        self.inner.read().await.history.clone()
+    }
+
     pub async fn add_silence(&self, silence: AlertSilence) {
         tracing::info!(
             comment = %silence.comment,
             matchers = ?silence.matchers,
             "Silence added"
         );
-        self.silences.write().await.push(silence);
+        self.inner.write().await.silences.push(silence);
     }
 
     /// Remove a silence by index.
     pub async fn remove_silence(&self, index: usize) {
-        let mut silences = self.silences.write().await;
-        if index < silences.len() {
-            let removed = silences.remove(index);
-            tracing::info!(
-                comment = %removed.comment,
-                "Silence removed"
-            );
+        let mut inner = self.inner.write().await;
+        if index < inner.silences.len() {
+            let removed = inner.silences.remove(index);
+            tracing::info!(comment = %removed.comment, "Silence removed");
         }
     }
 
-    /// List all active silences.
     pub async fn list_silences(&self) -> Vec<AlertSilence> {
-        self.silences.read().await.clone()
+        self.inner.read().await.silences.clone()
     }
 
-    /// Cap the fired alert history to the most recent `max_entries`.
+    /// Keep the most recent `max_entries` transitions.
     pub async fn prune_history(&self, max_entries: usize) {
-        let mut fired = self.fired.write().await;
-        if fired.len() > max_entries {
-            let excess = fired.len() - max_entries;
-            fired.drain(0..excess);
+        let mut inner = self.inner.write().await;
+        if inner.history.len() > max_entries {
+            let excess = inner.history.len() - max_entries;
+            inner.history.drain(..excess);
         }
     }
 
-    /// Remove silences that have expired (past their `ends_at` time).
+    /// Drop silences that have ended.
     pub async fn expire_silences(&self) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        let mut silences = self.silences.write().await;
-        let before = silences.len();
-        silences.retain(|s| s.ends_at > now);
-        let removed = before - silences.len();
+        let now = crate::agent::now_epoch();
+        let mut inner = self.inner.write().await;
+        let before = inner.silences.len();
+        inner.silences.retain(|s| s.ends_at > now);
+        let removed = before - inner.silences.len();
         if removed > 0 {
             tracing::debug!(removed, "Expired alert silences");
         }
     }
 }
 
+fn fire(rule: &AlertRuleConfig, series: &Series, now: u64) -> Alert {
+    let mut labels: BTreeMap<String, String> = rule.labels.clone();
+    labels.insert("alertname".into(), rule.name.clone());
+    labels.insert("severity".into(), rule.severity.as_str().into());
+    labels.insert("node".into(), series.node.clone());
+    if let Some(service) = &series.service {
+        labels.insert("service".into(), service.clone());
+    }
+    let subject = match &series.service {
+        Some(service) => format!("service {service} on node {}", series.node),
+        None => format!("node {}", series.node),
+    };
+    let description = format!(
+        "{} of {subject} is {} ({} {})",
+        rule.metric,
+        series.value,
+        rule.op.symbol(),
+        rule.threshold
+    );
+    let mut annotations = BTreeMap::from([("description".to_string(), description.clone())]);
+    annotations.insert(
+        "summary".into(),
+        rule.summary.clone().unwrap_or(description),
+    );
+    Alert {
+        status: AlertStatus::Firing,
+        labels,
+        annotations,
+        value: series.value,
+        starts_at: now,
+        ends_at: None,
+        webhook_url: rule.webhook_url.clone(),
+    }
+}
+
+fn resolve(mut alert: Alert, value: f64, now: u64) -> Alert {
+    alert.status = AlertStatus::Resolved;
+    alert.value = value;
+    alert.ends_at = Some(now);
+    alert
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{AlertOp, AlertSeverity};
 
-    #[tokio::test]
-    async fn fires_when_threshold_exceeded() {
-        let evaluator = AlertEvaluator::new();
-        evaluator
-            .set_rules(vec![AlertRule {
-                name: "high-cpu".into(),
-                metric: "cpu_usage".into(),
-                threshold: 0.8,
-                op: "gt".into(),
-                for_seconds: 0, // fire immediately
-                service: None,
-                webhook_url: None,
-                severity: AlertSeverity::Warning,
-                labels: HashMap::new(),
-                route: None,
-            }])
-            .await;
+    fn rule(
+        name: &str,
+        metric: &str,
+        op: AlertOp,
+        threshold: f64,
+        for_seconds: u64,
+    ) -> AlertRuleConfig {
+        AlertRuleConfig {
+            name: name.into(),
+            metric: metric.into(),
+            op,
+            threshold,
+            for_seconds,
+            service: None,
+            node: None,
+            severity: AlertSeverity::Critical,
+            labels: BTreeMap::from([("team".to_string(), "ops".to_string())]),
+            summary: None,
+            webhook_url: None,
+        }
+    }
 
-        let mut metrics = HashMap::new();
-        metrics.insert("cpu_usage".to_string(), 0.95);
+    fn node(metric: &str, node: &str, value: f64) -> Series {
+        Series {
+            metric: metric.into(),
+            node: node.into(),
+            service: None,
+            value,
+        }
+    }
 
-        let alerts = evaluator.evaluate(&metrics).await;
-        assert_eq!(alerts.len(), 1);
-        assert_eq!(alerts[0].rule_name, "high-cpu");
-        assert!(!alerts[0].resolved);
+    fn svc(metric: &str, service: &str, node: &str, value: f64) -> Series {
+        Series {
+            service: Some(service.into()),
+            ..self::node(metric, node, value)
+        }
     }
 
     #[tokio::test]
-    async fn no_fire_when_below_threshold() {
+    async fn each_breaching_series_fires_and_resolves_on_its_own() {
         let evaluator = AlertEvaluator::new();
         evaluator
-            .set_rules(vec![AlertRule {
-                name: "high-cpu".into(),
-                metric: "cpu_usage".into(),
-                threshold: 0.8,
-                op: "gt".into(),
-                for_seconds: 0,
-                service: None,
-                webhook_url: None,
-                severity: AlertSeverity::Warning,
-                labels: HashMap::new(),
-                route: None,
-            }])
+            .set_rules(
+                vec![rule("disk", "node_disk_usage_ratio", AlertOp::Gt, 0.9, 30)],
+                Some(1),
+            )
             .await;
 
-        let mut metrics = HashMap::new();
-        metrics.insert("cpu_usage".to_string(), 0.5);
+        let series = [
+            node("node_disk_usage_ratio", "a", 0.95),
+            node("node_disk_usage_ratio", "b", 0.5),
+        ];
+        assert!(evaluator.evaluate(&series, 100).await.is_empty(), "pending");
+        assert!(evaluator.evaluate(&series, 120).await.is_empty(), "pending");
+        let fired = evaluator.evaluate(&series, 130).await;
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].status, AlertStatus::Firing);
+        assert_eq!(fired[0].labels["node"], "a");
+        assert_eq!(fired[0].labels["severity"], "critical");
+        assert_eq!(fired[0].labels["team"], "ops");
+        assert!(!fired[0].labels.contains_key("service"));
+        assert!(
+            evaluator.evaluate(&series, 145).await.is_empty(),
+            "deduplicated"
+        );
 
-        let alerts = evaluator.evaluate(&metrics).await;
-        assert!(alerts.is_empty());
+        // b breaches too: a keeps firing, b starts pending.
+        let both = [
+            node("node_disk_usage_ratio", "a", 0.97),
+            node("node_disk_usage_ratio", "b", 0.99),
+        ];
+        assert!(evaluator.evaluate(&both, 150).await.is_empty());
+        let fired = evaluator.evaluate(&both, 180).await;
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].labels["node"], "b");
+        assert_eq!(evaluator.active_alerts().await.len(), 2);
+        assert_eq!(evaluator.active_alerts().await[0].value, 0.97);
+
+        // a recovers; b's node goes away.
+        let recovered = [node("node_disk_usage_ratio", "a", 0.4)];
+        let mut resolved = evaluator.evaluate(&recovered, 200).await;
+        resolved.sort_by(|x, y| x.labels.cmp(&y.labels));
+        assert_eq!(resolved.len(), 2);
+        assert!(resolved.iter().all(|a| a.status == AlertStatus::Resolved));
+        assert_eq!(resolved[0].ends_at, Some(200));
+        assert_eq!(resolved[0].starts_at, 130);
+        assert!(evaluator.active_alerts().await.is_empty());
+        assert_eq!(evaluator.fired_alerts().await.len(), 4);
     }
 
     #[tokio::test]
-    async fn deduplication_only_fires_once() {
+    async fn service_rules_evaluate_instances_and_honour_filters() {
         let evaluator = AlertEvaluator::new();
-        evaluator
-            .set_rules(vec![AlertRule {
-                name: "high-cpu".into(),
-                metric: "cpu_usage".into(),
-                threshold: 0.8,
-                op: "gt".into(),
-                for_seconds: 0,
-                service: None,
-                webhook_url: None,
-                severity: AlertSeverity::Warning,
-                labels: HashMap::new(),
-                route: None,
-            }])
-            .await;
+        let mut queue = rule("queue", "queue_depth", AlertOp::Gte, 10.0, 0);
+        queue.service = Some("worker".into());
+        let mut down = rule("down", "up", AlertOp::Lt, 1.0, 0);
+        down.node = Some("b".into());
+        evaluator.set_rules(vec![queue, down], None).await;
 
-        let mut metrics = HashMap::new();
-        metrics.insert("cpu_usage".to_string(), 0.95);
-
-        let alerts1 = evaluator.evaluate(&metrics).await;
-        assert_eq!(alerts1.len(), 1);
-
-        // Second evaluation should not fire again (dedup)
-        let alerts2 = evaluator.evaluate(&metrics).await;
-        assert!(alerts2.is_empty());
+        let series = [
+            svc("queue_depth", "worker", "a", 12.0),
+            svc("queue_depth", "worker", "b", 3.0),
+            svc("queue_depth", "other", "a", 50.0),
+            svc("up", "worker", "a", 0.0),
+            svc("up", "worker", "b", 0.0),
+            // A node series of the same name never matches a service rule.
+            node("queue_depth", "a", 99.0),
+        ];
+        let mut fired = evaluator.evaluate(&series, 10).await;
+        fired.sort_by(|x, y| x.labels.cmp(&y.labels));
+        let names: Vec<_> = fired
+            .iter()
+            .map(|a| format!("{}/{}/{}", a.name(), a.labels["service"], a.labels["node"]))
+            .collect();
+        assert_eq!(names, ["down/worker/b", "queue/worker/a"]);
+        assert!(fired[1].annotations["summary"].contains("service worker on node a"));
+        assert_ne!(fired[0].fingerprint(), fired[1].fingerprint());
     }
 
     #[tokio::test]
-    async fn resolved_when_condition_clears() {
+    async fn silences_hold_alerts_back_while_active() {
         let evaluator = AlertEvaluator::new();
         evaluator
-            .set_rules(vec![AlertRule {
-                name: "high-cpu".into(),
-                metric: "cpu_usage".into(),
-                threshold: 0.8,
-                op: "gt".into(),
-                for_seconds: 0,
-                service: None,
-                webhook_url: None,
-                severity: AlertSeverity::Warning,
-                labels: HashMap::new(),
-                route: None,
-            }])
+            .set_rules(vec![rule("load", "node_load1", AlertOp::Gt, 4.0, 0)], None)
             .await;
+        evaluator
+            .add_silence(AlertSilence {
+                matchers: HashMap::from([("node".to_string(), "a".to_string())]),
+                starts_at: 0,
+                ends_at: 100,
+                comment: "maintenance".into(),
+            })
+            .await;
+        let series = [node("node_load1", "a", 8.0), node("node_load1", "b", 8.0)];
+        let fired = evaluator.evaluate(&series, 50).await;
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].labels["node"], "b");
+        // Once the silence ends, a fires.
+        let fired = evaluator.evaluate(&series, 101).await;
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].labels["node"], "a");
+    }
 
-        let mut metrics = HashMap::new();
-        metrics.insert("cpu_usage".to_string(), 0.95);
-
-        let alerts = evaluator.evaluate(&metrics).await;
-        assert_eq!(alerts.len(), 1);
-        assert!(!alerts[0].resolved);
-
-        // Condition clears
-        metrics.insert("cpu_usage".to_string(), 0.5);
-        let resolved = evaluator.evaluate(&metrics).await;
+    #[tokio::test]
+    async fn removed_rules_resolve_their_alerts() {
+        let evaluator = AlertEvaluator::new();
+        evaluator
+            .set_rules(
+                vec![rule("load", "node_load1", AlertOp::Gt, 4.0, 0)],
+                Some(1),
+            )
+            .await;
+        let series = [node("node_load1", "a", 8.0)];
+        assert_eq!(evaluator.evaluate(&series, 1).await.len(), 1);
+        evaluator.set_rules(vec![], Some(2)).await;
+        let resolved = evaluator.evaluate(&series, 2).await;
         assert_eq!(resolved.len(), 1);
-        assert!(resolved[0].resolved);
+        assert_eq!(resolved[0].status, AlertStatus::Resolved);
+        assert_eq!(evaluator.revision().await, Some(2));
+    }
+
+    #[tokio::test]
+    async fn summaries_replace_a_nodes_earlier_points() {
+        use crate::metrics::aggregator::MetricsAggregator;
+        use crate::proto::MetricPoint;
+        let point = |name: &str, value: f64, service: Option<&str>| MetricPoint {
+            name: name.into(),
+            value,
+            labels: service
+                .map(|s| HashMap::from([("service".to_string(), s.to_string())]))
+                .unwrap_or_default(),
+            timestamp: 0,
+        };
+        let aggregator = MetricsAggregator::new();
+        aggregator
+            .ingest(
+                "a",
+                vec![
+                    point("node_load1", 1.0, None),
+                    point("up", 1.0, Some("web")),
+                    point("requests", 5.0, Some("web")),
+                ],
+            )
+            .await;
+        aggregator
+            .ingest("b", vec![point("up", 1.0, Some("web"))])
+            .await;
+        assert_eq!(aggregator.series().await.len(), 4);
+        // web moved off a.
+        aggregator
+            .ingest("a", vec![point("node_load1", 2.0, None)])
+            .await;
+        let mut series = aggregator.series().await;
+        series.sort_by(|x, y| x.node.cmp(&y.node));
+        assert_eq!(
+            series,
+            vec![node("node_load1", "a", 2.0), svc("up", "web", "b", 1.0)]
+        );
+        assert_eq!(aggregator.service_metric_avg("web", "up").await, Some(1.0));
+        assert_eq!(aggregator.service_metric_avg("web", "requests").await, None);
     }
 }

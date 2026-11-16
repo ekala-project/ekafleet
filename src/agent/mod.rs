@@ -3,6 +3,7 @@ pub mod exec;
 pub mod health;
 pub mod images;
 pub mod logs;
+pub mod metrics;
 pub mod migrate;
 pub mod netns;
 pub mod oci;
@@ -537,6 +538,14 @@ impl Components {
                 }
             }
         });
+
+        metrics::spawn_reporter(
+            Arc::from(node_id.as_str()),
+            config.data_dir.clone(),
+            local_state.clone(),
+            tx.clone(),
+            shutdown.child_token(),
+        );
 
         // Process incoming server messages until stream ends or shutdown
         loop {
