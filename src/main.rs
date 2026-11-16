@@ -441,6 +441,33 @@ enum Command {
         server: String,
     },
 
+    /// Query the audit log, newest first (Admin only)
+    Audit {
+        /// Only entries of this actor (token id or SPIFFE ID)
+        #[arg(long)]
+        actor: Option<String>,
+
+        /// Only this action (e.g. apply, access, authenticate, token_create)
+        #[arg(long)]
+        action: Option<String>,
+
+        /// Only this outcome (success, denied, failed)
+        #[arg(long)]
+        outcome: Option<String>,
+
+        /// Maximum number of entries to show
+        #[arg(long, default_value = "100")]
+        limit: u32,
+
+        /// Print JSON lines instead of a table
+        #[arg(long)]
+        json: bool,
+
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+
     /// Node management
     Node {
         #[command(subcommand)]
@@ -1237,6 +1264,15 @@ async fn main() -> anyhow::Result<()> {
             follow,
             server,
         } => commands::cmd_events(category, service, node, limit, follow, server).await?,
+
+        Command::Audit {
+            actor,
+            action,
+            outcome,
+            limit,
+            json,
+            server,
+        } => commands::cmd_audit(actor, action, outcome, limit, json, server).await?,
 
         Command::Node { action } => match action {
             NodeAction::List { server } => commands::cmd_node_list(server).await?,

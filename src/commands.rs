@@ -1059,6 +1059,60 @@ pub async fn cmd_events(
     }
 }
 
+pub async fn cmd_audit(
+    actor: Option<String>,
+    action: Option<String>,
+    outcome: Option<String>,
+    limit: u32,
+    json: bool,
+    server: String,
+) -> anyhow::Result<()> {
+    let mut client = connect_server(&server).await?;
+    let entries = client
+        .query_audit(ekafleet::proto::AuditQueryRequest {
+            actor: actor.unwrap_or_default(),
+            action: action.unwrap_or_default(),
+            outcome: outcome.unwrap_or_default(),
+            limit,
+        })
+        .await?
+        .into_inner()
+        .entries;
+    if json {
+        for e in &entries {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "timestamp": e.timestamp,
+                    "actor": e.actor,
+                    "action": e.action,
+                    "resource": e.resource,
+                    "detail": e.detail,
+                    "outcome": e.outcome,
+                    "count": e.count,
+                })
+            );
+        }
+        return Ok(());
+    }
+    if entries.is_empty() {
+        println!("No audit entries found.");
+        return Ok(());
+    }
+    for e in &entries {
+        let count = if e.count > 1 {
+            format!(" x{}", e.count)
+        } else {
+            String::new()
+        };
+        println!(
+            "[{}] {} {} {} by {}{} — {}",
+            e.timestamp, e.outcome, e.action, e.resource, e.actor, count, e.detail
+        );
+    }
+    Ok(())
+}
+
 pub async fn cmd_node_list(server: String) -> anyhow::Result<()> {
     let mut client = connect_server(&server).await?;
     let resp = client
