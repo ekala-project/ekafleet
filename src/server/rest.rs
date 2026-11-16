@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::Router;
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{delete, get};
 
@@ -171,6 +172,7 @@ pub struct HttpApiState {
     pub token_store: TokenStore,
     pub metrics: MetricsAggregator,
     pub alert_evaluator: AlertEvaluator,
+    pub audit_log: super::audit::AuditLog,
     /// Durable fleet state; user KV lives under [`USER_KV_PREFIX`].
     pub raft_state: crate::raft::state::FleetStateMachine,
     pub instance_tracker: Option<super::cloud::instance_tracker::InstanceTracker>,
@@ -228,11 +230,9 @@ pub async fn serve_http(
     raft_state: crate::raft::state::FleetStateMachine,
     jwt_bundle: String,
     tls: Option<HttpTlsConfig>,
+    audit_log: super::audit::AuditLog,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<()> {
-    use axum::extract::State;
-    use axum::http::StatusCode;
-
     let api_state = HttpApiState {
         fleet_state,
         event_store,
@@ -241,6 +241,7 @@ pub async fn serve_http(
         alert_evaluator,
         raft_state,
         instance_tracker,
+        audit_log: audit_log.clone(),
     };
 
     let authenticated_routes = Router::new()
@@ -254,6 +255,7 @@ pub async fn serve_http(
         .route("/v1/watch", get(rest_watch))
         .route("/v1/query", get(rest_query))
         .route("/v1/alerts", get(rest_alerts))
+        .route("/v1/audit", get(rest_audit))
         .route(
             "/v1/alerts/silences",
             get(rest_list_silences).post(rest_create_silence),
@@ -270,40 +272,11 @@ pub async fn serve_http(
         .route("/ui/{*path}", get(ui_handler))
         .with_state(api_state)
         .layer(axum::middleware::from_fn_with_state(
-            token_store,
-            |State(store): State<TokenStore>,
-             req: axum::http::Request<axum::body::Body>,
-             next: axum::middleware::Next| async move {
-                let auth_header = req
-                    .headers()
-                    .get("authorization")
-                    .and_then(|v| v.to_str().ok());
-                let token = extract_bearer_token(auth_header).ok_or(StatusCode::UNAUTHORIZED)?;
-
-                let (role, identity) = store
-                    .authenticate_identity(token)
-                    .ok_or(StatusCode::UNAUTHORIZED)?;
-                // The HTTP API and dashboard show the whole fleet.
-                if identity.namespace.is_some() {
-                    return Err(StatusCode::FORBIDDEN);
-                }
-
-                // Reads need Read; anything that changes state (KV writes,
-                // alert silences) needs Deploy.
-                let needed = if matches!(
-                    *req.method(),
-                    axum::http::Method::GET | axum::http::Method::HEAD
-                ) {
-                    Permission::Read
-                } else {
-                    Permission::Deploy
-                };
-                if !role.has_permission(needed) {
-                    return Err(StatusCode::FORBIDDEN);
-                }
-
-                Ok(next.run(req).await)
+            HttpAuth {
+                tokens: token_store,
+                audit: audit_log,
             },
+            authorize_http,
         ));
 
     // The JWT bundle is public key material: relying parties outside the
@@ -329,9 +302,12 @@ pub async fn serve_http(
 
     let Some(tls) = tls else {
         tracing::info!(%addr, "HTTP server listening");
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move { shutdown.cancelled().await })
-            .await?;
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move { shutdown.cancelled().await })
+        .await?;
         return Ok(());
     };
 
@@ -695,6 +671,128 @@ async fn rest_query(
             })),
         }
     }
+}
+
+/// Authentication state of the HTTP API.
+#[derive(Clone)]
+struct HttpAuth {
+    tokens: TokenStore,
+    audit: super::audit::AuditLog,
+}
+
+/// Authenticate and authorize an HTTP API request, auditing refusals.
+async fn authorize_http(
+    axum::extract::State(auth): axum::extract::State<HttpAuth>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> Result<axum::response::Response, StatusCode> {
+    let authorization = req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let remote = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+        .map(|c| c.0.ip());
+    let resource = format!("{} {}", req.method(), req.uri().path());
+
+    let refuse = |status: StatusCode, reason: &str| {
+        let auth = auth.clone();
+        let authorization = authorization.clone();
+        let resource = resource.clone();
+        let reason = reason.to_string();
+        async move {
+            if let Some(action) = super::access_audit::classify_http(status) {
+                let actor =
+                    super::access_audit::actor(&auth.tokens, authorization.as_deref(), None);
+                auth.audit
+                    .record(
+                        &actor,
+                        action,
+                        &resource,
+                        &super::access_audit::detail(&reason, remote),
+                        super::audit::AuditOutcome::Denied,
+                    )
+                    .await;
+            }
+            Err(status)
+        }
+    };
+
+    let Some(token) = extract_bearer_token(authorization.as_deref()) else {
+        return refuse(
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid authorization header",
+        )
+        .await;
+    };
+    let Some((role, identity)) = auth.tokens.authenticate_identity(token) else {
+        return refuse(StatusCode::UNAUTHORIZED, "invalid or expired token").await;
+    };
+    // The HTTP API and dashboard show the whole fleet.
+    if let Some(ns) = &identity.namespace {
+        return refuse(
+            StatusCode::FORBIDDEN,
+            &format!("token is scoped to namespace '{ns}'; the HTTP API is fleet-wide"),
+        )
+        .await;
+    }
+
+    // The audit log needs ReadAudit; other reads need Read; anything that
+    // changes state (KV writes, alert silences) needs Deploy.
+    let needed = if req.uri().path().starts_with("/v1/audit") {
+        Permission::ReadAudit
+    } else if matches!(
+        *req.method(),
+        axum::http::Method::GET | axum::http::Method::HEAD
+    ) {
+        Permission::Read
+    } else {
+        Permission::Deploy
+    };
+    if !role.has_permission(needed) {
+        return refuse(
+            StatusCode::FORBIDDEN,
+            &format!("{role:?} role does not have {needed:?} permission"),
+        )
+        .await;
+    }
+    Ok(next.run(req).await)
+}
+
+#[derive(serde::Deserialize)]
+struct AuditParams {
+    actor: Option<String>,
+    action: Option<String>,
+    outcome: Option<String>,
+    limit: Option<usize>,
+}
+
+/// GET /v1/audit — Audit log entries, newest first (Admin only).
+async fn rest_audit(
+    axum::extract::State(state): axum::extract::State<HttpApiState>,
+    params: axum::extract::Query<AuditParams>,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
+    let bad = |e: String| (StatusCode::BAD_REQUEST, e);
+    let query = super::audit::AuditQuery {
+        actor: params.actor.clone(),
+        action: params
+            .action
+            .as_deref()
+            .map(str::parse)
+            .transpose()
+            .map_err(bad)?,
+        outcome: params
+            .outcome
+            .as_deref()
+            .map(str::parse)
+            .transpose()
+            .map_err(bad)?,
+        limit: params.limit.unwrap_or(100).min(10_000),
+    };
+    let entries = state.audit_log.query(&query).await;
+    Ok(axum::Json(serde_json::json!(entries)))
 }
 
 // --- Feature 21: Alerting Pipeline REST endpoints ---

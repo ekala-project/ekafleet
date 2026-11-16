@@ -136,6 +136,12 @@ impl FleetControlService {
     }
 
     /// Serve service closures from `cache` and advertise its key to agents.
+    /// Record audit entries in `audit_log` (persisted by the server).
+    pub fn with_audit_log(mut self, audit_log: super::audit::AuditLog) -> Self {
+        self.audit_log = audit_log;
+        self
+    }
+
     /// Ingest agent metrics into `metrics` (shared with the HTTP API and the
     /// alert evaluator) rather than a private aggregator.
     pub fn with_metrics(mut self, metrics: MetricsAggregator) -> Self {
@@ -1320,6 +1326,45 @@ impl FleetControl for FleetControlService {
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 
+    async fn query_audit(
+        &self,
+        request: Request<crate::proto::AuditQueryRequest>,
+    ) -> Result<Response<crate::proto::AuditQueryResponse>, Status> {
+        require_fleet_permission(&request, Permission::ReadAudit)?;
+        let req = request.into_inner();
+        let non_empty = |s: String| (!s.is_empty()).then_some(s);
+        let action = non_empty(req.action)
+            .map(|a| a.parse())
+            .transpose()
+            .map_err(Status::invalid_argument)?;
+        let outcome = non_empty(req.outcome)
+            .map(|o| o.parse())
+            .transpose()
+            .map_err(Status::invalid_argument)?;
+        let query = super::audit::AuditQuery {
+            actor: non_empty(req.actor),
+            action,
+            outcome,
+            limit: (req.limit as usize).min(10_000),
+        };
+        let entries = self
+            .audit_log
+            .query(&query)
+            .await
+            .into_iter()
+            .map(|e| crate::proto::AuditEntryProto {
+                timestamp: e.timestamp,
+                actor: e.actor,
+                action: e.action.as_str(),
+                resource: e.resource,
+                detail: e.detail,
+                outcome: e.outcome.as_str().to_string(),
+                count: e.count,
+            })
+            .collect();
+        Ok(Response::new(crate::proto::AuditQueryResponse { entries }))
+    }
+
     async fn events(
         &self,
         request: Request<EventsRequest>,
@@ -2020,6 +2065,7 @@ pub struct GrpcServerConfig {
     pub binary_cache: Option<super::cache::BinaryCache>,
     /// Where agent metrics are aggregated.
     pub metrics: MetricsAggregator,
+    pub audit_log: super::audit::AuditLog,
 }
 
 /// Start the gRPC server with TLS and RBAC-based authentication.
@@ -2046,11 +2092,13 @@ pub async fn serve_grpc(
         allow_bearer_agents,
         binary_cache,
         metrics,
+        audit_log,
     } = config;
 
     tracing::info!(%addr, domain = %domain, "gRPC server listening (TLS + RBAC + SPIFFE)");
 
     let service_token_store = token_store.clone();
+    let service_token_store_for_audit = token_store.clone();
     let interceptor_domain = domain.clone();
     #[allow(clippy::result_large_err)]
     let interceptor = move |mut req: Request<()>| -> Result<Request<()>, Status> {
@@ -2147,7 +2195,8 @@ pub async fn serve_grpc(
     .with_ca(ca.clone())
     .with_fleet_key(fleet_key)
     .with_bearer_agents(allow_bearer_agents)
-    .with_metrics(metrics);
+    .with_metrics(metrics)
+    .with_audit_log(audit_log.clone());
     let service = match binary_cache {
         Some(cache) => service.with_binary_cache(cache),
         None => service,
@@ -2175,7 +2224,11 @@ pub async fn serve_grpc(
         .http2_keepalive_timeout(Some(Duration::from_secs(10)))
         .tcp_keepalive(Some(Duration::from_secs(60)))
         .add_service(FleetBootstrapServer::new(bootstrap))
-        .add_service(FleetControlServer::with_interceptor(service, interceptor))
+        .add_service(super::access_audit::AuditDenials::new(
+            FleetControlServer::with_interceptor(service, interceptor),
+            audit_log,
+            service_token_store_for_audit,
+        ))
         .serve_with_shutdown(addr, shutdown.cancelled())
         .await?;
 
