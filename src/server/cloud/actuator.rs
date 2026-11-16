@@ -656,6 +656,7 @@ mod tests {
             admission_webhooks: vec![],
             policies: vec![],
             signature_policy: None,
+            alerts: vec![],
         }
     }
 

@@ -97,6 +97,7 @@ fn make_service(name: &str, cpu: u64, memory: u64, replicas: u32) -> (String, Se
             volumes: Vec::new(),
             sidecars: Vec::new(),
             namespace: String::new(),
+            metrics: None,
             store_paths: vec![],
         },
     )
@@ -172,6 +173,7 @@ fn constraint_filtering() {
             volumes: Vec::new(),
             sidecars: Vec::new(),
             namespace: String::new(),
+            metrics: None,
             store_paths: vec![],
         },
     )]
@@ -223,6 +225,7 @@ fn system_job_all_nodes() {
             volumes: Vec::new(),
             sidecars: Vec::new(),
             namespace: String::new(),
+            metrics: None,
             store_paths: vec![],
         },
     )]
@@ -306,6 +309,7 @@ fn pool_affinity_prefers_correct_pool() {
             volumes: Vec::new(),
             sidecars: Vec::new(),
             namespace: String::new(),
+            metrics: None,
             store_paths: vec![],
         },
     )]
@@ -381,6 +385,7 @@ fn pool_affinity_spills_when_full() {
             volumes: Vec::new(),
             sidecars: Vec::new(),
             namespace: String::new(),
+            metrics: None,
             store_paths: vec![],
         },
     )]
@@ -461,6 +466,7 @@ fn pool_hard_constraint_blocks_spillover() {
             volumes: Vec::new(),
             sidecars: Vec::new(),
             namespace: String::new(),
+            metrics: None,
             store_paths: vec![],
         },
     )]
@@ -579,6 +585,7 @@ fn pool_labels_merged() {
             volumes: Vec::new(),
             sidecars: Vec::new(),
             namespace: String::new(),
+            metrics: None,
             store_paths: vec![],
         },
     )]
@@ -675,6 +682,7 @@ fn system_job_on_pool() {
             volumes: Vec::new(),
             sidecars: Vec::new(),
             namespace: String::new(),
+            metrics: None,
             store_paths: vec![],
         },
     )]
@@ -732,6 +740,7 @@ fn constraint_numeric_operators() {
             volumes: Vec::new(),
             sidecars: Vec::new(),
             namespace: String::new(),
+            metrics: None,
             store_paths: vec![],
         },
     )]
@@ -786,6 +795,7 @@ fn constraint_regexp() {
             volumes: Vec::new(),
             sidecars: Vec::new(),
             namespace: String::new(),
+            metrics: None,
             store_paths: vec![],
         },
     )]
@@ -840,6 +850,7 @@ fn constraint_is_set() {
             volumes: Vec::new(),
             sidecars: Vec::new(),
             namespace: String::new(),
+            metrics: None,
             store_paths: vec![],
         },
     )]
@@ -911,6 +922,7 @@ fn multiple_spread_blocks() {
             volumes: Vec::new(),
             sidecars: Vec::new(),
             namespace: String::new(),
+            metrics: None,
             store_paths: vec![],
         },
     )]
@@ -969,6 +981,7 @@ fn priority_ordering() {
                 volumes: Vec::new(),
                 sidecars: Vec::new(),
                 namespace: String::new(),
+                metrics: None,
                 store_paths: vec![],
             },
         ),
@@ -1004,6 +1017,7 @@ fn priority_ordering() {
                 volumes: Vec::new(),
                 sidecars: Vec::new(),
                 namespace: String::new(),
+                metrics: None,
                 store_paths: vec![],
             },
         ),
@@ -1089,6 +1103,7 @@ fn taint_blocks_non_tolerating_service() {
             volumes: Vec::new(),
             sidecars: Vec::new(),
             namespace: String::new(),
+            metrics: None,
             store_paths: vec![],
         },
     )]
@@ -1137,6 +1152,7 @@ fn sysbatch_runs_on_all_nodes() {
             volumes: Vec::new(),
             sidecars: Vec::new(),
             namespace: String::new(),
+            metrics: None,
             store_paths: vec![],
         },
     )]
@@ -1186,6 +1202,7 @@ fn stateful_sticky_placement_prefers_current_node() {
             volumes: Vec::new(),
             sidecars: Vec::new(),
             namespace: String::new(),
+            metrics: None,
             store_paths: vec![],
         },
     )]
@@ -1244,6 +1261,7 @@ fn non_stateful_ignores_current_placement() {
             volumes: Vec::new(),
             sidecars: Vec::new(),
             namespace: String::new(),
+            metrics: None,
             store_paths: vec![],
         },
     )]
@@ -1302,6 +1320,7 @@ fn stateful_sticky_falls_back_when_node_gone() {
             volumes: Vec::new(),
             sidecars: Vec::new(),
             namespace: String::new(),
+            metrics: None,
             store_paths: vec![],
         },
     )]

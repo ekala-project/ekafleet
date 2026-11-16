@@ -253,6 +253,7 @@ pub async fn serve_http(
         .route("/v1/deployments/{service}", get(rest_service_deployments))
         .route("/v1/watch", get(rest_watch))
         .route("/v1/query", get(rest_query))
+        .route("/v1/alerts", get(rest_alerts))
         .route(
             "/v1/alerts/silences",
             get(rest_list_silences).post(rest_create_silence),
@@ -697,6 +698,29 @@ async fn rest_query(
 }
 
 // --- Feature 21: Alerting Pipeline REST endpoints ---
+
+/// GET /v1/alerts — Alerts firing now, one per breaching series.
+async fn rest_alerts(
+    axum::extract::State(state): axum::extract::State<HttpApiState>,
+    query: axum::extract::Query<PageQuery>,
+) -> axum::Json<serde_json::Value> {
+    let alerts: Vec<serde_json::Value> = state
+        .alert_evaluator
+        .active_alerts()
+        .await
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "labels": a.labels,
+                "annotations": a.annotations,
+                "value": a.value,
+                "startsAt": super::alerts::rfc3339(a.starts_at),
+                "fingerprint": a.fingerprint(),
+            })
+        })
+        .collect();
+    axum::Json(serde_json::json!(query.slice(&alerts)))
+}
 
 /// GET /v1/alerts/silences — List all active silences.
 async fn rest_list_silences(
