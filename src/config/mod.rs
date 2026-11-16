@@ -30,6 +30,117 @@ pub struct FleetConfig {
     /// configured per-service.
     #[serde(default)]
     pub signature_policy: Option<SignaturePolicyConfig>,
+    /// Alert rules evaluated by the server against the metrics agents ship.
+    /// Versioned (and rolled back) with the rest of the configuration.
+    #[serde(default)]
+    pub alerts: Vec<AlertRuleConfig>,
+}
+
+/// A threshold alert on a node or service metric.
+///
+/// Metrics named `node_*` are node metrics, evaluated once per node; any
+/// other metric is scraped from services (see [`MetricsEndpoint`]) and
+/// evaluated once per service instance. Every breaching series fires and
+/// resolves on its own.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct AlertRuleConfig {
+    /// Unique rule name; the `alertname` label of its alerts.
+    pub name: String,
+    pub metric: String,
+    #[serde(default)]
+    pub op: AlertOp,
+    pub threshold: f64,
+    /// How long a series must breach before its alert fires.
+    #[serde(default = "default_alert_for_seconds")]
+    pub for_seconds: u64,
+    /// Only evaluate instances of this service.
+    #[serde(default)]
+    pub service: Option<String>,
+    /// Only evaluate this node.
+    #[serde(default)]
+    pub node: Option<String>,
+    #[serde(default)]
+    pub severity: AlertSeverity,
+    /// Extra labels attached to the alerts (for routing and silences).
+    #[serde(default)]
+    pub labels: std::collections::BTreeMap<String, String>,
+    /// Human-readable summary annotation.
+    #[serde(default)]
+    pub summary: Option<String>,
+    /// Alertmanager-compatible webhook receiving firing and resolved alerts.
+    #[serde(default)]
+    pub webhook_url: Option<String>,
+}
+
+fn default_alert_for_seconds() -> u64 {
+    60
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AlertOp {
+    #[default]
+    Gt,
+    Gte,
+    Lt,
+    Lte,
+    Eq,
+}
+
+impl AlertOp {
+    pub fn holds(self, value: f64, threshold: f64) -> bool {
+        match self {
+            AlertOp::Gt => value > threshold,
+            AlertOp::Gte => value >= threshold,
+            AlertOp::Lt => value < threshold,
+            AlertOp::Lte => value <= threshold,
+            AlertOp::Eq => value == threshold,
+        }
+    }
+
+    pub fn symbol(self) -> &'static str {
+        match self {
+            AlertOp::Gt => ">",
+            AlertOp::Gte => ">=",
+            AlertOp::Lt => "<",
+            AlertOp::Lte => "<=",
+            AlertOp::Eq => "==",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AlertSeverity {
+    Info,
+    #[default]
+    Warning,
+    Critical,
+}
+
+impl AlertSeverity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AlertSeverity::Info => "info",
+            AlertSeverity::Warning => "warning",
+            AlertSeverity::Critical => "critical",
+        }
+    }
+}
+
+/// A Prometheus metrics endpoint the hosting agent scrapes every 15
+/// seconds, on the service's loopback (inside its network namespace).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct MetricsEndpoint {
+    pub port: u16,
+    #[serde(default = "default_metrics_path")]
+    pub path: String,
+}
+
+fn default_metrics_path() -> String {
+    "/metrics".into()
 }
 
 /// Fleet-wide cosign image signature policy applied to the cosign signature of
@@ -243,6 +354,9 @@ pub struct ServiceConfig {
     /// networking. Non-default namespaces get isolated network namespaces.
     #[serde(default)]
     pub namespace: String,
+    /// Prometheus endpoint scraped by the hosting agent.
+    #[serde(default)]
+    pub metrics: Option<MetricsEndpoint>,
     /// Store paths the service needs, built by the server at apply time.
     /// Never read from the fleet configuration itself.
     #[serde(skip)]
@@ -958,8 +1072,89 @@ fn validate_container(
     }
 }
 
+fn validate_alerts(config: &FleetConfig, errors: &mut Vec<String>) {
+    let mut names = std::collections::HashSet::new();
+    for rule in &config.alerts {
+        let name = &rule.name;
+        let label_ok = |s: &str| {
+            !s.is_empty()
+                && !s.starts_with(|c: char| c.is_ascii_digit())
+                && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        };
+        if name.is_empty() || name.len() > 128 || name.chars().any(char::is_control) {
+            errors.push(format!(
+                "alert '{name}': name must be 1-128 printable characters"
+            ));
+        }
+        if !names.insert(name.as_str()) {
+            errors.push(format!("alert '{name}' is declared twice"));
+        }
+        if !label_ok(&rule.metric) || rule.metric.starts_with("__") {
+            errors.push(format!(
+                "alert '{name}': invalid metric name '{}'",
+                rule.metric
+            ));
+        }
+        if !rule.threshold.is_finite() {
+            errors.push(format!("alert '{name}': threshold must be finite"));
+        }
+        let node_metric = rule.metric.starts_with("node_");
+        if let Some(service) = &rule.service {
+            if node_metric {
+                errors.push(format!(
+                    "alert '{name}': '{}' is a node metric and cannot be filtered by service",
+                    rule.metric
+                ));
+            } else if let Some(svc) = config.services.get(service) {
+                if svc.metrics.is_none() {
+                    errors.push(format!(
+                        "alert '{name}': service '{service}' exposes no metrics endpoint"
+                    ));
+                }
+            } else {
+                errors.push(format!("alert '{name}': unknown service '{service}'"));
+            }
+        }
+        for key in rule.labels.keys() {
+            if !label_ok(key) || key.starts_with("__") {
+                errors.push(format!("alert '{name}': invalid label name '{key}'"));
+            } else if matches!(key.as_str(), "alertname" | "severity" | "node" | "service") {
+                errors.push(format!(
+                    "alert '{name}': label '{key}' is set by the server and cannot be overridden"
+                ));
+            }
+        }
+        if let Some(url) = &rule.webhook_url
+            && let Err(e) = validate_webhook_url(url)
+        {
+            errors.push(format!("alert '{name}': webhookUrl: {e}"));
+        }
+    }
+}
+
+/// An absolute http(s) URL with a host, without credentials in it.
+pub fn validate_webhook_url(url: &str) -> Result<(), String> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .ok_or("must start with http:// or https://")?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() {
+        return Err("has no host".into());
+    }
+    if authority.contains('@') {
+        return Err("must not embed credentials".into());
+    }
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("must not contain whitespace".into());
+    }
+    Ok(())
+}
+
 pub fn validate(config: &FleetConfig) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
+
+    validate_alerts(config, &mut errors);
 
     if let Some(policy) = &config.signature_policy
         && let Err(e) = policy.to_runtime_policy()
@@ -1077,6 +1272,23 @@ pub fn validate(config: &FleetConfig) -> Result<(), Vec<String>> {
 
         if let Some(container) = &service.container {
             validate_container(name, service, container, &mut errors);
+        }
+
+        if let Some(metrics) = &service.metrics {
+            if metrics.port == 0 {
+                errors.push(format!("service '{name}' metrics: port must not be 0"));
+            }
+            if !metrics.path.starts_with('/')
+                || metrics
+                    .path
+                    .chars()
+                    .any(|c| c.is_whitespace() || c.is_control())
+            {
+                errors.push(format!(
+                    "service '{name}' metrics: path '{}' must start with '/' and contain no whitespace",
+                    metrics.path
+                ));
+            }
         }
 
         // Exactly one of command or container must be set
@@ -1704,5 +1916,91 @@ mod cgroup_tests {
         let cg = rc.to_cgroup_controls().expect("controls expected");
         assert_eq!(cg.cpu_weight, 300);
         assert_eq!(cg.cpu_quota_percent, 200);
+    }
+}
+
+#[cfg(test)]
+mod alert_tests {
+    use super::*;
+
+    fn fleet(alerts: serde_json::Value) -> FleetConfig {
+        serde_json::from_value(serde_json::json!({
+            "name": "t",
+            "domain": "fleet.test",
+            "services": {
+                "web": { "command": "web", "metrics": { "port": 9100 } },
+                "db": { "command": "db" },
+            },
+            "alerts": alerts,
+        }))
+        .unwrap()
+    }
+
+    fn errors(config: &FleetConfig) -> Vec<String> {
+        validate(config).err().unwrap_or_default()
+    }
+
+    #[test]
+    fn alert_rules_parse_with_defaults() {
+        let config = fleet(serde_json::json!([
+            { "name": "disk", "metric": "node_disk_usage_ratio", "threshold": 0.9 },
+            {
+                "name": "down", "metric": "up", "op": "lt", "threshold": 1,
+                "forSeconds": 0, "service": "web", "severity": "critical",
+                "labels": { "team": "web" }, "webhookUrl": "https://hooks.test/am",
+            },
+        ]));
+        assert_eq!(errors(&config), Vec::<String>::new());
+        let disk = &config.alerts[0];
+        assert_eq!(disk.op, AlertOp::Gt);
+        assert_eq!(disk.for_seconds, 60);
+        assert_eq!(disk.severity, AlertSeverity::Warning);
+        assert_eq!(
+            config.services["web"].metrics.as_ref().unwrap().path,
+            "/metrics"
+        );
+        assert!(AlertOp::Lt.holds(0.0, 1.0));
+        assert!(!AlertOp::Gte.holds(0.5, 1.0));
+    }
+
+    #[test]
+    fn invalid_alert_rules_are_rejected() {
+        let config = fleet(serde_json::json!([
+            { "name": "a", "metric": "node_load1", "threshold": 1, "service": "web" },
+            { "name": "a", "metric": "bad-name", "threshold": 1 },
+            { "name": "b", "metric": "up", "threshold": 1, "service": "db" },
+            { "name": "c", "metric": "up", "threshold": 1, "service": "nope" },
+            { "name": "d", "metric": "up", "threshold": 1, "labels": { "node": "x" } },
+            { "name": "e", "metric": "up", "threshold": 1, "webhookUrl": "ftp://x" },
+            { "name": "f", "metric": "up", "threshold": 1, "webhookUrl": "http://u:p@x/" },
+        ]));
+        let errors = errors(&config).join("\n");
+        for expected in [
+            "is a node metric and cannot be filtered by service",
+            "alert 'a' is declared twice",
+            "invalid metric name 'bad-name'",
+            "service 'db' exposes no metrics endpoint",
+            "unknown service 'nope'",
+            "label 'node' is set by the server",
+            "must start with http:// or https://",
+            "must not embed credentials",
+        ] {
+            assert!(
+                errors.contains(expected),
+                "missing '{expected}' in:\n{errors}"
+            );
+        }
+    }
+
+    #[test]
+    fn metrics_endpoints_are_validated() {
+        let mut config = fleet(serde_json::json!([]));
+        config.services.get_mut("web").unwrap().metrics = Some(MetricsEndpoint {
+            port: 0,
+            path: "metrics".into(),
+        });
+        let errors = errors(&config).join("\n");
+        assert!(errors.contains("port must not be 0"), "{errors}");
+        assert!(errors.contains("must start with '/'"), "{errors}");
     }
 }

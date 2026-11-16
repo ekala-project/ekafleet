@@ -1,4 +1,5 @@
 mod agent_msg;
+pub mod alerts;
 pub mod api;
 mod api_system;
 pub mod audit;
@@ -230,6 +231,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         data_dir: config.data_dir.clone(),
         allow_bearer_agents: config.allow_bearer_agents,
         binary_cache: Some(binary_cache),
+        metrics: metrics.clone(),
     };
 
     let grpc_shutdown = shutdown.clone();
@@ -250,6 +252,12 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     });
 
     dns::DnsPublisher::new(fleet_state.clone()).spawn(shutdown.child_token());
+    alerts::AlertLoop {
+        raft_state: grpc_config.raft_state.clone(),
+        metrics: metrics.clone(),
+        evaluator: alert_evaluator.clone(),
+    }
+    .spawn(shutdown.child_token());
 
     if let Some(agent) = config.embedded_agent {
         spawn_embedded_agent(

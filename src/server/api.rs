@@ -136,6 +136,13 @@ impl FleetControlService {
     }
 
     /// Serve service closures from `cache` and advertise its key to agents.
+    /// Ingest agent metrics into `metrics` (shared with the HTTP API and the
+    /// alert evaluator) rather than a private aggregator.
+    pub fn with_metrics(mut self, metrics: MetricsAggregator) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
     pub fn with_binary_cache(mut self, cache: super::cache::BinaryCache) -> Self {
         self.state.set_cache_public_key(cache.public_key());
         self.binary_cache = Some(cache);
@@ -2011,6 +2018,8 @@ pub struct GrpcServerConfig {
     pub allow_bearer_agents: bool,
     /// Binary cache for service closures.
     pub binary_cache: Option<super::cache::BinaryCache>,
+    /// Where agent metrics are aggregated.
+    pub metrics: MetricsAggregator,
 }
 
 /// Start the gRPC server with TLS and RBAC-based authentication.
@@ -2036,6 +2045,7 @@ pub async fn serve_grpc(
         data_dir,
         allow_bearer_agents,
         binary_cache,
+        metrics,
     } = config;
 
     tracing::info!(%addr, domain = %domain, "gRPC server listening (TLS + RBAC + SPIFFE)");
@@ -2136,7 +2146,8 @@ pub async fn serve_grpc(
     .with_cert_issuer(cert_issuer, trust_bundle_pem.clone(), jwt_bundle)
     .with_ca(ca.clone())
     .with_fleet_key(fleet_key)
-    .with_bearer_agents(allow_bearer_agents);
+    .with_bearer_agents(allow_bearer_agents)
+    .with_metrics(metrics);
     let service = match binary_cache {
         Some(cache) => service.with_binary_cache(cache),
         None => service,

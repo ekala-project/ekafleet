@@ -699,6 +699,81 @@ let
     };
   };
 
+  # `MetricsEndpoint`.
+  metricsEndpoint = strictSubmodule {
+    port = mkOption {
+      type = types.port;
+      description = "Port of the metrics endpoint on the service's loopback.";
+    };
+    path = mkOption {
+      type = types.str;
+      default = "/metrics";
+    };
+  };
+
+  # `AlertRuleConfig`.
+  alertRule = strictSubmodule {
+    name = mkOption {
+      type = types.str;
+      description = "Unique rule name (the `alertname` label).";
+    };
+    metric = mkOption {
+      type = types.str;
+      description = ''
+        Metric to evaluate. `node_*` metrics are evaluated per node; others
+        come from service metrics endpoints and are evaluated per instance.
+      '';
+    };
+    op = mkOption {
+      type = types.enum [
+        "gt"
+        "gte"
+        "lt"
+        "lte"
+        "eq"
+      ];
+      default = "gt";
+    };
+    threshold = mkOption { type = types.number; };
+    forSeconds = mkOption {
+      type = types.ints.unsigned;
+      default = 60;
+      description = "How long a series must breach before it fires.";
+    };
+    service = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      description = "Only evaluate instances of this service.";
+    };
+    node = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      description = "Only evaluate this node.";
+    };
+    severity = mkOption {
+      type = types.enum [
+        "info"
+        "warning"
+        "critical"
+      ];
+      default = "warning";
+    };
+    labels = mkOption {
+      type = types.attrsOf types.str;
+      default = { };
+      description = "Extra alert labels, for routing and silences.";
+    };
+    summary = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+    };
+    webhookUrl = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      description = "Alertmanager-compatible webhook receiving firing and resolved alerts.";
+    };
+  };
+
   # ── Service ─────────────────────────────────────────────────────────
 
   service = strictSubmodule {
@@ -751,6 +826,15 @@ let
     sidecars = mkOption {
       type = types.listOf sidecar;
       default = [ ];
+    };
+    metrics = mkOption {
+      type = types.nullOr metricsEndpoint;
+      default = null;
+      description = ''
+        Prometheus endpoint the hosting agent scrapes every 15 seconds on the
+        service's loopback (inside its network namespace). Series are summed
+        by metric name per instance; `up` reports whether the scrape worked.
+      '';
     };
   };
 
@@ -1106,6 +1190,11 @@ in
       type = types.listOf (types.attrsOf types.anything);
       default = [ ];
       description = "Organizational policy rules evaluated during plan/apply.";
+    };
+    alerts = mkOption {
+      type = types.listOf alertRule;
+      default = [ ];
+      description = "Threshold alert rules on node and service metrics.";
     };
     signaturePolicy = mkOption {
       type = types.nullOr signaturePolicy;
