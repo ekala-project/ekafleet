@@ -59,6 +59,9 @@ service FleetControl {
   // Query fleet events with filtering.
   rpc Events(EventsRequest) returns (EventsResponse);
 
+  // Query the audit log, newest first (Admin only).
+  rpc QueryAudit(AuditQueryRequest) returns (AuditQueryResponse);
+
   // List all connected nodes with details.
   rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
 
@@ -1036,6 +1039,32 @@ message LogsRequest {
 message LogsChunk {
   string node_id = 1;
   bytes data = 2;
+}
+
+// --- Audit ---
+
+message AuditQueryRequest {
+  // Empty fields do not filter.
+  string actor = 1;
+  string action = 2;
+  string outcome = 3;
+  // 0 means 100.
+  uint32 limit = 4;
+}
+
+message AuditEntryProto {
+  uint64 timestamp = 1;
+  string actor = 2;
+  string action = 3;
+  string resource = 4;
+  string detail = 5;
+  string outcome = 6;
+  // How many identical occurrences the entry stands for.
+  uint64 count = 7;
+}
+
+message AuditQueryResponse {
+  repeated AuditEntryProto entries = 1;
 }
 
 // --- Events ---

@@ -1,3 +1,4 @@
+pub mod access_audit;
 mod agent_msg;
 pub mod alerts;
 pub mod api;
@@ -144,6 +145,13 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     let event_store = events::EventStore::new();
     let metrics = crate::metrics::aggregator::MetricsAggregator::new();
     let alert_evaluator = crate::metrics::alerting::AlertEvaluator::new();
+    // The audit trail is a security record: refuse to start without it.
+    let audit_log = audit::AuditLog::open(&config.data_dir).map_err(|e| {
+        anyhow::anyhow!(
+            "cannot open the audit log in {}: {e}",
+            config.data_dir.join("audit").display()
+        )
+    })?;
 
     // Initialize RBAC token store with persistence and load any saved tokens
     let token_store = rbac::TokenStore::with_persistence(&config.data_dir);
@@ -232,6 +240,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         allow_bearer_agents: config.allow_bearer_agents,
         binary_cache: Some(binary_cache),
         metrics: metrics.clone(),
+        audit_log: audit_log.clone(),
     };
 
     let grpc_shutdown = shutdown.clone();
@@ -246,6 +255,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         metrics: metrics.clone(),
         alerts: alert_evaluator.clone(),
         event_store: event_store.clone(),
+        audit_log: audit_log.clone(),
     };
     tokio::spawn(async move {
         housekeeping_loop(hk_deps, hk_shutdown).await;
@@ -286,6 +296,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
             http_raft_state,
             jwt_bundle,
             http_tls,
+            audit_log,
             http_shutdown,
         ) => {
             result?;
@@ -428,6 +439,7 @@ struct HousekeepingDeps {
     metrics: crate::metrics::aggregator::MetricsAggregator,
     alerts: crate::metrics::alerting::AlertEvaluator,
     event_store: events::EventStore,
+    audit_log: audit::AuditLog,
 }
 
 /// Periodic housekeeping loop that runs every 60 seconds to clean up stale
@@ -440,6 +452,7 @@ async fn housekeeping_loop(deps: HousekeepingDeps, shutdown: CancellationToken) 
         metrics,
         alerts,
         event_store,
+        audit_log,
     } = deps;
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
     let mut tick_count: u64 = 0;
@@ -491,6 +504,7 @@ async fn housekeeping_loop(deps: HousekeepingDeps, shutdown: CancellationToken) 
         // 4. Prune alert history and expired silences
         alerts.prune_history(1000).await;
         alerts.expire_silences().await;
+        audit_log.flush().await;
 
         // 5. Periodic Raft snapshot and log compaction (every ~100 minutes)
         if tick_count.is_multiple_of(100) {

@@ -164,6 +164,8 @@ pub enum Permission {
     ManageSecrets,
     /// Stream control (agent connections)
     AgentConnect,
+    /// Read the audit log (Admin only)
+    ReadAudit,
 }
 
 impl Role {
