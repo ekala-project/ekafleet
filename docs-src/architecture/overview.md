@@ -76,7 +76,6 @@ Everything else stays in-process: the state machine, scheduler, and reconciler n
 | **metrics** | Scrapes local service metrics, collects node metrics |
 | **template** | Config file template rendering with fleet context |
 | **storage** | Persistent volume provisioning, snapshots, migration |
-| **gossip** | SWIM-based membership and service catalog propagation |
 | **certs** | CSR generation, certificate request/renewal from built-in CA |
 | **oci_images** | OCI registry client, content-addressable image store, layer unpacking, garbage collection |
 | **workload_api** | SPIFFE Workload API over Unix domain socket, served by the agent; callers attested via `SO_PEERCRED` + cgroup |

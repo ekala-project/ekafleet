@@ -102,7 +102,6 @@ The agent continues operating autonomously:
 | Health checks | Continue polling |
 | DNS resolution | Serve from cache |
 | Certificates | Valid until expiry (default 1 hour) |
-| Gossip | Still works between agents |
 | System activation | **Blocked** until server returns |
 | New deployments | **Blocked** until server returns |
 
