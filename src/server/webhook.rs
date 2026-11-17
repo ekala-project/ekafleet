@@ -1,13 +1,21 @@
 //! Outbound webhooks: the HTTP(S) client shared by alert notifications,
-//! event notifications and admission reviews, delivery with retries, and
-//! the admission review exchange.
+//! event notifications and admission reviews, delivery with retries, the
+//! admission review exchange, and event notifications.
 
+use std::sync::Arc;
 use std::time::Duration;
+
+use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 
 use http_body_util::BodyExt;
 use hyper::body::Bytes;
 
-use crate::config::{AdmissionWebhook, FailPolicy};
+use crate::config::{AdmissionWebhook, EventWebhook, FailPolicy};
+use crate::raft::state::FleetStateMachine;
+use crate::secrets::store::SecretStore;
+
+use super::events::{EventStore, FleetEvent};
 
 /// Delivery attempts before a notification is dropped.
 const ATTEMPTS: u32 = 5;
@@ -183,6 +191,152 @@ pub async fn review(
     Ok(warnings)
 }
 
+/// First retry of a failed event notification.
+const EVENT_FIRST_RETRY: Duration = Duration::from_secs(2);
+
+/// POSTs fleet events to the configuration's event webhooks.
+pub struct EventNotifier {
+    pub events: EventStore,
+    pub raft_state: FleetStateMachine,
+    pub secret_store: Arc<RwLock<SecretStore>>,
+}
+
+/// The event webhooks of one configuration revision.
+#[derive(Default)]
+struct Subscriptions {
+    revision: Option<u64>,
+    fleet: String,
+    webhooks: Vec<EventWebhook>,
+}
+
+impl EventNotifier {
+    pub fn spawn(self, shutdown: CancellationToken) {
+        // Subscribe now so no event emitted after startup is missed.
+        let mut events = self.events.subscribe();
+        tokio::spawn(async move {
+            let client = WebhookClient::new();
+            let mut subscriptions = Subscriptions::default();
+            loop {
+                let event = tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    received = events.recv() => match received {
+                        Ok(event) => event,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                            tracing::warn!(missed, "Event webhooks fell behind; events were not sent");
+                            continue;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                    },
+                };
+                self.reload(&mut subscriptions).await;
+                for webhook in subscriptions
+                    .webhooks
+                    .iter()
+                    .filter(|w| w.wants(&event.kind))
+                {
+                    if let Some(notification) = self
+                        .notification(webhook, &subscriptions.fleet, &event)
+                        .await
+                    {
+                        tokio::spawn(deliver(
+                            client.clone(),
+                            notification,
+                            EVENT_FIRST_RETRY,
+                            "event",
+                        ));
+                    }
+                }
+            }
+        });
+    }
+
+    async fn reload(&self, subscriptions: &mut Subscriptions) {
+        let current = self.raft_state.current_config().await;
+        let revision = current.as_ref().map(|r| r.revision);
+        if revision == subscriptions.revision {
+            return;
+        }
+        match current.as_ref().map(|r| r.config()).transpose() {
+            Ok(config) => {
+                *subscriptions = Subscriptions {
+                    revision,
+                    fleet: config.as_ref().map(|c| c.name.clone()).unwrap_or_default(),
+                    webhooks: config.map(|c| c.webhooks).unwrap_or_default(),
+                };
+            }
+            Err(e) => tracing::error!(?revision, error = %e, "Cannot read event webhooks"),
+        }
+    }
+
+    /// The signed notification of `event` for `webhook`; `None` if its
+    /// signing secret has no value.
+    async fn notification(
+        &self,
+        webhook: &EventWebhook,
+        fleet: &str,
+        event: &FleetEvent,
+    ) -> Option<Notification> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let body = event_body(&id, fleet, event);
+        let mut headers = vec![
+            ("x-ekafleet-event", event.kind.clone()),
+            ("x-ekafleet-delivery", id),
+        ];
+        if let Some(secret) = &webhook.secret {
+            let signature = {
+                let stored = self.raft_state.secrets().await;
+                let sealed = stored
+                    .get(crate::secrets::FLEET_SCOPE)
+                    .and_then(|s| s.get(secret));
+                let store = self.secret_store.read().await;
+                sealed.and_then(|(sealed, _)| {
+                    store
+                        .open(crate::secrets::FLEET_SCOPE, secret, sealed)
+                        .map_err(|e| tracing::error!(webhook = %webhook.name, error = %e, "Cannot open a webhook signing secret"))
+                        .ok()
+                        .map(|key| sign(&key, &body))
+                })
+            };
+            let Some(signature) = signature else {
+                tracing::warn!(
+                    webhook = %webhook.name,
+                    secret = %secret,
+                    "Not sending an event: the webhook's signing secret has no value \
+                     (ekafleet secret set {} {secret})",
+                    crate::secrets::FLEET_SCOPE
+                );
+                return None;
+            };
+            headers.push(("x-ekafleet-signature", signature));
+        }
+        Some(Notification {
+            url: webhook.url.clone(),
+            body,
+            headers,
+        })
+    }
+}
+
+/// The JSON body of an event notification.
+fn event_body(id: &str, fleet: &str, event: &FleetEvent) -> String {
+    let mut body = serde_json::to_value(event).unwrap_or_default();
+    if let Some(object) = body.as_object_mut() {
+        object.insert("id".into(), id.into());
+        object.insert("fleet".into(), fleet.into());
+    }
+    body.to_string()
+}
+
+/// `sha256=<hex HMAC-SHA256 of body under key>`.
+pub fn sign(key: &[u8], body: &str) -> String {
+    let tag = ring::hmac::sign(
+        &ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key),
+        body.as_bytes(),
+    );
+    let hex: String = tag.as_ref().iter().map(|b| format!("{b:02x}")).collect();
+    format!("sha256={hex}")
+}
+
 #[derive(Debug, PartialEq)]
 enum Answer {
     Allowed,
@@ -332,6 +486,81 @@ mod tests {
             .await
             .is_err()
         );
+    }
+
+    #[test]
+    fn signatures_are_hmac_sha256() {
+        // RFC 4231 test case 2.
+        assert_eq!(
+            sign(b"Jefe", "what do ya want for nothing?"),
+            "sha256=5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
+
+    #[tokio::test]
+    async fn events_are_sent_signed_to_matching_webhooks() {
+        use crate::raft::state::Command;
+        let (url, server) = serve(vec![("200 OK", "")]).await;
+        let raft_state = FleetStateMachine::new();
+        let store = SecretStore::new(&[7u8; 32]);
+        let sealed = store
+            .seal(crate::secrets::FLEET_SCOPE, "hook-key", b"k3y")
+            .unwrap();
+        raft_state
+            .put_secret(crate::secrets::FLEET_SCOPE, "hook-key", sealed)
+            .await
+            .unwrap();
+        let config = serde_json::json!({
+            "name": "prod",
+            "domain": "fleet.internal",
+            "webhooks": [
+                {"name": "deploys", "url": url, "events": ["deploy.*"], "secret": "hook-key"},
+                {"name": "never", "url": "http://127.0.0.1:1/x", "events": ["drain.started"]},
+            ],
+        });
+        raft_state
+            .apply_config(Command::ApplyConfig {
+                flake_ref: "/f".into(),
+                config_json: config.to_string(),
+                applied_at: 0,
+                applied_by: "test".into(),
+                rollback_of: None,
+                closures: Default::default(),
+                images: Default::default(),
+            })
+            .await
+            .unwrap();
+        let events = EventStore::new();
+        let shutdown = CancellationToken::new();
+        EventNotifier {
+            events: events.clone(),
+            raft_state,
+            secret_store: Arc::new(RwLock::new(store)),
+        }
+        .spawn(shutdown.clone());
+        events
+            .emit_kind(
+                "deploy.failed",
+                super::super::events::EventLevel::Error,
+                super::super::events::EventCategory::Deployment,
+                Some("api"),
+                None,
+                "boom",
+            )
+            .await;
+        let request = server.await.unwrap().remove(0);
+        shutdown.cancel();
+        let (head, body) = request.split_once("\r\n\r\n").unwrap();
+        let head = head.to_ascii_lowercase();
+        assert!(head.contains("x-ekafleet-event: deploy.failed"), "{head}");
+        assert!(
+            head.contains(&format!("x-ekafleet-signature: {}", sign(b"k3y", body))),
+            "{head}"
+        );
+        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body["type"], "deploy.failed");
+        assert_eq!(body["fleet"], "prod");
+        assert_eq!(body["service"], "api");
     }
 
     #[test]

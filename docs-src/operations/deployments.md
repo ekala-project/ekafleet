@@ -120,35 +120,80 @@ Tier 2: api-server              (depends on postgres)
 Tier 3: web-frontend            (depends on api-server)
 ```
 
-## Deployment Hooks
+## Event Webhooks
 
-Fleet-level hooks execute custom scripts at deployment lifecycle points:
+The server POSTs fleet events to webhooks as JSON. It never runs commands
+from the fleet configuration.
 
 ```nix
-hooks = {
-  preDeploy  = [ "/usr/local/bin/notify" "deploy-start" ];
-  postDeploy = [ "/usr/local/bin/notify" "deploy-done" ];
-};
+webhooks = [
+  {
+    name = "deploys";
+    url = "https://hooks.example.com/ekafleet";
+    events = [ "deploy.*" "config.*" "drain.completed" ];
+    secret = "hook-key";   # ekafleet secret set _fleet hook-key
+  }
+];
 ```
 
-Hooks receive `EKAFLEET_SERVICE` and `EKAFLEET_ACTION` environment variables.
+Event types:
 
-## Admission Webhooks
+| Type | When |
+|------|------|
+| `config.applied`, `config.rolled_back`, `config.failed` | A new revision is first reconciled |
+| `config.rejected` | Admission rejects an apply |
+| `deploy.started`, `deploy.succeeded`, `deploy.failed`, `deploy.rolled_back` | Per-service deployments |
+| `drain.started`, `drain.completed` | A node is drained, and later has no instances left |
+| `node.connected`, `node.left` | Agents connect, or are evicted after missing heartbeats |
 
-External admission webhooks validate deployments before execution:
+Each body is the event (`id`, `type`, `timestamp`, `fleet`, `level`,
+`category`, `service`, `node`, `message`). Headers include
+`X-Ekafleet-Event` and `X-Ekafleet-Delivery` (the `id`). With `secret` set,
+`X-Ekafleet-Signature: sha256=<hex>` carries the HMAC-SHA256 of the raw
+body, keyed by that fleet-level secret. Receivers should check it. While
+the secret has no value, no events are sent to that webhook. Failed
+deliveries are retried with backoff (5 attempts).
+
+## Admission
+
+Plan and apply admit a configuration after validating it and before
+building anything. A rejected apply never becomes a revision, and it is
+recorded in the audit log. Admission checks, in order:
+
+1. **Policies**: an `enforce` violation rejects; `warn` only warns.
+2. **Namespace quotas**: each namespace's total requests, with every
+   service counted at its most instances.
+3. **Admission webhooks**, which see the change:
 
 ```nix
 admissionWebhooks = [
   {
     name = "security-review";
-    url = "http://policy-server:8080/validate";
-    failPolicy = "fail";
+    url = "https://policy.example.com/validate";
+    failPolicy = "fail";     # or "ignore": failures only warn
     timeoutSeconds = 10;
   }
 ];
 ```
 
-Each webhook receives a JSON POST with the planned operations and must return `{"allowed": true}` to proceed. If any webhook with `failPolicy = "fail"` rejects, the deployment is blocked.
+Each webhook receives a POST of an `AdmissionReview`:
+
+```json
+{
+  "apiVersion": "ekafleet/v1", "kind": "AdmissionReview",
+  "dryRun": false, "actor": "token:3f2a… (ci)", "flakeRef": "github:org/fleet/abc123",
+  "fleet": "prod", "previousRevision": 41,
+  "changes": {"created": ["web"], "updated": ["api"], "deleted": []},
+  "services": { "...": "every service's configuration" },
+  "namespaces": {"shop": {"cpu": 600, "memory": 256, "disk": 0, "instances": 4, "services": 2}}
+}
+```
+
+It must answer 2xx with `{"allowed": true}`, or with `{"allowed": false,
+"message": "reason"}` to reject. Any other answer, or no answer, rejects
+the change unless `failPolicy = "ignore"`. Plan sends the same review with
+`"dryRun": true`. Rollbacks restore an already-admitted revision and are
+not reviewed again.
 
 ## Dispatch Jobs
 

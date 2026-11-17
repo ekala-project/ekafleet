@@ -1071,22 +1071,25 @@ let
 
   # ── Fleet-level extras ──────────────────────────────────────────────
 
-  hooks = strictSubmodule {
-    preDeploy = mkOption {
-      type = types.nullOr (types.listOf types.str);
-      default = null;
+  # `EventWebhook`.
+  eventWebhook = strictSubmodule {
+    name = mkOption { type = types.str; };
+    url = mkOption { type = types.str; };
+    events = mkOption {
+      type = types.listOf types.str;
+      example = [
+        "deploy.failed"
+        "drain.*"
+      ];
+      description = "Event types, `prefix.*` patterns or `*`.";
     };
-    postDeploy = mkOption {
-      type = types.nullOr (types.listOf types.str);
+    secret = mkOption {
+      type = types.nullOr types.str;
       default = null;
-    };
-    preDrain = mkOption {
-      type = types.nullOr (types.listOf types.str);
-      default = null;
-    };
-    postDrain = mkOption {
-      type = types.nullOr (types.listOf types.str);
-      default = null;
+      description = ''
+        Fleet-level static secret (`ekafleet secret set _fleet <name>`) keying
+        the `X-Ekafleet-Signature: sha256=<HMAC-SHA256 of the body>` header.
+      '';
     };
   };
 
@@ -1204,10 +1207,10 @@ in
       default = { };
       description = "Node pools, keyed by name.";
     };
-    hooks = mkOption {
-      type = hooks;
-      default = { };
-      description = "Deployment lifecycle script hooks.";
+    webhooks = mkOption {
+      type = types.listOf eventWebhook;
+      default = [ ];
+      description = "Webhooks notified of fleet events.";
     };
     namespaces = mkOption {
       type = types.attrsOf namespace;
