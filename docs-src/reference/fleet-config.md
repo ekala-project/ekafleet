@@ -438,20 +438,22 @@ sidecars = [
 ];
 ```
 
-## HookConfig
-
-Script hooks executed at deployment lifecycle points.
+## Namespaces
 
 ```nix
-hooks = {
-  preDeploy  = [ "/usr/local/bin/notify" "deploy-start" ];
-  postDeploy = [ "/usr/local/bin/notify" "deploy-done" ];
-  preDrain   = [ "/usr/local/bin/check-maintenance" ];
-  postDrain  = [ "/usr/local/bin/notify" "drain-done" ];
+namespaces.shop.quota = {
+  cpu = 4000;        # total CPU requests, millicores
+  memory = 8192;     # total memory requests, MB
+  disk = 50000;      # total disk requests, MB
+  instances = 20;
+  services = 10;
 };
 ```
 
-Hooks are executed with `EKAFLEET_SERVICE` and `EKAFLEET_ACTION` environment variables.
+Quotas are checked at plan and apply. Each service counts at its most
+instances: its replicas, or every eligible machine for system jobs. A
+namespace that is not listed has no quota. Namespace names are 1-32
+lowercase letters, digits and inner dashes.
 
 ## Machine
 
@@ -597,37 +599,38 @@ policies = [
 
 Operators: `>=`, `>`, `<=`, `<`, `==`, `!=`
 
-## WebhookConfig
+## EventWebhook
 
-Outbound webhook notifications triggered by fleet events:
+Webhooks notified of fleet events (see [Deployments](../operations/deployments.md#event-webhooks)):
 
 ```nix
 webhooks = [
   {
-    name = "slack-deploys";
-    url = "http://webhook-proxy:8080/deploy";
-    events = [ "deployment" "rollback" ];
-    timeout_seconds = 10;
+    name = "deploys";
+    url = "https://hooks.example.com/ekafleet";
+    events = [ "deploy.*" "drain.completed" ];   # types, prefix.* or *
+    secret = "hook-key";   # optional: ekafleet secret set _fleet hook-key
   }
 ];
 ```
 
 ## AdmissionWebhook
 
-External admission webhooks for validating deployments before execution.
+External admission webhooks reviewing configurations at plan and apply
+(see [Deployments](../operations/deployments.md#admission)).
 
 ```nix
 admissionWebhooks = [
   {
     name = "security-review";
-    url = "http://policy-server:8080/validate";
+    url = "https://policy.example.com/validate";
     failPolicy = "fail";      # "fail" or "ignore" (default: "fail")
-    timeoutSeconds = 10;      # Request timeout (default: 10)
+    timeoutSeconds = 10;      # 1-60 (default: 10)
   }
 ];
 ```
 
-The webhook receives a JSON POST with the planned operations. It must return `{"allowed": true}` or `{"allowed": false, "message": "reason"}`.
+The webhook receives an `AdmissionReview` POST. It must return `{"allowed": true}` or `{"allowed": false, "message": "reason"}`.
 
 ## AlertRule
 

@@ -219,6 +219,19 @@ pub async fn missing_secret_warnings(
                 .collect::<Vec<_>>()
         })
         .collect();
+    let fleet = stored.get(crate::secrets::FLEET_SCOPE);
+    for webhook in &config.webhooks {
+        if let Some(secret) = &webhook.secret
+            && !fleet.is_some_and(|s| s.contains_key(secret))
+        {
+            warnings.push(format!(
+                "webhook '{}' signs with secret '{secret}', which has no value; \
+                 no events are sent to it until `ekafleet secret set {} {secret}`",
+                webhook.name,
+                crate::secrets::FLEET_SCOPE
+            ));
+        }
+    }
     warnings.sort();
     warnings
 }

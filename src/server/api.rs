@@ -429,6 +429,16 @@ impl FleetControl for FleetControlService {
             .state
             .register_agent_connection(&node_id, remote.clone(), pool_name)
             .await;
+        self.event_store
+            .emit_kind(
+                "node.connected",
+                super::events::EventLevel::Info,
+                super::events::EventCategory::NodeJoin,
+                None,
+                Some(&node_id),
+                &format!("Node {node_id} connected from {remote}"),
+            )
+            .await;
 
         // Correlate agent IP with a tracked cloud instance.
         // The remote address is "ip:port", so extract just the IP part.
@@ -706,6 +716,7 @@ impl FleetControl for FleetControlService {
         let secret_store = self.secret_store.clone();
         let webhook_client = self.webhook_client.clone();
         let audit_log = self.audit_log.clone();
+        let event_store = self.event_store.clone();
         tokio::spawn(async move {
             let send = |revision: u64, status: crate::proto::ApplyStatus, message: String| {
                 let tx = tx.clone();
@@ -764,6 +775,16 @@ impl FleetControl for FleetControlService {
                         &flake_ref,
                         &format!("admission rejected: {reason}"),
                         super::audit::AuditOutcome::Denied,
+                    )
+                    .await;
+                event_store
+                    .emit_kind(
+                        "config.rejected",
+                        super::events::EventLevel::Warning,
+                        super::events::EventCategory::Configuration,
+                        None,
+                        None,
+                        &format!("{actor} applying {flake_ref}: {reason}"),
                     )
                     .await;
                 send(
@@ -1035,6 +1056,16 @@ impl FleetControl for FleetControlService {
 
         // No new placements here, and existing ones move elsewhere.
         self.state.set_draining(&req.machine).await;
+        self.event_store
+            .emit_kind(
+                "drain.started",
+                super::events::EventLevel::Info,
+                super::events::EventCategory::Drain,
+                None,
+                Some(&req.machine),
+                &format!("Draining node {}", req.machine),
+            )
+            .await;
 
         // Find services running on this node
         let (_, services, _) = self.state.fleet_status().await;
@@ -1457,6 +1488,7 @@ impl FleetControl for FleetControlService {
                 "drain" => Some(EventCategory::Drain),
                 "secret_rotation" => Some(EventCategory::SecretRotation),
                 "attestation" => Some(EventCategory::Attestation),
+                "configuration" => Some(EventCategory::Configuration),
                 _ => None,
             }
         };
@@ -2271,6 +2303,12 @@ pub async fn serve_grpc(
         shutdown.clone(),
     );
     service.secret_publisher().spawn(shutdown.clone());
+    super::webhook::EventNotifier {
+        events: service.event_store.clone(),
+        raft_state: service.raft_state.clone(),
+        secret_store: service.secret_store.clone(),
+    }
+    .spawn(shutdown.clone());
     if allow_bearer_agents {
         tracing::warn!("Accepting bearer-token agents (development mode)");
     }

@@ -16,6 +16,10 @@ pub const SERVICE_SECRETS_DIR: &str = "/run/secrets";
 /// Longest accepted secret value (64 KiB).
 pub const MAX_SECRET_SIZE: usize = 64 * 1024;
 
+/// Scope of fleet-level static secrets, which no service may be named and
+/// no agent receives: `ekafleet secret set _fleet <name>`.
+pub const FLEET_SCOPE: &str = "_fleet";
+
 /// Check a secret or service name used as a file name on agents: 1–128 of
 /// `[A-Za-z0-9._-]`, not starting with a dot.
 pub fn validate_name(kind: &str, name: &str) -> Result<(), String> {
