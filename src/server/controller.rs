@@ -113,7 +113,12 @@ impl Controller {
     ) {
         let mut tick = tokio::time::interval(interval);
         let mut actuator: Option<(u64, ScalingActuator)> = None;
+        // The last revision announced as an event; one recorded before a
+        // restart was announced then.
+        let mut announced = None;
+        let mut drained = std::collections::HashSet::new();
         if let Some(current) = self.raft.current_config().await {
+            announced = Some(current.revision);
             tracing::info!(
                 revision = current.revision,
                 flake_ref = %current.flake_ref,
@@ -135,7 +140,71 @@ impl Controller {
             if update.status == ApplyStatus::ApplyFailed {
                 tracing::error!(revision = update.revision, message = %update.message, "Reconcile failed");
             }
+            if announced != Some(revision.revision) {
+                announced = Some(revision.revision);
+                self.announce(&revision, &update).await;
+            }
+            self.announce_drained(&mut drained).await;
             let _ = self.updates.send(update);
+        }
+    }
+
+    /// Emit the event for the first reconcile of a new revision.
+    async fn announce(&self, revision: &ConfigRevision, update: &ReconcileUpdate) {
+        let (kind, level) = match (update.status, revision.rollback_of) {
+            (ApplyStatus::ApplyFailed, _) => ("config.failed", EventLevel::Error),
+            (_, Some(_)) => ("config.rolled_back", EventLevel::Warning),
+            _ => ("config.applied", EventLevel::Info),
+        };
+        let message = match revision.rollback_of {
+            Some(of) => format!(
+                "{} (rollback to revision {of} by {})",
+                update.message, revision.applied_by
+            ),
+            None => format!(
+                "{} (applied by {} from {})",
+                update.message, revision.applied_by, revision.flake_ref
+            ),
+        };
+        self.events
+            .emit_kind(
+                kind,
+                level,
+                EventCategory::Configuration,
+                None,
+                None,
+                &message,
+            )
+            .await;
+    }
+
+    /// Emit `drain.completed` once for each draining node that no longer
+    /// runs any instance. `drained` remembers the nodes announced.
+    async fn announce_drained(&self, drained: &mut std::collections::HashSet<String>) {
+        let draining = self.state.draining_nodes().await;
+        drained.retain(|node| draining.contains(node));
+        let pending: Vec<_> = draining.iter().filter(|n| !drained.contains(*n)).collect();
+        if pending.is_empty() {
+            return;
+        }
+        let (_, services, _) = self.state.fleet_status().await;
+        for node in pending {
+            let busy = services
+                .iter()
+                .any(|s| s.instances.iter().any(|i| &i.node_id == node));
+            if !busy {
+                drained.insert(node.clone());
+                self.events
+                    .emit_kind(
+                        "drain.completed",
+                        EventLevel::Info,
+                        EventCategory::Drain,
+                        None,
+                        Some(node),
+                        &format!("Node {node} is drained"),
+                    )
+                    .await;
+            }
         }
     }
 

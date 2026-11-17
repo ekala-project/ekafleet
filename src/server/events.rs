@@ -2,13 +2,16 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, broadcast};
 
 /// Maximum number of events retained in memory.
 const MAX_EVENTS: usize = 10_000;
 
 /// Maximum number of deployment history entries (global across all services).
 const MAX_DEPLOY_HISTORY: usize = 1000;
+
+/// Events buffered for subscribers (event webhooks) that fall behind.
+const SUBSCRIBER_BACKLOG: usize = 1024;
 
 /// Severity level for fleet events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -22,6 +25,10 @@ pub enum EventLevel {
 /// A fleet event recording a significant cluster action.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct FleetEvent {
+    /// Dotted event type, e.g. `deploy.succeeded`; what event webhooks
+    /// subscribe to.
+    #[serde(rename = "type")]
+    pub kind: String,
     pub timestamp: u64,
     pub level: EventLevel,
     pub category: EventCategory,
@@ -43,6 +50,25 @@ pub enum EventCategory {
     Drain,
     SecretRotation,
     Attestation,
+    Configuration,
+}
+
+impl EventCategory {
+    /// Event type of events emitted without a more specific one.
+    fn default_kind(self) -> &'static str {
+        match self {
+            Self::Deployment => "deploy",
+            Self::Scheduling => "scheduling",
+            Self::Health => "health",
+            Self::Scaling => "scaling",
+            Self::NodeJoin => "node.joined",
+            Self::NodeLeave => "node.left",
+            Self::Drain => "drain",
+            Self::SecretRotation => "secret.rotated",
+            Self::Attestation => "node.attested",
+            Self::Configuration => "config",
+        }
+    }
 }
 
 /// A deployment history entry for a service.
@@ -73,6 +99,7 @@ pub enum DeployOutcome {
 pub struct EventStore {
     events: Arc<RwLock<VecDeque<FleetEvent>>>,
     deploy_history: Arc<RwLock<VecDeque<DeployRecord>>>,
+    subscribers: broadcast::Sender<FleetEvent>,
 }
 
 impl Default for EventStore {
@@ -86,7 +113,13 @@ impl EventStore {
         Self {
             events: Arc::new(RwLock::new(VecDeque::with_capacity(MAX_EVENTS))),
             deploy_history: Arc::new(RwLock::new(VecDeque::with_capacity(MAX_DEPLOY_HISTORY))),
+            subscribers: broadcast::channel(SUBSCRIBER_BACKLOG).0,
         }
+    }
+
+    /// Every event recorded from now on.
+    pub fn subscribe(&self) -> broadcast::Receiver<FleetEvent> {
+        self.subscribers.subscribe()
     }
 
     /// Record a fleet event.
@@ -103,7 +136,29 @@ impl EventStore {
         node: Option<&str>,
         message: &str,
     ) {
+        self.emit_kind(
+            category.default_kind(),
+            level,
+            category,
+            service,
+            node,
+            message,
+        )
+        .await;
+    }
+
+    /// Record a fleet event of a specific type.
+    pub async fn emit_kind(
+        &self,
+        kind: &str,
+        level: EventLevel,
+        category: EventCategory,
+        service: Option<&str>,
+        node: Option<&str>,
+        message: &str,
+    ) {
         let event = FleetEvent {
+            kind: kind.to_string(),
             timestamp: now_epoch(),
             level,
             category,
@@ -119,6 +174,8 @@ impl EventStore {
             event.message
         );
 
+        // No subscribers is fine.
+        let _ = self.subscribers.send(event.clone());
         let mut events = self.events.write().await;
         if events.len() >= MAX_EVENTS {
             events.pop_front();
@@ -168,7 +225,8 @@ impl EventStore {
             message: "deployment started".to_string(),
         };
 
-        self.emit_detail(
+        self.emit_kind(
+            "deploy.started",
             EventLevel::Info,
             EventCategory::Deployment,
             Some(service_name),
@@ -220,7 +278,14 @@ impl EventStore {
 
         drop(history);
 
-        self.emit_detail(
+        let kind = match outcome {
+            DeployOutcome::Succeeded => "deploy.succeeded",
+            DeployOutcome::Failed => "deploy.failed",
+            DeployOutcome::RolledBack => "deploy.rolled_back",
+            DeployOutcome::InProgress => "deploy.progress",
+        };
+        self.emit_kind(
+            kind,
             level,
             EventCategory::Deployment,
             service_name.as_deref(),

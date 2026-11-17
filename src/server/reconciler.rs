@@ -1301,7 +1301,7 @@ mod tests {
             services: HashMap::new(),
             machines: HashMap::new(),
             node_pools: HashMap::new(),
-            hooks: Default::default(),
+            webhooks: vec![],
             admission_webhooks: vec![],
             namespaces: Default::default(),
             policies: vec![],

@@ -16,9 +16,10 @@ pub struct FleetConfig {
     pub machines: HashMap<String, MachineConfig>,
     #[serde(default)]
     pub node_pools: HashMap<String, NodePoolConfig>,
-    /// Script hooks executed at deployment lifecycle points.
+    /// Webhooks notified of fleet events (deploys, drains, configuration
+    /// changes, nodes connecting and leaving).
     #[serde(default)]
-    pub hooks: HookConfig,
+    pub webhooks: Vec<EventWebhook>,
     /// Admission webhooks for validating deployments.
     #[serde(default)]
     pub admission_webhooks: Vec<AdmissionWebhook>,
@@ -102,6 +103,39 @@ fn validate_namespaces_and_admission(config: &FleetConfig, errors: &mut Vec<Stri
             && let Err(e) = validate_namespace_name(&cfg.namespace)
         {
             errors.push(format!("service '{service}': {e}"));
+        }
+    }
+    for service in config.services.keys() {
+        if service.starts_with('_') {
+            errors.push(format!(
+                "service '{service}': names starting with '_' are reserved"
+            ));
+        }
+    }
+    let mut names = std::collections::HashSet::new();
+    for webhook in &config.webhooks {
+        if !names.insert(webhook.name.as_str()) {
+            errors.push(format!("webhooks: duplicate name '{}'", webhook.name));
+        }
+        if let Err(e) = validate_webhook_url(&webhook.url) {
+            errors.push(format!("webhook '{}': url {e}", webhook.name));
+        }
+        if webhook.events.is_empty() {
+            errors.push(format!("webhook '{}': events is empty", webhook.name));
+        }
+        for pattern in &webhook.events {
+            if !valid_event_pattern(pattern) {
+                errors.push(format!(
+                    "webhook '{}': invalid event pattern '{pattern}' (use a type like \
+                     'deploy.failed', a prefix like 'deploy.*', or '*')",
+                    webhook.name
+                ));
+            }
+        }
+        if let Some(secret) = &webhook.secret
+            && let Err(e) = crate::secrets::validate_name("secret", secret)
+        {
+            errors.push(format!("webhook '{}': {e}", webhook.name));
         }
     }
     let mut names = std::collections::HashSet::new();
@@ -354,21 +388,53 @@ fn parse_rekor_key_pem(pem: &str) -> Result<Vec<u8>, crate::agent::oci::signatur
 }
 
 /// Script hooks executed at various deployment lifecycle points.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// A webhook POSTed every fleet event whose type matches one of `events`.
+///
+/// Bodies are the event as JSON. With `secret` set, each carries
+/// `X-Ekafleet-Signature: sha256=<hex HMAC-SHA256 of the body>`, keyed by
+/// the fleet-level static secret of that name (`ekafleet secret set _fleet
+/// <secret>`); events are not sent while it has no value.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct HookConfig {
-    /// Command executed before deploying a service.
+pub struct EventWebhook {
+    pub name: String,
+    pub url: String,
+    /// Event types (`deploy.failed`), prefixes (`deploy.*`) or `*`.
+    pub events: Vec<String>,
     #[serde(default)]
-    pub pre_deploy: Option<Vec<String>>,
-    /// Command executed after deploying a service.
-    #[serde(default)]
-    pub post_deploy: Option<Vec<String>>,
-    /// Command executed before draining a node.
-    #[serde(default)]
-    pub pre_drain: Option<Vec<String>>,
-    /// Command executed after draining a node.
-    #[serde(default)]
-    pub post_drain: Option<Vec<String>>,
+    pub secret: Option<String>,
+}
+
+impl EventWebhook {
+    pub fn wants(&self, kind: &str) -> bool {
+        self.events.iter().any(|p| event_matches(p, kind))
+    }
+}
+
+/// Whether event type `kind` matches `pattern`: equal, `*`, or `prefix.*`
+/// for `prefix` and every type under it.
+pub fn event_matches(pattern: &str, kind: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    match pattern.strip_suffix(".*") {
+        Some(prefix) => {
+            kind == prefix
+                || kind
+                    .strip_prefix(prefix)
+                    .is_some_and(|rest| rest.starts_with('.'))
+        }
+        None => pattern == kind,
+    }
+}
+
+fn valid_event_pattern(pattern: &str) -> bool {
+    let body = pattern.strip_suffix(".*").unwrap_or(pattern);
+    pattern == "*"
+        || (!body.is_empty()
+            && body.split('.').all(|part| {
+                !part.is_empty() && part.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+            }))
 }
 
 /// Configuration for an admission webhook that validates deployments.
@@ -1499,10 +1565,10 @@ mod nix_module_tests {
             "domain": "fleet.internal",
             "admissionWebhooks": [],
             "policies": [],
-            "hooks": {
-                "preDeploy": null, "postDeploy": null,
-                "preDrain": null, "postDrain": null
-            },
+            "webhooks": [],
+            "namespaces": {"shop": {"quota": {
+                "cpu": 500, "memory": null, "disk": null, "instances": null, "services": null
+            }}},
             "nodePools": {
                 "default": {
                     "labels": {"env": "prod"},
@@ -2010,6 +2076,22 @@ mod cgroup_tests {
 
 #[cfg(test)]
 mod alert_tests {
+    #[test]
+    fn event_patterns_match_types_and_prefixes() {
+        assert!(super::event_matches("*", "deploy.failed"));
+        assert!(super::event_matches("deploy.*", "deploy.failed"));
+        assert!(super::event_matches("deploy.*", "deploy"));
+        assert!(!super::event_matches("deploy.*", "deployer.x"));
+        assert!(super::event_matches("deploy.failed", "deploy.failed"));
+        assert!(!super::event_matches("deploy.failed", "deploy.started"));
+        for ok in ["*", "deploy.*", "node.left", "deploy.rolled_back"] {
+            assert!(super::valid_event_pattern(ok), "{ok}");
+        }
+        for bad in ["", "deploy*", "*.failed", "Deploy", "a..b", ".*"] {
+            assert!(!super::valid_event_pattern(bad), "{bad}");
+        }
+    }
+
     use super::*;
 
     fn fleet(alerts: serde_json::Value) -> FleetConfig {
