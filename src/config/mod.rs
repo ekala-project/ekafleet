@@ -92,6 +92,61 @@ pub fn validate_namespace_name(name: &str) -> Result<(), String> {
     }
 }
 
+/// A Prometheus metric or label name (without `:`).
+fn label_name_ok(s: &str) -> bool {
+    !s.is_empty()
+        && !s.starts_with(|c: char| c.is_ascii_digit())
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn valid_metric_name(s: &str) -> bool {
+    label_name_ok(s) && !s.starts_with("__")
+}
+
+fn validate_autoscale(name: &str, service: &ServiceConfig, errors: &mut Vec<String>) {
+    let Some(autoscale) = &service.scheduling.autoscale else {
+        return;
+    };
+    let mut error = |e: String| errors.push(format!("service '{name}' autoscale: {e}"));
+    if service.scheduling.job_type != JobType::Service {
+        error("only service jobs can autoscale".into());
+    }
+    if autoscale.min == 0 || autoscale.min > autoscale.max {
+        error(format!(
+            "need 1 <= min <= max, not min {} and max {}",
+            autoscale.min, autoscale.max
+        ));
+    }
+    if autoscale.rules.is_empty() {
+        error("rules is empty".into());
+    }
+    if !(15..=86400).contains(&autoscale.scale_down_delay_seconds) {
+        error("scaleDownDelaySeconds must be between 15 and 86400".into());
+    }
+    for rule in &autoscale.rules {
+        if !rule.target.is_finite() || rule.target <= 0.0 {
+            error(format!("rule '{}': target must be positive", rule.metric));
+        }
+        let request = |r: &Option<ResourceValue>| r.as_ref().map_or(0, |r| r.request);
+        match rule.metric.as_str() {
+            "cpu" if request(&service.resources.cpu) == 0 => {
+                error("rule 'cpu' needs resources.cpu.request".into())
+            }
+            "memory" if request(&service.resources.memory) == 0 => {
+                error("rule 'memory' needs resources.memory.request".into())
+            }
+            "cpu" | "memory" => {}
+            metric if service.metrics.is_none() => error(format!(
+                "rule '{metric}' needs the service's metrics endpoint"
+            )),
+            metric if !valid_metric_name(metric) => {
+                error(format!("rule '{metric}': invalid metric name"))
+            }
+            _ => {}
+        }
+    }
+}
+
 fn validate_namespaces_and_admission(config: &FleetConfig, errors: &mut Vec<String>) {
     for name in config.namespaces.keys() {
         if let Err(e) = validate_namespace_name(name) {
@@ -104,6 +159,9 @@ fn validate_namespaces_and_admission(config: &FleetConfig, errors: &mut Vec<Stri
         {
             errors.push(format!("service '{service}': {e}"));
         }
+    }
+    for (name, service) in &config.services {
+        validate_autoscale(name, service, errors);
     }
     for service in config.services.keys() {
         if service.starts_with('_') {
@@ -1230,11 +1288,7 @@ fn validate_alerts(config: &FleetConfig, errors: &mut Vec<String>) {
     let mut names = std::collections::HashSet::new();
     for rule in &config.alerts {
         let name = &rule.name;
-        let label_ok = |s: &str| {
-            !s.is_empty()
-                && !s.starts_with(|c: char| c.is_ascii_digit())
-                && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        };
+        let label_ok = label_name_ok;
         if name.is_empty() || name.len() > 128 || name.chars().any(char::is_control) {
             errors.push(format!(
                 "alert '{name}': name must be 1-128 printable characters"
@@ -2076,6 +2130,47 @@ mod cgroup_tests {
 
 #[cfg(test)]
 mod alert_tests {
+    #[test]
+    fn autoscaling_needs_requests_metrics_and_sane_bounds() {
+        let config: super::FleetConfig = serde_json::from_value(serde_json::json!({
+            "name": "t", "domain": "d",
+            "services": {
+                "api": {
+                    "command": "/bin/true",
+                    "scheduling": {"autoscale": {"min": 3, "max": 2, "rules": [
+                        {"metric": "cpu", "target": 0.5},
+                        {"metric": "queue_depth", "target": 10},
+                    ]}},
+                },
+                "job": {
+                    "command": "/bin/true",
+                    "resources": {"memory": {"request": 64}},
+                    "scheduling": {"type": "batch", "autoscale": {"min": 1, "max": 2, "rules": [
+                        {"metric": "memory", "target": 0.5},
+                    ]}},
+                },
+            },
+        }))
+        .unwrap();
+        let errors = super::validate(&config).unwrap_err();
+        for expected in [
+            "service 'api' autoscale: need 1 <= min <= max, not min 3 and max 2",
+            "service 'api' autoscale: rule 'cpu' needs resources.cpu.request",
+            "service 'api' autoscale: rule 'queue_depth' needs the service's metrics endpoint",
+            "service 'job' autoscale: only service jobs can autoscale",
+        ] {
+            assert!(
+                errors.iter().any(|e| e == expected),
+                "{expected}: {errors:?}"
+            );
+        }
+        assert_eq!(
+            errors.iter().filter(|e| e.contains("autoscale")).count(),
+            4,
+            "{errors:?}"
+        );
+    }
+
     #[test]
     fn event_patterns_match_types_and_prefixes() {
         assert!(super::event_matches("*", "deploy.failed"));

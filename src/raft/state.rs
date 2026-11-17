@@ -999,6 +999,20 @@ impl FleetStateMachine {
             .and_then(|v| v.as_slice().try_into().ok().map(u32::from_le_bytes))
     }
 
+    /// Every runtime replica count override, by service.
+    pub async fn replica_overrides(&self) -> BTreeMap<String, u32> {
+        let state = self.inner.read().await;
+        state
+            .kv
+            .iter()
+            .filter_map(|(key, value)| {
+                let service = key.strip_prefix("replica-override/")?;
+                let count = value.as_slice().try_into().ok().map(u32::from_le_bytes)?;
+                Some((service.to_string(), count))
+            })
+            .collect()
+    }
+
     /// Clear a runtime replica count override for a service.
     pub async fn clear_replica_override(&self, service_name: &str) -> Result<(), RaftError> {
         self.apply_next(Command::KvDelete {

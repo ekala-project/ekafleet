@@ -603,6 +603,32 @@ let
   # percentage string ("50%"), matching `DisruptionValue` (untagged).
   disruptionValue = types.either types.ints.unsigned types.str;
 
+  # `AutoscaleConfig`.
+  autoscale = strictSubmodule {
+    min = mkOption { type = types.ints.positive; };
+    max = mkOption { type = types.ints.positive; };
+    rules = mkOption {
+      type = types.listOf (strictSubmodule {
+        metric = mkOption {
+          type = types.str;
+          description = ''
+            `cpu` or `memory` (utilization of the request), or a metric the
+            service exports (a per-instance value).
+          '';
+        };
+        target = mkOption {
+          type = types.either types.ints.positive types.float;
+          description = "Target utilization (`0.7`) or per-instance value.";
+        };
+      });
+    };
+    scaleDownDelaySeconds = mkOption {
+      type = types.ints.positive;
+      default = 300;
+      description = "How long recommendations must stay lower before scaling down.";
+    };
+  };
+
   disruptionBudget = strictSubmodule {
     minAvailable = mkOption {
       type = types.nullOr disruptionValue;
@@ -696,6 +722,11 @@ let
     parameterized = mkOption {
       type = types.nullOr parameterized;
       default = null;
+    };
+    autoscale = mkOption {
+      type = types.nullOr autoscale;
+      default = null;
+      description = "Scale `replicas` between `min` and `max` on metrics (service jobs only).";
     };
   };
 
