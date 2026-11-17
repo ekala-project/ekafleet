@@ -51,7 +51,6 @@ validation checks.
 | Raft Storage | `src/raft/storage.rs` | AES-256-GCM encrypted log + snapshots, restore-on-boot |
 | WireGuard Keys | `src/mesh/wireguard.rs` | Private key handling (stdin, never argv), `Zeroizing<String>` |
 | OCI Signatures | `src/agent/oci/signature.rs` | Cosign/sigstore image signature verification |
-| Gossip Auth | `src/gossip/` | HMAC-SHA256 on all membership messages |
 | Token Generation | `src/commands.rs` | 256-bit random via `ring::rand::SystemRandom` |
 
 ## Architecture
@@ -178,10 +177,6 @@ src/
 │   ├── alerting.rs      # Threshold-based alerting with webhook delivery
 │   ├── collector.rs     # Prometheus endpoint scraping
 │   └── node.rs          # Node-level resource metrics (/proc)
-├── gossip/
-│   ├── mod.rs           # Gossip module
-│   ├── swim.rs          # SWIM protocol implementation
-│   └── catalog.rs       # Service catalog propagation (namespace-scoped)
 ├── raft/
 │   ├── mod.rs           # Raft module
 │   ├── state.rs         # FleetStateMachine (deployments, secrets, DNS, KV, cloud instances, namespace IPs)

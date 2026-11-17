@@ -39,7 +39,6 @@ The default nftables table (`inet ekafleet`) includes:
 | `ct state established,related accept` | Allow return traffic |
 | `iif lo accept` | Allow loopback |
 | `udp dport 51820 accept` | Allow WireGuard |
-| `udp dport 7401 accept` | Allow gossip |
 | `tcp dport 7400 accept` | Allow gRPC |
 | `tcp dport 7402 accept` | Allow HTTP API |
 

@@ -5,7 +5,6 @@
 | Port | Protocol | Used By | Purpose |
 |------|----------|---------|---------|
 | 7400 | TCP (gRPC) | Server + Agent | Server API, agent ↔ server communication, node join (`FleetBootstrap`) |
-| 7401 | UDP | Server + Agent | Gossip (SWIM membership protocol) |
 | 7402 | TCP (HTTP) | Server | HTTP API (health, metrics) |
 | 53 | UDP/TCP | Server + Agent | DNS (authority on server, resolver on agent) |
 | 51820 | UDP | Server + Agent | WireGuard mesh |
@@ -32,7 +31,6 @@ Servers must be able to reach agents on:
 ### Between All Fleet Nodes
 
 All fleet nodes (servers and agents) need mutual connectivity on:
-- UDP 7401 (gossip)
 - UDP 51820 (WireGuard)
 
 ### External Access (Ingress Nodes)
