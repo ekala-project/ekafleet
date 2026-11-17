@@ -113,7 +113,7 @@ ekafleet is a single binary that consolidates capabilities from 10+ separate too
 | External service registration | **Yes** | **Yes** (ExternalName) | **Yes** | Non-fleet services in DNS catalog |
 | Distributed tracing | **Yes** | No (needs Istio) | **Yes** (via Envoy) | W3C Trace Context propagation |
 | mTLS enforcement | **Yes** | No (needs Istio) | **Yes** | SPIFFE ID-based caller authorization |
-| Gossip-based discovery | **Yes** | No | **Yes** (Serf) | SWIM protocol for agent-to-agent |
+| Gossip-based discovery | No | No | **Yes** (Serf) | Server-authoritative catalog over the agent stream |
 | Multi-region federation | **Yes** | *Partial* (Federation v2) | **Yes** (WAN) | Cross-cluster service discovery |
 
 ## Security & Identity
@@ -195,7 +195,7 @@ ekafleet is a single binary that consolidates capabilities from 10+ separate too
 | Feature | ekafleet | Kubernetes | Nomad + Consul | Notes |
 |---------|----------|------------|----------------|-------|
 | Consensus (server HA) | *Planned* | **Yes** (etcd/Raft) | **Yes** (Raft) | Single-node with durable state; multi-node Raft planned |
-| Gossip protocol | **Yes** (SWIM) | No | **Yes** (Serf/SWIM) | Failure detection, catalog propagation |
+| Gossip protocol | No | No | **Yes** (Serf/SWIM) | Failure detection via agent heartbeats |
 | Leader election | *Planned* | **Yes** (etcd) | **Yes** (Raft) | `--peers` parsed, not yet wired |
 | Graceful degradation | **Yes** | **Yes** | **Yes** | Agents continue when server unreachable |
 | State snapshots | **Yes** | **Yes** (etcd backup) | **Yes** (snapshot) | Raft snapshot/restore |

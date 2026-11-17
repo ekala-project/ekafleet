@@ -129,16 +129,6 @@ service SpiffeWorkloadAPI {
 }
 ```
 
-## Gossip: UDP (SWIM)
-
-Port 7401. Used for:
-
-- **Membership** — Alive/suspect/dead detection (2-5 second failure detection)
-- **Service catalog** — Eventually-consistent service discovery between agents
-- **DNS cache hints** — Cache invalidation signals between agents
-
-The gossip layer works independently of the server, providing continued service discovery even during server outages.
-
 ## HTTP API
 
 Port 7402. Public endpoints:

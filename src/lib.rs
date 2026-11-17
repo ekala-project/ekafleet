@@ -7,7 +7,6 @@ pub mod ca;
 pub mod config;
 pub mod dns;
 pub mod fsutil;
-pub mod gossip;
 pub mod mesh;
 pub mod metrics;
 pub mod policy;

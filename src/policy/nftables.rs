@@ -79,8 +79,6 @@ table inet {table} {{
         iif lo accept
         # Allow WireGuard
         udp dport 51820 accept
-        # Allow gossip
-        udp dport 7401 accept
         # Allow gRPC
         tcp dport 7400 accept
         # Allow HTTP API
