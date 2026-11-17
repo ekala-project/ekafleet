@@ -8,41 +8,45 @@ ekafleet supports manual scaling, metric-based autoscaling, and pool-level scali
 ekafleet scale api-server 5
 ```
 
-This triggers re-evaluation and deployment of the delta.
+This records a replica override that the reconciler schedules. The
+override lasts until an apply changes the service's configured `replicas`,
+or removes the service. Autoscaled services cannot be scaled by hand:
+change their `min` and `max` instead.
 
 ## Service Autoscaling
 
-The autoscaling engine evaluates policies against collected metrics and computes desired replica counts.
+```nix
+services.api.scheduling.autoscale = {
+  min = 2;
+  max = 20;
+  rules = [
+    { metric = "cpu"; target = 0.7; }            # 70% of resources.cpu.request
+    { metric = "queue_depth"; target = 100; }    # per instance, scraped
+  ];
+  scaleDownDelaySeconds = 300;                   # default
+};
+```
 
-### Scaling Policies
+Every 15 seconds each agent reports each service's CPU and memory use,
+read from the unit's cgroup (`service_cpu_millicores`,
+`service_memory_bytes`), along with the metrics the service exports (see
+`metrics` in the service config). The server then works out a
+recommendation for each rule:
 
-Policies define min/max bounds and metric-based rules:
+- `cpu` and `memory` target utilization of the request. They need
+  `resources.cpu.request` or `resources.memory.request`.
+- Any other metric is one the service exports. The target is a
+  per-instance value, and the service needs a `metrics` endpoint.
 
-| Field | Description |
-|-------|-------------|
-| `min_replicas` | Floor for scale-down |
-| `max_replicas` | Ceiling for scale-up |
-| `rules` | List of metric-based scaling rules |
+Each rule recommends `ceil(replicas × average / target)`, using the average
+over the instances that report the metric. A rule within 10% of its target
+recommends no change. The largest recommendation wins, clamped to
+`[min, max]`. Scale-ups apply at once. A scale-down waits until every
+recommendation over the last `scaleDownDelaySeconds` was at most that low.
+Each change emits a `service.scaled` event.
 
-### Scaling Rules
-
-Each rule defines a target metric value and thresholds:
-
-| Field | Description |
-|-------|-------------|
-| `metric_name` | Prometheus metric to evaluate |
-| `target_value` | Desired metric value |
-| `scale_up_threshold` | Ratio above which to scale up |
-| `scale_down_threshold` | Ratio below which to scale down |
-
-### How It Works
-
-1. Metrics are collected from agents every 15 seconds
-2. The scaling engine evaluates policies periodically
-3. For each service, it computes the average metric value across instances
-4. If the ratio of current to target exceeds the scale-up threshold, it adds replicas
-5. If below the scale-down threshold, it removes replicas
-6. A cooldown period (default: 60 seconds) prevents thrashing
+Namespace quotas count an autoscaled service at its `max`. Removing
+`autoscale` from a service returns it to its configured `replicas`.
 
 ## Pool-Level Scaling
 

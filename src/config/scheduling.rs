@@ -50,6 +50,41 @@ pub struct SchedulingConfig {
     /// Only valid for `batch` and `sysbatch` job types.
     #[serde(default)]
     pub parameterized: Option<ParameterizedConfig>,
+    /// Scale the replica count between `min` and `max` on metrics. Only for
+    /// `service` jobs; `replicas` is then the count before the first decision.
+    #[serde(default)]
+    pub autoscale: Option<AutoscaleConfig>,
+}
+
+/// Service autoscaling.
+///
+/// Each rule recommends `ceil(replicas × average / target)` replicas, where
+/// `average` is the metric's mean over the instances reporting it; the
+/// largest recommendation wins. A rule within 10% of its target recommends
+/// no change. Scale-ups apply at once; a scale-down waits until every
+/// recommendation in the last `scaleDownDelaySeconds` was at most as high.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct AutoscaleConfig {
+    pub min: u32,
+    pub max: u32,
+    pub rules: Vec<AutoscaleRule>,
+    #[serde(default = "default_scale_down_delay")]
+    pub scale_down_delay_seconds: u64,
+}
+
+fn default_scale_down_delay() -> u64 {
+    300
+}
+
+/// `cpu` and `memory` target utilization of the request (`0.7` is 70%);
+/// any other metric is one the service exports, targeting a per-instance
+/// value.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutoscaleRule {
+    pub metric: String,
+    pub target: f64,
 }
 
 /// Configuration for parameterized (dispatchable) batch jobs.
@@ -83,6 +118,7 @@ impl Default for SchedulingConfig {
             service_affinity: Vec::new(),
             disruption_budget: None,
             parameterized: None,
+            autoscale: None,
         }
     }
 }

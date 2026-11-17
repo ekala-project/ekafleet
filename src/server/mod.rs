@@ -5,6 +5,7 @@ pub mod alerts;
 pub mod api;
 mod api_system;
 pub mod audit;
+pub mod autoscaler;
 pub mod bootstrap;
 pub mod cache;
 pub mod cloud;
@@ -261,6 +262,13 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     });
 
     dns::DnsPublisher::new(fleet_state.clone()).spawn(shutdown.child_token());
+    autoscaler::Autoscaler {
+        raft_state: grpc_config.raft_state.clone(),
+        state: fleet_state.clone(),
+        metrics: metrics.clone(),
+        events: event_store.clone(),
+    }
+    .spawn(shutdown.child_token());
     alerts::AlertLoop {
         raft_state: grpc_config.raft_state.clone(),
         metrics: metrics.clone(),

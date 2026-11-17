@@ -103,7 +103,8 @@ fn namespace_of(service: &ServiceConfig) -> &str {
     }
 }
 
-/// The most instances a service can run.
+/// The most instances a service can run: its autoscaling maximum, its
+/// replicas, or for system jobs one per eligible machine.
 pub fn max_instances(desired: &FleetConfig, service: &ServiceConfig) -> u64 {
     match service.scheduling.job_type {
         JobType::System | JobType::Sysbatch => {
@@ -123,7 +124,10 @@ pub fn max_instances(desired: &FleetConfig, service: &ServiceConfig) -> u64 {
                 .sum();
             machines + scaled
         }
-        _ => u64::from(service.scheduling.replicas),
+        _ => match &service.scheduling.autoscale {
+            Some(autoscale) => u64::from(autoscale.max),
+            None => u64::from(service.scheduling.replicas),
+        },
     }
 }
 

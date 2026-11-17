@@ -860,6 +860,12 @@ impl FleetControl for FleetControlService {
                     return;
                 }
             };
+            super::autoscaler::settle_overrides(
+                &raft_state,
+                previous_config.as_ref(),
+                &evaluated.config,
+            )
+            .await;
             controller.trigger();
             prune_gcroots(&gcroots, &raft_state.config_revisions().await).await;
             if !send(
@@ -999,6 +1005,9 @@ impl FleetControl for FleetControlService {
             })
             .await
             .map_err(|e| Status::internal(format!("cannot record configuration: {e}")))?;
+        if let (Ok(previous), Ok(restored)) = (current.config(), target.config()) {
+            super::autoscaler::settle_overrides(&self.raft_state, Some(&previous), &restored).await;
+        }
         self.controller.trigger();
         tracing::info!(revision, rollback_of = wanted, "Rollback recorded");
 
@@ -1106,6 +1115,22 @@ impl FleetControl for FleetControlService {
         require_permission(&request, Permission::Scale)?;
         self.require_service_access(&request, &request.get_ref().service_name)
             .await?;
+        let autoscale = self
+            .raft_state
+            .current_config()
+            .await
+            .and_then(|r| r.config().ok())
+            .and_then(|c| c.services.get(&request.get_ref().service_name).cloned())
+            .and_then(|s| s.scheduling.autoscale);
+        if let Some(autoscale) = autoscale {
+            return Err(Status::failed_precondition(format!(
+                "service '{}' is autoscaled between {} and {} replicas; change \
+                 scheduling.autoscale in the fleet configuration instead",
+                request.get_ref().service_name,
+                autoscale.min,
+                autoscale.max
+            )));
+        }
         self.audit(
             &request,
             super::audit::AuditAction::Scale,
