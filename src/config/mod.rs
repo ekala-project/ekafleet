@@ -34,6 +34,94 @@ pub struct FleetConfig {
     /// Versioned (and rolled back) with the rest of the configuration.
     #[serde(default)]
     pub alerts: Vec<AlertRuleConfig>,
+    /// Namespaces with settings, keyed by name. Services may use namespaces
+    /// that are not listed here; those have no quota.
+    #[serde(default)]
+    pub namespaces: HashMap<String, NamespaceConfig>,
+}
+
+/// Settings of a namespace.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct NamespaceConfig {
+    #[serde(default)]
+    pub quota: NamespaceQuota,
+}
+
+/// Limits on what a namespace's services may request in total, checked
+/// when a configuration is applied. Requests are counted per instance, at
+/// the most instances a service can run (its autoscaling maximum, or every
+/// eligible machine for system jobs). Unset limits are unlimited.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct NamespaceQuota {
+    /// Total CPU requests, in millicores.
+    #[serde(default)]
+    pub cpu: Option<u64>,
+    /// Total memory requests, in MB.
+    #[serde(default)]
+    pub memory: Option<u64>,
+    /// Total disk requests, in MB.
+    #[serde(default)]
+    pub disk: Option<u64>,
+    /// Total instances.
+    #[serde(default)]
+    pub instances: Option<u64>,
+    /// Number of services.
+    #[serde(default)]
+    pub services: Option<u64>,
+}
+
+/// A namespace name: usable as a DNS label and in network namespace and
+/// interface names.
+pub fn validate_namespace_name(name: &str) -> Result<(), String> {
+    let ok = !name.is_empty()
+        && name.len() <= 32
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !name.starts_with('-')
+        && !name.ends_with('-');
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "invalid namespace name '{name}': use 1-32 lowercase letters, digits and inner dashes"
+        ))
+    }
+}
+
+fn validate_namespaces_and_admission(config: &FleetConfig, errors: &mut Vec<String>) {
+    for name in config.namespaces.keys() {
+        if let Err(e) = validate_namespace_name(name) {
+            errors.push(format!("namespaces: {e}"));
+        }
+    }
+    for (service, cfg) in &config.services {
+        if !cfg.namespace.is_empty()
+            && let Err(e) = validate_namespace_name(&cfg.namespace)
+        {
+            errors.push(format!("service '{service}': {e}"));
+        }
+    }
+    let mut names = std::collections::HashSet::new();
+    for webhook in &config.admission_webhooks {
+        if !names.insert(webhook.name.as_str()) {
+            errors.push(format!(
+                "admissionWebhooks: duplicate name '{}'",
+                webhook.name
+            ));
+        }
+        if let Err(e) = validate_webhook_url(&webhook.url) {
+            errors.push(format!("admission webhook '{}': url {e}", webhook.name));
+        }
+        if !(1..=60).contains(&webhook.timeout_seconds) {
+            errors.push(format!(
+                "admission webhook '{}': timeoutSeconds must be between 1 and 60",
+                webhook.name
+            ));
+        }
+    }
 }
 
 /// A threshold alert on a node or service metric.
@@ -1155,6 +1243,7 @@ pub fn validate(config: &FleetConfig) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
 
     validate_alerts(config, &mut errors);
+    validate_namespaces_and_admission(config, &mut errors);
 
     if let Some(policy) = &config.signature_policy
         && let Err(e) = policy.to_runtime_policy()

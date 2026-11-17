@@ -1,4 +1,5 @@
 pub mod access_audit;
+pub mod admission;
 mod agent_msg;
 pub mod alerts;
 pub mod api;
@@ -14,10 +15,8 @@ pub mod events;
 pub mod federation;
 pub mod images;
 pub mod mesh;
-pub mod namespace;
 pub mod nix;
 pub mod policy;
-pub mod quota;
 pub mod rbac;
 pub mod rebalance;
 pub mod reconciler;
