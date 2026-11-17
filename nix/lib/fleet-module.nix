@@ -1090,6 +1090,35 @@ let
     };
   };
 
+  # `NamespaceConfig`.
+  namespace = strictSubmodule {
+    quota = mkOption {
+      type = strictSubmodule (
+        lib.genAttrs [ "cpu" "memory" "disk" "instances" "services" ] (
+          name:
+          mkOption {
+            type = types.nullOr types.ints.unsigned;
+            default = null;
+            description =
+              {
+                cpu = "Total CPU requests, in millicores.";
+                memory = "Total memory requests, in MB.";
+                disk = "Total disk requests, in MB.";
+                instances = "Total instances.";
+                services = "Number of services.";
+              }
+              .${name};
+          }
+        )
+      );
+      default = { };
+      description = ''
+        Limits on what the namespace's services may request in total, checked
+        at apply. Each service counts at its most instances. Unset is unlimited.
+      '';
+    };
+  };
+
   admissionWebhook = strictSubmodule {
     name = mkOption { type = types.str; };
     url = mkOption { type = types.str; };
@@ -1179,6 +1208,11 @@ in
       type = hooks;
       default = { };
       description = "Deployment lifecycle script hooks.";
+    };
+    namespaces = mkOption {
+      type = types.attrsOf namespace;
+      default = { };
+      description = "Namespace settings (quotas), keyed by namespace name.";
     };
     admissionWebhooks = mkOption {
       type = types.listOf admissionWebhook;

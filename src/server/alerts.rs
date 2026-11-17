@@ -15,10 +15,10 @@ use crate::metrics::aggregator::MetricsAggregator;
 use crate::metrics::alerting::{Alert, AlertEvaluator, AlertStatus};
 use crate::raft::state::FleetStateMachine;
 
+use super::webhook::{Notification, WebhookClient, deliver};
+
 pub const INTERVAL: Duration = Duration::from_secs(15);
-const ATTEMPTS: u32 = 5;
 const FIRST_RETRY: Duration = Duration::from_secs(2);
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct AlertLoop {
     pub raft_state: FleetStateMachine,
@@ -44,7 +44,12 @@ impl AlertLoop {
                     .evaluate(&series, crate::agent::now_epoch())
                     .await;
                 for (url, payload) in notifications(&transitions) {
-                    tokio::spawn(deliver(client.clone(), url, payload, FIRST_RETRY));
+                    let notification = Notification {
+                        url,
+                        body: payload.to_string(),
+                        headers: Vec::new(),
+                    };
+                    tokio::spawn(deliver(client.clone(), notification, FIRST_RETRY, "alert"));
                 }
             }
         });
@@ -116,100 +121,6 @@ fn payload(name: &str, firing: bool, alerts: &[&Alert]) -> serde_json::Value {
             "fingerprint": a.fingerprint(),
         })).collect::<Vec<_>>(),
     })
-}
-
-type HttpsConnector =
-    hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>;
-
-/// HTTP(S) client for webhooks, trusting the platform's root certificates.
-#[derive(Clone)]
-pub struct WebhookClient {
-    http: hyper_util::client::legacy::Client<
-        HttpsConnector,
-        http_body_util::Full<hyper::body::Bytes>,
-    >,
-}
-
-impl Default for WebhookClient {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl WebhookClient {
-    pub fn new() -> Self {
-        let mut roots = rustls::RootCertStore::empty();
-        for cert in rustls_native_certs::load_native_certs().certs {
-            let _ = roots.add(cert);
-        }
-        let tls = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        let https = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_tls_config(tls)
-            .https_or_http()
-            .enable_http1()
-            .build();
-        Self {
-            http: hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-                .build(https),
-        }
-    }
-
-    /// POST a JSON body and return the response status.
-    async fn post_json(&self, url: &str, body: &str) -> Result<hyper::StatusCode, String> {
-        let request = hyper::Request::builder()
-            .method(hyper::Method::POST)
-            .uri(url)
-            .header(hyper::header::CONTENT_TYPE, "application/json")
-            .header(
-                hyper::header::USER_AGENT,
-                concat!("ekafleet/", env!("CARGO_PKG_VERSION")),
-            )
-            .body(http_body_util::Full::new(hyper::body::Bytes::from(
-                body.to_owned(),
-            )))
-            .map_err(|e| e.to_string())?;
-        let response = tokio::time::timeout(REQUEST_TIMEOUT, self.http.request(request))
-            .await
-            .map_err(|_| format!("timed out after {REQUEST_TIMEOUT:?}"))?
-            .map_err(|e| e.to_string())?;
-        Ok(response.status())
-    }
-}
-
-/// POST `payload` to `url`, retrying network errors, 429 and 5xx with
-/// exponential backoff starting at `first_retry`.
-async fn deliver(
-    client: WebhookClient,
-    url: String,
-    payload: serde_json::Value,
-    first_retry: Duration,
-) {
-    let body = payload.to_string();
-    let mut delay = first_retry;
-    for attempt in 1..=ATTEMPTS {
-        let retry = match client.post_json(&url, &body).await {
-            Ok(status) if status.is_success() => {
-                tracing::debug!(%url, "Alert notification delivered");
-                return;
-            }
-            Ok(status) => {
-                tracing::warn!(%url, %status, attempt, "Alert webhook refused the notification");
-                status.is_server_error() || status.as_u16() == 429
-            }
-            Err(e) => {
-                tracing::warn!(%url, error = %e, attempt, "Alert webhook unreachable");
-                true
-            }
-        };
-        if !retry || attempt == ATTEMPTS {
-            break;
-        }
-        tokio::time::sleep(delay).await;
-        delay *= 2;
-    }
-    tracing::error!(%url, "Giving up on an alert notification");
 }
 
 /// Unix seconds as an RFC 3339 UTC timestamp.
@@ -291,45 +202,5 @@ mod tests {
         assert_eq!(resolved["status"], "resolved");
         assert_eq!(resolved["alerts"][0]["endsAt"], "2023-11-14T22:14:20Z");
         assert_eq!(resolved["commonLabels"]["node"], "c");
-    }
-
-    #[tokio::test]
-    async fn failed_deliveries_are_retried() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}/hook", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move {
-            let mut bodies = Vec::new();
-            for status in ["503 Service Unavailable", "200 OK"] {
-                let (mut conn, _) = listener.accept().await.unwrap();
-                let mut request = Vec::new();
-                let mut buf = [0u8; 4096];
-                // Read until the JSON body is complete.
-                while !request.ends_with(b"}") {
-                    let n = conn.read(&mut buf).await.unwrap();
-                    assert!(n > 0);
-                    request.extend_from_slice(&buf[..n]);
-                }
-                bodies.push(String::from_utf8(request).unwrap());
-                conn.write_all(
-                    format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
-                        .as_bytes(),
-                )
-                .await
-                .unwrap();
-            }
-            bodies
-        });
-        let delivery = tokio::spawn(deliver(
-            WebhookClient::new(),
-            url,
-            serde_json::json!({"version": "4"}),
-            Duration::from_millis(10),
-        ));
-        let bodies = server.await.unwrap();
-        delivery.await.unwrap();
-        assert_eq!(bodies.len(), 2);
-        assert!(bodies[1].starts_with("POST /hook "));
-        assert!(bodies[1].contains("application/json"));
     }
 }

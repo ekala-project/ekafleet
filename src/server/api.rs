@@ -74,6 +74,8 @@ pub struct FleetControlService {
     pub(super) token_store: TokenStore,
     /// Append-only audit log recording which principal performed each action.
     pub(super) audit_log: super::audit::AuditLog,
+    /// Client for admission webhooks.
+    pub(super) webhook_client: super::webhook::WebhookClient,
     /// Accept agent streams authenticated by a bearer token instead of a
     /// node SVID. Only `ekafleet dev` enables this.
     pub(super) allow_bearer_agents: bool,
@@ -130,6 +132,7 @@ impl FleetControlService {
             event_store,
             token_store,
             audit_log: super::audit::AuditLog::new(),
+            webhook_client: super::webhook::WebhookClient::new(),
             allow_bearer_agents: false,
             binary_cache: None,
         }
@@ -567,6 +570,7 @@ impl FleetControl for FleetControlService {
 
     async fn plan(&self, request: Request<PlanRequest>) -> Result<Response<PlanResponse>, Status> {
         require_fleet_permission(&request, Permission::Read)?;
+        let actor = Self::actor(&request);
         let req = request.into_inner();
         tracing::info!(flake_ref = %req.flake_ref, "Plan requested");
 
@@ -580,6 +584,28 @@ impl FleetControl for FleetControlService {
             return Err(Status::invalid_argument(format!(
                 "validation failed: {}",
                 errors.join("; ")
+            )));
+        }
+        let previous = self.raft_state.current_config().await;
+        let previous_config = previous.as_ref().and_then(|r| r.config().ok());
+        let admission = super::admission::admit(
+            &self.webhook_client,
+            &desired,
+            previous
+                .as_ref()
+                .zip(previous_config.as_ref())
+                .map(|(r, c)| (r.revision, c)),
+            super::admission::Request {
+                actor: &actor,
+                flake_ref: &req.flake_ref,
+                dry_run: true,
+            },
+        )
+        .await;
+        if !admission.admitted() {
+            return Err(Status::failed_precondition(format!(
+                "admission rejected the configuration: {}",
+                admission.errors.join("; ")
             )));
         }
 
@@ -643,7 +669,8 @@ impl FleetControl for FleetControlService {
             });
         }
 
-        let warnings = super::secrets::missing_secret_warnings(&desired, &self.raft_state).await;
+        let mut warnings = admission.warnings;
+        warnings.extend(super::secrets::missing_secret_warnings(&desired, &self.raft_state).await);
         Ok(Response::new(PlanResponse {
             operations,
             has_changes: plan.has_changes,
@@ -677,6 +704,8 @@ impl FleetControl for FleetControlService {
         let controller = self.controller.clone();
         let gcroots = self.data_dir.join("gcroots");
         let secret_store = self.secret_store.clone();
+        let webhook_client = self.webhook_client.clone();
+        let audit_log = self.audit_log.clone();
         tokio::spawn(async move {
             let send = |revision: u64, status: crate::proto::ApplyStatus, message: String| {
                 let tx = tx.clone();
@@ -710,9 +739,44 @@ impl FleetControl for FleetControlService {
                 .await;
                 return;
             }
-            for warning in
-                super::secrets::missing_secret_warnings(&evaluated.config, &raft_state).await
-            {
+            let previous = raft_state.current_config().await;
+            let previous_config = previous.as_ref().and_then(|r| r.config().ok());
+            let admission = super::admission::admit(
+                &webhook_client,
+                &evaluated.config,
+                previous
+                    .as_ref()
+                    .zip(previous_config.as_ref())
+                    .map(|(r, c)| (r.revision, c)),
+                super::admission::Request {
+                    actor: &actor,
+                    flake_ref: &evaluated.locked_ref,
+                    dry_run: false,
+                },
+            )
+            .await;
+            if !admission.admitted() {
+                let reason = admission.errors.join("; ");
+                audit_log
+                    .record(
+                        &actor,
+                        super::audit::AuditAction::Apply,
+                        &flake_ref,
+                        &format!("admission rejected: {reason}"),
+                        super::audit::AuditOutcome::Denied,
+                    )
+                    .await;
+                send(
+                    0,
+                    ApplyFailed,
+                    format!("Apply failed: admission rejected the configuration: {reason}"),
+                )
+                .await;
+                return;
+            }
+            for warning in admission.warnings.into_iter().chain(
+                super::secrets::missing_secret_warnings(&evaluated.config, &raft_state).await,
+            ) {
                 send(0, ApplyInProgress, format!("Warning: {warning}")).await;
             }
 
