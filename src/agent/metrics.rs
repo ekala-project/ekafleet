@@ -4,7 +4,8 @@
 //! endpoint of every service it runs (inside the service's network
 //! namespace), and sends everything in one `MetricsSummary`. A service's
 //! series are summed by metric name, so the server sees one value per
-//! metric per service instance; `up` is 1 when the scrape succeeded.
+//! metric per service instance; `up` is 1 when the scrape succeeded. Each
+//! service's CPU and memory use, from its unit's cgroup, comes along.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -14,6 +15,7 @@ use std::time::Duration;
 use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
+use crate::metrics::cgroup::CgroupSampler;
 use crate::metrics::collector::{self, Target};
 use crate::metrics::node::NodeSampler;
 use crate::proto::agent_message::Payload;
@@ -44,8 +46,14 @@ pub fn targets(desired: &HashMap<String, ServiceSpec>) -> Vec<Target> {
     targets
 }
 
-/// Points for one collection round.
-pub async fn collect(sampler: &mut NodeSampler, targets: Vec<Target>) -> Vec<MetricPoint> {
+/// Points for one collection round: the node, the cgroups of `services`,
+/// and the scrape `targets`.
+pub async fn collect(
+    sampler: &mut NodeSampler,
+    cgroups: &mut CgroupSampler,
+    services: &[String],
+    targets: Vec<Target>,
+) -> Vec<MetricPoint> {
     let timestamp = super::now_epoch();
     let point = |name: String, value: f64, service: Option<&str>| MetricPoint {
         name,
@@ -60,6 +68,12 @@ pub async fn collect(sampler: &mut NodeSampler, targets: Vec<Target>) -> Vec<Met
         .into_iter()
         .map(|(name, value)| point(name, value, None))
         .collect();
+    points.extend(
+        cgroups
+            .sample(services)
+            .into_iter()
+            .map(|(service, name, value)| point(name.to_string(), value, Some(&service))),
+    );
 
     let mut scrapes = tokio::task::JoinSet::new();
     for target in targets {
@@ -101,6 +115,7 @@ pub(super) fn spawn_reporter(
 ) {
     tokio::spawn(async move {
         let mut sampler = NodeSampler::new(data_dir);
+        let mut cgroups = CgroupSampler::default();
         let mut interval = tokio::time::interval(INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -108,8 +123,13 @@ pub(super) fn spawn_reporter(
                 _ = shutdown.cancelled() => break,
                 _ = interval.tick() => {}
             }
-            let targets = targets(&local_state.read().await.desired_services);
-            let points = collect(&mut sampler, targets).await;
+            let (services, targets) = {
+                let state = local_state.read().await;
+                let mut services: Vec<String> = state.desired_services.keys().cloned().collect();
+                services.sort();
+                (services, targets(&state.desired_services))
+            };
+            let points = collect(&mut sampler, &mut cgroups, &services, targets).await;
             let msg = AgentMessage {
                 payload: Some(Payload::Metrics(MetricsSummary {
                     node_id: node_id.to_string(),
@@ -164,8 +184,11 @@ mod tests {
             .local_addr()
             .unwrap()
             .port();
+        let cgroup_root = tempfile::tempdir().unwrap();
         let points = collect(
             &mut sampler,
+            &mut CgroupSampler::new(cgroup_root.path().to_path_buf()),
+            &["web".to_string()],
             vec![Target {
                 service: "web".into(),
                 port,
