@@ -1303,6 +1303,7 @@ mod tests {
             node_pools: HashMap::new(),
             hooks: Default::default(),
             admission_webhooks: vec![],
+            namespaces: Default::default(),
             policies: vec![],
             signature_policy: None,
             alerts: vec![],

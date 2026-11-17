@@ -654,6 +654,7 @@ mod tests {
             node_pools,
             hooks: Default::default(),
             admission_webhooks: vec![],
+            namespaces: Default::default(),
             policies: vec![],
             signature_policy: None,
             alerts: vec![],
