@@ -2188,6 +2188,24 @@ impl FleetControl for FleetControlService {
             .map(Response::new)
     }
 
+    async fn list_dynamic_leases(
+        &self,
+        request: Request<crate::proto::ListDynamicLeasesRequest>,
+    ) -> Result<Response<crate::proto::ListDynamicLeasesResponse>, Status> {
+        self.handle_list_dynamic_leases(request)
+            .await
+            .map(Response::new)
+    }
+
+    async fn revoke_dynamic_secret(
+        &self,
+        request: Request<crate::proto::RevokeDynamicSecretRequest>,
+    ) -> Result<Response<crate::proto::RevokeDynamicSecretResponse>, Status> {
+        self.handle_revoke_dynamic_secret(request)
+            .await
+            .map(Response::new)
+    }
+
     async fn create_transit_key(
         &self,
         request: Request<crate::proto::CreateTransitKeyRequest>,
@@ -2503,6 +2521,15 @@ pub async fn serve_grpc(
         shutdown.clone(),
     );
     service.secret_publisher().spawn(shutdown.clone());
+    super::dynamic::LeaseManager {
+        raft_state: service.raft_state.clone(),
+        state: service.state.clone(),
+        events: service.event_store.clone(),
+        fleet_key: service.fleet_key.clone(),
+        secret_store: service.secret_store.clone(),
+        backend: Arc::new(crate::secrets::dynamic::Databases),
+    }
+    .spawn(shutdown.clone());
     super::webhook::EventNotifier {
         events: service.event_store.clone(),
         raft_state: service.raft_state.clone(),

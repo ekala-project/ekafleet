@@ -85,11 +85,25 @@ healthCheck = {
 
 ```nix
 secrets.<name> = {
-  type   = "static";        # "static" or "dynamic" (required)
-  engine = "postgresql";     # For dynamic: database engine (optional)
-  role   = "rw";             # For dynamic: credential role (optional)
+  type   = "static";        # "static" (default) or "dynamic"
+  engine = "orders-db";     # Dynamic: a `secretEngines` entry (required)
+  role   = "readwrite";     # Dynamic: readonly | readwrite | admin (required)
+  ttl    = 86400;           # Dynamic: lease seconds (default 86400, min 300)
 };
 ```
+
+Every secret is delivered at `/run/secrets/<name>`. Dynamic secrets hold JSON with `username`, `password` and `url`. See [Secrets](../operations/secrets.md#dynamic-secrets).
+
+## SecretEngineConfig
+
+```nix
+secretEngines.<name> = {
+  adminUrlSecret = "orders-db-admin";  # Fleet secret with the admin URL (required)
+  database       = "orders";           # Database issued users can access (required)
+};
+```
+
+The admin URL (`postgres://…` or `mysql://…`) is set with `ekafleet secret set _fleet <adminUrlSecret>`.
 
 ## IdentityConfig
 

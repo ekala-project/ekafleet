@@ -12,6 +12,7 @@ pub mod cloud;
 pub mod controller;
 pub mod deployer;
 pub mod dns;
+pub mod dynamic;
 pub mod events;
 pub mod federation;
 pub mod images;

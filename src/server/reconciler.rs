@@ -604,7 +604,7 @@ fn service_config_to_spec(name: &str, cfg: &config::ServiceConfig) -> crate::pro
             templates.sort_by(|a, b| a.dest_path.cmp(&b.dest_path));
             templates
         },
-        secrets: config::static_secrets(cfg),
+        secrets: config::declared_secrets(cfg),
         container,
     }
 }
@@ -1348,6 +1348,7 @@ mod tests {
             policies: vec![],
             signature_policy: None,
             alerts: vec![],
+            secret_engines: HashMap::new(),
         }
     }
 

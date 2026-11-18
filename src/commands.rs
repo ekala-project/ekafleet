@@ -1874,6 +1874,70 @@ pub async fn cmd_secret_rollback(
     Ok(())
 }
 
+pub async fn cmd_secret_leases(service: Option<String>, server: String) -> anyhow::Result<()> {
+    let mut client = connect_server(&server).await?;
+    let resp = client
+        .list_dynamic_leases(ekafleet::proto::ListDynamicLeasesRequest {
+            service_name: service.unwrap_or_default(),
+        })
+        .await?
+        .into_inner();
+    if resp.leases.is_empty() {
+        println!("No dynamic secrets issued.");
+    } else {
+        println!(
+            "{:<20}  {:<16}  {:<10}  {:<10}  {:<16}  {:<20}  EXPIRES",
+            "SERVICE", "SECRET", "ENGINE", "ROLE", "USER", "RENEWS"
+        );
+        for l in &resp.leases {
+            println!(
+                "{:<20}  {:<16}  {:<10}  {:<10}  {:<16}  {:<20}  {}",
+                l.service_name,
+                l.secret_name,
+                l.engine,
+                l.role,
+                l.username,
+                format_unix_time(l.renew_at),
+                format_unix_time(l.expires_at)
+            );
+        }
+    }
+    if !resp.retired.is_empty() {
+        println!();
+        println!("{:<10}  {:<16}  DROP AT", "ENGINE", "RETIRED USER");
+        for u in &resp.retired {
+            println!(
+                "{:<10}  {:<16}  {}",
+                u.engine,
+                u.username,
+                format_unix_time(u.drop_at)
+            );
+        }
+    }
+    Ok(())
+}
+
+pub async fn cmd_secret_revoke(
+    service: String,
+    name: String,
+    server: String,
+) -> anyhow::Result<()> {
+    let mut client = connect_server(&server).await?;
+    let resp = client
+        .revoke_dynamic_secret(ekafleet::proto::RevokeDynamicSecretRequest {
+            service_name: service.clone(),
+            secret_name: name.clone(),
+        })
+        .await?
+        .into_inner();
+    if resp.revoked {
+        println!("Dynamic secret {service}/{name} revoked; a new user is being issued.");
+    } else {
+        anyhow::bail!("{service}/{name} has no issued dynamic credentials");
+    }
+    Ok(())
+}
+
 pub async fn cmd_acl_token_revoke(token: String, server: String) -> anyhow::Result<()> {
     let mut client = connect_server(&server).await?;
     let resp = client
