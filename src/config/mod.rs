@@ -573,6 +573,10 @@ pub struct ServiceConfig {
     /// Never read from the fleet configuration itself.
     #[serde(skip)]
     pub store_paths: Vec<String>,
+    /// Transit keys the service's workloads may encrypt and decrypt with
+    /// (authenticated by their service SVID).
+    #[serde(default, rename = "transitKeys")]
+    pub transit_keys: Vec<String>,
 }
 
 /// OCI container configuration for a service.
@@ -1409,6 +1413,16 @@ pub fn validate(config: &FleetConfig) -> Result<(), Vec<String>> {
                     "service '{name}' secret '{key}': type must be 'static' or 'dynamic', not '{}'",
                     secret.secret_type
                 ));
+            }
+        }
+
+        let mut transit_keys = std::collections::HashSet::new();
+        for key in &service.transit_keys {
+            if let Err(e) = crate::secrets::validate_name("transit key", key) {
+                errors.push(format!("service '{name}' transitKeys: {e}"));
+            }
+            if !transit_keys.insert(key.as_str()) {
+                errors.push(format!("service '{name}' lists transit key '{key}' twice"));
             }
         }
 

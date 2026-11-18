@@ -385,6 +385,21 @@ ekafleet secret rollback <SERVICE> <NAME> <VERSION> # restore an earlier version
 
 Fleet-level secrets (such as event webhook signing keys) use the reserved service name `_fleet`.
 
+### `ekafleet transit`
+
+Encrypt and decrypt with keys held by the server (see [Secrets](../operations/secrets.md#transit-encryption)). Plaintext is read from stdin (or `--file`).
+
+```
+ekafleet transit key create <NAME>          # in --namespace (or the token's, or "default")
+ekafleet transit key rotate <NAME>          # add a version
+ekafleet transit key list                   # names, namespaces, latest versions
+ekafleet transit key delete <NAME> --yes    # values encrypted with it are lost
+ekafleet transit encrypt <KEY> [--file PATH] [--cert PEM --key-file PEM]
+ekafleet transit decrypt <KEY> [--file PATH] [--cert PEM --key-file PEM]
+```
+
+`--cert`/`--key-file` present a client certificate, such as a service SVID, over mTLS (needs `--ca-cert`).
+
 ### `ekafleet service`
 
 Service introspection (systemd-specific).

@@ -238,17 +238,35 @@ pub async fn missing_secret_warnings(
 }
 
 /// Whether `key` opens the first stored secret (`None` if there are none).
-fn key_opens_secrets(
-    key: &[u8; 32],
-    secrets: &HashMap<String, HashMap<String, (Vec<u8>, u64)>>,
-) -> Option<bool> {
-    let store = SecretStore::new(key);
-    secrets.iter().find_map(|(service, values)| {
+fn key_opens_secrets(key: &[u8; 32], probe: Option<&(String, String, Vec<u8>)>) -> Option<bool> {
+    probe.map(|(scope, name, sealed)| SecretStore::new(key).open(scope, name, sealed).is_ok())
+}
+
+/// One value sealed under the fleet key, to tell which key seals them all:
+/// a static secret, or else a transit key version.
+async fn sealed_probe(raft: &FleetStateMachine) -> Option<(String, String, Vec<u8>)> {
+    let secrets = raft.secrets().await;
+    let secret = secrets.iter().find_map(|(service, values)| {
         values
             .iter()
             .next()
-            .map(|(name, (sealed, _))| store.open(service, name, sealed).is_ok())
-    })
+            .map(|(name, (sealed, _))| (service.clone(), name.clone(), sealed.clone()))
+    });
+    if secret.is_some() {
+        return secret;
+    }
+    raft.transit_keys()
+        .await
+        .into_iter()
+        .find_map(|(name, key)| {
+            key.versions.first().map(|sealed| {
+                (
+                    crate::secrets::transit::SEAL_SCOPE.to_string(),
+                    crate::secrets::transit::seal_name(&name, 1),
+                    sealed.clone(),
+                )
+            })
+        })
 }
 
 /// Finish or undo a fleet key rotation interrupted by a crash: a staged key
@@ -268,9 +286,9 @@ pub async fn settle_fleet_key(
         key.try_into()
             .map_err(|_| anyhow::anyhow!("fleet key must be 32 bytes"))
     };
-    let secrets = raft.secrets().await;
-    let current_opens = key_opens_secrets(&Zeroizing::new(as_array(&current)?), &secrets);
-    let staged_opens = key_opens_secrets(&Zeroizing::new(as_array(&staged)?), &secrets);
+    let probe = sealed_probe(raft).await;
+    let current_opens = key_opens_secrets(&Zeroizing::new(as_array(&current)?), probe.as_ref());
+    let staged_opens = key_opens_secrets(&Zeroizing::new(as_array(&staged)?), probe.as_ref());
     match (current_opens, staged_opens) {
         (Some(true), _) => {
             tracing::warn!("Discarding a fleet key rotation that did not complete");
@@ -559,6 +577,25 @@ impl FleetControlService {
             }
         }
 
+        let mut resealed_transit: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
+        for (name, key) in self.raft_state.transit_keys().await {
+            let mut versions = Vec::with_capacity(key.versions.len());
+            for (i, sealed) in key.versions.iter().enumerate() {
+                let label = crate::secrets::transit::seal_name(&name, i as u32 + 1);
+                let value = store
+                    .open(crate::secrets::transit::SEAL_SCOPE, &label, sealed)
+                    .map_err(|e| {
+                        Status::internal(format!("transit key {label} is unreadable: {e}"))
+                    })?;
+                versions.push(
+                    new_store
+                        .seal(crate::secrets::transit::SEAL_SCOPE, &label, &value)
+                        .map_err(|e| Status::internal(e.to_string()))?,
+                );
+            }
+            resealed_transit.insert(name, versions);
+        }
+
         let hex: Zeroizing<String> =
             Zeroizing::new(new_key.iter().map(|b| format!("{b:02x}")).collect());
         let staged = self.data_dir.join(NEXT_FLEET_KEY_FILE);
@@ -567,7 +604,7 @@ impl FleetControlService {
             .map_err(|e| Status::internal(format!("failed to stage rotated key: {e}")))?;
         if let Err(e) = self
             .raft_state
-            .reseal_secrets(resealed, resealed_history)
+            .reseal_secrets(resealed, resealed_history, resealed_transit)
             .await
         {
             let _ = tokio::fs::remove_file(&staged).await;
@@ -807,6 +844,7 @@ mod tests {
         let sealed = SecretStore::new(&[2u8; 32]).seal("web", "k", b"v").unwrap();
         raft.reseal_secrets(
             [("web".into(), [("k".into(), sealed)].into())].into(),
+            HashMap::new(),
             HashMap::new(),
         )
         .await

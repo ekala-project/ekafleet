@@ -1541,6 +1541,7 @@ mod tests {
                 namespace: String::new(),
                 metrics: None,
                 store_paths: vec![],
+                transit_keys: vec![],
             },
         );
         // Policy: requires at least 2 replicas.
@@ -1758,6 +1759,7 @@ mod tests {
             namespace: String::new(),
             metrics: None,
             store_paths: vec![],
+            transit_keys: vec![],
         }
     }
 

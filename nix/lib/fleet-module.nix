@@ -858,6 +858,15 @@ let
       type = types.listOf sidecar;
       default = [ ];
     };
+    transitKeys = mkOption {
+      type = types.listOf types.str;
+      default = [ ];
+      description = ''
+        Transit keys (`ekafleet transit key create`) this service's workloads
+        may encrypt and decrypt with, authenticating to the server with their
+        service SVID. Each key must be in the service's namespace.
+      '';
+    };
     metrics = mkOption {
       type = types.nullOr metricsEndpoint;
       default = null;
