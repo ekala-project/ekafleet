@@ -5,7 +5,7 @@ ekafleet consolidates many separate tools into a single binary.
 | External Tool | Capability | ekafleet Subsystem |
 |---------------|-----------|-------------------|
 | **Nomad** | Scheduling, deployment, scaling | `scheduler` + `deployer` + `scaling` |
-| **Consul DNS** | Service discovery | `dns_authority` + `dns_resolver` |
+| **Consul DNS** | Service discovery, external services | `server::dns` + `dns::resolver` + `server::external` |
 | **Consul Connect** | Service mesh, mTLS | `wireguard` + `certs` + `nftables` |
 | **Consul KV** | Distributed config | `raft` state (server) |
 | **Vault KV** | Static secrets | `secrets_store` |
@@ -13,7 +13,6 @@ ekafleet consolidates many separate tools into a single binary.
 | **Vault Dynamic** | Database credentials | `secrets_store` (dynamic engine) |
 | **SPIRE** | Workload attestation, Workload API | `ca_root` + `attestation` + `workload_api` (full SPIFFE Workload API, node attestation, CSR signing) |
 | **cert-manager** | TLS automation | `certs` (auto-renewal) |
-| **external-dns** | DNS record management | `dns_authority` |
 | **nginx / Traefik** | Reverse proxy, ingress | `proxy_l7` + `proxy_l4` (circuit breaking, retries) |
 | **Prometheus** | Metrics collection | `metrics` |
 | **WireGuard tools** | Mesh networking | `wireguard` |

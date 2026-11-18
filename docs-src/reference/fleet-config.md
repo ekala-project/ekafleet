@@ -12,6 +12,7 @@ Complete reference for the `fleet.nix` configuration schema.
     services = { ... };        # Service definitions
     machines = { ... };        # Machine inventory
     nodePools = { ... };       # Node pool definitions (optional)
+    externalServices = { ... };# Services outside the fleet, in DNS (optional)
   };
 }
 ```
@@ -104,6 +105,22 @@ secretEngines.<name> = {
 ```
 
 The admin URL (`postgres://…` or `mysql://…`) is set with `ekafleet secret set _fleet <adminUrlSecret>`.
+
+## ExternalServiceConfig
+
+```nix
+externalServices.<name> = {
+  addresses = [ "10.0.0.50:5432" ];  # IPv4 ip:port endpoints (required)
+  healthCheck = {                    # optional, checked from the server
+    type = "http";                   # "tcp" or "http" (required)
+    path = "/health";                # http only (default "/")
+    interval = 10;                   # seconds (default 10)
+    timeout = 2;                     # seconds (default 2)
+  };
+};
+```
+
+Resolvable as `<name>.external.<domain>`; see [DNS](../operations/dns.md#external-services).
 
 ## IdentityConfig
 
@@ -616,7 +633,7 @@ Operators: `>=`, `>`, `<=`, `<`, `==`, `!=`
 
 ## EventWebhook
 
-Webhooks notified of fleet events (see [Deployments](../operations/deployments.md#event-webhooks)):
+Webhooks notified of fleet events (see [Deployments](../operations/deployments.md#event-webhooks)), including `external.unhealthy` / `external.healthy` from [external service](../operations/dns.md#external-services) checks:
 
 ```nix
 webhooks = [

@@ -1,66 +1,74 @@
 # DNS & Service Discovery
 
-ekafleet provides built-in DNS for service discovery, replacing Consul DNS and external-dns.
+ekafleet has built-in DNS for service discovery, replacing Consul DNS.
 
 ## How It Works
 
-### Server: DNS Authority
+### Server: record authority
 
-The server maintains authoritative DNS records for the fleet domain (e.g., `fleet.internal`):
+The server is the authority for the fleet domain (e.g. `fleet.internal`). Every 5 seconds it builds each node's complete record set from:
 
-- **A records**: `<service>.service.fleet.internal` → WireGuard IPs of hosting machines
-- **SRV records**: `_<port>._tcp.<service>.service.fleet.internal` → port + host
-- Records are **health-aware** — unhealthy instances are removed
-- Updated **immediately** on deploy or reschedule
+- the desired state it assigned each node,
+- the mesh addresses nodes advertised,
+- replica health,
+- the health of external services.
 
-### Agent: DNS Resolver
+When a node's records change, the server pushes that node a `DnsUpdate` snapshot. Unchanged snapshots are re-sent every 30 seconds. Every answer has a TTL of 10 seconds.
 
-Each agent runs a local caching resolver:
+A replica is served while its node reports it running and not unhealthy.
 
-- Listens on `127.0.0.53:53`
-- Fleet queries → answered from cache or forwarded to server
-- External queries → forwarded to upstream DNS
-- Cache TTL equals the health check interval
-- Cache invalidated on health status changes
+### Agent: local resolver
 
-Services use this resolver via `/etc/resolv.conf`.
+Each agent answers queries itself, from the last snapshot it received, so name resolution keeps working through a server outage:
 
-## Usage
+- **Host:** listens on `127.0.0.1:53` (`--dns-listen`, or `--no-dns` to disable).
+- **Namespace networks:** each namespace network gets a listener on its bridge gateway, and that namespace's services get a `resolv.conf` pointing at it.
+- **Other names:** queries outside the fleet domain go to the upstream resolvers (`--dns-upstream`, default: the nameservers in `/etc/resolv.conf`).
 
-Services discover each other using DNS names:
+## Names
+
+All names are relative to the fleet domain.
+
+| Name | Records | Visible to |
+|------|---------|------------|
+| `<node>.node` | A: the node's mesh address | everyone |
+| `<svc>.service` | A: mesh addresses of nodes with a serving replica; SRV: `<port> <node>.node` per declared port | everyone (default-namespace services) |
+| `<svc>.service` | A: overlay addresses of serving replicas; SRV: `<port> <svc>.service` | nodes running something in the service's namespace |
+| `<name>.external` | A: healthy addresses of the external service; SRV: `<port> <name>.external` | everyone |
+
+Namespace records take precedence over fleet-wide records with the same name, and are hidden outside their namespace.
 
 ```bash
-# A record: get IPs of the api-server service
-dig api-server.service.fleet.internal
-
-# SRV record: get port and host
-dig _http._tcp.api-server.service.fleet.internal SRV
+dig api.service.fleet.internal          # A
+dig api.service.fleet.internal SRV      # port + target
+dig orders-db.external.fleet.internal   # external service
 ```
 
-In application code, just use the hostname:
+In application code, use the hostname:
 
 ```python
-# Python example
-import requests
-response = requests.get("http://api-server.service.fleet.internal:8080/data")
+requests.get("http://api.service.fleet.internal:8080/data")
 ```
 
-## External Service Registration
+## External Services
 
-Services that live outside the fleet (external databases, SaaS endpoints, third-party APIs) can be registered in the service catalog so they participate in DNS discovery and health checking:
+Services outside the fleet, such as managed databases or SaaS endpoints, can be declared in the fleet configuration. Fleet services can then find them by name instead of hard-coding addresses:
 
 ```nix
-externalServices.production-db = {
-  addresses = [ "db-primary.example.com:5432" "db-replica.example.com:5432" ];
-  healthCheckUrl = "http://db-primary.example.com:8080/health";
+externalServices.orders-db = {
+  addresses = [ "10.0.0.50:5432" "10.0.0.51:5432" ];   # IPv4 ip:port
+  healthCheck = {
+    type = "tcp";        # or "http": GET `path`, passes on 2xx/3xx
+    interval = 10;       # seconds (default 10)
+    timeout = 2;         # seconds (default 2)
+  };
 };
 ```
 
-External services are resolved at `<name>.external.fleet.internal`:
+How health checks work:
 
-```bash
-dig production-db.external.fleet.internal
-```
-
-Health-aware DNS applies to external services too — unhealthy endpoints are removed from DNS responses. This lets fleet services use DNS-based service discovery for both internal and external dependencies without hardcoding endpoints.
-
+- **Where checks run:** on the server. The server therefore needs to reach the addresses.
+- **Failing addresses:** an address that fails two checks in a row is left out of DNS until a check passes again.
+- **When all addresses fail:** the name answers NXDOMAIN.
+- **Without a `healthCheck`:** every address is always served.
+- **Events:** health changes are recorded as `external.unhealthy` and `external.healthy` fleet events, which [event webhooks](../reference/fleet-config.md#eventwebhook) can subscribe to.
