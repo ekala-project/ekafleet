@@ -42,6 +42,58 @@ pub struct FleetConfig {
     /// Database engines that issue `dynamic` secrets, keyed by name.
     #[serde(default)]
     pub secret_engines: HashMap<String, SecretEngineConfig>,
+    /// Services running outside the fleet (managed databases, SaaS
+    /// endpoints), resolvable as `<name>.external.<domain>`.
+    #[serde(default)]
+    pub external_services: HashMap<String, ExternalServiceConfig>,
+}
+
+/// A service outside the fleet that fleet DNS answers for.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ExternalServiceConfig {
+    /// `ip:port` endpoints (IPv4).
+    pub addresses: Vec<String>,
+    /// Checked by the server; failing addresses are left out of DNS.
+    #[serde(default)]
+    pub health_check: Option<ExternalHealthCheck>,
+}
+
+impl ExternalServiceConfig {
+    /// The parsed addresses; [`validate`] rejects configurations where any
+    /// does not parse.
+    pub fn endpoints(&self) -> Vec<std::net::SocketAddrV4> {
+        self.addresses
+            .iter()
+            .filter_map(|a| a.parse().ok())
+            .collect()
+    }
+}
+
+/// How the server checks an external service's addresses.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ExternalHealthCheck {
+    /// `tcp` (connect) or `http` (GET `path`, any 2xx/3xx passes).
+    #[serde(rename = "type")]
+    pub check_type: String,
+    /// HTTP request path.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Seconds between checks.
+    #[serde(default = "default_external_interval")]
+    pub interval: u64,
+    /// Seconds before a check fails.
+    #[serde(default = "default_external_timeout")]
+    pub timeout: u64,
+}
+
+fn default_external_interval() -> u64 {
+    10
+}
+
+fn default_external_timeout() -> u64 {
+    2
 }
 
 /// A database server that issues dynamic credentials.
@@ -1458,9 +1510,68 @@ fn validate_secret_engines(config: &FleetConfig, errors: &mut Vec<String>) {
     }
 }
 
+fn validate_external_services(config: &FleetConfig, errors: &mut Vec<String>) {
+    let mut services: Vec<_> = config.external_services.iter().collect();
+    services.sort_by_key(|(name, _)| name.as_str());
+    for (name, service) in services {
+        if !is_dns_label(name) {
+            errors.push(format!(
+                "external service '{name}': name must be a DNS label (a-z, 0-9, '-')"
+            ));
+        }
+        if service.addresses.is_empty() {
+            errors.push(format!("external service '{name}' needs addresses"));
+        }
+        for address in &service.addresses {
+            if address.parse::<std::net::SocketAddrV4>().is_err() {
+                errors.push(format!(
+                    "external service '{name}': address '{address}' is not ip:port (IPv4)"
+                ));
+            }
+        }
+        if let Some(check) = &service.health_check {
+            match check.check_type.as_str() {
+                "tcp" if check.path.is_some() => errors.push(format!(
+                    "external service '{name}': healthCheck path is for http checks"
+                )),
+                "tcp" => {}
+                "http" => {
+                    if let Some(path) = &check.path
+                        && !path.starts_with('/')
+                    {
+                        errors.push(format!(
+                            "external service '{name}': healthCheck path must start with '/'"
+                        ));
+                    }
+                }
+                other => errors.push(format!(
+                    "external service '{name}': healthCheck type must be 'tcp' or 'http', not '{other}'"
+                )),
+            }
+            if check.interval == 0 || check.timeout == 0 {
+                errors.push(format!(
+                    "external service '{name}': healthCheck interval and timeout must be positive"
+                ));
+            }
+        }
+    }
+}
+
+/// Whether `name` is a lower-case DNS label.
+pub fn is_dns_label(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 63
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
 pub fn validate(config: &FleetConfig) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
     validate_secret_engines(config, &mut errors);
+    validate_external_services(config, &mut errors);
 
     validate_alerts(config, &mut errors);
     validate_namespaces_and_admission(config, &mut errors);
@@ -1837,6 +1948,55 @@ mod nix_module_tests {
         assert_eq!(svc.scheduling.job_type, JobType::Service);
         assert_eq!(svc.scheduling.update.strategy, UpdateStrategy::Rolling);
         assert_eq!(svc.ports["http"].port, 8080);
+    }
+
+    #[test]
+    fn external_services_are_validated() {
+        let config = |services: serde_json::Value| -> FleetConfig {
+            serde_json::from_value(serde_json::json!({
+                "name": "t",
+                "domain": "fleet.test",
+                "externalServices": services,
+            }))
+            .unwrap()
+        };
+        let ok = config(serde_json::json!({
+            "orders-db": {"addresses": ["10.0.0.5:5432"], "healthCheck": {"type": "tcp"}},
+            "api": {"addresses": ["10.0.0.6:443"], "healthCheck": {"type": "http", "path": "/h"}},
+        }));
+        assert!(validate(&ok).is_ok(), "{:?}", validate(&ok));
+        assert_eq!(
+            ok.external_services["api"]
+                .health_check
+                .as_ref()
+                .unwrap()
+                .interval,
+            10
+        );
+
+        let bad = config(serde_json::json!({
+            "Bad.Name": {"addresses": ["10.0.0.5:5432"]},
+            "empty": {"addresses": []},
+            "host": {"addresses": ["db.example.com:5432", "::1"]},
+            "kind": {"addresses": ["10.0.0.5:1"], "healthCheck": {"type": "icmp"}},
+            "path": {"addresses": ["10.0.0.5:1"], "healthCheck": {"type": "http", "path": "h"}},
+            "tcppath": {"addresses": ["10.0.0.5:1"], "healthCheck": {"type": "tcp", "path": "/"}},
+            "zero": {"addresses": ["10.0.0.5:1"], "healthCheck": {"type": "tcp", "interval": 0}},
+        }));
+        let errors = validate(&bad).unwrap_err();
+        assert_eq!(errors.len(), 8, "{errors:#?}");
+        let errors = errors.join("\n");
+        for expected in [
+            "'Bad.Name': name must be a DNS label",
+            "'empty' needs addresses",
+            "'db.example.com:5432' is not ip:port",
+            "type must be 'tcp' or 'http', not 'icmp'",
+            "path must start with '/'",
+            "path is for http checks",
+            "interval and timeout must be positive",
+        ] {
+            assert!(errors.contains(expected), "{expected}: {errors}");
+        }
     }
 
     #[test]

@@ -14,6 +14,7 @@ pub mod deployer;
 pub mod dns;
 pub mod dynamic;
 pub mod events;
+pub mod external;
 pub mod federation;
 pub mod images;
 pub mod mesh;
@@ -263,7 +264,16 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         housekeeping_loop(hk_deps, hk_shutdown).await;
     });
 
-    dns::DnsPublisher::new(fleet_state.clone()).spawn(shutdown.child_token());
+    let external_health = external::ExternalHealth::new();
+    external::ExternalChecker {
+        raft_state: grpc_config.raft_state.clone(),
+        health: external_health.clone(),
+        events: event_store.clone(),
+    }
+    .spawn(shutdown.child_token());
+    dns::DnsPublisher::new(fleet_state.clone())
+        .with_external(grpc_config.raft_state.clone(), external_health)
+        .spawn(shutdown.child_token());
     autoscaler::Autoscaler {
         raft_state: grpc_config.raft_state.clone(),
         state: fleet_state.clone(),

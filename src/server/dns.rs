@@ -16,21 +16,26 @@
 //! - `<svc>.service` in namespace `ns`: the overlay addresses of serving
 //!   replicas, plus SRV records `<port> <svc>.service`, sent only to nodes
 //!   that run something in `ns`.
+//! - `<name>.external`: the addresses of an `externalServices` entry that
+//!   pass its health check (see `server::external`), plus SRV records
+//!   `<port> <name>.external`.
 //!
 //! A replica is serving when its node reports it running and not unhealthy.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
+use super::external::ExternalHealth;
 use super::state::FleetState;
 use crate::proto::server_message::Payload as ServerPayload;
 use crate::proto::{
     DnsRecord, DnsRecordType, DnsUpdate, HealthStatus, ServerMessage, ServiceSpec, ServiceState,
 };
+use crate::raft::state::FleetStateMachine;
 
 /// TTL of every answer: short, so clients notice failover quickly.
 pub const RECORD_TTL: u32 = 10;
@@ -50,6 +55,8 @@ pub struct DnsInputs {
     pub mesh_ips: BTreeMap<String, Ipv4Addr>,
     /// (node, service) pairs whose replica is serving.
     pub serving: HashSet<(String, String)>,
+    /// Serving addresses of each external service.
+    pub external: BTreeMap<String, Vec<SocketAddrV4>>,
 }
 
 impl DnsInputs {
@@ -140,6 +147,29 @@ pub fn build_records(inputs: &DnsInputs) -> BTreeMap<String, Vec<DnsRecord>> {
             }
         }
     }
+    for (name, endpoints) in &inputs.external {
+        let ips: BTreeSet<String> = endpoints.iter().map(|a| a.ip().to_string()).collect();
+        if ips.is_empty() {
+            continue;
+        }
+        let name = format!("{name}.external");
+        let srv: BTreeSet<String> = endpoints
+            .iter()
+            .map(|a| format!("{} {name}", a.port()))
+            .collect();
+        fleet.push(record(
+            name.clone(),
+            DnsRecordType::A,
+            ips.into_iter().collect(),
+            "",
+        ));
+        fleet.push(record(
+            name,
+            DnsRecordType::Srv,
+            srv.into_iter().collect(),
+            "",
+        ));
+    }
     for (name, (ips, srv)) in hosted {
         if !ips.is_empty() {
             let name = format!("{name}.service");
@@ -193,6 +223,7 @@ pub fn build_records(inputs: &DnsInputs) -> BTreeMap<String, Vec<DnsRecord>> {
 /// Pushes record snapshots to connected agents when they change.
 pub struct DnsPublisher {
     state: FleetState,
+    external: Option<(FleetStateMachine, ExternalHealth)>,
     sent: Mutex<HashMap<String, (Vec<DnsRecord>, Instant)>>,
 }
 
@@ -200,14 +231,34 @@ impl DnsPublisher {
     pub fn new(state: FleetState) -> Self {
         Self {
             state,
+            external: None,
             sent: Mutex::default(),
         }
+    }
+
+    /// Also publish the external services of the current configuration.
+    pub fn with_external(mut self, raft_state: FleetStateMachine, health: ExternalHealth) -> Self {
+        self.external = Some((raft_state, health));
+        self
+    }
+
+    async fn inputs(&self) -> DnsInputs {
+        let mut inputs = DnsInputs::gather(&self.state).await;
+        if let Some((raft_state, health)) = &self.external
+            && let Some(revision) = raft_state.current_config().await
+        {
+            match revision.config() {
+                Ok(config) => inputs.external = health.serving(&config).await,
+                Err(e) => tracing::error!(error = %e, "Cannot read external services"),
+            }
+        }
+        inputs
     }
 
     /// Send each connected agent its records if they changed (or have not
     /// been sent for a while). Returns how many agents were sent records.
     pub async fn publish(&self) -> usize {
-        let mut records = build_records(&DnsInputs::gather(&self.state).await);
+        let mut records = build_records(&self.inputs().await);
         let connected = self.state.connected_nodes().await;
         let mut sent = self.sent.lock().await;
         sent.retain(|node, _| connected.contains(node));
@@ -277,6 +328,35 @@ mod tests {
         records
             .iter()
             .find(|r| r.name == name && r.record_type == kind as i32)
+    }
+
+    #[test]
+    fn external_services_are_fleet_wide() {
+        let inputs = DnsInputs {
+            mesh_ips: BTreeMap::from([("a".into(), Ipv4Addr::new(10, 100, 0, 1))]),
+            external: BTreeMap::from([
+                (
+                    "db".into(),
+                    vec![
+                        "10.0.0.2:5432".parse().unwrap(),
+                        "10.0.0.1:5432".parse().unwrap(),
+                    ],
+                ),
+                // Every address failing: no records at all.
+                ("down".into(), Vec::new()),
+            ]),
+            ..Default::default()
+        };
+        let records = build_records(&inputs);
+        let a = &records["a"];
+        let db = find(a, "db.external", DnsRecordType::A).unwrap();
+        assert_eq!(db.values, ["10.0.0.1", "10.0.0.2"]);
+        assert!(db.namespace.is_empty());
+        assert_eq!(
+            find(a, "db.external", DnsRecordType::Srv).unwrap().values,
+            ["5432 db.external"]
+        );
+        assert!(!a.iter().any(|r| r.name == "down.external"));
     }
 
     #[test]

@@ -239,7 +239,7 @@ ekafleet is a single binary that consolidates capabilities from 10+ separate too
 | External Tool(s) | ekafleet Subsystem | Coverage |
 |-------------------|-------------------|----------|
 | Nomad | `scheduler` + `deployer` + `scaling` + `reconciler` | Full |
-| Consul DNS | `dns_authority` + `dns_resolver` + `external` | Full |
+| Consul DNS | `server::dns` + `dns::resolver` + `server::external` | Full |
 | Consul Connect | `wireguard` + `certs` + `nftables` + `proxy` | Full |
 | Consul KV | `raft` state machine + REST KV API | Full |
 | Vault KV | `secrets_store` + `versioned` | Full |
@@ -247,7 +247,7 @@ ekafleet is a single binary that consolidates capabilities from 10+ separate too
 | Vault Dynamic Secrets | `dynamic` (PostgreSQL, MySQL) | Full |
 | SPIRE | `ca_root` + `attestation` + `workload_api` + `federation` | Full |
 | cert-manager | `certs` (auto-renewal, CSR flow) | Full |
-| external-dns | `dns_authority` | Full |
+| external-dns | — | *None* (fleet DNS is internal; nothing is published to outside DNS providers) |
 | nginx / Traefik / Envoy | `proxy_l7` + `proxy_l4` + `circuit` + `ratelimit` | Full |
 | Istio / Linkerd | `wireguard` + `mtls` + `circuit` + `tracing_ctx` | *Partial* (no sidecar injection, no traffic policies) |
 | Cilium / Calico | `nftables` (ingress + egress) | Full |

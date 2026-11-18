@@ -1164,6 +1164,46 @@ let
     };
   };
 
+  # `ExternalServiceConfig`.
+  externalService = strictSubmodule {
+    addresses = mkOption {
+      type = types.nonEmptyListOf types.str;
+      example = [ "10.0.0.50:5432" ];
+      description = "`ip:port` endpoints (IPv4).";
+    };
+    healthCheck = mkOption {
+      type = types.nullOr (strictSubmodule {
+        type = mkOption {
+          type = types.enum [
+            "tcp"
+            "http"
+          ];
+          description = "`tcp` connects; `http` sends GET `path` and passes on 2xx/3xx.";
+        };
+        path = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          description = "HTTP request path (default `/`).";
+        };
+        interval = mkOption {
+          type = types.ints.positive;
+          default = 10;
+          description = "Seconds between checks.";
+        };
+        timeout = mkOption {
+          type = types.ints.positive;
+          default = 2;
+          description = "Seconds before a check fails.";
+        };
+      });
+      default = null;
+      description = ''
+        Checked from the server. An address failing two checks in a row is
+        left out of DNS until a check passes.
+      '';
+    };
+  };
+
   # `NamespaceConfig`.
   namespace = strictSubmodule {
     quota = mkOption {
@@ -1282,6 +1322,14 @@ in
       type = types.attrsOf secretEngine;
       default = { };
       description = "Database engines issuing `dynamic` secrets, keyed by name.";
+    };
+    externalServices = mkOption {
+      type = types.attrsOf externalService;
+      default = { };
+      description = ''
+        Services outside the fleet, resolvable on every node as
+        `<name>.external.<domain>`.
+      '';
     };
     webhooks = mkOption {
       type = types.listOf eventWebhook;
