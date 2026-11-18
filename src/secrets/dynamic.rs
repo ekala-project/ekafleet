@@ -1,420 +1,227 @@
-#![allow(dead_code)]
+//! Dynamic database credentials: a fresh database user per service secret,
+//! created through a secret engine's admin connection and dropped when it
+//! is replaced or no longer declared.
+//!
+//! The server issues the credentials and delivers them like a static secret,
+//! as JSON (`{"username", "password", "url"}`) at `/run/secrets/<name>`.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::future::Future;
+use std::pin::Pin;
 
 use ring::rand::{SecureRandom, SystemRandom};
-use tokio::sync::RwLock;
+use zeroize::Zeroizing;
 
-use super::db_driver::{self, DbEngine};
-use crate::agent::now_epoch;
+use super::db_driver::{self, DbDriverError, Permissions, RoleTemplate};
 
-/// Dynamic secrets engine for generating short-lived database credentials.
-///
-/// When a registered engine has a connection URL, credentials are provisioned
-/// directly in the database (CREATE USER + GRANT). On revocation, the user
-/// is dropped (DROP USER). When no database is reachable, credential material
-/// is still generated for distribution via the secrets store.
-#[derive(Clone)]
-pub struct DynamicSecretsEngine {
-    inner: Arc<RwLock<EngineState>>,
-    rng: Arc<SystemRandom>,
-}
+/// Lease length when a secret doesn't set `ttl` (one day).
+pub const DEFAULT_TTL: u64 = 86_400;
 
-struct EngineState {
-    engines: HashMap<String, RegisteredEngine>,
-    leases: HashMap<String, DynamicLease>,
-    lease_counter: u64,
-}
+/// Shortest accepted lease (five minutes).
+pub const MIN_TTL: u64 = 300;
 
-struct RegisteredEngine {
-    name: String,
-    connection_url: String,
-    db_engine: DbEngine,
-    /// Default database to grant access to
-    default_database: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct DynamicLease {
-    pub service_name: String,
-    pub secret_name: String,
-    pub credentials: Credentials,
-    pub expires_at: u64,
-    pub lease_id: String,
-    /// Whether credentials were provisioned in the actual database
-    pub provisioned: bool,
-    /// The engine name (for revocation)
-    engine_name: String,
-    /// The connection URL (for revocation)
-    connection_url: String,
-    /// The detected DB engine type
-    db_engine: DbEngine,
-}
-
-#[derive(Debug, Clone)]
-pub struct Credentials {
-    pub username: String,
-    pub password: String,
-    /// Connection string the service should use (with embedded credentials)
-    pub connection_url: Option<String>,
-}
-
-/// Duration of a dynamic lease.
-#[derive(Debug, Clone, Copy)]
-pub struct LeaseTtl {
-    pub seconds: u64,
-}
-
-impl Default for LeaseTtl {
-    fn default() -> Self {
-        Self { seconds: 3600 } // 1 hour
-    }
-}
+/// Roles a dynamic secret may ask for.
+pub const ROLES: &[&str] = &["readonly", "readwrite", "admin"];
 
 #[derive(Debug, thiserror::Error)]
 pub enum DynamicSecretError {
-    #[error("engine '{0}' not found")]
-    EngineNotFound(String),
-    #[error("lease '{0}' not found")]
-    LeaseNotFound(String),
+    #[error("unknown role '{0}' (expected readonly, readwrite or admin)")]
+    UnknownRole(String),
     #[error("random generation failed")]
     RngFailure,
-    #[error("database driver error: {0}")]
-    DbDriver(#[from] db_driver::DbDriverError),
+    #[error("invalid admin connection URL: {0}")]
+    InvalidUrl(String),
+    #[error(transparent)]
+    Db(#[from] DbDriverError),
 }
 
-impl Default for DynamicSecretsEngine {
-    fn default() -> Self {
-        Self::new()
+/// The privileges `role` grants.
+pub fn role_permissions(role: &str) -> Result<Permissions, DynamicSecretError> {
+    match role {
+        "readonly" => Ok(Permissions::ReadOnly),
+        "readwrite" => Ok(Permissions::ReadWrite),
+        "admin" => Ok(Permissions::Admin),
+        _ => Err(DynamicSecretError::UnknownRole(role.to_string())),
     }
 }
 
-impl DynamicSecretsEngine {
-    pub fn new() -> Self {
-        Self {
-            inner: Arc::new(RwLock::new(EngineState {
-                engines: HashMap::new(),
-                leases: HashMap::new(),
-                lease_counter: 0,
-            })),
-            rng: Arc::new(SystemRandom::new()),
-        }
+/// Credentials of one issued database user.
+pub struct Credentials {
+    pub username: String,
+    pub password: Zeroizing<String>,
+    /// Connection URL for the service, with the credentials embedded.
+    pub url: Zeroizing<String>,
+}
+
+impl Credentials {
+    /// A new random user for the database `database` on the server that
+    /// `admin_url` points at.
+    pub fn generate(admin_url: &str, database: &str) -> Result<Self, DynamicSecretError> {
+        let username = format!("ek_{}", random_hex(6)?);
+        let password = Zeroizing::new(random_hex(24)?);
+        let url = service_url(admin_url, &username, &password, database)?;
+        Ok(Self {
+            username,
+            password,
+            url,
+        })
     }
 
-    /// Register a database engine for dynamic credential generation.
-    ///
-    /// The `connection_url` is used both to detect the engine type (postgres://,
-    /// mysql://) and to connect for provisioning. The `default_database` is the
-    /// database name used in GRANT statements.
-    pub async fn register_engine(
-        &self,
-        engine_name: &str,
-        connection_url: &str,
-        default_database: &str,
-    ) -> Result<(), DynamicSecretError> {
-        let db_engine = db_driver::detect_engine(connection_url)?;
-
-        let mut state = self.inner.write().await;
-        state.engines.insert(
-            engine_name.to_string(),
-            RegisteredEngine {
-                name: engine_name.to_string(),
-                connection_url: connection_url.to_string(),
-                db_engine,
-                default_database: default_database.to_string(),
-            },
-        );
-
-        tracing::info!(
-            engine = %engine_name,
-            db = %default_database,
-            "Dynamic secrets engine registered"
-        );
-        Ok(())
-    }
-
-    /// Generate dynamic credentials for a service.
-    ///
-    /// 1. Generates random username and password
-    /// 2. Connects to the database and provisions the user (CREATE ROLE/USER + GRANT)
-    /// 3. Creates a lease for tracking and later revocation
-    ///
-    /// If the database is unreachable, credentials are still generated
-    /// (marked as `provisioned: false`) so they can be retried.
-    pub async fn generate_credentials(
-        &self,
-        engine: &str,
-        role: &str,
-        service_name: &str,
-        ttl: Option<LeaseTtl>,
-    ) -> Result<DynamicLease, DynamicSecretError> {
-        let ttl = ttl.unwrap_or_default();
-        let mut state = self.inner.write().await;
-
-        let registered = state
-            .engines
-            .get(engine)
-            .ok_or_else(|| DynamicSecretError::EngineNotFound(engine.to_string()))?;
-
-        let connection_url = registered.connection_url.clone();
-        let db_engine = registered.db_engine.clone();
-        let default_database = registered.default_database.clone();
-
-        state.lease_counter += 1;
-        let lease_id = format!("{engine}/{role}/{}", state.lease_counter);
-
-        let username = format!("v-{}-{}-{}", service_name, role, self.random_hex(4)?);
-        let password = self.random_hex(32)?;
-
-        // Build a role template from the role name
-        let role_template = db_driver::parse_role(role, &default_database);
-
-        // Drop the lock before doing I/O
-        drop(state);
-
-        // Attempt to provision in the actual database
-        let provisioned = match db_driver::provision_credentials(
-            &db_engine,
-            &connection_url,
-            &username,
-            &password,
-            &role_template,
+    /// The JSON the service reads.
+    pub fn to_json(&self) -> Zeroizing<Vec<u8>> {
+        Zeroizing::new(
+            serde_json::json!({
+                "username": self.username,
+                "password": self.password.as_str(),
+                "url": self.url.as_str(),
+            })
+            .to_string()
+            .into_bytes(),
         )
-        .await
-        {
-            Ok(()) => {
-                tracing::info!(
-                    engine = %engine,
-                    user = %username,
-                    database = %default_database,
-                    "Credentials provisioned in database"
-                );
-                true
-            }
-            Err(e) => {
-                tracing::warn!(
-                    engine = %engine,
-                    error = %e,
-                    "Database provisioning failed — credentials generated but not active in DB"
-                );
-                false
-            }
-        };
-
-        // Build a service-usable connection URL with the generated credentials
-        let service_connection_url =
-            build_service_url(&connection_url, &username, &password, &default_database);
-
-        let lease = DynamicLease {
-            service_name: service_name.to_string(),
-            secret_name: format!("{engine}/{role}"),
-            credentials: Credentials {
-                username,
-                password,
-                connection_url: Some(service_connection_url),
-            },
-            expires_at: now_epoch() + ttl.seconds,
-            lease_id: lease_id.clone(),
-            provisioned,
-            engine_name: engine.to_string(),
-            connection_url: connection_url.clone(),
-            db_engine,
-        };
-
-        let mut state = self.inner.write().await;
-        state.leases.insert(lease_id, lease.clone());
-
-        tracing::info!(
-            engine = %engine,
-            role = %role,
-            service = %service_name,
-            lease = %lease.lease_id,
-            provisioned,
-            "Dynamic lease created"
-        );
-
-        Ok(lease)
-    }
-
-    /// Revoke a dynamic lease.
-    ///
-    /// If the credentials were provisioned in the database, this also
-    /// drops the user (terminates connections, revokes privileges, DROP USER).
-    pub async fn revoke_lease(&self, lease_id: &str) -> Result<(), DynamicSecretError> {
-        let mut state = self.inner.write().await;
-        let lease = state
-            .leases
-            .remove(lease_id)
-            .ok_or_else(|| DynamicSecretError::LeaseNotFound(lease_id.to_string()))?;
-
-        // Drop the lock before doing I/O
-        drop(state);
-
-        if lease.provisioned {
-            match db_driver::revoke_credentials(
-                &lease.db_engine,
-                &lease.connection_url,
-                &lease.credentials.username,
-            )
-            .await
-            {
-                Ok(()) => {
-                    tracing::info!(
-                        lease = %lease_id,
-                        user = %lease.credentials.username,
-                        "Database credentials revoked"
-                    );
-                }
-                Err(e) => {
-                    tracing::error!(
-                        lease = %lease_id,
-                        user = %lease.credentials.username,
-                        error = %e,
-                        "Failed to revoke database credentials — user may still exist"
-                    );
-                    return Err(e.into());
-                }
-            }
-        } else {
-            tracing::info!(
-                lease = %lease_id,
-                "Lease revoked (credentials were not provisioned in DB)"
-            );
-        }
-
-        Ok(())
-    }
-
-    /// Revoke all expired leases.
-    ///
-    /// This should be called periodically (e.g., every 60 seconds) to clean
-    /// up expired credentials from databases.
-    pub async fn revoke_expired(&self) -> Vec<(String, Result<(), DynamicSecretError>)> {
-        let now = now_epoch();
-        let expired_ids: Vec<String> = {
-            let state = self.inner.read().await;
-            state
-                .leases
-                .iter()
-                .filter(|(_, l)| l.expires_at <= now)
-                .map(|(id, _)| id.clone())
-                .collect()
-        };
-
-        let mut results = Vec::new();
-        for lease_id in expired_ids {
-            let result = self.revoke_lease(&lease_id).await;
-            results.push((lease_id, result));
-        }
-        results
-    }
-
-    /// List all active (non-expired) leases.
-    pub async fn active_leases(&self) -> Vec<DynamicLease> {
-        let state = self.inner.read().await;
-        let now = now_epoch();
-        state
-            .leases
-            .values()
-            .filter(|l| l.expires_at > now)
-            .cloned()
-            .collect()
-    }
-
-    /// Retry provisioning for leases that failed database provisioning.
-    pub async fn retry_unprovisioned(&self) -> Vec<(String, Result<(), DynamicSecretError>)> {
-        let unprovisioned: Vec<DynamicLease> = {
-            let state = self.inner.read().await;
-            state
-                .leases
-                .values()
-                .filter(|l| !l.provisioned && l.expires_at > now_epoch())
-                .cloned()
-                .collect()
-        };
-
-        let mut results = Vec::new();
-        for lease in unprovisioned {
-            let registered = {
-                let state = self.inner.read().await;
-                state.engines.get(&lease.engine_name).map(|e| {
-                    (
-                        e.connection_url.clone(),
-                        e.db_engine.clone(),
-                        e.default_database.clone(),
-                    )
-                })
-            };
-
-            if let Some((conn_url, db_engine, db_name)) = registered {
-                let role_template = db_driver::parse_role(
-                    lease.secret_name.split('/').nth(1).unwrap_or("readonly"),
-                    &db_name,
-                );
-                let result = db_driver::provision_credentials(
-                    &db_engine,
-                    &conn_url,
-                    &lease.credentials.username,
-                    &lease.credentials.password,
-                    &role_template,
-                )
-                .await;
-
-                match &result {
-                    Ok(()) => {
-                        let mut state = self.inner.write().await;
-                        if let Some(l) = state.leases.get_mut(&lease.lease_id) {
-                            l.provisioned = true;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            lease = %lease.lease_id,
-                            error = %e,
-                            "Retry provisioning failed"
-                        );
-                    }
-                }
-                results.push((
-                    lease.lease_id.clone(),
-                    result.map_err(DynamicSecretError::from),
-                ));
-            }
-        }
-        results
-    }
-
-    /// Generate a random hex string of the given byte length.
-    fn random_hex(&self, byte_len: usize) -> Result<String, DynamicSecretError> {
-        let mut bytes = vec![0u8; byte_len];
-        self.rng
-            .fill(&mut bytes)
-            .map_err(|_| DynamicSecretError::RngFailure)?;
-        Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
     }
 }
 
-/// Build a connection URL for the service with embedded credentials.
-fn build_service_url(admin_url: &str, username: &str, password: &str, database: &str) -> String {
-    // Parse the admin URL to extract host:port
-    // Formats: postgres://admin:pass@host:port/admindb or mysql://admin:pass@host:port/admindb
-    if let Some(rest) = admin_url
-        .strip_prefix("postgres://")
-        .or_else(|| admin_url.strip_prefix("postgresql://"))
-    {
-        let host_part = rest.rsplit('@').next().unwrap_or(rest);
-        let host_port = host_part.split('/').next().unwrap_or(host_part);
-        format!("postgres://{username}:{password}@{host_port}/{database}")
-    } else if let Some(rest) = admin_url.strip_prefix("mysql://") {
-        let host_part = rest.rsplit('@').next().unwrap_or(rest);
-        let host_port = host_part.split('/').next().unwrap_or(host_part);
-        format!("mysql://{username}:{password}@{host_port}/{database}")
-    } else {
-        format!("{admin_url}?user={username}&password={password}")
+fn random_hex(bytes: usize) -> Result<String, DynamicSecretError> {
+    let mut buf = Zeroizing::new(vec![0u8; bytes]);
+    SystemRandom::new()
+        .fill(&mut buf)
+        .map_err(|_| DynamicSecretError::RngFailure)?;
+    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// `admin_url` with its credentials and database replaced, keeping the
+/// scheme, host, port and query (e.g. `sslmode`).
+fn service_url(
+    admin_url: &str,
+    username: &str,
+    password: &str,
+    database: &str,
+) -> Result<Zeroizing<String>, DynamicSecretError> {
+    let invalid = || DynamicSecretError::InvalidUrl("expected scheme://user:pass@host/db".into());
+    db_driver::detect_engine(admin_url)?;
+    let (scheme, rest) = admin_url.split_once("://").ok_or_else(invalid)?;
+    let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    if host.is_empty() {
+        return Err(invalid());
+    }
+    let query = tail.find('?').map_or("", |i| &tail[i..]);
+    Ok(Zeroizing::new(format!(
+        "{scheme}://{username}:{password}@{host}/{database}{query}"
+    )))
+}
+
+type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Creates and drops database users. [`Databases`] talks to real servers;
+/// tests substitute their own.
+pub trait CredentialBackend: Send + Sync {
+    /// Create `username` with `role`'s privileges on `database`, valid until
+    /// `valid_until` (Unix seconds).
+    fn provision<'a>(
+        &'a self,
+        admin_url: &'a str,
+        credentials: &'a Credentials,
+        database: &'a str,
+        role: &'a str,
+        valid_until: u64,
+    ) -> BoxFuture<'a, Result<(), DynamicSecretError>>;
+
+    /// Drop `username`, ending its sessions.
+    fn revoke<'a>(
+        &'a self,
+        admin_url: &'a str,
+        username: &'a str,
+    ) -> BoxFuture<'a, Result<(), DynamicSecretError>>;
+}
+
+/// PostgreSQL and MySQL servers, through [`db_driver`].
+pub struct Databases;
+
+impl CredentialBackend for Databases {
+    fn provision<'a>(
+        &'a self,
+        admin_url: &'a str,
+        credentials: &'a Credentials,
+        database: &'a str,
+        role: &'a str,
+        valid_until: u64,
+    ) -> BoxFuture<'a, Result<(), DynamicSecretError>> {
+        Box::pin(async move {
+            let engine = db_driver::detect_engine(admin_url)?;
+            let template = RoleTemplate {
+                database: database.to_string(),
+                permissions: role_permissions(role)?,
+            };
+            db_driver::provision_credentials(
+                &engine,
+                admin_url,
+                &credentials.username,
+                &credentials.password,
+                &template,
+                valid_until,
+            )
+            .await?;
+            Ok(())
+        })
+    }
+
+    fn revoke<'a>(
+        &'a self,
+        admin_url: &'a str,
+        username: &'a str,
+    ) -> BoxFuture<'a, Result<(), DynamicSecretError>> {
+        Box::pin(async move {
+            let engine = db_driver::detect_engine(admin_url)?;
+            db_driver::revoke_credentials(&engine, admin_url, username).await?;
+            Ok(())
+        })
     }
 }
 
 #[cfg(test)]
-#[path = "dynamic_tests.rs"]
-mod tests;
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credentials_point_at_the_admin_host_and_service_database() {
+        let creds = Credentials::generate(
+            "postgres://admin:p%40ss@db.internal:5432/postgres?sslmode=require",
+            "shop",
+        )
+        .unwrap();
+        assert!(creds.username.starts_with("ek_") && creds.username.len() == 15);
+        assert_eq!(creds.password.len(), 48);
+        assert_eq!(
+            creds.url.as_str(),
+            format!(
+                "postgres://{}:{}@db.internal:5432/shop?sslmode=require",
+                creds.username,
+                creds.password.as_str()
+            )
+        );
+        let json: serde_json::Value = serde_json::from_slice(&creds.to_json()).unwrap();
+        assert_eq!(json["username"], creds.username.as_str());
+        assert_eq!(json["url"], creds.url.as_str());
+
+        let mysql = Credentials::generate("mysql://root@10.0.0.5", "app").unwrap();
+        assert!(mysql.url.starts_with("mysql://ek_"));
+        assert!(mysql.url.ends_with("@10.0.0.5/app"));
+
+        assert!(Credentials::generate("redis://x@y/0", "app").is_err());
+        assert!(Credentials::generate("postgres://admin@/x", "app").is_err());
+        assert_ne!(
+            Credentials::generate("mysql://r@h", "a").unwrap().username,
+            mysql.username
+        );
+    }
+
+    #[test]
+    fn roles_are_exact() {
+        for role in ROLES {
+            assert!(role_permissions(role).is_ok());
+        }
+        assert!(role_permissions("rw").is_err());
+        assert!(role_permissions("superuser").is_err());
+    }
+}

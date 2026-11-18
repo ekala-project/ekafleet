@@ -221,6 +221,27 @@ pub async fn missing_secret_warnings(
         })
         .collect();
     let fleet = stored.get(crate::secrets::FLEET_SCOPE);
+    let mut engines: Vec<_> = config
+        .services
+        .values()
+        .flat_map(|s| s.secrets.values())
+        .filter(|s| s.is_dynamic())
+        .filter_map(|s| s.engine.as_deref())
+        .filter_map(|name| config.secret_engines.get(name).map(|e| (name, e)))
+        .collect();
+    engines.sort_by_key(|(name, _)| *name);
+    engines.dedup_by_key(|(name, _)| *name);
+    for (name, engine) in engines {
+        if !fleet.is_some_and(|s| s.contains_key(&engine.admin_url_secret)) {
+            warnings.push(format!(
+                "secret engine '{name}' reads its admin URL from secret '{}', which has no \
+                 value; its dynamic secrets are not issued until `ekafleet secret set {} {}`",
+                engine.admin_url_secret,
+                crate::secrets::FLEET_SCOPE,
+                engine.admin_url_secret
+            ));
+        }
+    }
     for webhook in &config.webhooks {
         if let Some(secret) = &webhook.secret
             && !fleet.is_some_and(|s| s.contains_key(secret))
@@ -315,6 +336,23 @@ fn check_names(service: &str, secret: &str) -> Result<(), Status> {
 }
 
 impl FleetControlService {
+    /// Refuse to write a secret the applied configuration declares dynamic:
+    /// its value belongs to the lease manager.
+    async fn refuse_dynamic(&self, service: &str, secret: &str) -> Result<(), Status> {
+        let config = self
+            .raft_state
+            .current_config()
+            .await
+            .and_then(|r| r.config().ok());
+        if config.is_some_and(|c| crate::config::is_dynamic_secret(&c, service, secret)) {
+            return Err(Status::failed_precondition(format!(
+                "{service}/{secret} is a dynamic secret; its credentials are issued by its \
+                 engine (use `ekafleet secret revoke {service} {secret}` to replace them)"
+            )));
+        }
+        Ok(())
+    }
+
     /// The publisher pushing this server's secrets to agents.
     pub fn secret_publisher(&self) -> SecretPublisher {
         SecretPublisher::new(
@@ -334,6 +372,8 @@ impl FleetControlService {
         let req = request.get_ref();
         let resource = format!("{}/{}", req.service_name, req.secret_name);
         check_names(&req.service_name, &req.secret_name)?;
+        self.refuse_dynamic(&req.service_name, &req.secret_name)
+            .await?;
         if req.value.is_empty() {
             return Err(Status::invalid_argument("secret value is empty"));
         }
@@ -398,7 +438,7 @@ impl FleetControlService {
         }
         if let Some(Ok(config)) = self.raft_state.current_config().await.map(|r| r.config()) {
             for (service, cfg) in &config.services {
-                for name in crate::config::static_secrets(cfg) {
+                for name in crate::config::declared_secrets(cfg) {
                     entries.entry((service.clone(), name)).or_default().1 = true;
                 }
             }
@@ -426,6 +466,8 @@ impl FleetControlService {
         require_permission(&request, Permission::ManageSecrets)?;
         let req = request.get_ref();
         check_names(&req.service_name, &req.secret_name)?;
+        self.refuse_dynamic(&req.service_name, &req.secret_name)
+            .await?;
         self.require_service_access(&request, &req.service_name)
             .await?;
         let deleted = self
@@ -486,6 +528,8 @@ impl FleetControlService {
         require_permission(&request, Permission::ManageSecrets)?;
         let req = request.get_ref();
         check_names(&req.service_name, &req.secret_name)?;
+        self.refuse_dynamic(&req.service_name, &req.secret_name)
+            .await?;
         self.require_service_access(&request, &req.service_name)
             .await?;
         let resource = format!("{}/{}", req.service_name, req.secret_name);

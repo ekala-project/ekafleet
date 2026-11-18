@@ -512,7 +512,7 @@ enum Command {
         action: AclAction,
     },
 
-    /// Static secrets of services (delivered at /run/secrets/<name>)
+    /// Secrets of services (delivered at /run/secrets/<name>)
     Secret {
         #[command(subcommand)]
         action: SecretAction,
@@ -781,6 +781,24 @@ enum SecretAction {
     },
     /// List a secret's current and kept earlier versions
     Versions {
+        /// Service the secret belongs to
+        service: String,
+        /// Secret name
+        name: String,
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+    /// List dynamic secrets' database users, and users still to drop
+    Leases {
+        /// Only this service's leases
+        service: Option<String>,
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+    /// Drop a dynamic secret's database user now and issue a new one
+    Revoke {
         /// Service the secret belongs to
         service: String,
         /// Secret name
@@ -1467,6 +1485,14 @@ async fn main() -> anyhow::Result<()> {
                 version,
                 server,
             } => commands::cmd_secret_rollback(service, name, version, server).await?,
+            SecretAction::Leases { service, server } => {
+                commands::cmd_secret_leases(service, server).await?
+            }
+            SecretAction::Revoke {
+                service,
+                name,
+                server,
+            } => commands::cmd_secret_revoke(service, name, server).await?,
         },
 
         Command::Transit { action } => match action {

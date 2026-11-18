@@ -16,44 +16,59 @@ secrets.api-key = {
 
 ### Dynamic Secrets
 
-Generates unique database credentials per service instance with automatic rotation. Credentials are provisioned directly in the database and revoked on lease expiry.
+Dynamic secrets are database credentials the server issues per service: a database user of its own, replaced before its lease runs out, and dropped when it's replaced or no longer declared. A secret engine names a database server and the database to grant access to; its admin connection URL is a fleet secret, so it never appears in the configuration.
 
 ```nix
-secrets.db = {
+fleet.secretEngines.orders-db = {
+  adminUrlSecret = "orders-db-admin";   # ekafleet secret set _fleet orders-db-admin
+  database = "orders";
+};
+
+fleet.services.api.secrets.db = {
   type = "dynamic";
-  engine = "postgresql";
-  role = "rw";
+  engine = "orders-db";
+  role = "readwrite";                   # readonly | readwrite | admin
+  ttl = 86400;                          # seconds (default 86400, at least 300)
 };
 ```
 
-**Supported databases:**
+```bash
+echo -n 'postgres://admin:pw@db.internal:5432/postgres?sslmode=require' \
+  | ekafleet secret set _fleet orders-db-admin
+```
 
-| Engine | Connection URL | Provisioning |
-|--------|---------------|-------------|
-| PostgreSQL | `postgres://admin:pass@host:5432/db` | CREATE ROLE + GRANT |
-| MySQL | `mysql://root:pass@host:3306/db` | CREATE USER + GRANT |
+The service reads JSON at `/run/secrets/db`:
 
-**Role mappings:**
+```json
+{"username": "ek_3f9a1c0b7d2e", "password": "…", "url": "postgres://ek_3f9a1c0b7d2e:…@db.internal:5432/orders?sslmode=require"}
+```
 
-| Role name | Permissions granted |
-|-----------|-------------------|
-| `readonly` / `ro` / `read` | SELECT |
-| `readwrite` / `rw` / `write` | SELECT, INSERT, UPDATE, DELETE |
-| `admin` / `superuser` / `all` | ALL PRIVILEGES |
+The URL keeps the admin URL's scheme, host, port and query, with the issued credentials and the engine's database.
+
+**Supported databases:** PostgreSQL (`postgres://`, `postgresql://`) and MySQL (`mysql://`).
+
+| Role | Privileges on the engine's database |
+|------|-------------------------------------|
+| `readonly` | `SELECT` |
+| `readwrite` | `SELECT, INSERT, UPDATE, DELETE` |
+| `admin` | `ALL PRIVILEGES` |
 
 **Lifecycle:**
 
-1. Server registers the database engine with admin connection URL
-2. On service deploy, server generates random username + password
-3. Server connects to DB and runs `CREATE ROLE`/`USER` + `GRANT`
-4. Credentials + service connection URL distributed to agent
-5. On lease expiry (default 1 hour), server runs `DROP ROLE`/`USER`
+1. When a configuration declaring the secret is applied, the server creates a random user through the admin connection, with its password set to expire at the end of the lease (`VALID UNTIL` on PostgreSQL; on MySQL `PASSWORD EXPIRE INTERVAL`, rounded up to whole days).
+2. The credentials are stored in Raft, sealed under the fleet key like a static secret, and delivered to the nodes running the service. The service starts once they arrive.
+3. Two thirds of the way through the lease, the server issues a new user. Nodes receive it and restart the service, as for any changed secret.
+4. The replaced user is dropped (its sessions ended) when its lease expires, leaving the last third of the lease for the restart.
+5. When a service or secret is removed from the configuration, its user is dropped at once. If the database is unreachable, issuing and dropping are retried every 30 seconds; current credentials stay in place meanwhile.
 
-**Safety features:**
-- `CONNECTION LIMIT 10` prevents credential abuse
-- `VALID UNTIL` (Postgres) / `PASSWORD EXPIRE` (MySQL) for DB-enforced expiry
-- Existing connections terminated on revocation
-- SQL injection prevented via identifier/literal escaping
+Changing a secret's `engine` or `role` issues a new user right away. Dynamic secrets can't be set, deleted or rolled back with `ekafleet secret`; instead:
+
+```bash
+ekafleet secret leases [SERVICE]      # issued users, renewal and expiry times, users waiting to be dropped
+ekafleet secret revoke api db         # drop the user now and issue a new one
+```
+
+Issued users get `CONNECTION LIMIT 10` (PostgreSQL) or `MAX_USER_CONNECTIONS 10` (MySQL). Each renewal restarts the service on every node at about the same time, so choose a `ttl` long enough that this is rare.
 
 ### Transit Encryption
 
@@ -162,16 +177,6 @@ A rollback stores the old value as a new version, so agents pick it up like any 
 ## Secret Rotation Notification
 
 When a secret's value changes, the agent rewrites the file and restarts the services on that node that declare it, so they read the new value (templates that use it are re-rendered first).
-
-## Dynamic Secret Connection URLs
-
-For dynamic secrets, the injected file contains a ready-to-use connection URL:
-
-```
-postgres://v-api-server-rw-a1b2c3d4:randompassword@db.host:5432/myapp
-```
-
-Services can read this directly from the secret file and connect without additional configuration.
 
 ## Integration with sops-nix / agenix
 

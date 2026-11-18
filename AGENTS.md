@@ -44,7 +44,7 @@ validation checks.
 | Area | Path | What to protect |
 |------|------|-----------------|
 | Certificate Authority | `src/ca/` | Root + intermediate CA keys, leaf issuance, SPIFFE SVIDs |
-| Secret Storage | `src/secrets/` | AES-256-GCM encryption, per-agent HKDF key derivation, AAD binding |
+| Secret Storage | `src/secrets/`, `src/server/dynamic.rs` | AES-256-GCM encryption, per-agent HKDF key derivation, AAD binding, dynamic DB admin URLs (never logged) |
 | Auth & RBAC | `src/server/api.rs`, `src/server/rbac.rs` | mTLS SPIFFE ID extraction, bearer tokens, namespace-scoped RBAC |
 | Transit Encryption | `src/secrets/transit.rs`, `src/server/transit.rs` | Keys sealed under the fleet key, name+version AAD, workload access limited to declared `transitKeys` |
 | Seal Module | `src/server/seal.rs` | PBKDF2+AES-256-GCM envelope encryption for key material at rest |
@@ -86,6 +86,7 @@ src/
 │   ├── policy.rs        # Organizational policy engine for admission control
 │   ├── webhook.rs       # Outbound webhook notifications
 │   ├── federation.rs    # Multi-region cluster federation
+│   ├── dynamic.rs       # Lease manager: issue/renew/drop dynamic DB users; lease RPCs
 │   ├── rebalance.rs     # Stateful drift: `ekafleet rebalance` move plan/apply + settle
 │   ├── secrets.rs       # Secret RPCs, delivery to agents, fleet key rotation + reseal
 │   ├── transit.rs       # Transit key RPCs; workload SVIDs limited to declared `transitKeys`
@@ -144,7 +145,8 @@ src/
 │   ├── store.rs         # AES-256-GCM encrypted secret store with AAD binding
 │   ├── key_derivation.rs# Per-agent HKDF-SHA256 key derivation + re-encryption
 │   ├── injector.rs      # Agent-side secret file injection (mode 0400)
-│   ├── dynamic.rs       # Dynamic secret engine (PostgreSQL/MySQL credential rotation)
+│   ├── dynamic.rs       # Dynamic DB credentials: generation, roles, backend trait
+│   ├── db_driver.rs     # PostgreSQL/MySQL user create/drop (sqlx)
 │   └── transit.rs       # Transit ciphertext format (versioned AES-256-GCM, AAD-bound)
 ├── dns/
 │   ├── mod.rs           # DNS module
@@ -270,6 +272,6 @@ Do not commit with attribution lines (no `Co-Authored-By`).
 - **CLI commands**: `server`, `agent`, `dev`, `plan`, `apply`, `status`, `drift`,
   `rollback`, `capacity`, `services`, `drain`, `scale`, `rebalance`, `logs`, `ssh`, `snapshot`,
   `restore`, `upgrade`, `dispatch`, `exec`, `inspect`, `events`, `top`, `node`,
-  `acl token create/list/revoke`, `secret set/list/delete/versions/rollback`,
+  `acl token create/list/revoke`, `secret set/list/delete/versions/rollback/leases/revoke`,
   `transit key create/rotate/list/delete`, `transit encrypt/decrypt`, `generation list/switch/diff`,
   `system gc/reboot/rebuild`, `token create`, `completions` — all functional.

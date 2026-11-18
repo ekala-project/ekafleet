@@ -658,6 +658,7 @@ mod tests {
             policies: vec![],
             signature_policy: None,
             alerts: vec![],
+            secret_engines: HashMap::new(),
         }
     }
 

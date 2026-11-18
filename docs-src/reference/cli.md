@@ -381,7 +381,11 @@ ekafleet secret list [SERVICE]                      # names, versions, declared 
 ekafleet secret delete <SERVICE> <NAME>             # delete, with earlier versions
 ekafleet secret versions <SERVICE> <NAME>           # current and kept earlier versions
 ekafleet secret rollback <SERVICE> <NAME> <VERSION> # restore an earlier version
+ekafleet secret leases [SERVICE]                    # dynamic secrets' database users
+ekafleet secret revoke <SERVICE> <NAME>             # drop a dynamic user, issue a new one
 ```
+
+Dynamic secrets (database credentials from a secret engine) are issued and renewed by the server; `set`, `delete` and `rollback` refuse them.
 
 Fleet-level secrets (such as event webhook signing keys) use the reserved service name `_fleet`.
 

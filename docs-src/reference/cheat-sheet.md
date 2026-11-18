@@ -120,6 +120,8 @@ ekafleet acl token revoke $TOKEN                # Revoke a token
 ekafleet secret set web api-key < key.txt       # Store a new version (stdin)
 ekafleet secret versions web api-key            # Current and earlier versions
 ekafleet secret rollback web api-key 3          # Restore version 3
+ekafleet secret leases                          # Dynamic DB users and expiry
+ekafleet secret revoke web db                   # Replace a dynamic DB user now
 ekafleet transit key create orders              # Server-held encryption key
 ekafleet transit encrypt orders < card.txt      # -> ekafleet:v1:...
 ekafleet transit decrypt orders < card.enc      # Plaintext to stdout
