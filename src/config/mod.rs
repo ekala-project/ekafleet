@@ -39,6 +39,20 @@ pub struct FleetConfig {
     /// that are not listed here; those have no quota.
     #[serde(default)]
     pub namespaces: HashMap<String, NamespaceConfig>,
+    /// Database engines that issue `dynamic` secrets, keyed by name.
+    #[serde(default)]
+    pub secret_engines: HashMap<String, SecretEngineConfig>,
+}
+
+/// A database server that issues dynamic credentials.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SecretEngineConfig {
+    /// Fleet secret (`ekafleet secret set _fleet <name>`) holding the admin
+    /// connection URL, e.g. `postgres://admin:pw@db:5432/postgres`.
+    pub admin_url_secret: String,
+    /// Database services get access to.
+    pub database: String,
 }
 
 /// Settings of a namespace.
@@ -791,9 +805,10 @@ fn default_threshold() -> u32 {
     3
 }
 
-/// A secret a service declares. `type = "static"` secrets are values set
-/// with `ekafleet secret set`, delivered to the service at
-/// `/run/secrets/<name>`; `"dynamic"` ones come from a secret engine.
+/// A secret a service declares, delivered at `/run/secrets/<name>`.
+/// `type = "static"` secrets are values set with `ekafleet secret set`;
+/// `"dynamic"` ones are database credentials issued by `engine` with
+/// `role`, replaced before `ttl` seconds pass.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecretConfig {
@@ -803,6 +818,19 @@ pub struct SecretConfig {
     pub engine: Option<String>,
     #[serde(default)]
     pub role: Option<String>,
+    #[serde(default)]
+    pub ttl: Option<u64>,
+}
+
+impl SecretConfig {
+    pub fn is_dynamic(&self) -> bool {
+        self.secret_type == "dynamic"
+    }
+
+    /// Lease length of a dynamic secret.
+    pub fn ttl(&self) -> u64 {
+        self.ttl.unwrap_or(crate::secrets::dynamic::DEFAULT_TTL)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1215,6 +1243,23 @@ fn default_secret_type() -> String {
     "static".to_string()
 }
 
+/// Every secret a service declares (static and dynamic), sorted: what its
+/// node delivers to it.
+pub fn declared_secrets(service: &ServiceConfig) -> Vec<String> {
+    let mut names: Vec<String> = service.secrets.keys().cloned().collect();
+    names.sort();
+    names
+}
+
+/// Whether `service` declares `name` as a dynamic secret.
+pub fn is_dynamic_secret(config: &FleetConfig, service: &str, name: &str) -> bool {
+    config
+        .services
+        .get(service)
+        .and_then(|s| s.secrets.get(name))
+        .is_some_and(SecretConfig::is_dynamic)
+}
+
 /// The static secrets a service declares, sorted.
 pub fn static_secrets(service: &ServiceConfig) -> Vec<String> {
     let mut names: Vec<String> = service
@@ -1363,8 +1408,59 @@ pub fn validate_webhook_url(url: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_dynamic_secret(
+    config: &FleetConfig,
+    service: &str,
+    key: &str,
+    secret: &SecretConfig,
+    errors: &mut Vec<String>,
+) {
+    let at = format!("service '{service}' secret '{key}'");
+    match secret.engine.as_deref() {
+        None => errors.push(format!("{at}: a dynamic secret needs an engine")),
+        Some(engine) if !config.secret_engines.contains_key(engine) => {
+            errors.push(format!("{at}: engine '{engine}' is not in secretEngines"))
+        }
+        Some(_) => {}
+    }
+    match secret.role.as_deref() {
+        None => errors.push(format!(
+            "{at}: a dynamic secret needs a role ({})",
+            crate::secrets::dynamic::ROLES.join(", ")
+        )),
+        Some(role) => {
+            if let Err(e) = crate::secrets::dynamic::role_permissions(role) {
+                errors.push(format!("{at}: {e}"));
+            }
+        }
+    }
+    if secret.ttl() < crate::secrets::dynamic::MIN_TTL {
+        errors.push(format!(
+            "{at}: ttl must be at least {} seconds",
+            crate::secrets::dynamic::MIN_TTL
+        ));
+    }
+}
+
+fn validate_secret_engines(config: &FleetConfig, errors: &mut Vec<String>) {
+    let mut engines: Vec<_> = config.secret_engines.iter().collect();
+    engines.sort_by_key(|(name, _)| name.as_str());
+    for (name, engine) in engines {
+        if let Err(e) = crate::secrets::validate_name("secret engine", name) {
+            errors.push(e);
+        }
+        if let Err(e) = crate::secrets::validate_name("secret", &engine.admin_url_secret) {
+            errors.push(format!("secret engine '{name}' adminUrlSecret: {e}"));
+        }
+        if engine.database.is_empty() {
+            errors.push(format!("secret engine '{name}' needs a database"));
+        }
+    }
+}
+
 pub fn validate(config: &FleetConfig) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
+    validate_secret_engines(config, &mut errors);
 
     validate_alerts(config, &mut errors);
     validate_namespaces_and_admission(config, &mut errors);
@@ -1408,11 +1504,18 @@ pub fn validate(config: &FleetConfig) -> Result<(), Vec<String>> {
             if let Err(e) = crate::secrets::validate_name("secret", key) {
                 errors.push(format!("service '{name}' secret '{key}': {e}"));
             }
-            if !matches!(secret.secret_type.as_str(), "static" | "dynamic") {
-                errors.push(format!(
-                    "service '{name}' secret '{key}': type must be 'static' or 'dynamic', not '{}'",
-                    secret.secret_type
-                ));
+            match secret.secret_type.as_str() {
+                "static" => {
+                    if secret.engine.is_some() || secret.role.is_some() || secret.ttl.is_some() {
+                        errors.push(format!(
+                            "service '{name}' secret '{key}': engine, role and ttl are for dynamic secrets"
+                        ));
+                    }
+                }
+                "dynamic" => validate_dynamic_secret(config, name, key, secret, &mut errors),
+                other => errors.push(format!(
+                    "service '{name}' secret '{key}': type must be 'static' or 'dynamic', not '{other}'"
+                )),
             }
         }
 
@@ -1860,21 +1963,68 @@ mod nix_module_tests {
             }))
             .unwrap()
         };
-        let ok = config(serde_json::json!({
+        let with_engine = |mut config: FleetConfig| {
+            config.secret_engines.insert(
+                "pg".into(),
+                SecretEngineConfig {
+                    admin_url_secret: "pg-admin".into(),
+                    database: "shop".into(),
+                },
+            );
+            config
+        };
+        let ok = with_engine(config(serde_json::json!({
             "token": {},
-            "db": {"type": "dynamic", "engine": "postgres", "role": "ro"},
+            "db": {"type": "dynamic", "engine": "pg", "role": "readonly", "ttl": 3600},
             "api-key": {"type": "static"},
-        }));
+            // As the Nix module emits a static secret.
+            "plain": {"type": "static", "engine": null, "role": null, "ttl": null},
+        })));
         assert!(validate(&ok).is_ok(), "{:?}", validate(&ok));
-        assert_eq!(static_secrets(&ok.services["api"]), ["api-key", "token"]);
+        assert_eq!(
+            static_secrets(&ok.services["api"]),
+            ["api-key", "plain", "token"]
+        );
+        assert_eq!(
+            declared_secrets(&ok.services["api"]),
+            ["api-key", "db", "plain", "token"]
+        );
+        assert!(is_dynamic_secret(&ok, "api", "db"));
+        assert!(!is_dynamic_secret(&ok, "api", "token"));
 
-        let bad = config(serde_json::json!({
+        let bad = with_engine(config(serde_json::json!({
             "../x": {},
             "y": {"type": "vault"},
-        }));
+            "a": {"type": "dynamic", "engine": "mysql", "role": "readonly"},
+            "b": {"type": "dynamic", "engine": "pg", "role": "rw"},
+            "c": {"type": "dynamic", "engine": "pg", "role": "admin", "ttl": 10},
+            "d": {"type": "dynamic"},
+            "e": {"role": "readonly"},
+        })));
         let errors = validate(&bad).unwrap_err().join("\n");
         assert!(errors.contains("secret '../x': secret name"), "{errors}");
         assert!(errors.contains("secret 'y': type must be"), "{errors}");
+        assert!(
+            errors.contains("secret 'a': engine 'mysql' is not in secretEngines"),
+            "{errors}"
+        );
+        assert!(errors.contains("secret 'b': unknown role 'rw'"), "{errors}");
+        assert!(
+            errors.contains("secret 'c': ttl must be at least"),
+            "{errors}"
+        );
+        assert!(
+            errors.contains("secret 'd': a dynamic secret needs an engine"),
+            "{errors}"
+        );
+        assert!(
+            errors.contains("secret 'd': a dynamic secret needs a role"),
+            "{errors}"
+        );
+        assert!(
+            errors.contains("secret 'e': engine, role and ttl are for dynamic"),
+            "{errors}"
+        );
     }
 
     #[test]

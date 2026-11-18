@@ -47,18 +47,24 @@ pub enum DbDriverError {
 
 /// Provision a database user with the given credentials.
 ///
-/// Connects to the database at `connection_url`, creates the user,
-/// and grants permissions according to the role template.
+/// Connects to the database at `connection_url`, creates the user, grants
+/// permissions according to the role template, and has the database expire
+/// the password at `valid_until` (Unix seconds).
 pub async fn provision_credentials(
     engine: &DbEngine,
     connection_url: &str,
     username: &str,
     password: &str,
     role: &RoleTemplate,
+    valid_until: u64,
 ) -> Result<(), DbDriverError> {
     match engine {
-        DbEngine::Postgres => provision_postgres(connection_url, username, password, role).await,
-        DbEngine::Mysql => provision_mysql(connection_url, username, password, role).await,
+        DbEngine::Postgres => {
+            provision_postgres(connection_url, username, password, role, valid_until).await
+        }
+        DbEngine::Mysql => {
+            provision_mysql(connection_url, username, password, role, valid_until).await
+        }
     }
 }
 
@@ -91,21 +97,6 @@ pub fn detect_engine(connection_url: &str) -> Result<DbEngine, DbDriverError> {
     }
 }
 
-/// Parse a role name into a RoleTemplate.
-pub fn parse_role(role_name: &str, database: &str) -> RoleTemplate {
-    let permissions = match role_name {
-        "readonly" | "ro" | "read" => Permissions::ReadOnly,
-        "readwrite" | "rw" | "write" => Permissions::ReadWrite,
-        "admin" | "superuser" | "all" => Permissions::Admin,
-        _ => Permissions::ReadOnly, // default to least privilege
-    };
-
-    RoleTemplate {
-        database: database.to_string(),
-        permissions,
-    }
-}
-
 // ─── PostgreSQL ─────────────────────────────────────────────────────
 
 async fn provision_postgres(
@@ -113,6 +104,7 @@ async fn provision_postgres(
     username: &str,
     password: &str,
     role: &RoleTemplate,
+    valid_until: u64,
 ) -> Result<(), DbDriverError> {
     use sqlx::Executor;
     use sqlx::postgres::PgPoolOptions;
@@ -168,11 +160,11 @@ async fn provision_postgres(
         .await
         .map_err(|e| DbDriverError::ProvisionFailed(format!("ALTER ROLE: {e}")))?;
 
-    // Set role to expire matching the lease TTL
+    // The password expires with the lease.
     let valid_sql = format!(
         "ALTER ROLE \"{}\" VALID UNTIL '{}'",
         escape_pg_ident(username),
-        pg_timestamp_hours(1),
+        pg_timestamp(valid_until),
     );
     pool.execute(valid_sql.as_str())
         .await
@@ -234,6 +226,7 @@ async fn provision_mysql(
     username: &str,
     password: &str,
     role: &RoleTemplate,
+    valid_until: u64,
 ) -> Result<(), DbDriverError> {
     use sqlx::Executor;
     use sqlx::mysql::MySqlPoolOptions;
@@ -284,10 +277,11 @@ async fn provision_mysql(
     );
     let _ = pool.execute(resource_sql.as_str()).await;
 
-    // Set password expiry matching the lease TTL
+    // MySQL expires passwords in whole days: round the lease up.
     let expire_sql = format!(
-        "ALTER USER '{}'@'%' PASSWORD EXPIRE INTERVAL 1 DAY",
+        "ALTER USER '{}'@'%' PASSWORD EXPIRE INTERVAL {} DAY",
         escape_mysql_ident(username),
+        mysql_expiry_days(valid_until),
     );
     let _ = pool.execute(expire_sql.as_str()).await;
 
@@ -359,19 +353,27 @@ fn escape_mysql_literal(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "\\'")
 }
 
-/// Generate a PostgreSQL timestamp N hours from now.
-fn pg_timestamp_hours(hours: u64) -> String {
-    let secs = std::time::SystemTime::now()
+fn now() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-        + hours * 3600;
+}
 
-    // Format as ISO 8601
-    let dt = time::OffsetDateTime::from_unix_timestamp(secs as i64)
-        .unwrap_or(time::OffsetDateTime::now_utc());
-    dt.format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_else(|_| "2099-01-01T00:00:00Z".to_string())
+/// A PostgreSQL timestamp for Unix time `secs`.
+fn pg_timestamp(secs: u64) -> String {
+    time::OffsetDateTime::from_unix_timestamp(secs as i64)
+        .ok()
+        .and_then(|dt| {
+            dt.format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        })
+        .unwrap_or_else(|| "infinity".to_string())
+}
+
+/// Days from now until `valid_until`, rounded up (at least one).
+fn mysql_expiry_days(valid_until: u64) -> u64 {
+    valid_until.saturating_sub(now()).div_ceil(86_400).max(1)
 }
 
 #[cfg(test)]
@@ -407,31 +409,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_role_readonly() {
-        let role = parse_role("readonly", "mydb");
-        assert!(matches!(role.permissions, Permissions::ReadOnly));
-        assert_eq!(role.database, "mydb");
-    }
-
-    #[test]
-    fn parse_role_readwrite() {
-        let role = parse_role("rw", "mydb");
-        assert!(matches!(role.permissions, Permissions::ReadWrite));
-    }
-
-    #[test]
-    fn parse_role_admin() {
-        let role = parse_role("admin", "mydb");
-        assert!(matches!(role.permissions, Permissions::Admin));
-    }
-
-    #[test]
-    fn parse_role_unknown_defaults_readonly() {
-        let role = parse_role("custom-role", "mydb");
-        assert!(matches!(role.permissions, Permissions::ReadOnly));
-    }
-
-    #[test]
     fn escape_pg_prevents_injection() {
         assert_eq!(escape_pg_ident("normal"), "normal");
         assert_eq!(escape_pg_ident("has\"quote"), "has\"\"quote");
@@ -452,9 +429,9 @@ mod tests {
     }
 
     #[test]
-    fn pg_timestamp_is_future() {
-        let ts = pg_timestamp_hours(1);
-        assert!(ts.contains('T'));
-        assert!(ts.len() > 10);
+    fn expiry_follows_the_lease() {
+        assert_eq!(pg_timestamp(86_400), "1970-01-02T00:00:00Z");
+        assert_eq!(mysql_expiry_days(0), 1);
+        assert_eq!(mysql_expiry_days(now() + 86_400 + 1), 2);
     }
 }

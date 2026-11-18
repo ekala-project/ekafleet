@@ -181,19 +181,35 @@ let
       description = ''
         `static`: a value set with `ekafleet secret set <service> <name>`,
         readable by the service at `/run/secrets/<name>`. The service starts
-        once every static secret it declares has a value. `dynamic`: issued by
-        a secret engine.
+        once every static secret it declares has a value. `dynamic`: database
+        credentials issued by `engine`, delivered at the same path as JSON
+        (`username`, `password`, `url`) and replaced before `ttl` runs out.
       '';
     };
     engine = mkOption {
       type = types.nullOr types.str;
       default = null;
-      description = "Secret engine.";
+      description = "Dynamic secrets: the `secretEngines` entry issuing them.";
     };
     role = mkOption {
-      type = types.nullOr types.str;
+      type = types.nullOr (
+        types.enum [
+          "readonly"
+          "readwrite"
+          "admin"
+        ]
+      );
       default = null;
-      description = "Secret role.";
+      description = "Dynamic secrets: privileges on the engine's database.";
+    };
+    ttl = mkOption {
+      type = types.nullOr types.ints.positive;
+      default = null;
+      description = ''
+        Dynamic secrets: lease length in seconds (default 86400, at least
+        300). A new user is issued two thirds of the way through, and the
+        service restarts to pick it up.
+      '';
     };
   };
 
@@ -1133,6 +1149,21 @@ let
     };
   };
 
+  # `SecretEngineConfig`.
+  secretEngine = strictSubmodule {
+    adminUrlSecret = mkOption {
+      type = types.str;
+      description = ''
+        Fleet secret (`ekafleet secret set _fleet <name>`) holding the admin
+        connection URL, e.g. `postgres://admin:pw@db:5432/postgres`.
+      '';
+    };
+    database = mkOption {
+      type = types.str;
+      description = "Database that issued users get access to.";
+    };
+  };
+
   # `NamespaceConfig`.
   namespace = strictSubmodule {
     quota = mkOption {
@@ -1246,6 +1277,11 @@ in
       type = types.attrsOf nodePool;
       default = { };
       description = "Node pools, keyed by name.";
+    };
+    secretEngines = mkOption {
+      type = types.attrsOf secretEngine;
+      default = { };
+      description = "Database engines issuing `dynamic` secrets, keyed by name.";
     };
     webhooks = mkOption {
       type = types.listOf eventWebhook;

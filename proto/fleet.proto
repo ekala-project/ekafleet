@@ -129,6 +129,10 @@ service FleetControl {
   rpc DeleteSecret(DeleteSecretRequest) returns (DeleteSecretResponse);
   rpc ListSecretVersions(ListSecretVersionsRequest) returns (ListSecretVersionsResponse);
   rpc RollbackSecret(RollbackSecretRequest) returns (RollbackSecretResponse);
+  // Dynamic database credentials: current users and users still to drop.
+  rpc ListDynamicLeases(ListDynamicLeasesRequest) returns (ListDynamicLeasesResponse);
+  // Drop a dynamic secret's user now; a new one is issued right away.
+  rpc RevokeDynamicSecret(RevokeDynamicSecretRequest) returns (RevokeDynamicSecretResponse);
 
   // Transit encryption: named keys held by the server. Workloads may call
   // TransitEncrypt/TransitDecrypt with their service SVID.
@@ -1446,6 +1450,41 @@ message RollbackSecretRequest {
 
 message RollbackSecretResponse {
   uint64 version = 1;  // the new current version
+}
+
+message ListDynamicLeasesRequest {
+  string service_name = 1;  // empty = all visible services
+}
+
+message DynamicLeaseInfo {
+  string service_name = 1;
+  string secret_name = 2;
+  string engine = 3;
+  string role = 4;
+  string username = 5;
+  uint64 issued_at = 6;
+  uint64 expires_at = 7;
+  uint64 renew_at = 8;
+}
+
+message RetiredUserInfo {
+  string engine = 1;
+  string username = 2;
+  uint64 drop_at = 3;
+}
+
+message ListDynamicLeasesResponse {
+  repeated DynamicLeaseInfo leases = 1;
+  repeated RetiredUserInfo retired = 2;  // only for fleet-wide principals
+}
+
+message RevokeDynamicSecretRequest {
+  string service_name = 1;
+  string secret_name = 2;
+}
+
+message RevokeDynamicSecretResponse {
+  bool revoked = 1;
 }
 
 // --- Transit ---

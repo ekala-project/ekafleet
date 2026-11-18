@@ -46,6 +46,13 @@ struct StateMachineInner {
     /// key (scope [`crate::secrets::transit::SEAL_SCOPE`]).
     #[serde(default)]
     transit_keys: BTreeMap<String, TransitKey>,
+    /// Dynamic secrets' current users: service → name → lease. Their
+    /// credentials are stored (sealed) in `secrets` like a static value.
+    #[serde(default)]
+    dynamic_leases: BTreeMap<String, BTreeMap<String, DynamicLease>>,
+    /// Database users still to drop.
+    #[serde(default)]
+    retired_users: Vec<RetiredUser>,
     /// DNS zone data
     dns_zones: HashMap<String, Vec<DnsEntry>>,
     /// General-purpose key-value store (used for volume tracking, etc.)
@@ -81,6 +88,33 @@ struct StateMachineInner {
 pub struct TransitKey {
     pub namespace: String,
     pub versions: Vec<Vec<u8>>,
+}
+
+/// The database user currently backing a dynamic secret.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DynamicLease {
+    pub engine: String,
+    pub role: String,
+    pub username: String,
+    pub issued_at: u64,
+    /// When the database stops accepting the user's password.
+    pub expires_at: u64,
+}
+
+impl DynamicLease {
+    /// When to issue a replacement: two thirds of the way through, leaving
+    /// the last third for services to pick it up before this one expires.
+    pub fn renew_at(&self) -> u64 {
+        self.issued_at + self.expires_at.saturating_sub(self.issued_at) * 2 / 3
+    }
+}
+
+/// A database user replaced or no longer declared, to drop at `drop_at`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetiredUser {
+    pub engine: String,
+    pub username: String,
+    pub drop_at: u64,
 }
 
 /// A cloud-provisioned machine instance tracked in Raft state.
@@ -254,6 +288,26 @@ pub enum Command {
     },
     DeleteTransitKey {
         name: String,
+    },
+    /// Store new credentials for a dynamic secret (a new version, without
+    /// history); the user they replace is retired at its expiry.
+    IssueDynamicSecret {
+        service_name: String,
+        secret_name: String,
+        encrypted_value: Vec<u8>,
+        lease: DynamicLease,
+    },
+    /// Remove a dynamic secret's value and lease, retiring its user at
+    /// `drop_at`.
+    RetireDynamicSecret {
+        service_name: String,
+        secret_name: String,
+        drop_at: u64,
+    },
+    /// A retired database user was dropped (or can never be).
+    ForgetRetiredUser {
+        engine: String,
+        username: String,
     },
     UpdateDns {
         zone: String,
@@ -556,6 +610,71 @@ impl FleetStateMachine {
             }
             Command::DeleteTransitKey { name } => {
                 state.transit_keys.remove(&name);
+            }
+            Command::IssueDynamicSecret {
+                service_name,
+                secret_name,
+                encrypted_value,
+                lease,
+            } => {
+                *state
+                    .secret_versions
+                    .entry(service_name.clone())
+                    .or_default()
+                    .entry(secret_name.clone())
+                    .or_default() += 1;
+                state
+                    .secrets
+                    .entry(service_name.clone())
+                    .or_default()
+                    .insert(secret_name.clone(), encrypted_value);
+                let previous = state
+                    .dynamic_leases
+                    .entry(service_name)
+                    .or_default()
+                    .insert(secret_name, lease);
+                if let Some(previous) = previous {
+                    state.retired_users.push(RetiredUser {
+                        engine: previous.engine,
+                        username: previous.username,
+                        drop_at: previous.expires_at,
+                    });
+                }
+            }
+            Command::RetireDynamicSecret {
+                service_name,
+                secret_name,
+                drop_at,
+            } => {
+                if let Some(svc) = state.secrets.get_mut(&service_name) {
+                    svc.remove(&secret_name);
+                    if svc.is_empty() {
+                        state.secrets.remove(&service_name);
+                    }
+                }
+                let lease = state
+                    .dynamic_leases
+                    .get_mut(&service_name)
+                    .and_then(|svc| svc.remove(&secret_name));
+                if state
+                    .dynamic_leases
+                    .get(&service_name)
+                    .is_some_and(BTreeMap::is_empty)
+                {
+                    state.dynamic_leases.remove(&service_name);
+                }
+                if let Some(lease) = lease {
+                    state.retired_users.push(RetiredUser {
+                        engine: lease.engine,
+                        username: lease.username,
+                        drop_at,
+                    });
+                }
+            }
+            Command::ForgetRetiredUser { engine, username } => {
+                state
+                    .retired_users
+                    .retain(|u| !(u.engine == engine && u.username == username));
             }
             Command::UpdateDns { zone, entries } => {
                 let dns_entries: Vec<DnsEntry> = entries
@@ -948,6 +1067,80 @@ impl FleetStateMachine {
         )
         .await
         .map(|_| true)
+    }
+
+    /// Every dynamic secret's lease: service → name → lease.
+    pub async fn dynamic_leases(&self) -> BTreeMap<String, BTreeMap<String, DynamicLease>> {
+        self.inner.read().await.dynamic_leases.clone()
+    }
+
+    /// Database users waiting to be dropped.
+    pub async fn retired_users(&self) -> Vec<RetiredUser> {
+        self.inner.read().await.retired_users.clone()
+    }
+
+    /// Store new credentials for a dynamic secret; returns their version.
+    pub async fn issue_dynamic_secret(
+        &self,
+        service_name: &str,
+        secret_name: &str,
+        sealed: Vec<u8>,
+        lease: DynamicLease,
+    ) -> Result<u64, RaftError> {
+        let mut state = self.inner.write().await;
+        self.commit_locked(
+            &mut state,
+            Command::IssueDynamicSecret {
+                service_name: service_name.to_string(),
+                secret_name: secret_name.to_string(),
+                encrypted_value: sealed,
+                lease,
+            },
+        )
+        .await?;
+        Ok(state.secret_versions[service_name][secret_name])
+    }
+
+    /// Remove a dynamic secret, retiring its user at `drop_at`. Returns
+    /// whether it had a lease.
+    pub async fn retire_dynamic_secret(
+        &self,
+        service_name: &str,
+        secret_name: &str,
+        drop_at: u64,
+    ) -> Result<bool, RaftError> {
+        let mut state = self.inner.write().await;
+        if !state
+            .dynamic_leases
+            .get(service_name)
+            .is_some_and(|svc| svc.contains_key(secret_name))
+        {
+            return Ok(false);
+        }
+        self.commit_locked(
+            &mut state,
+            Command::RetireDynamicSecret {
+                service_name: service_name.to_string(),
+                secret_name: secret_name.to_string(),
+                drop_at,
+            },
+        )
+        .await
+        .map(|_| true)
+    }
+
+    /// Stop tracking a retired user.
+    pub async fn forget_retired_user(&self, engine: &str, username: &str) -> Result<(), RaftError> {
+        let mut state = self.inner.write().await;
+        self.commit_locked(
+            &mut state,
+            Command::ForgetRetiredUser {
+                engine: engine.to_string(),
+                username: username.to_string(),
+            },
+        )
+        .await
+        .map(|_| ())
     }
 
     /// Get a value from the key-value store.
@@ -1622,6 +1815,56 @@ mod tests {
 
         sm.delete_secret("web", "key").await.unwrap();
         assert!(sm.secret_history().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dynamic_secrets_replace_and_retire_their_users() {
+        let sm = FleetStateMachine::new();
+        let lease = |user: &str, issued_at: u64| DynamicLease {
+            engine: "pg".into(),
+            role: "readonly".into(),
+            username: user.into(),
+            issued_at,
+            expires_at: issued_at + 300,
+        };
+        assert_eq!(lease("a", 100).renew_at(), 300);
+        let v1 = sm
+            .issue_dynamic_secret("web", "db", b"one".to_vec(), lease("a", 100))
+            .await
+            .unwrap();
+        let v2 = sm
+            .issue_dynamic_secret("web", "db", b"two".to_vec(), lease("b", 300))
+            .await
+            .unwrap();
+        assert_eq!((v1, v2), (1, 2));
+        assert_eq!(sm.secrets().await["web"]["db"], (b"two".to_vec(), 2));
+        assert!(sm.secret_history().await.is_empty());
+        assert_eq!(sm.dynamic_leases().await["web"]["db"].username, "b");
+        // The replaced user is dropped when its password expires.
+        assert_eq!(
+            sm.retired_users().await,
+            [RetiredUser {
+                engine: "pg".into(),
+                username: "a".into(),
+                drop_at: 400,
+            }]
+        );
+
+        assert!(sm.retire_dynamic_secret("web", "db", 350).await.unwrap());
+        assert!(!sm.retire_dynamic_secret("web", "db", 350).await.unwrap());
+        assert!(sm.secrets().await.is_empty());
+        assert!(sm.dynamic_leases().await.is_empty());
+        assert_eq!(sm.retired_users().await.len(), 2);
+        sm.forget_retired_user("pg", "a").await.unwrap();
+        let left = sm.retired_users().await;
+        assert_eq!((left[0].username.as_str(), left[0].drop_at), ("b", 350));
+
+        // Issued again later, the version keeps climbing.
+        let v3 = sm
+            .issue_dynamic_secret("web", "db", b"three".to_vec(), lease("c", 500))
+            .await
+            .unwrap();
+        assert_eq!(v3, 3);
     }
 
     #[tokio::test]
