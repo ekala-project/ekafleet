@@ -708,6 +708,61 @@ pub async fn cmd_scale(service: String, count: u32, server: String) -> anyhow::R
     Ok(())
 }
 
+pub async fn cmd_rebalance(
+    apply: bool,
+    max_moves: u32,
+    services: Vec<String>,
+    server: String,
+) -> anyhow::Result<()> {
+    let mut client = connect_server(&server).await?;
+    let result = client
+        .rebalance(ekafleet::proto::RebalanceRequest {
+            apply,
+            max_moves,
+            services,
+        })
+        .await?
+        .into_inner();
+
+    let line = |m: &ekafleet::proto::RebalanceMove| {
+        format!(
+            "  {} ({}): {} -> {}",
+            m.service_name, m.instance_id, m.from_node, m.to_node
+        )
+    };
+    if !result.pending.is_empty() {
+        println!("In progress:");
+        for m in &result.pending {
+            println!("{}", line(m));
+        }
+    }
+    if result.moves.is_empty() {
+        println!("Nothing to move.");
+    } else {
+        println!(
+            "{}",
+            if result.applied {
+                "Moving:"
+            } else {
+                "Would move:"
+            }
+        );
+        for m in &result.moves {
+            println!("{}", line(m));
+        }
+    }
+    if !result.skipped.is_empty() {
+        println!("Not moved:");
+        for s in &result.skipped {
+            println!("  {}: {}", s.service_name, s.reason);
+        }
+    }
+    if !result.moves.is_empty() && !result.applied {
+        println!("Run with --apply to make these moves.");
+    }
+    Ok(())
+}
+
 /// Parse a duration like `90`, `30s`, `15m`, `1h` or `7d`.
 pub fn parse_duration(text: &str) -> anyhow::Result<std::time::Duration> {
     let text = text.trim();

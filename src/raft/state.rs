@@ -1021,6 +1021,49 @@ impl FleetStateMachine {
         .await
         .map(drop)
     }
+
+    /// Ask the reconciler to move a stateful instance to `node`: it prefers
+    /// that node for the instance instead of the one it runs on now.
+    pub async fn set_placement_move(
+        &self,
+        service_name: &str,
+        instance_id: &str,
+        node: &str,
+    ) -> Result<(), RaftError> {
+        self.apply_next(Command::KvPut {
+            key: format!("placement-move/{service_name}/{instance_id}"),
+            value: node.as_bytes().to_vec(),
+        })
+        .await
+        .map(drop)
+    }
+
+    /// Every requested move: `(service, instance)` → destination node.
+    pub async fn placement_moves(&self) -> BTreeMap<(String, String), String> {
+        let state = self.inner.read().await;
+        state
+            .kv
+            .iter()
+            .filter_map(|(key, value)| {
+                let (service, instance) = key.strip_prefix("placement-move/")?.split_once('/')?;
+                let node = String::from_utf8(value.clone()).ok()?;
+                Some(((service.to_string(), instance.to_string()), node))
+            })
+            .collect()
+    }
+
+    /// Forget a requested move, made or abandoned.
+    pub async fn clear_placement_move(
+        &self,
+        service_name: &str,
+        instance_id: &str,
+    ) -> Result<(), RaftError> {
+        self.apply_next(Command::KvDelete {
+            key: format!("placement-move/{service_name}/{instance_id}"),
+        })
+        .await
+        .map(drop)
+    }
 }
 
 #[cfg(test)]
@@ -1349,6 +1392,22 @@ mod tests {
         let again = durable(dir.path(), 1);
         again.load().await.unwrap();
         assert_eq!(again.get_replica_override("web").await, None);
+    }
+
+    #[tokio::test]
+    async fn placement_moves_are_listed_by_instance() {
+        let sm = FleetStateMachine::new();
+        sm.set_placement_move("db", "db-0", "node-3").await.unwrap();
+        sm.set_placement_move("db", "db-1", "node-1").await.unwrap();
+        sm.set_replica_override("db", 2).await.unwrap();
+        let moves = sm.placement_moves().await;
+        assert_eq!(moves.len(), 2);
+        assert_eq!(moves[&("db".into(), "db-0".into())], "node-3");
+        sm.clear_placement_move("db", "db-0").await.unwrap();
+        assert_eq!(
+            sm.placement_moves().await.into_keys().collect::<Vec<_>>(),
+            vec![("db".to_string(), "db-1".to_string())]
+        );
     }
 
     #[tokio::test]

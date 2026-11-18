@@ -31,13 +31,13 @@ use crate::proto::{
     ListAclTokensResponse, ListDeploymentsRequest, ListDeploymentsResponse, ListGenerationsRequest,
     ListGenerationsResponse, ListNodesRequest, ListNodesResponse, LogsChunk, LogsRequest,
     NodeDetail, OperationType, PlanRequest, PlanResponse, PlannedOperation, PromoteRequest,
-    PromoteResponse, RestoreRequest, RestoreResponse, RevokeAclTokenRequest,
-    RevokeAclTokenResponse, RollbackRequest, RollbackResponse, RotateFleetKeyRequest,
-    RotateFleetKeyResponse, ScaleRequest, ScaleResponse, ServerMessage, SnapshotRequest,
-    SnapshotResponse, StatusRequest, SwitchGenerationRequest, SwitchGenerationResponse,
-    SystemGcRequest, SystemGcResponse, SystemRebootRequest, SystemRebootResponse,
-    SystemRebuildRequest, SystemRebuildResponse, TopRequest, TopResponse, TrustBundleUpdate,
-    UpdateNodeRequest, UpdateNodeResponse,
+    PromoteResponse, RebalanceMove, RebalanceRequest, RebalanceResponse, RebalanceSkip,
+    RestoreRequest, RestoreResponse, RevokeAclTokenRequest, RevokeAclTokenResponse,
+    RollbackRequest, RollbackResponse, RotateFleetKeyRequest, RotateFleetKeyResponse, ScaleRequest,
+    ScaleResponse, ServerMessage, SnapshotRequest, SnapshotResponse, StatusRequest,
+    SwitchGenerationRequest, SwitchGenerationResponse, SystemGcRequest, SystemGcResponse,
+    SystemRebootRequest, SystemRebootResponse, SystemRebuildRequest, SystemRebuildResponse,
+    TopRequest, TopResponse, TrustBundleUpdate, UpdateNodeRequest, UpdateNodeResponse,
 };
 use crate::raft::state::FleetStateMachine;
 use crate::secrets::store::SecretStore;
@@ -1180,6 +1180,108 @@ impl FleetControl for FleetControlService {
             success: true,
             previous_count: current_count,
             new_count: req.desired_count,
+        }))
+    }
+
+    async fn rebalance(
+        &self,
+        request: Request<RebalanceRequest>,
+    ) -> Result<Response<RebalanceResponse>, Status> {
+        let apply = request.get_ref().apply;
+        require_permission(
+            &request,
+            if apply {
+                Permission::Scale
+            } else {
+                Permission::Read
+            },
+        )?;
+        for service in &request.get_ref().services {
+            self.require_service_access(&request, service).await?;
+        }
+        let config = self
+            .raft_state
+            .current_config()
+            .await
+            .ok_or_else(|| Status::failed_precondition("no configuration has been applied"))?
+            .config()
+            .map_err(|e| Status::internal(format!("current configuration unreadable: {e}")))?;
+        for service in &request.get_ref().services {
+            if !config.services.contains_key(service) {
+                return Err(Status::not_found(format!("no service '{service}'")));
+            }
+        }
+        let only = match (
+            self.visible_services(&request).await,
+            &request.get_ref().services,
+        ) {
+            (visible, requested) if requested.is_empty() => visible,
+            (_, requested) => Some(requested.iter().cloned().collect()),
+        };
+        let max_moves = request.get_ref().max_moves.max(1) as usize;
+
+        let inputs = super::reconciler::scheduling_inputs(
+            &config,
+            &self.state,
+            Some(&self.instance_tracker),
+            &self.raft_state,
+        )
+        .await;
+        let pending = self.raft_state.placement_moves().await;
+        let eval = super::rebalance::evaluate(&config, &inputs, &pending, only.as_ref(), max_moves);
+
+        if apply && !eval.moves.is_empty() {
+            for m in &eval.moves {
+                self.raft_state
+                    .set_placement_move(&m.service, &m.instance_id, &m.to_node)
+                    .await
+                    .map_err(|e| Status::internal(format!("failed to record move: {e}")))?;
+                let message = format!(
+                    "moving {} from {} to {}",
+                    m.instance_id, m.from_node, m.to_node
+                );
+                self.audit(
+                    &request,
+                    super::audit::AuditAction::Rebalance,
+                    &m.service,
+                    &message,
+                    super::audit::AuditOutcome::Success,
+                )
+                .await;
+                self.event_store
+                    .emit_kind(
+                        "rebalance.started",
+                        super::events::EventLevel::Info,
+                        super::events::EventCategory::Scheduling,
+                        Some(&m.service),
+                        Some(&m.to_node),
+                        &message,
+                    )
+                    .await;
+                tracing::info!(service = %m.service, instance = %m.instance_id,
+                    from = %m.from_node, to = %m.to_node, "Rebalance move requested");
+            }
+            self.state.reconcile_trigger().trigger();
+        }
+
+        let to_proto = |m: super::rebalance::Move| RebalanceMove {
+            service_name: m.service,
+            instance_id: m.instance_id,
+            from_node: m.from_node,
+            to_node: m.to_node,
+        };
+        Ok(Response::new(RebalanceResponse {
+            applied: apply && !eval.moves.is_empty(),
+            moves: eval.moves.into_iter().map(to_proto).collect(),
+            skipped: eval
+                .skipped
+                .into_iter()
+                .map(|s| RebalanceSkip {
+                    service_name: s.service,
+                    reason: s.reason,
+                })
+                .collect(),
+            pending: eval.pending.into_iter().map(to_proto).collect(),
         }))
     }
 

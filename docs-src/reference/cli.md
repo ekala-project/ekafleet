@@ -204,6 +204,14 @@ Scale a service to a desired replica count. Displays previous and new instance c
 ekafleet scale <SERVICE> <COUNT> [--server 127.0.0.1:7400]
 ```
 
+### `ekafleet rebalance`
+
+Show the moves that would put stateful instances back on the nodes the scheduler prefers, or make them with `--apply`. Each move migrates the instance's volumes. Moves respect disruption budgets, and at most `--max-moves` instances move per run. See [Rebalancing](../operations/scaling.md#rebalancing).
+
+```
+ekafleet rebalance [--apply] [--max-moves 1] [--service <SERVICE>]... [--server 127.0.0.1:7400]
+```
+
 ### `ekafleet logs <service>`
 
 Stream logs from service replicas. Replaces the old hint-only behavior with actual log streaming via gRPC.
