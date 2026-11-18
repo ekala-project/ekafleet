@@ -1643,6 +1643,54 @@ pub async fn cmd_secret_delete(
     Ok(())
 }
 
+pub async fn cmd_secret_versions(
+    service: String,
+    name: String,
+    server: String,
+) -> anyhow::Result<()> {
+    let mut client = connect_server(&server).await?;
+    let resp = client
+        .list_secret_versions(ekafleet::proto::ListSecretVersionsRequest {
+            service_name: service.clone(),
+            secret_name: name.clone(),
+        })
+        .await?
+        .into_inner();
+    if resp.current == 0 {
+        println!("Secret {service}/{name} has no value");
+        return Ok(());
+    }
+    println!("Secret {service}/{name}");
+    println!("  current: {}", resp.current);
+    if !resp.earlier.is_empty() {
+        let earlier: Vec<String> = resp.earlier.iter().rev().map(u64::to_string).collect();
+        println!("  earlier: {}", earlier.join(", "));
+    }
+    Ok(())
+}
+
+pub async fn cmd_secret_rollback(
+    service: String,
+    name: String,
+    version: u64,
+    server: String,
+) -> anyhow::Result<()> {
+    let mut client = connect_server(&server).await?;
+    let resp = client
+        .rollback_secret(ekafleet::proto::RollbackSecretRequest {
+            service_name: service.clone(),
+            secret_name: name.clone(),
+            version,
+        })
+        .await?
+        .into_inner();
+    println!(
+        "Secret {service}/{name}: version {version} restored as version {}",
+        resp.version
+    );
+    Ok(())
+}
+
 pub async fn cmd_acl_token_revoke(token: String, server: String) -> anyhow::Result<()> {
     let mut client = connect_server(&server).await?;
     let resp = client

@@ -127,6 +127,8 @@ service FleetControl {
   rpc SetSecret(SetSecretRequest) returns (SetSecretResponse);
   rpc ListSecrets(ListSecretsRequest) returns (ListSecretsResponse);
   rpc DeleteSecret(DeleteSecretRequest) returns (DeleteSecretResponse);
+  rpc ListSecretVersions(ListSecretVersionsRequest) returns (ListSecretVersionsResponse);
+  rpc RollbackSecret(RollbackSecretRequest) returns (RollbackSecretResponse);
 
   // Volume snapshots, kept on the node that holds the volume.
   rpc CreateVolumeSnapshot(VolumeSnapshotRequest) returns (VolumeSnapshotResponse);
@@ -1415,6 +1417,26 @@ message DeleteSecretRequest {
 
 message DeleteSecretResponse {
   bool deleted = 1;
+}
+
+message ListSecretVersionsRequest {
+  string service_name = 1;
+  string secret_name = 2;
+}
+
+message ListSecretVersionsResponse {
+  uint64 current = 1;            // 0 = no value
+  repeated uint64 earlier = 2;   // kept versions, oldest first
+}
+
+message RollbackSecretRequest {
+  string service_name = 1;
+  string secret_name = 2;
+  uint64 version = 3;
+}
+
+message RollbackSecretResponse {
+  uint64 version = 1;  // the new current version
 }
 
 // --- Volume snapshots ---

@@ -371,6 +371,20 @@ ACL token management.
 | `acl token revoke <TOKEN>` | Revoke a token |
 | `acl token list` | List registered tokens |
 
+### `ekafleet secret`
+
+Manage static secret values. Values are read from stdin (or `--file`), never from the command line, and are never printed.
+
+```
+ekafleet secret set <SERVICE> <NAME> [--file PATH]   # store a new version
+ekafleet secret list [SERVICE]                      # names, versions, declared or not
+ekafleet secret delete <SERVICE> <NAME>             # delete, with earlier versions
+ekafleet secret versions <SERVICE> <NAME>           # current and kept earlier versions
+ekafleet secret rollback <SERVICE> <NAME> <VERSION> # restore an earlier version
+```
+
+Fleet-level secrets (such as event webhook signing keys) use the reserved service name `_fleet`.
+
 ### `ekafleet service`
 
 Service introspection (systemd-specific).

@@ -4,7 +4,6 @@ pub mod injector;
 pub mod key_derivation;
 pub mod store;
 pub mod transit;
-pub mod versioned;
 
 /// Where the agent keeps decrypted static secrets: one directory per service
 /// on tmpfs, bind-mounted read-only at [`SERVICE_SECRETS_DIR`] in the unit.

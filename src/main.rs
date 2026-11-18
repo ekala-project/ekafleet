@@ -763,12 +763,34 @@ enum SecretAction {
         #[arg(long, default_value = "127.0.0.1:7400")]
         server: String,
     },
-    /// Delete a secret's value
+    /// Delete a secret's value, with its earlier versions
     Delete {
         /// Service the secret belongs to
         service: String,
         /// Secret name
         name: String,
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+    /// List a secret's current and kept earlier versions
+    Versions {
+        /// Service the secret belongs to
+        service: String,
+        /// Secret name
+        name: String,
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+    /// Make an earlier version current again (stored as a new version)
+    Rollback {
+        /// Service the secret belongs to
+        service: String,
+        /// Secret name
+        name: String,
+        /// Version to restore
+        version: u64,
         /// Server address
         #[arg(long, default_value = "127.0.0.1:7400")]
         server: String,
@@ -1347,6 +1369,17 @@ async fn main() -> anyhow::Result<()> {
                 name,
                 server,
             } => commands::cmd_secret_delete(service, name, server).await?,
+            SecretAction::Versions {
+                service,
+                name,
+                server,
+            } => commands::cmd_secret_versions(service, name, server).await?,
+            SecretAction::Rollback {
+                service,
+                name,
+                version,
+                server,
+            } => commands::cmd_secret_rollback(service, name, version, server).await?,
         },
 
         Command::Volume {
