@@ -2170,6 +2170,24 @@ impl FleetControl for FleetControlService {
         self.handle_delete_secret(request).await.map(Response::new)
     }
 
+    async fn list_secret_versions(
+        &self,
+        request: Request<crate::proto::ListSecretVersionsRequest>,
+    ) -> Result<Response<crate::proto::ListSecretVersionsResponse>, Status> {
+        self.handle_list_secret_versions(request)
+            .await
+            .map(Response::new)
+    }
+
+    async fn rollback_secret(
+        &self,
+        request: Request<crate::proto::RollbackSecretRequest>,
+    ) -> Result<Response<crate::proto::RollbackSecretResponse>, Status> {
+        self.handle_rollback_secret(request)
+            .await
+            .map(Response::new)
+    }
+
     async fn create_volume_snapshot(
         &self,
         request: Request<crate::proto::VolumeSnapshotRequest>,

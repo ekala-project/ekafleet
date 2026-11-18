@@ -142,8 +142,7 @@ src/
 │   ├── key_derivation.rs# Per-agent HKDF-SHA256 key derivation + re-encryption
 │   ├── injector.rs      # Agent-side secret file injection (mode 0400)
 │   ├── dynamic.rs       # Dynamic secret engine (PostgreSQL/MySQL credential rotation)
-│   ├── transit.rs       # Transit encryption (encrypt/decrypt named keys)
-│   └── versioned.rs     # Secret versioning with rollback
+│   └── transit.rs       # Transit encryption (encrypt/decrypt named keys)
 ├── dns/
 │   ├── mod.rs           # DNS module
 │   ├── authority.rs     # Authoritative DNS server for fleet domain (namespace-scoped zones)

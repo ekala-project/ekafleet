@@ -129,18 +129,19 @@ Secrets are scoped to services. A service can only access secrets declared in it
 
 ## Versioning & Rollback
 
-Each secret has a version number that increments on every update. The agent tracks injected versions to avoid unnecessary file writes. When a new version is pushed, the agent writes the updated value atomically.
-
-Previous versions are retained (up to a configurable limit, default 5) allowing rollback to a prior value if a secret update breaks authentication:
+Each secret has a version number that increments on every update; agents only rewrite a secret file when they receive a newer version. The server keeps the 9 versions before the current one, sealed like the current value and resealed with it when the fleet key rotates. Deleting a secret also deletes its earlier versions.
 
 ```bash
-# List available versions
-curl -H "Authorization: Bearer $TOKEN" http://server:7402/v1/secrets/api-server/db-password/versions
+ekafleet secret versions api-server db-password
+# Secret api-server/db-password
+#   current: 7
+#   earlier: 6, 5, 4
 
-# Rollback to a specific version
-curl -X POST -H "Authorization: Bearer $TOKEN" \
-  http://server:7402/v1/secrets/api-server/db-password/rollback?version=3
+ekafleet secret rollback api-server db-password 5
+# Secret api-server/db-password: version 5 restored as version 8
 ```
+
+A rollback stores the old value as a new version, so agents pick it up like any other update. Listing versions needs `Read`; rolling back needs `ManageSecrets` (and is audited).
 
 ## Secret Rotation Notification
 

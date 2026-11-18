@@ -12,6 +12,12 @@ use super::storage::{LogEntry, RaftStorage};
 const TERM: u64 = 1;
 
 /// Fleet state machine for Raft consensus.
+/// Earlier versions kept per static secret, for `ekafleet secret rollback`.
+pub const SECRET_HISTORY: usize = 9;
+
+/// service → name → earlier (version, sealed value), oldest first.
+pub type SecretHistory = HashMap<String, HashMap<String, Vec<(u64, Vec<u8>)>>>;
+
 /// Stores all persistent fleet state: deployments, secrets, DNS, scheduling plans.
 #[derive(Clone)]
 pub struct FleetStateMachine {
@@ -32,6 +38,10 @@ struct StateMachineInner {
     /// set again gets a higher version than any agent has seen.
     #[serde(default)]
     secret_versions: HashMap<String, HashMap<String, u64>>,
+    /// service → name → earlier (version, sealed value), oldest first; at
+    /// most [`SECRET_HISTORY`] per secret. Dropped with the secret.
+    #[serde(default)]
+    secret_history: SecretHistory,
     /// DNS zone data
     dns_zones: HashMap<String, Vec<DnsEntry>>,
     /// General-purpose key-value store (used for volume tracking, etc.)
@@ -218,6 +228,9 @@ pub enum Command {
     /// keeping versions (fleet key rotation).
     ResealSecrets {
         secrets: HashMap<String, HashMap<String, Vec<u8>>>,
+        /// Earlier versions, resealed too: service → name → version → value.
+        #[serde(default)]
+        history: HashMap<String, HashMap<String, HashMap<u64, Vec<u8>>>>,
     },
     UpdateDns {
         zone: String,
@@ -439,17 +452,30 @@ impl FleetStateMachine {
                 secret_name,
                 encrypted_value,
             } => {
-                *state
+                let version = state
                     .secret_versions
                     .entry(service_name.clone())
                     .or_default()
                     .entry(secret_name.clone())
-                    .or_default() += 1;
-                state
+                    .or_default();
+                let previous_version = *version;
+                *version += 1;
+                let previous = state
                     .secrets
-                    .entry(service_name)
+                    .entry(service_name.clone())
                     .or_default()
-                    .insert(secret_name, encrypted_value);
+                    .insert(secret_name.clone(), encrypted_value);
+                if let Some(previous) = previous {
+                    let history = state
+                        .secret_history
+                        .entry(service_name)
+                        .or_default()
+                        .entry(secret_name)
+                        .or_default();
+                    history.push((previous_version, previous));
+                    let excess = history.len().saturating_sub(SECRET_HISTORY);
+                    history.drain(..excess);
+                }
             }
             Command::DeleteSecret {
                 service_name,
@@ -461,13 +487,31 @@ impl FleetStateMachine {
                         state.secrets.remove(&service_name);
                     }
                 }
+                if let Some(svc) = state.secret_history.get_mut(&service_name) {
+                    svc.remove(&secret_name);
+                    if svc.is_empty() {
+                        state.secret_history.remove(&service_name);
+                    }
+                }
             }
-            Command::ResealSecrets { secrets } => {
+            Command::ResealSecrets { secrets, history } => {
                 for (service, values) in secrets {
                     if let Some(stored) = state.secrets.get_mut(&service) {
                         for (name, sealed) in values {
                             if let Some(slot) = stored.get_mut(&name) {
                                 *slot = sealed;
+                            }
+                        }
+                    }
+                }
+                for (service, values) in history {
+                    let Some(stored) = state.secret_history.get_mut(&service) else {
+                        continue;
+                    };
+                    for (name, mut versions) in values {
+                        for (version, sealed) in stored.get_mut(&name).into_iter().flatten() {
+                            if let Some(resealed) = versions.remove(version) {
+                                *sealed = resealed;
                             }
                         }
                     }
@@ -698,6 +742,36 @@ impl FleetStateMachine {
         Ok(state.secret_versions[service_name][secret_name])
     }
 
+    /// Make an earlier version of a secret current again, as a new version.
+    /// Returns that version, or `None` if `version` isn't kept.
+    pub async fn rollback_secret(
+        &self,
+        service_name: &str,
+        secret_name: &str,
+        version: u64,
+    ) -> Result<Option<u64>, RaftError> {
+        let mut state = self.inner.write().await;
+        let Some(sealed) = state
+            .secret_history
+            .get(service_name)
+            .and_then(|s| s.get(secret_name))
+            .and_then(|h| h.iter().find(|(v, _)| *v == version))
+            .map(|(_, sealed)| sealed.clone())
+        else {
+            return Ok(None);
+        };
+        self.commit_locked(
+            &mut state,
+            Command::PutSecret {
+                service_name: service_name.to_string(),
+                secret_name: secret_name.to_string(),
+                encrypted_value: sealed,
+            },
+        )
+        .await?;
+        Ok(Some(state.secret_versions[service_name][secret_name]))
+    }
+
     /// Delete a secret's value. Returns whether it had one.
     pub async fn delete_secret(
         &self,
@@ -743,13 +817,21 @@ impl FleetStateMachine {
             .collect()
     }
 
-    /// Replace sealed values after a fleet key rotation (versions kept).
+    /// Earlier versions of every secret: service → name → [(version,
+    /// sealed value)], oldest first.
+    pub async fn secret_history(&self) -> SecretHistory {
+        self.inner.read().await.secret_history.clone()
+    }
+
+    /// Replace sealed values, current and earlier, after a fleet key
+    /// rotation (versions kept).
     pub async fn reseal_secrets(
         &self,
         secrets: HashMap<String, HashMap<String, Vec<u8>>>,
+        history: HashMap<String, HashMap<String, HashMap<u64, Vec<u8>>>>,
     ) -> Result<(), RaftError> {
         let mut state = self.inner.write().await;
-        self.commit_locked(&mut state, Command::ResealSecrets { secrets })
+        self.commit_locked(&mut state, Command::ResealSecrets { secrets, history })
             .await
             .map(drop)
     }
@@ -1102,6 +1184,7 @@ mod tests {
                 ),
             ]
             .into(),
+            HashMap::new(),
         )
         .await
         .unwrap();
@@ -1392,6 +1475,37 @@ mod tests {
         let again = durable(dir.path(), 1);
         again.load().await.unwrap();
         assert_eq!(again.get_replica_override("web").await, None);
+    }
+
+    #[tokio::test]
+    async fn earlier_secret_versions_are_kept_resealed_and_restorable() {
+        let sm = FleetStateMachine::new();
+        for i in 1..=(SECRET_HISTORY as u8 + 3) {
+            sm.put_secret("web", "key", vec![i]).await.unwrap();
+        }
+        let history = &sm.secret_history().await["web"]["key"];
+        assert_eq!(history.len(), SECRET_HISTORY);
+        // Versions 1-2 fell out; 3..=11 are kept, 12 is current.
+        assert_eq!(history[0], (3, vec![3]));
+        assert_eq!(sm.rollback_secret("web", "key", 2).await.unwrap(), None);
+        assert_eq!(sm.rollback_secret("web", "key", 5).await.unwrap(), Some(13));
+        assert_eq!(sm.secrets().await["web"]["key"], (vec![5], 13));
+
+        sm.reseal_secrets(
+            HashMap::new(),
+            [(
+                "web".into(),
+                [("key".into(), [(12, b"R".to_vec())].into())].into(),
+            )]
+            .into(),
+        )
+        .await
+        .unwrap();
+        let history = &sm.secret_history().await["web"]["key"];
+        assert!(history.contains(&(12, b"R".to_vec())));
+
+        sm.delete_secret("web", "key").await.unwrap();
+        assert!(sm.secret_history().await.is_empty());
     }
 
     #[tokio::test]

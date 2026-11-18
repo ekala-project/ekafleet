@@ -787,3 +787,57 @@ async fn rebalance_needs_an_applied_configuration() {
         .await;
     assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
 }
+
+#[tokio::test]
+async fn secret_versions_roll_back() {
+    let (grpc_addr, _, ca_cert_pem, token) = start_server().await;
+    let mut client = connect_client(grpc_addr, &ca_cert_pem, &token).await;
+    for value in ["one", "two", "three"] {
+        client
+            .set_secret(ekafleet::proto::SetSecretRequest {
+                service_name: "web".into(),
+                secret_name: "api-key".into(),
+                value: value.as_bytes().to_vec(),
+            })
+            .await
+            .unwrap();
+    }
+    let listed = client
+        .list_secret_versions(ekafleet::proto::ListSecretVersionsRequest {
+            service_name: "web".into(),
+            secret_name: "api-key".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!((listed.current, listed.earlier), (3, vec![1, 2]));
+
+    let restored = client
+        .rollback_secret(ekafleet::proto::RollbackSecretRequest {
+            service_name: "web".into(),
+            secret_name: "api-key".into(),
+            version: 1,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(restored.version, 4);
+    let listed = client
+        .list_secret_versions(ekafleet::proto::ListSecretVersionsRequest {
+            service_name: "web".into(),
+            secret_name: "api-key".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!((listed.current, listed.earlier), (4, vec![1, 2, 3]));
+
+    let missing = client
+        .rollback_secret(ekafleet::proto::RollbackSecretRequest {
+            service_name: "web".into(),
+            secret_name: "api-key".into(),
+            version: 9,
+        })
+        .await;
+    assert_eq!(missing.unwrap_err().code(), tonic::Code::NotFound);
+}
