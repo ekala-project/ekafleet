@@ -841,3 +841,61 @@ async fn secret_versions_roll_back() {
         .await;
     assert_eq!(missing.unwrap_err().code(), tonic::Code::NotFound);
 }
+
+#[tokio::test]
+async fn transit_encrypts_and_decrypts_across_rotation() {
+    let (grpc_addr, _, ca_cert_pem, token) = start_server().await;
+    let mut client = connect_client(grpc_addr, &ca_cert_pem, &token).await;
+    let key = client
+        .create_transit_key(ekafleet::proto::CreateTransitKeyRequest {
+            name: "orders".into(),
+            namespace: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!((key.namespace.as_str(), key.latest_version), ("default", 1));
+    let encrypt = |plaintext: &[u8]| ekafleet::proto::TransitEncryptRequest {
+        key_name: "orders".into(),
+        plaintext: plaintext.to_vec(),
+    };
+    let v1 = client
+        .transit_encrypt(encrypt(b"4242"))
+        .await
+        .unwrap()
+        .into_inner()
+        .ciphertext;
+    client
+        .rotate_transit_key(ekafleet::proto::RotateTransitKeyRequest {
+            name: "orders".into(),
+        })
+        .await
+        .unwrap();
+    let v2 = client
+        .transit_encrypt(encrypt(b"4242"))
+        .await
+        .unwrap()
+        .into_inner()
+        .ciphertext;
+    assert!(v1.starts_with("ekafleet:v1:") && v2.starts_with("ekafleet:v2:"));
+    for ciphertext in [v1, v2] {
+        let plain = client
+            .transit_decrypt(ekafleet::proto::TransitDecryptRequest {
+                key_name: "orders".into(),
+                ciphertext,
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .plaintext;
+        assert_eq!(plain, b"4242");
+    }
+    let keys = client
+        .list_transit_keys(ekafleet::proto::ListTransitKeysRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+        .keys;
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].latest_version, 2);
+}

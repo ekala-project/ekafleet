@@ -26,6 +26,7 @@ services.<name> = {
   container     = ContainerConfig;       # OCI container config (required unless command is set)
   ports         = { <name> = PortConfig; };
   secrets       = { <name> = SecretConfig; };
+  transitKeys   = [ "string" ];          # Transit keys its SVID may use (optional)
   identity      = IdentityConfig;
   resources     = ResourceConfig;
   scheduling    = SchedulingConfig;

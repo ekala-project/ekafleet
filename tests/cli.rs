@@ -411,3 +411,23 @@ fn logs_help() {
 fn logs_fails_without_server() {
     ekafleet().args(["logs", "web"]).assert().failure();
 }
+
+// ─── Transit subcommand ─────────────────────────────────────────────
+
+#[test]
+fn transit_key_delete_needs_confirmation() {
+    ekafleet()
+        .args(["transit", "key", "delete", "orders"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("pass --yes"));
+}
+
+#[test]
+fn transit_cert_needs_its_key() {
+    ekafleet()
+        .args(["transit", "encrypt", "orders", "--cert", "svid.pem"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--key-file"));
+}

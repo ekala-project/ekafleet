@@ -99,6 +99,7 @@ fn make_service(name: &str, cpu: u64, memory: u64, replicas: u32) -> (String, Se
             namespace: String::new(),
             metrics: None,
             store_paths: vec![],
+            transit_keys: vec![],
         },
     )
 }
@@ -175,6 +176,7 @@ fn constraint_filtering() {
             namespace: String::new(),
             metrics: None,
             store_paths: vec![],
+            transit_keys: vec![],
         },
     )]
     .into();
@@ -227,6 +229,7 @@ fn system_job_all_nodes() {
             namespace: String::new(),
             metrics: None,
             store_paths: vec![],
+            transit_keys: vec![],
         },
     )]
     .into();
@@ -311,6 +314,7 @@ fn pool_affinity_prefers_correct_pool() {
             namespace: String::new(),
             metrics: None,
             store_paths: vec![],
+            transit_keys: vec![],
         },
     )]
     .into();
@@ -387,6 +391,7 @@ fn pool_affinity_spills_when_full() {
             namespace: String::new(),
             metrics: None,
             store_paths: vec![],
+            transit_keys: vec![],
         },
     )]
     .into();
@@ -468,6 +473,7 @@ fn pool_hard_constraint_blocks_spillover() {
             namespace: String::new(),
             metrics: None,
             store_paths: vec![],
+            transit_keys: vec![],
         },
     )]
     .into();
@@ -587,6 +593,7 @@ fn pool_labels_merged() {
             namespace: String::new(),
             metrics: None,
             store_paths: vec![],
+            transit_keys: vec![],
         },
     )]
     .into();
@@ -684,6 +691,7 @@ fn system_job_on_pool() {
             namespace: String::new(),
             metrics: None,
             store_paths: vec![],
+            transit_keys: vec![],
         },
     )]
     .into();
@@ -742,6 +750,7 @@ fn constraint_numeric_operators() {
             namespace: String::new(),
             metrics: None,
             store_paths: vec![],
+            transit_keys: vec![],
         },
     )]
     .into();
@@ -797,6 +806,7 @@ fn constraint_regexp() {
             namespace: String::new(),
             metrics: None,
             store_paths: vec![],
+            transit_keys: vec![],
         },
     )]
     .into();
@@ -852,6 +862,7 @@ fn constraint_is_set() {
             namespace: String::new(),
             metrics: None,
             store_paths: vec![],
+            transit_keys: vec![],
         },
     )]
     .into();
@@ -924,6 +935,7 @@ fn multiple_spread_blocks() {
             namespace: String::new(),
             metrics: None,
             store_paths: vec![],
+            transit_keys: vec![],
         },
     )]
     .into();
@@ -983,6 +995,7 @@ fn priority_ordering() {
                 namespace: String::new(),
                 metrics: None,
                 store_paths: vec![],
+                transit_keys: vec![],
             },
         ),
         (
@@ -1019,6 +1032,7 @@ fn priority_ordering() {
                 namespace: String::new(),
                 metrics: None,
                 store_paths: vec![],
+                transit_keys: vec![],
             },
         ),
     ]
@@ -1105,6 +1119,7 @@ fn taint_blocks_non_tolerating_service() {
             namespace: String::new(),
             metrics: None,
             store_paths: vec![],
+            transit_keys: vec![],
         },
     )]
     .into();
@@ -1154,6 +1169,7 @@ fn sysbatch_runs_on_all_nodes() {
             namespace: String::new(),
             metrics: None,
             store_paths: vec![],
+            transit_keys: vec![],
         },
     )]
     .into();
@@ -1204,6 +1220,7 @@ fn stateful_sticky_placement_prefers_current_node() {
             namespace: String::new(),
             metrics: None,
             store_paths: vec![],
+            transit_keys: vec![],
         },
     )]
     .into();
@@ -1263,6 +1280,7 @@ fn non_stateful_ignores_current_placement() {
             namespace: String::new(),
             metrics: None,
             store_paths: vec![],
+            transit_keys: vec![],
         },
     )]
     .into();
@@ -1322,6 +1340,7 @@ fn stateful_sticky_falls_back_when_node_gone() {
             namespace: String::new(),
             metrics: None,
             store_paths: vec![],
+            transit_keys: vec![],
         },
     )]
     .into();

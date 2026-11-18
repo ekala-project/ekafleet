@@ -57,19 +57,42 @@ secrets.db = {
 
 ### Transit Encryption
 
-Provides encrypt/decrypt operations using named keys — application secrets never leave the server.
+Transit keys let services encrypt data (for example, columns before they are written to a database) without ever holding a key. The server keeps each key in Raft, sealed under the fleet key, and does the encryption and decryption itself.
 
-```nix
-# Services call the transit API to encrypt/decrypt data
-# without having access to the raw encryption key
+```bash
+ekafleet transit key create orders            # in namespace "default"
+ekafleet --namespace shop transit key create carts
+echo -n 4242424242424242 | ekafleet transit encrypt orders
+# ekafleet:v1:3q2+7w...
+ekafleet transit decrypt orders <<< 'ekafleet:v1:3q2+7w...'
+ekafleet transit key rotate orders            # new values use v2; v1 values still decrypt
+ekafleet transit key list
+ekafleet transit key delete orders --yes      # values encrypted with it are lost
 ```
 
-**Operations:**
-- `create_key(name)` — create a named AES-256-GCM key
-- `encrypt(key_name, plaintext)` — encrypt with named key
-- `decrypt(key_name, ciphertext)` — decrypt with named key
+Ciphertext is `ekafleet:v<version>:<base64>` (AES-256-GCM with a random nonce). The key name and version are authenticated, so a value only decrypts with the key and version that made it. Plaintext is limited to 1 MiB.
 
-Useful for services that need to encrypt data at rest but shouldn't hold the encryption key directly.
+**Who may use a key:**
+
+- Operators and admins, with `Read` to list keys, `ManageSecrets` to create, rotate, or delete them (audited), and `Transit` to encrypt and decrypt. A namespace-scoped token only sees its namespace's keys; keys it creates go in that namespace.
+- Workloads, authenticating over mTLS with their service SVID (`spiffe://<domain>/service/<name>`). A service may only use the keys it lists in `transitKeys`, and only keys in its own namespace. Workloads can't list or manage keys.
+
+```nix
+services.checkout = {
+  namespace = "shop";
+  transitKeys = [ "carts" ];
+  # ...
+};
+```
+
+A workload calls the `TransitEncrypt` and `TransitDecrypt` RPCs with its SVID, or runs the CLI:
+
+```bash
+ekafleet --ca-cert bundle.pem --server fleet:7400 \
+  transit encrypt carts --cert svid.pem --key-file svid-key.pem < cart.json
+```
+
+Rotating the fleet key reseals every version of every transit key along with the static secrets. Rotating a transit key never rewrites existing ciphertext; re-encrypt values yourself if old versions must stop being used.
 
 ## How It Works
 
@@ -118,14 +141,7 @@ Secrets are scoped to services. A service can only access secrets declared in it
 
 ## Secret Injection Path
 
-```text
-/var/lib/ekafleet/secrets/
-├── api-server/
-│   ├── api-key          (static secret)
-│   └── db               (dynamic: contains connection URL)
-└── web-frontend/
-    └── session-secret
-```
+The agent writes each secret of a service (mode `0400`) under `/run/ekafleet/secrets/<service>/`, and binds that directory read-only at `/run/secrets` inside the service, so a service reads its secret `api-key` at `/run/secrets/api-key`.
 
 ## Versioning & Rollback
 
@@ -145,9 +161,7 @@ A rollback stores the old value as a new version, so agents pick it up like any 
 
 ## Secret Rotation Notification
 
-When a secret is updated on disk, the agent can signal the service to reload without restart. By default, `SIGHUP` is sent to the service's systemd unit after writing the new secret value. This enables zero-downtime credential rotation.
-
-The signal is only sent when the secret value actually changes (not on no-op version checks). If the signal delivery fails (e.g., process not running), the failure is logged but does not block the secret injection.
+When a secret's value changes, the agent rewrites the file and restarts the services on that node that declare it, so they read the new value (templates that use it are re-rendered first).
 
 ## Dynamic Secret Connection URLs
 

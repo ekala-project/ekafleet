@@ -42,6 +42,10 @@ struct StateMachineInner {
     /// most [`SECRET_HISTORY`] per secret. Dropped with the secret.
     #[serde(default)]
     secret_history: SecretHistory,
+    /// Transit keys by name; each version's key is sealed under the fleet
+    /// key (scope [`crate::secrets::transit::SEAL_SCOPE`]).
+    #[serde(default)]
+    transit_keys: BTreeMap<String, TransitKey>,
     /// DNS zone data
     dns_zones: HashMap<String, Vec<DnsEntry>>,
     /// General-purpose key-value store (used for volume tracking, etc.)
@@ -69,6 +73,14 @@ struct StateMachineInner {
     config_revisions: Vec<ConfigRevision>,
     /// Last applied log index
     last_applied: u64,
+}
+
+/// A transit encryption key: its namespace and every version, oldest
+/// first (version N at index N-1), each sealed under the fleet key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransitKey {
+    pub namespace: String,
+    pub versions: Vec<Vec<u8>>,
 }
 
 /// A cloud-provisioned machine instance tracked in Raft state.
@@ -231,6 +243,17 @@ pub enum Command {
         /// Earlier versions, resealed too: service → name → version → value.
         #[serde(default)]
         history: HashMap<String, HashMap<String, HashMap<u64, Vec<u8>>>>,
+        /// Transit keys, resealed: name → every version.
+        #[serde(default)]
+        transit: HashMap<String, Vec<Vec<u8>>>,
+    },
+    /// Create, rotate (a version added) or replace a transit key.
+    PutTransitKey {
+        name: String,
+        key: TransitKey,
+    },
+    DeleteTransitKey {
+        name: String,
     },
     UpdateDns {
         zone: String,
@@ -494,7 +517,18 @@ impl FleetStateMachine {
                     }
                 }
             }
-            Command::ResealSecrets { secrets, history } => {
+            Command::ResealSecrets {
+                secrets,
+                history,
+                transit,
+            } => {
+                for (name, versions) in transit {
+                    if let Some(key) = state.transit_keys.get_mut(&name)
+                        && key.versions.len() == versions.len()
+                    {
+                        key.versions = versions;
+                    }
+                }
                 for (service, values) in secrets {
                     if let Some(stored) = state.secrets.get_mut(&service) {
                         for (name, sealed) in values {
@@ -516,6 +550,12 @@ impl FleetStateMachine {
                         }
                     }
                 }
+            }
+            Command::PutTransitKey { name, key } => {
+                state.transit_keys.insert(name, key);
+            }
+            Command::DeleteTransitKey { name } => {
+                state.transit_keys.remove(&name);
             }
             Command::UpdateDns { zone, entries } => {
                 let dns_entries: Vec<DnsEntry> = entries
@@ -829,11 +869,85 @@ impl FleetStateMachine {
         &self,
         secrets: HashMap<String, HashMap<String, Vec<u8>>>,
         history: HashMap<String, HashMap<String, HashMap<u64, Vec<u8>>>>,
+        transit: HashMap<String, Vec<Vec<u8>>>,
     ) -> Result<(), RaftError> {
         let mut state = self.inner.write().await;
-        self.commit_locked(&mut state, Command::ResealSecrets { secrets, history })
-            .await
-            .map(drop)
+        self.commit_locked(
+            &mut state,
+            Command::ResealSecrets {
+                secrets,
+                history,
+                transit,
+            },
+        )
+        .await
+        .map(drop)
+    }
+
+    /// Every transit key, by name.
+    pub async fn transit_keys(&self) -> BTreeMap<String, TransitKey> {
+        self.inner.read().await.transit_keys.clone()
+    }
+
+    pub async fn transit_key(&self, name: &str) -> Option<TransitKey> {
+        self.inner.read().await.transit_keys.get(name).cloned()
+    }
+
+    /// Store a new transit key; false if one with that name exists.
+    pub async fn create_transit_key(&self, name: &str, key: TransitKey) -> Result<bool, RaftError> {
+        let mut state = self.inner.write().await;
+        if state.transit_keys.contains_key(name) {
+            return Ok(false);
+        }
+        self.commit_locked(
+            &mut state,
+            Command::PutTransitKey {
+                name: name.to_string(),
+                key,
+            },
+        )
+        .await
+        .map(|_| true)
+    }
+
+    /// Add a version (sealed) to a transit key; returns the new version,
+    /// or `None` if there is no such key.
+    pub async fn add_transit_key_version(
+        &self,
+        name: &str,
+        sealed: Vec<u8>,
+    ) -> Result<Option<u32>, RaftError> {
+        let mut state = self.inner.write().await;
+        let Some(mut key) = state.transit_keys.get(name).cloned() else {
+            return Ok(None);
+        };
+        key.versions.push(sealed);
+        let version = key.versions.len() as u32;
+        self.commit_locked(
+            &mut state,
+            Command::PutTransitKey {
+                name: name.to_string(),
+                key,
+            },
+        )
+        .await?;
+        Ok(Some(version))
+    }
+
+    /// Delete a transit key; false if there was none.
+    pub async fn delete_transit_key(&self, name: &str) -> Result<bool, RaftError> {
+        let mut state = self.inner.write().await;
+        if !state.transit_keys.contains_key(name) {
+            return Ok(false);
+        }
+        self.commit_locked(
+            &mut state,
+            Command::DeleteTransitKey {
+                name: name.to_string(),
+            },
+        )
+        .await
+        .map(|_| true)
     }
 
     /// Get a value from the key-value store.
@@ -1185,6 +1299,7 @@ mod tests {
             ]
             .into(),
             HashMap::new(),
+            HashMap::new(),
         )
         .await
         .unwrap();
@@ -1498,6 +1613,7 @@ mod tests {
                 [("key".into(), [(12, b"R".to_vec())].into())].into(),
             )]
             .into(),
+            HashMap::new(),
         )
         .await
         .unwrap();
@@ -1506,6 +1622,49 @@ mod tests {
 
         sm.delete_secret("web", "key").await.unwrap();
         assert!(sm.secret_history().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn transit_keys_gain_versions_and_reseal_whole() {
+        let sm = FleetStateMachine::new();
+        let key = TransitKey {
+            namespace: "default".into(),
+            versions: vec![b"k1".to_vec()],
+        };
+        assert!(sm.create_transit_key("orders", key.clone()).await.unwrap());
+        assert!(!sm.create_transit_key("orders", key).await.unwrap());
+        assert_eq!(
+            sm.add_transit_key_version("orders", b"k2".to_vec())
+                .await
+                .unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            sm.add_transit_key_version("nope", vec![]).await.unwrap(),
+            None
+        );
+
+        // A reseal that raced a rotation (wrong version count) is ignored.
+        sm.reseal_secrets(
+            HashMap::new(),
+            HashMap::new(),
+            [("orders".to_string(), vec![b"K1".to_vec()])].into(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sm.transit_key("orders").await.unwrap().versions.len(), 2);
+        assert_eq!(sm.transit_key("orders").await.unwrap().versions[0], b"k1");
+        sm.reseal_secrets(
+            HashMap::new(),
+            HashMap::new(),
+            [("orders".to_string(), vec![b"K1".to_vec(), b"K2".to_vec()])].into(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sm.transit_key("orders").await.unwrap().versions[1], b"K2");
+
+        assert!(sm.delete_transit_key("orders").await.unwrap());
+        assert!(sm.transit_keys().await.is_empty());
     }
 
     #[tokio::test]

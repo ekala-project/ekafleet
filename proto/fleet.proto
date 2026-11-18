@@ -130,6 +130,15 @@ service FleetControl {
   rpc ListSecretVersions(ListSecretVersionsRequest) returns (ListSecretVersionsResponse);
   rpc RollbackSecret(RollbackSecretRequest) returns (RollbackSecretResponse);
 
+  // Transit encryption: named keys held by the server. Workloads may call
+  // TransitEncrypt/TransitDecrypt with their service SVID.
+  rpc CreateTransitKey(CreateTransitKeyRequest) returns (TransitKeyInfo);
+  rpc RotateTransitKey(RotateTransitKeyRequest) returns (TransitKeyInfo);
+  rpc ListTransitKeys(ListTransitKeysRequest) returns (ListTransitKeysResponse);
+  rpc DeleteTransitKey(DeleteTransitKeyRequest) returns (DeleteTransitKeyResponse);
+  rpc TransitEncrypt(TransitEncryptRequest) returns (TransitEncryptResponse);
+  rpc TransitDecrypt(TransitDecryptRequest) returns (TransitDecryptResponse);
+
   // Volume snapshots, kept on the node that holds the volume.
   rpc CreateVolumeSnapshot(VolumeSnapshotRequest) returns (VolumeSnapshotResponse);
   rpc ListVolumeSnapshots(VolumeSnapshotRequest) returns (VolumeSnapshotResponse);
@@ -1437,6 +1446,55 @@ message RollbackSecretRequest {
 
 message RollbackSecretResponse {
   uint64 version = 1;  // the new current version
+}
+
+// --- Transit ---
+
+message CreateTransitKeyRequest {
+  string name = 1;
+  string namespace = 2;  // empty = the token's namespace, or "default"
+}
+
+message RotateTransitKeyRequest {
+  string name = 1;
+}
+
+message TransitKeyInfo {
+  string name = 1;
+  string namespace = 2;
+  uint32 latest_version = 3;
+}
+
+message ListTransitKeysRequest {}
+
+message ListTransitKeysResponse {
+  repeated TransitKeyInfo keys = 1;
+}
+
+message DeleteTransitKeyRequest {
+  string name = 1;
+}
+
+message DeleteTransitKeyResponse {
+  bool deleted = 1;
+}
+
+message TransitEncryptRequest {
+  string key_name = 1;
+  bytes plaintext = 2;
+}
+
+message TransitEncryptResponse {
+  string ciphertext = 1;  // ekafleet:v<version>:<base64>
+}
+
+message TransitDecryptRequest {
+  string key_name = 1;
+  string ciphertext = 2;
+}
+
+message TransitDecryptResponse {
+  bytes plaintext = 1;
 }
 
 // --- Volume snapshots ---

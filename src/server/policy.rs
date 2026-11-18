@@ -254,6 +254,7 @@ mod tests {
             namespace: String::new(),
             metrics: None,
             store_paths: vec![],
+            transit_keys: vec![],
         }
     }
 
