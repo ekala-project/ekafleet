@@ -85,7 +85,7 @@ src/
 │   ├── policy.rs        # Organizational policy engine for admission control
 │   ├── webhook.rs       # Outbound webhook notifications
 │   ├── federation.rs    # Multi-region cluster federation
-│   ├── rebalance.rs     # Descheduler for workload rebalancing
+│   ├── rebalance.rs     # Stateful drift: `ekafleet rebalance` move plan/apply + settle
 │   ├── agent_msg.rs     # Inbound agent message dispatch
 │   └── cloud/
 │       ├── mod.rs       # Cloud provider registry
@@ -266,7 +266,7 @@ Do not commit with attribution lines (no `Co-Authored-By`).
 - **`#[allow(dead_code)]`** on modules in `lib.rs` is intentional during buildout.
   Do not remove these unless you've verified all items in the module are used.
 - **CLI commands**: `server`, `agent`, `dev`, `plan`, `apply`, `status`, `drift`,
-  `rollback`, `capacity`, `services`, `drain`, `scale`, `logs`, `ssh`, `snapshot`,
+  `rollback`, `capacity`, `services`, `drain`, `scale`, `rebalance`, `logs`, `ssh`, `snapshot`,
   `restore`, `upgrade`, `dispatch`, `exec`, `inspect`, `events`, `top`, `node`,
   `acl token create/list/revoke`, `generation list/switch/diff`,
   `system gc/reboot/rebuild`, `token create`, `completions` — all functional.

@@ -189,7 +189,7 @@ Placing multiple replicas of the same service on the same machine is penalized h
 
 ## Phase 3: Select
 
-The highest-scoring candidate is selected. Resources are allocated, and the next replica is scheduled with updated availability.
+The highest-scoring candidate is selected; equal scores go to the machine whose name sorts first, so the same inputs always give the same placement. Resources are allocated, and the next replica is scheduled with updated availability.
 
 ## Job Types
 
@@ -201,7 +201,9 @@ The highest-scoring candidate is selected. Resources are allocated, and the next
 | `batch` | Same as service but exits on completion |
 | `sysbatch` | Runs once on every matching machine, then completes |
 
-Services are scheduled in priority order (highest first), then by type: system, sysbatch, service, stateful, batch.
+Services are scheduled in priority order (highest first), then by type: system, sysbatch, service, stateful, batch, then by name.
+
+Stateful instances keep their node until it is drained or no longer fits them; see [Rebalancing](scaling.md#rebalancing) to move them to better nodes after drift.
 
 ## Lifecycle Policies
 

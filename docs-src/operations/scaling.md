@@ -242,14 +242,34 @@ Migration is skipped automatically for volumes with `storageClass = "nfs"` and `
 
 ## Rebalancing
 
-After cluster drift (node failures, recoveries, scale-ups), workloads may concentrate on surviving nodes. The descheduler evaluates whether services would be better placed on different machines by comparing actual placement against ideal (freshly computed) placement:
+Stateless services (`type = "service"`) are placed from scratch on every reconciliation, so they always run where the scheduler wants them: when a failed node comes back or a new one joins, they spread onto it on the next pass.
+
+Stateful instances stay on the node that holds their data (the +200 data-locality bonus), so after drift they can stay on crowded or smaller nodes. `ekafleet rebalance` compares their placement with the one the scheduler would choose from scratch:
 
 ```bash
-# Check for rebalance opportunities
-curl -H "Authorization: Bearer $TOKEN" http://server:7402/v1/rebalance
+ekafleet rebalance                       # show the moves
+ekafleet rebalance --apply               # make one move
+ekafleet rebalance --apply --max-moves 3 --service db
 ```
 
-Each suggestion includes the service name, current node, ideal node, and reason. Rebalancing is advisory — the operator reviews suggestions and triggers rescheduling manually.
+```
+Would move:
+  db (db-1): small-a -> big-b
+Not moved:
+  db: limited by --max-moves
+Run with --apply to make these moves.
+```
+
+Applied moves are recorded in Raft; the reconciler then reschedules the instance to its new node, migrating its volumes first as it does for a drain. A move is reported as a `rebalance.started` event, then `rebalance.completed`, or `rebalance.failed` if the migration fails or the destination no longer fits. In that case the instance stays where it was.
+
+A service is only rebalanced when:
+
+- it can take its data along: `migrate.migrateOnReschedule` (the default) and ReadWriteOnce volumes;
+- its disruption budget allows it: no more instances move in one round than `disruptionBudget` lets stop;
+- no earlier move for it is still in progress, and the reconciler isn't already placing it;
+- the move would not push another stateful instance off its node (each move is checked against the scheduler first).
+
+Dry runs need the `Read` permission and applying needs `Scale`. Namespace-scoped tokens only see and move their namespace's services. Nothing rebalances on its own.
 
 ## Capacity Planning
 

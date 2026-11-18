@@ -355,6 +355,26 @@ enum Command {
         server: String,
     },
 
+    /// Move stateful instances back to the nodes the scheduler prefers
+    /// (shows the moves unless --apply)
+    Rebalance {
+        /// Request the moves instead of only showing them
+        #[arg(long)]
+        apply: bool,
+
+        /// Most instances to move in this round
+        #[arg(long, default_value_t = 1)]
+        max_moves: u32,
+
+        /// Only these services (repeatable)
+        #[arg(long = "service")]
+        services: Vec<String>,
+
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+
     /// Generate join token
     Token {
         #[command(subcommand)]
@@ -1210,6 +1230,13 @@ async fn main() -> anyhow::Result<()> {
             count,
             server,
         } => commands::cmd_scale(service, count, server).await?,
+
+        Command::Rebalance {
+            apply,
+            max_moves,
+            services,
+            server,
+        } => commands::cmd_rebalance(apply, max_moves, services, server).await?,
 
         Command::Token {
             action:

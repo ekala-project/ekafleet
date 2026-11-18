@@ -201,7 +201,7 @@ ekafleet is a single binary that consolidates capabilities from 10+ separate too
 | State snapshots | **Yes** | **Yes** (etcd backup) | **Yes** (snapshot) | Raft snapshot/restore |
 | Disaster recovery CLI | **Yes** | **Yes** (etcdctl) | **Yes** (snapshot save/restore) | `ekafleet snapshot` / `ekafleet restore` |
 | Multi-region federation | **Yes** | *Partial* (Federation v2) | **Yes** (multi-region) | Cross-cluster discovery and trust |
-| Rebalancing / descheduler | **Yes** | **Yes** (descheduler) | No | Advisory reschedule suggestions |
+| Rebalancing / descheduler | **Yes** | **Yes** (descheduler) | No | `ekafleet rebalance` plan/apply for stateful drift |
 | Self-upgrade orchestration | **Yes** | **Yes** (kubeadm upgrade) | **Yes** | Foundation via snapshot/restore |
 
 ## API & Developer Experience
