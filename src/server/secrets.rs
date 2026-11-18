@@ -22,8 +22,9 @@ use super::rbac::{Permission, require_permission};
 use super::state::FleetState;
 use crate::proto::server_message::Payload as ServerPayload;
 use crate::proto::{
-    DeleteSecretRequest, DeleteSecretResponse, FleetKeyUpdate, ListSecretsRequest,
-    ListSecretsResponse, RotateFleetKeyResponse, SecretInfo, SecretUpdate, ServerMessage,
+    DeleteSecretRequest, DeleteSecretResponse, FleetKeyUpdate, ListSecretVersionsRequest,
+    ListSecretVersionsResponse, ListSecretsRequest, ListSecretsResponse, RollbackSecretRequest,
+    RollbackSecretResponse, RotateFleetKeyResponse, SecretInfo, SecretUpdate, ServerMessage,
     SetSecretRequest, SetSecretResponse,
 };
 use crate::raft::state::FleetStateMachine;
@@ -433,6 +434,75 @@ impl FleetControlService {
         Ok(DeleteSecretResponse { deleted })
     }
 
+    pub(super) async fn handle_list_secret_versions(
+        &self,
+        request: Request<ListSecretVersionsRequest>,
+    ) -> Result<ListSecretVersionsResponse, Status> {
+        require_permission(&request, Permission::Read)?;
+        let req = request.get_ref();
+        check_names(&req.service_name, &req.secret_name)?;
+        self.require_service_access(&request, &req.service_name)
+            .await?;
+        let current = self
+            .raft_state
+            .secrets()
+            .await
+            .get(&req.service_name)
+            .and_then(|s| s.get(&req.secret_name))
+            .map_or(0, |(_, version)| *version);
+        let earlier = self
+            .raft_state
+            .secret_history()
+            .await
+            .get(&req.service_name)
+            .and_then(|s| s.get(&req.secret_name))
+            .map(|h| h.iter().map(|(version, _)| *version).collect())
+            .unwrap_or_default();
+        Ok(ListSecretVersionsResponse { current, earlier })
+    }
+
+    pub(super) async fn handle_rollback_secret(
+        &self,
+        request: Request<RollbackSecretRequest>,
+    ) -> Result<RollbackSecretResponse, Status> {
+        require_permission(&request, Permission::ManageSecrets)?;
+        let req = request.get_ref();
+        check_names(&req.service_name, &req.secret_name)?;
+        self.require_service_access(&request, &req.service_name)
+            .await?;
+        let resource = format!("{}/{}", req.service_name, req.secret_name);
+        // Under the key lock, like a write, so a rotation can't reseal the
+        // history between reading and storing the value.
+        let restored = {
+            let _fleet_key = self.fleet_key.read().await;
+            self.raft_state
+                .rollback_secret(&req.service_name, &req.secret_name, req.version)
+                .await
+                .map_err(|e| Status::internal(format!("failed to store secret: {e}")))?
+        };
+        let Some(version) = restored else {
+            return Err(Status::not_found(format!(
+                "{resource} has no earlier version {}",
+                req.version
+            )));
+        };
+        self.audit(
+            &request,
+            AuditAction::SecretWrite,
+            &resource,
+            &format!(
+                "rolled back to version {} as version {version}",
+                req.version
+            ),
+            AuditOutcome::Success,
+        )
+        .await;
+        tracing::info!(service = %req.service_name, secret = %req.secret_name,
+            from = req.version, version, "Secret rolled back");
+        self.state.assignments_changed().trigger();
+        Ok(RollbackSecretResponse { version })
+    }
+
     /// Replace the fleet key: every stored secret is resealed under the new
     /// key, and agents get their new derived key before any value sealed
     /// for it. The new key is staged on disk until the resealed values are
@@ -450,7 +520,29 @@ impl FleetControlService {
         let mut fleet_key = self.fleet_key.write().await;
         let mut store = self.secret_store.write().await;
         let mut resealed: HashMap<String, HashMap<String, Vec<u8>>> = HashMap::new();
+        let mut resealed_history: HashMap<String, HashMap<String, HashMap<u64, Vec<u8>>>> =
+            HashMap::new();
         let mut count = 0usize;
+        for (service, values) in self.raft_state.secret_history().await {
+            for (name, versions) in values {
+                for (version, sealed) in versions {
+                    let value = store.open(&service, &name, &sealed).map_err(|e| {
+                        Status::internal(format!(
+                            "secret {service}/{name} version {version} is unreadable: {e}"
+                        ))
+                    })?;
+                    let sealed = new_store
+                        .seal(&service, &name, &value)
+                        .map_err(|e| Status::internal(e.to_string()))?;
+                    resealed_history
+                        .entry(service.clone())
+                        .or_default()
+                        .entry(name.clone())
+                        .or_default()
+                        .insert(version, sealed);
+                }
+            }
+        }
         for (service, values) in self.raft_state.secrets().await {
             for (name, (sealed, _)) in values {
                 let value = store.open(&service, &name, &sealed).map_err(|e| {
@@ -473,7 +565,11 @@ impl FleetControlService {
         super::seal::write_maybe_sealed(&staged, hex.as_bytes(), "staged fleet encryption key")
             .await
             .map_err(|e| Status::internal(format!("failed to stage rotated key: {e}")))?;
-        if let Err(e) = self.raft_state.reseal_secrets(resealed).await {
+        if let Err(e) = self
+            .raft_state
+            .reseal_secrets(resealed, resealed_history)
+            .await
+        {
             let _ = tokio::fs::remove_file(&staged).await;
             return Err(Status::internal(format!(
                 "failed to store resealed secrets: {e}"
@@ -709,9 +805,12 @@ mod tests {
 
         // Already resealed: the staged key is adopted.
         let sealed = SecretStore::new(&[2u8; 32]).seal("web", "k", b"v").unwrap();
-        raft.reseal_secrets([("web".into(), [("k".into(), sealed)].into())].into())
-            .await
-            .unwrap();
+        raft.reseal_secrets(
+            [("web".into(), [("k".into(), sealed)].into())].into(),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
         stage();
         let key = settle_fleet_key(dir.path(), old.clone(), Some(new.clone()), &raft)
             .await
