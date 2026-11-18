@@ -1404,3 +1404,32 @@ fn volume_sizes_count_only_against_declared_disk() {
     let plan = schedule(&services, &machines, &no_pools(), &current);
     assert!(plan.placements.is_empty());
 }
+
+#[test]
+fn equal_scores_resolve_the_same_way_every_time() {
+    // Identical machines and services give every candidate the same score;
+    // the outcome must not depend on hash map iteration order, which
+    // differs between independently built maps.
+    let place = || {
+        let machines: HashMap<String, MachineConfig> = (0..8)
+            .map(|i| make_machine(&format!("node-{i}"), 4000, 8192, vec![]))
+            .collect();
+        let services: HashMap<String, ServiceConfig> = ["a", "b", "c", "d", "e"]
+            .iter()
+            .map(|name| make_service(name, 100, 128, 2))
+            .collect();
+        let mut placements: Vec<(String, String, String)> =
+            schedule(&services, &machines, &no_pools(), &HashMap::new())
+                .placements
+                .into_iter()
+                .map(|p| (p.service_name, p.instance_id, p.machine_name))
+                .collect();
+        placements.sort();
+        placements
+    };
+    let first = place();
+    assert_eq!(first.len(), 10);
+    for _ in 0..20 {
+        assert_eq!(place(), first);
+    }
+}
