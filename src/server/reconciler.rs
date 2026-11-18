@@ -79,7 +79,7 @@ struct MigrationFailureSummary {
 
 /// Pair each node a service leaves with a node it moves to (both sorted);
 /// nodes left over on either side are a scale-down or a fresh replica.
-fn node_moves<'a>(current: &[&'a str], desired: &[&'a str]) -> Vec<(&'a str, &'a str)> {
+pub(super) fn node_moves<'a>(current: &[&'a str], desired: &[&'a str]) -> Vec<(&'a str, &'a str)> {
     let mut leaving: Vec<&str> = current
         .iter()
         .filter(|n| !desired.contains(n))
@@ -144,6 +144,7 @@ pub async fn reconcile(
 
     if !plan.has_changes {
         tracing::debug!("No changes detected");
+        super::rebalance::settle(desired, &plan, &[], raft_state, events).await;
         return Ok(plan);
     }
     tracing::info!(
@@ -157,14 +158,21 @@ pub async fn reconcile(
     Ok(plan)
 }
 
-/// Compare desired state with actual state to produce operations.
-pub async fn compute_plan(
+/// What the scheduler places from: the desired services with runtime
+/// replica overrides, the schedulable machines (static and cloud, minus
+/// draining nodes), and where each instance runs now.
+pub struct SchedulingInputs {
+    pub services: HashMap<String, config::ServiceConfig>,
+    pub machines: HashMap<String, MachineConfig>,
+    pub current_placements: CurrentPlacements,
+}
+
+pub async fn scheduling_inputs(
     desired: &FleetConfig,
-    _current_nodes: &[String],
     state: &FleetState,
     instance_tracker: Option<&InstanceTracker>,
     raft_state: &FleetStateMachine,
-) -> ReconcilePlan {
+) -> SchedulingInputs {
     // Merge static machines with cloud-provisioned dynamic machines, minus
     // nodes being drained: their services move elsewhere, taking
     // their volumes along.
@@ -188,7 +196,7 @@ pub async fn compute_plan(
     let mut services = desired.services.clone();
     for (name, cfg) in services.iter_mut() {
         if let Some(count) = raft_state.get_replica_override(name).await {
-            tracing::info!(
+            tracing::debug!(
                 service = %name,
                 config_replicas = cfg.scheduling.replicas,
                 override_replicas = count,
@@ -196,6 +204,31 @@ pub async fn compute_plan(
             );
             cfg.scheduling.replicas = count;
         }
+    }
+
+    SchedulingInputs {
+        services,
+        machines,
+        current_placements,
+    }
+}
+
+/// Compare desired state with actual state to produce operations.
+pub async fn compute_plan(
+    desired: &FleetConfig,
+    _current_nodes: &[String],
+    state: &FleetState,
+    instance_tracker: Option<&InstanceTracker>,
+    raft_state: &FleetStateMachine,
+) -> ReconcilePlan {
+    let SchedulingInputs {
+        services,
+        machines,
+        mut current_placements,
+    } = scheduling_inputs(desired, state, instance_tracker, raft_state).await;
+    // Instances `ekafleet rebalance` asked to move prefer their destination.
+    for ((service, instance), node) in raft_state.placement_moves().await {
+        current_placements.insert((service, instance), node);
     }
 
     // Publish per-service resource requests so read paths (e.g. the `top` RPC)
@@ -1093,6 +1126,14 @@ async fn apply_plan(
         }
     }
 
+    super::rebalance::settle(
+        desired,
+        plan,
+        &migration_failed_services,
+        raft_state,
+        events,
+    )
+    .await;
     Ok(())
 }
 
@@ -1603,6 +1644,101 @@ mod tests {
         // Making the node schedulable again ends the drain.
         state.set_schedulable("alpha", true).await;
         assert!(state.draining_nodes().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn requested_moves_reschedule_and_settle() {
+        let state = FleetState::new();
+        let mut config = empty_fleet_config();
+        let mut receivers = Vec::new();
+        for node in ["alpha", "beta"] {
+            receivers.push(
+                state
+                    .register_agent(node, "127.0.0.1:5000".into(), "default".into())
+                    .await,
+            );
+            config.machines.insert(
+                node.into(),
+                MachineConfig {
+                    target_host: node.into(),
+                    labels: HashMap::new(),
+                    capacity: CapacityConfig {
+                        cpu: 4000,
+                        memory: 8192,
+                        disk: 0,
+                    },
+                    pool: "default".into(),
+                    reserved: CapacityConfig::default(),
+                    taints: vec![],
+                    extended_resources: HashMap::new(),
+                },
+            );
+        }
+        let mut db = simple_service();
+        db.scheduling.job_type = config::JobType::Stateful;
+        db.volumes = vec![
+            serde_json::from_value(serde_json::json!({
+                "name": "data",
+                "mountPath": "/var/lib/db",
+            }))
+            .unwrap(),
+        ];
+        config.services.insert("db".into(), db);
+        state
+            .update_status(
+                "alpha",
+                vec![crate::proto::ServiceInstance {
+                    service_name: "db".into(),
+                    instance_id: "db-0".into(),
+                    store_path: String::new(),
+                    state: crate::proto::ServiceState::ServiceRunning as i32,
+                }],
+            )
+            .await;
+        let raft = FleetStateMachine::new();
+        let record = |node: &str| crate::raft::state::Command::Deploy {
+            service_name: "db".into(),
+            store_path: String::new(),
+            placements: vec![crate::raft::state::PlacementRecord {
+                instance_id: "db-0".into(),
+                machine_name: node.into(),
+            }],
+        };
+        raft.apply_next(record("alpha")).await.unwrap();
+        let plan = compute_plan(&config, &[], &state, None, &raft).await;
+        assert!(plan.reschedules.is_empty(), "the instance sticks to alpha");
+
+        raft.set_placement_move("db", "db-0", "beta").await.unwrap();
+        let plan = compute_plan(&config, &[], &state, None, &raft).await;
+        let [op] = plan.reschedules.as_slice() else {
+            panic!("expected one reschedule, got {:?}", plan.reschedules);
+        };
+        assert_eq!(op.placements[0].machine_name, "beta");
+        assert_eq!(op.migrations.len(), 1);
+
+        // Still on its way: the move stays.
+        let events = super::super::events::EventStore::new();
+        super::super::rebalance::settle(&config, &plan, &[], &raft, Some(&events)).await;
+        assert_eq!(raft.placement_moves().await.len(), 1);
+
+        // Recorded on beta: the move is done.
+        raft.apply_next(record("beta")).await.unwrap();
+        super::super::rebalance::settle(&config, &plan, &[], &raft, Some(&events)).await;
+        assert!(raft.placement_moves().await.is_empty());
+        assert!(
+            events
+                .query(None, None, 100)
+                .await
+                .iter()
+                .any(|e| e.kind == "rebalance.completed")
+        );
+
+        // A failed migration abandons the move.
+        raft.set_placement_move("db", "db-0", "alpha")
+            .await
+            .unwrap();
+        super::super::rebalance::settle(&config, &plan, &["db".into()], &raft, Some(&events)).await;
+        assert!(raft.placement_moves().await.is_empty());
     }
 
     fn simple_service() -> ServiceConfig {

@@ -52,6 +52,7 @@ pub enum AuditAction {
     Plan,
     Drain,
     Scale,
+    Rebalance,
     Rollback,
     TokenCreate,
     TokenRevoke,

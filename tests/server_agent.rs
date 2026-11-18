@@ -772,3 +772,18 @@ async fn list_deployments_returns_empty() {
 
     assert!(resp.deployments.is_empty());
 }
+
+#[tokio::test]
+async fn rebalance_needs_an_applied_configuration() {
+    let (grpc_addr, _, ca_cert_pem, token) = start_server().await;
+    let mut client = connect_client(grpc_addr, &ca_cert_pem, &token).await;
+
+    let result = client
+        .rebalance(ekafleet::proto::RebalanceRequest {
+            apply: false,
+            max_moves: 0,
+            services: vec![],
+        })
+        .await;
+    assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
+}

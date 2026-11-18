@@ -42,6 +42,7 @@ ekafleet events --service web --limit 10        # Filter by service
 
 ```bash
 ekafleet scale web 5                            # Scale to 5 replicas
+ekafleet rebalance [--apply]                    # Move drifted stateful instances back
 ekafleet logs web                               # Service logs (last 100 lines)
 ekafleet logs web -f                            # Stream logs continuously
 ekafleet logs web --tail 50 --node node-1       # Tail from specific node
