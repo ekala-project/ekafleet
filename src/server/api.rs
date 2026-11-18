@@ -2188,6 +2188,60 @@ impl FleetControl for FleetControlService {
             .map(Response::new)
     }
 
+    async fn create_transit_key(
+        &self,
+        request: Request<crate::proto::CreateTransitKeyRequest>,
+    ) -> Result<Response<crate::proto::TransitKeyInfo>, Status> {
+        self.handle_create_transit_key(request)
+            .await
+            .map(Response::new)
+    }
+
+    async fn rotate_transit_key(
+        &self,
+        request: Request<crate::proto::RotateTransitKeyRequest>,
+    ) -> Result<Response<crate::proto::TransitKeyInfo>, Status> {
+        self.handle_rotate_transit_key(request)
+            .await
+            .map(Response::new)
+    }
+
+    async fn list_transit_keys(
+        &self,
+        request: Request<crate::proto::ListTransitKeysRequest>,
+    ) -> Result<Response<crate::proto::ListTransitKeysResponse>, Status> {
+        self.handle_list_transit_keys(request)
+            .await
+            .map(Response::new)
+    }
+
+    async fn delete_transit_key(
+        &self,
+        request: Request<crate::proto::DeleteTransitKeyRequest>,
+    ) -> Result<Response<crate::proto::DeleteTransitKeyResponse>, Status> {
+        self.handle_delete_transit_key(request)
+            .await
+            .map(Response::new)
+    }
+
+    async fn transit_encrypt(
+        &self,
+        request: Request<crate::proto::TransitEncryptRequest>,
+    ) -> Result<Response<crate::proto::TransitEncryptResponse>, Status> {
+        self.handle_transit_encrypt(request)
+            .await
+            .map(Response::new)
+    }
+
+    async fn transit_decrypt(
+        &self,
+        request: Request<crate::proto::TransitDecryptRequest>,
+    ) -> Result<Response<crate::proto::TransitDecryptResponse>, Status> {
+        self.handle_transit_decrypt(request)
+            .await
+            .map(Response::new)
+    }
+
     async fn create_volume_snapshot(
         &self,
         request: Request<crate::proto::VolumeSnapshotRequest>,
@@ -2369,9 +2423,10 @@ pub async fn serve_grpc(
         // so this cannot be forged by setting a header.
         //
         // Extract the SPIFFE ID from the leaf certificate's SAN URI and derive
-        // a role from the path structure (/server/* → Admin, /agent/* → Agent).
-        // Any other CA-verified identity (e.g. a workload's service SVID) is
-        // refused outright rather than granted a fallback role.
+        // a role from the path structure (/server/* → Admin, /agent/* → Agent,
+        // /service/* → Workload, which may only use transit keys its service
+        // declares). Any other CA-verified identity is refused outright rather
+        // than granted a fallback role.
         if let Some(certs) = req.peer_certs()
             && let Some(leaf) = certs.first()
         {

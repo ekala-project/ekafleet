@@ -1,224 +1,183 @@
-#![allow(dead_code)]
+//! Transit encryption: named, versioned AES-256-GCM keys held by the
+//! server, so services can encrypt data without holding a key.
+//!
+//! Ciphertext is `ekafleet:v<version>:<base64(nonce || ciphertext || tag)>`,
+//! authenticated with the key name and version, so a value only decrypts
+//! with the key (and version) that produced it. Rotating a key adds a
+//! version; new values use the latest and old ones still decrypt.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use ring::rand::{SecureRandom, SystemRandom};
-use tokio::sync::RwLock;
+use zeroize::Zeroizing;
 
 const NONCE_LEN: usize = 12;
-const KEY_LEN: usize = 32;
+pub const KEY_LEN: usize = 32;
+const PREFIX: &str = "ekafleet:v";
 
-/// Transit encryption engine providing named encryption keys for
-/// application-level encrypt/decrypt operations (encryption as a service).
-#[derive(Clone)]
-pub struct TransitEngine {
-    inner: Arc<RwLock<TransitState>>,
-    rng: Arc<SystemRandom>,
-}
+/// Largest plaintext accepted (1 MiB).
+pub const MAX_PLAINTEXT: usize = 1024 * 1024;
 
-struct TransitState {
-    keys: HashMap<String, NamedKey>,
-}
+/// Scope transit key material is sealed under in the secret store; no
+/// service may be named like it.
+pub const SEAL_SCOPE: &str = "_transit";
 
-struct NamedKey {
-    key: LessSafeKey,
-}
-
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum TransitError {
-    #[error("key '{0}' not found")]
-    KeyNotFound(String),
-    #[error("encryption failed")]
-    EncryptionFailed,
+    #[error("ciphertext is not an ekafleet transit value")]
+    Malformed,
+    #[error("key version {0} does not exist")]
+    UnknownVersion(u32),
     #[error("decryption failed")]
     DecryptionFailed,
+    #[error("encryption failed")]
+    EncryptionFailed,
     #[error("random generation failed")]
     RngFailure,
 }
 
-impl Default for TransitEngine {
-    fn default() -> Self {
-        Self::new()
-    }
+/// A fresh random key.
+pub fn generate_key() -> Result<Zeroizing<[u8; KEY_LEN]>, TransitError> {
+    let mut key = Zeroizing::new([0u8; KEY_LEN]);
+    SystemRandom::new()
+        .fill(key.as_mut())
+        .map_err(|_| TransitError::RngFailure)?;
+    Ok(key)
 }
 
-impl TransitEngine {
-    pub fn new() -> Self {
-        Self {
-            inner: Arc::new(RwLock::new(TransitState {
-                keys: HashMap::new(),
-            })),
-            rng: Arc::new(SystemRandom::new()),
-        }
+/// Name under which version `version` of key `name` is sealed.
+pub fn seal_name(name: &str, version: u32) -> String {
+    format!("{name}/v{version}")
+}
+
+fn aad(name: &str, version: u32) -> Vec<u8> {
+    format!("ekafleet-transit\0{name}\0{version}").into_bytes()
+}
+
+fn cipher(key: &[u8]) -> Result<LessSafeKey, TransitError> {
+    UnboundKey::new(&AES_256_GCM, key)
+        .map(LessSafeKey::new)
+        .map_err(|_| TransitError::EncryptionFailed)
+}
+
+/// Encrypt `plaintext` with version `version` of key `name`.
+pub fn encrypt(
+    name: &str,
+    version: u32,
+    key: &[u8],
+    plaintext: &[u8],
+) -> Result<String, TransitError> {
+    let mut nonce = [0u8; NONCE_LEN];
+    SystemRandom::new()
+        .fill(&mut nonce)
+        .map_err(|_| TransitError::RngFailure)?;
+    let mut sealed = plaintext.to_vec();
+    cipher(key)?
+        .seal_in_place_append_tag(
+            Nonce::assume_unique_for_key(nonce),
+            Aad::from(aad(name, version)),
+            &mut sealed,
+        )
+        .map_err(|_| TransitError::EncryptionFailed)?;
+    let mut out = nonce.to_vec();
+    out.extend_from_slice(&sealed);
+    Ok(format!("{PREFIX}{version}:{}", STANDARD.encode(out)))
+}
+
+/// The key version a ciphertext was made with.
+pub fn version_of(ciphertext: &str) -> Result<u32, TransitError> {
+    let (version, _) = split(ciphertext)?;
+    Ok(version)
+}
+
+fn split(ciphertext: &str) -> Result<(u32, &str), TransitError> {
+    let rest = ciphertext
+        .trim()
+        .strip_prefix(PREFIX)
+        .ok_or(TransitError::Malformed)?;
+    let (version, body) = rest.split_once(':').ok_or(TransitError::Malformed)?;
+    let version = version.parse().map_err(|_| TransitError::Malformed)?;
+    if version == 0 {
+        return Err(TransitError::Malformed);
     }
+    Ok((version, body))
+}
 
-    /// Create a new named encryption key (AES-256-GCM).
-    pub async fn create_key(&self, name: &str) -> Result<(), TransitError> {
-        let mut key_bytes = [0u8; KEY_LEN];
-        self.rng
-            .fill(&mut key_bytes)
-            .map_err(|_| TransitError::RngFailure)?;
-
-        let unbound = UnboundKey::new(&AES_256_GCM, &key_bytes)
-            .map_err(|_| TransitError::EncryptionFailed)?;
-        let key = LessSafeKey::new(unbound);
-
-        let mut state = self.inner.write().await;
-        state.keys.insert(name.to_string(), NamedKey { key });
-
-        tracing::info!(key_name = %name, "Transit encryption key created");
-        Ok(())
+/// Decrypt a value made with key `name`; `key` is the version it names.
+pub fn decrypt(
+    name: &str,
+    key: &[u8],
+    ciphertext: &str,
+) -> Result<Zeroizing<Vec<u8>>, TransitError> {
+    let (version, body) = split(ciphertext)?;
+    let raw = STANDARD.decode(body).map_err(|_| TransitError::Malformed)?;
+    if raw.len() < NONCE_LEN {
+        return Err(TransitError::Malformed);
     }
-
-    /// Encrypt plaintext with a named key. Returns nonce || ciphertext || tag.
-    pub async fn encrypt(&self, key_name: &str, plaintext: &[u8]) -> Result<Vec<u8>, TransitError> {
-        let state = self.inner.read().await;
-        let named_key = state
-            .keys
-            .get(key_name)
-            .ok_or_else(|| TransitError::KeyNotFound(key_name.to_string()))?;
-
-        let mut nonce_bytes = [0u8; NONCE_LEN];
-        self.rng
-            .fill(&mut nonce_bytes)
-            .map_err(|_| TransitError::RngFailure)?;
-
-        let nonce = Nonce::assume_unique_for_key(nonce_bytes);
-
-        let mut in_out = plaintext.to_vec();
-        named_key
-            .key
-            .seal_in_place_append_tag(nonce, Aad::from(key_name.as_bytes()), &mut in_out)
-            .map_err(|_| TransitError::EncryptionFailed)?;
-
-        let mut sealed = Vec::with_capacity(NONCE_LEN + in_out.len());
-        sealed.extend_from_slice(&nonce_bytes);
-        sealed.extend_from_slice(&in_out);
-        Ok(sealed)
-    }
-
-    /// Decrypt ciphertext with a named key. Expects nonce || ciphertext || tag.
-    pub async fn decrypt(
-        &self,
-        key_name: &str,
-        ciphertext: &[u8],
-    ) -> Result<Vec<u8>, TransitError> {
-        if ciphertext.len() < NONCE_LEN {
-            return Err(TransitError::DecryptionFailed);
-        }
-
-        let state = self.inner.read().await;
-        let named_key = state
-            .keys
-            .get(key_name)
-            .ok_or_else(|| TransitError::KeyNotFound(key_name.to_string()))?;
-
-        let (nonce_bytes, ct_and_tag) = ciphertext.split_at(NONCE_LEN);
-        let nonce = Nonce::try_assume_unique_for_key(nonce_bytes)
-            .map_err(|_| TransitError::DecryptionFailed)?;
-
-        let mut in_out = ct_and_tag.to_vec();
-        let plaintext = named_key
-            .key
-            .open_in_place(nonce, Aad::from(key_name.as_bytes()), &mut in_out)
-            .map_err(|_| TransitError::DecryptionFailed)?;
-
-        Ok(plaintext.to_vec())
-    }
-
-    /// List all named keys.
-    pub async fn list_keys(&self) -> Vec<String> {
-        let state = self.inner.read().await;
-        state.keys.keys().cloned().collect()
-    }
-
-    /// Delete a named key. Returns true if the key existed.
-    pub async fn delete_key(&self, name: &str) -> bool {
-        let mut state = self.inner.write().await;
-        let removed = state.keys.remove(name).is_some();
-        if removed {
-            tracing::info!(key_name = %name, "Transit encryption key deleted");
-        }
-        removed
-    }
+    let (nonce, sealed) = raw.split_at(NONCE_LEN);
+    let nonce =
+        Nonce::try_assume_unique_for_key(nonce).map_err(|_| TransitError::DecryptionFailed)?;
+    let mut buf = Zeroizing::new(sealed.to_vec());
+    let plaintext = cipher(key)?
+        .open_in_place(nonce, Aad::from(aad(name, version)), &mut buf)
+        .map_err(|_| TransitError::DecryptionFailed)?;
+    Ok(Zeroizing::new(plaintext.to_vec()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn encrypt_decrypt_roundtrip() {
-        let engine = TransitEngine::new();
-        engine.create_key("my-key").await.unwrap();
+    #[test]
+    fn values_decrypt_only_with_their_key_and_version() {
+        let k1 = generate_key().unwrap();
+        let k2 = generate_key().unwrap();
+        let ct = encrypt("orders", 1, k1.as_ref(), b"card 4242").unwrap();
+        assert!(ct.starts_with("ekafleet:v1:"));
+        assert_eq!(version_of(&ct), Ok(1));
+        assert_eq!(
+            &**decrypt("orders", k1.as_ref(), &ct).unwrap(),
+            b"card 4242"
+        );
 
-        let plaintext = b"hello, world!";
-        let ciphertext = engine.encrypt("my-key", plaintext).await.unwrap();
-        let decrypted = engine.decrypt("my-key", &ciphertext).await.unwrap();
-
-        assert_eq!(decrypted, plaintext);
+        // Another key, another key name, or a relabelled version fail.
+        assert_eq!(
+            decrypt("orders", k2.as_ref(), &ct).unwrap_err(),
+            TransitError::DecryptionFailed
+        );
+        assert_eq!(
+            decrypt("users", k1.as_ref(), &ct).unwrap_err(),
+            TransitError::DecryptionFailed
+        );
+        let relabelled = ct.replacen("ekafleet:v1:", "ekafleet:v2:", 1);
+        assert_eq!(
+            decrypt("orders", k1.as_ref(), &relabelled).unwrap_err(),
+            TransitError::DecryptionFailed
+        );
     }
 
-    #[tokio::test]
-    async fn encrypt_with_unknown_key_fails() {
-        let engine = TransitEngine::new();
-
-        let result = engine.encrypt("nonexistent", b"data").await;
-        assert!(matches!(result, Err(TransitError::KeyNotFound(_))));
-    }
-
-    #[tokio::test]
-    async fn decrypt_with_unknown_key_fails() {
-        let engine = TransitEngine::new();
-
-        let result = engine.decrypt("nonexistent", &[0u8; 32]).await;
-        assert!(matches!(result, Err(TransitError::KeyNotFound(_))));
-    }
-
-    #[tokio::test]
-    async fn different_keys_cannot_decrypt_each_other() {
-        let engine = TransitEngine::new();
-        engine.create_key("key-a").await.unwrap();
-        engine.create_key("key-b").await.unwrap();
-
-        let ciphertext = engine.encrypt("key-a", b"secret").await.unwrap();
-        let result = engine.decrypt("key-b", &ciphertext).await;
-
-        assert!(matches!(result, Err(TransitError::DecryptionFailed)));
-    }
-
-    #[tokio::test]
-    async fn list_keys_returns_all() {
-        let engine = TransitEngine::new();
-        engine.create_key("alpha").await.unwrap();
-        engine.create_key("beta").await.unwrap();
-
-        let mut keys = engine.list_keys().await;
-        keys.sort();
-        assert_eq!(keys, vec!["alpha", "beta"]);
-    }
-
-    #[tokio::test]
-    async fn delete_key_removes_it() {
-        let engine = TransitEngine::new();
-        engine.create_key("ephemeral").await.unwrap();
-
-        assert!(engine.delete_key("ephemeral").await);
-        assert!(!engine.delete_key("ephemeral").await);
-        assert!(engine.list_keys().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn tampered_ciphertext_fails() {
-        let engine = TransitEngine::new();
-        engine.create_key("k").await.unwrap();
-
-        let mut ct = engine.encrypt("k", b"data").await.unwrap();
-        ct[NONCE_LEN + 1] ^= 0xFF;
-
-        let result = engine.decrypt("k", &ct).await;
-        assert!(matches!(result, Err(TransitError::DecryptionFailed)));
+    #[test]
+    fn malformed_values_are_rejected() {
+        let key = generate_key().unwrap();
+        for bad in [
+            "",
+            "vault:v1:abc",
+            "ekafleet:v0:AAAA",
+            "ekafleet:vx:AAAA",
+            "ekafleet:v1",
+            "ekafleet:v1:!!!",
+            "ekafleet:v1:AAAA",
+        ] {
+            assert_eq!(
+                decrypt("k", key.as_ref(), bad).unwrap_err(),
+                TransitError::Malformed,
+                "{bad}"
+            );
+        }
+        let mut ct = encrypt("k", 3, key.as_ref(), b"data").unwrap();
+        ct.pop();
+        ct.push(if ct.ends_with('A') { 'B' } else { 'A' });
+        assert!(decrypt("k", key.as_ref(), &ct).is_err());
     }
 }

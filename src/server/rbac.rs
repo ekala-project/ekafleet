@@ -21,6 +21,9 @@ pub enum Role {
     /// stream; it cannot read fleet state or perform operator actions, so a
     /// compromised node cannot act on the rest of the fleet.
     Agent,
+    /// A service workload (mTLS service SVID). May only use the transit
+    /// keys its service lists in `transitKeys`.
+    Workload,
 }
 
 /// Marks how a request was authenticated. Stored in request extensions by the
@@ -42,9 +45,10 @@ impl PeerIdentity {
     /// path determines the role:
     /// - `/server/<id>` → Admin (peer server in an HA cluster)
     /// - `/agent/<name>` → Agent (data-plane node; control stream only)
+    /// - `/service/<name>` → Workload (transit keys of its service only)
     ///
-    /// Any other identity (workload SVIDs, foreign trust domains, malformed
-    /// IDs) returns `None` and must be refused.
+    /// Any other identity (foreign trust domains, malformed IDs) returns
+    /// `None` and must be refused.
     pub fn from_spiffe_id(domain: &str, spiffe_id: String) -> Option<Self> {
         let path = spiffe_id
             .strip_prefix("spiffe://")
@@ -52,6 +56,8 @@ impl PeerIdentity {
             .filter(|path| path.starts_with('/'))?;
         let role = if crate::ca::agent_name_from_spiffe_id(domain, &spiffe_id).is_some() {
             Role::Agent
+        } else if crate::ca::service_name_from_spiffe_id(domain, &spiffe_id).is_some() {
+            Role::Workload
         } else if path
             .strip_prefix("/server/")
             .is_some_and(|id| crate::ca::validate_identity_name(id).is_ok())
@@ -67,6 +73,14 @@ impl PeerIdentity {
     pub fn agent_name(&self, domain: &str) -> Option<&str> {
         match self.role {
             Role::Agent => crate::ca::agent_name_from_spiffe_id(domain, &self.spiffe_id),
+            _ => None,
+        }
+    }
+
+    /// The service name when this peer is a workload of `domain`.
+    pub fn service_name(&self, domain: &str) -> Option<&str> {
+        match self.role {
+            Role::Workload => crate::ca::service_name_from_spiffe_id(domain, &self.spiffe_id),
             _ => None,
         }
     }
@@ -166,6 +180,8 @@ pub enum Permission {
     AgentConnect,
     /// Read the audit log (Admin only)
     ReadAudit,
+    /// Encrypt and decrypt with transit keys
+    Transit,
 }
 
 impl Role {
@@ -181,9 +197,11 @@ impl Role {
                     | Permission::Drain
                     | Permission::ManageSecrets
                     | Permission::AgentConnect
+                    | Permission::Transit
             ),
             Role::Viewer => matches!(permission, Permission::Read),
             Role::Agent => matches!(permission, Permission::AgentConnect),
+            Role::Workload => matches!(permission, Permission::Transit),
         }
     }
 }
@@ -666,9 +684,38 @@ mod tests {
     }
 
     #[test]
+    fn workload_svids_may_only_use_transit() {
+        let peer = PeerIdentity::from_spiffe_id(
+            "fleet.internal",
+            "spiffe://fleet.internal/service/api-server".into(),
+        )
+        .unwrap();
+        assert_eq!(peer.role, Role::Workload);
+        assert_eq!(peer.service_name("fleet.internal"), Some("api-server"));
+        assert_eq!(peer.agent_name("fleet.internal"), None);
+        assert!(Role::Workload.has_permission(Permission::Transit));
+        for perm in [
+            Permission::Read,
+            Permission::Deploy,
+            Permission::Scale,
+            Permission::Drain,
+            Permission::ManageTokens,
+            Permission::ManageSecrets,
+            Permission::AgentConnect,
+            Permission::ReadAudit,
+        ] {
+            assert!(!Role::Workload.has_permission(perm), "{perm:?}");
+        }
+        assert!(!Role::Viewer.has_permission(Permission::Transit));
+        assert!(!Role::Agent.has_permission(Permission::Transit));
+    }
+
+    #[test]
     fn peer_identity_rejects_other_identities() {
         for id in [
-            "spiffe://fleet.internal/service/api-server",
+            "spiffe://fleet.internal/service/",
+            "spiffe://fleet.internal/service/a/b",
+            "spiffe://other.domain/service/api-server",
             "spiffe://fleet.internal/workload/api-server",
             "spiffe://unknown/unidentified",
             "spiffe://other.domain/server/abc",

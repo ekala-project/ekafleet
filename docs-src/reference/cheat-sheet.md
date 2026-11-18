@@ -114,6 +114,18 @@ ekafleet acl token list                         # List tokens (descriptions, not
 ekafleet acl token revoke $TOKEN                # Revoke a token
 ```
 
+## Secrets & Transit
+
+```bash
+ekafleet secret set web api-key < key.txt       # Store a new version (stdin)
+ekafleet secret versions web api-key            # Current and earlier versions
+ekafleet secret rollback web api-key 3          # Restore version 3
+ekafleet transit key create orders              # Server-held encryption key
+ekafleet transit encrypt orders < card.txt      # -> ekafleet:v1:...
+ekafleet transit decrypt orders < card.enc      # Plaintext to stdout
+ekafleet transit key rotate orders              # New version; old values still decrypt
+```
+
 ## Disaster Recovery
 
 ```bash
@@ -188,3 +200,4 @@ Use with `ekafleet events --category <name>`:
 | `admin` | Everything: deploy, scale, drain, manage tokens |
 | `operator` | Operations: deploy, scale, drain, read |
 | `viewer` | Read-only: status, services, events, logs |
+| workload (service SVID) | Transit encrypt/decrypt with its service's `transitKeys` only |

@@ -518,6 +518,12 @@ enum Command {
         action: SecretAction,
     },
 
+    /// Transit encryption with server-held keys
+    Transit {
+        #[command(subcommand)]
+        action: TransitAction,
+    },
+
     /// Persistent volumes of stateful services
     Volume {
         #[command(subcommand)]
@@ -791,6 +797,87 @@ enum SecretAction {
         name: String,
         /// Version to restore
         version: u64,
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum TransitAction {
+    /// Manage transit keys
+    Key {
+        #[command(subcommand)]
+        action: TransitKeyAction,
+    },
+    /// Encrypt stdin (or --file); prints `ekafleet:v<N>:...`
+    Encrypt {
+        /// Transit key name
+        key: String,
+        /// Read the plaintext from this file instead of stdin
+        #[arg(long)]
+        file: Option<std::path::PathBuf>,
+        /// Client certificate (e.g. a service SVID) for mTLS
+        #[arg(long, requires = "key_file")]
+        cert: Option<std::path::PathBuf>,
+        /// Private key for --cert
+        #[arg(long = "key-file", id = "key_file", requires = "cert")]
+        key_file: Option<std::path::PathBuf>,
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+    /// Decrypt a value from stdin (or --file); writes the plaintext to stdout
+    Decrypt {
+        /// Transit key name
+        key: String,
+        /// Read the ciphertext from this file instead of stdin
+        #[arg(long)]
+        file: Option<std::path::PathBuf>,
+        /// Client certificate (e.g. a service SVID) for mTLS
+        #[arg(long, requires = "key_file")]
+        cert: Option<std::path::PathBuf>,
+        /// Private key for --cert
+        #[arg(long = "key-file", id = "key_file", requires = "cert")]
+        key_file: Option<std::path::PathBuf>,
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum TransitKeyAction {
+    /// Create a key
+    Create {
+        /// Key name; it belongs to `--namespace` (default: the token's
+        /// namespace, or "default")
+        name: String,
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+    /// Add a version; new values use it, old ones still decrypt
+    Rotate {
+        /// Key name
+        name: String,
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+    /// List keys and their latest versions
+    List {
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+    /// Delete a key; values encrypted with it can no longer be decrypted
+    Delete {
+        /// Key name
+        name: String,
+        /// Confirm the deletion
+        #[arg(long)]
+        yes: bool,
         /// Server address
         #[arg(long, default_value = "127.0.0.1:7400")]
         server: String,
@@ -1380,6 +1467,47 @@ async fn main() -> anyhow::Result<()> {
                 version,
                 server,
             } => commands::cmd_secret_rollback(service, name, version, server).await?,
+        },
+
+        Command::Transit { action } => match action {
+            TransitAction::Key { action } => match action {
+                TransitKeyAction::Create { name, server } => {
+                    commands::cmd_transit_key_create(name, server).await?
+                }
+                TransitKeyAction::Rotate { name, server } => {
+                    commands::cmd_transit_key_rotate(name, server).await?
+                }
+                TransitKeyAction::List { server } => commands::cmd_transit_key_list(server).await?,
+                TransitKeyAction::Delete { name, yes, server } => {
+                    commands::cmd_transit_key_delete(name, yes, server).await?
+                }
+            },
+            TransitAction::Encrypt {
+                key,
+                file,
+                cert,
+                key_file,
+                server,
+            } => {
+                let identity = commands::ClientIdentity {
+                    cert,
+                    key: key_file,
+                };
+                commands::cmd_transit_encrypt(key, file, identity, server).await?
+            }
+            TransitAction::Decrypt {
+                key,
+                file,
+                cert,
+                key_file,
+                server,
+            } => {
+                let identity = commands::ClientIdentity {
+                    cert,
+                    key: key_file,
+                };
+                commands::cmd_transit_decrypt(key, file, identity, server).await?
+            }
         },
 
         Command::Volume {

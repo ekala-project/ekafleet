@@ -58,6 +58,8 @@ pub enum AuditAction {
     TokenRevoke,
     SecretWrite,
     SecretRead,
+    /// Transit key created, rotated or deleted.
+    TransitKey,
     VolumeSnapshot,
     VolumeRestore,
     NodeAttest,

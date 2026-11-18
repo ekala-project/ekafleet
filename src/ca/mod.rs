@@ -103,6 +103,16 @@ pub fn agent_name_from_spiffe_id<'a>(domain: &str, spiffe_id: &'a str) -> Option
     Some(name)
 }
 
+/// The service name in a workload SVID of `domain`
+/// (`spiffe://<domain>/service/<name>`).
+pub fn service_name_from_spiffe_id<'a>(domain: &str, spiffe_id: &'a str) -> Option<&'a str> {
+    let rest = spiffe_id.strip_prefix("spiffe://")?;
+    let rest = rest.strip_prefix(domain)?;
+    let name = rest.strip_prefix("/service/")?;
+    validate_identity_name(name).ok()?;
+    Some(name)
+}
+
 /// Abstraction over CA signing operations.
 ///
 /// Two implementations exist:

@@ -49,6 +49,15 @@ impl tonic::service::Interceptor for AuthInterceptor {
 /// precedence for the address so per-command `--server` flags keep working;
 /// TLS and auth come from the global context resolved in `main`.
 pub async fn connect_server(server: &str) -> anyhow::Result<FleetClient> {
+    connect_server_as(server, None).await
+}
+
+/// Like [`connect_server`], presenting a client certificate (e.g. a
+/// workload's service SVID, `(cert, key)` PEM paths) over mTLS.
+pub async fn connect_server_as(
+    server: &str,
+    identity: Option<(&std::path::Path, &std::path::Path)>,
+) -> anyhow::Result<FleetClient> {
     let ctx = client_config::context();
 
     // Per-command `--server` flags default to the historical address. Treat a
@@ -65,6 +74,17 @@ pub async fn connect_server(server: &str) -> anyhow::Result<FleetClient> {
             .map_err(|e| anyhow::anyhow!("failed to read CA cert {}: {e}", ca_path.display()))?;
         let ca_cert = tonic::transport::Certificate::from_pem(ca_pem);
         let mut tls = tonic::transport::ClientTlsConfig::new().ca_certificate(ca_cert);
+        if let Some((cert, key)) = identity {
+            let read = |path: &std::path::Path| {
+                std::fs::read(path)
+                    .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))
+            };
+            let key = zeroize::Zeroizing::new(read(key)?);
+            tls = tls.identity(tonic::transport::Identity::from_pem(
+                read(cert)?,
+                key.as_slice(),
+            ));
+        }
         // When connecting by IP, the CA validates the chain but SNI/hostname
         // verification needs a name; use the server's canonical identity.
         if server.starts_with(|c: char| c.is_ascii_digit()) {
@@ -74,6 +94,8 @@ pub async fn connect_server(server: &str) -> anyhow::Result<FleetClient> {
             .tls_config(tls)?
             .connect()
             .await?
+    } else if identity.is_some() {
+        anyhow::bail!("a client certificate needs TLS; pass --ca-cert");
     } else {
         tonic::transport::Endpoint::from_shared(format!("http://{server}"))?
             .connect()
@@ -1532,6 +1554,167 @@ pub async fn cmd_secret_list(service: Option<String>, server: String) -> anyhow:
             s.service_name, s.secret_name, version
         );
     }
+    Ok(())
+}
+
+/// Read a value from `file`, or stdin when absent.
+fn read_input(
+    file: Option<&std::path::Path>,
+    what: &str,
+) -> anyhow::Result<zeroize::Zeroizing<Vec<u8>>> {
+    use std::io::{IsTerminal, Read};
+    let mut value = zeroize::Zeroizing::new(Vec::new());
+    match file {
+        Some(path) => {
+            *value = std::fs::read(path)
+                .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?
+        }
+        None => {
+            if std::io::stdin().is_terminal() {
+                eprintln!("Enter the {what}, then press Ctrl-D:");
+            }
+            std::io::stdin().read_to_end(&mut value)?;
+        }
+    }
+    Ok(value)
+}
+
+fn print_transit_key(key: &ekafleet::proto::TransitKeyInfo) {
+    println!(
+        "{:<24}  {:<16}  {:>7}",
+        key.name, key.namespace, key.latest_version
+    );
+}
+
+pub async fn cmd_transit_key_create(name: String, server: String) -> anyhow::Result<()> {
+    // An unset `--namespace` lets the server pick the token's namespace.
+    let ctx = client_config::context();
+    let namespace = if ctx.namespace == client_config::DEFAULT_NAMESPACE {
+        String::new()
+    } else {
+        ctx.namespace.clone()
+    };
+    let mut client = connect_server(&server).await?;
+    let key = client
+        .create_transit_key(ekafleet::proto::CreateTransitKeyRequest { name, namespace })
+        .await?
+        .into_inner();
+    println!(
+        "Transit key {} created in namespace {}",
+        key.name, key.namespace
+    );
+    Ok(())
+}
+
+pub async fn cmd_transit_key_rotate(name: String, server: String) -> anyhow::Result<()> {
+    let mut client = connect_server(&server).await?;
+    let key = client
+        .rotate_transit_key(ekafleet::proto::RotateTransitKeyRequest { name })
+        .await?
+        .into_inner();
+    println!(
+        "Transit key {} now encrypts with version {}",
+        key.name, key.latest_version
+    );
+    Ok(())
+}
+
+pub async fn cmd_transit_key_list(server: String) -> anyhow::Result<()> {
+    let mut client = connect_server(&server).await?;
+    let keys = client
+        .list_transit_keys(ekafleet::proto::ListTransitKeysRequest {})
+        .await?
+        .into_inner()
+        .keys;
+    if keys.is_empty() {
+        println!("No transit keys.");
+        return Ok(());
+    }
+    println!("{:<24}  {:<16}  {:>7}", "KEY", "NAMESPACE", "VERSION");
+    keys.iter().for_each(print_transit_key);
+    Ok(())
+}
+
+pub async fn cmd_transit_key_delete(name: String, yes: bool, server: String) -> anyhow::Result<()> {
+    if !yes {
+        anyhow::bail!(
+            "deleting transit key '{name}' makes everything encrypted with it unreadable; pass --yes"
+        );
+    }
+    let mut client = connect_server(&server).await?;
+    let resp = client
+        .delete_transit_key(ekafleet::proto::DeleteTransitKeyRequest { name: name.clone() })
+        .await?
+        .into_inner();
+    if resp.deleted {
+        println!("Transit key {name} deleted.");
+    } else {
+        println!("No transit key {name}.");
+    }
+    Ok(())
+}
+
+/// Client certificate and key for `transit encrypt/decrypt`.
+pub struct ClientIdentity {
+    pub cert: Option<std::path::PathBuf>,
+    pub key: Option<std::path::PathBuf>,
+}
+
+impl ClientIdentity {
+    async fn connect(&self, server: &str) -> anyhow::Result<FleetClient> {
+        match (&self.cert, &self.key) {
+            (Some(cert), Some(key)) => connect_server_as(server, Some((cert, key))).await,
+            (None, None) => connect_server(server).await,
+            _ => anyhow::bail!("--cert and --key go together"),
+        }
+    }
+}
+
+pub async fn cmd_transit_encrypt(
+    key: String,
+    file: Option<std::path::PathBuf>,
+    identity: ClientIdentity,
+    server: String,
+) -> anyhow::Result<()> {
+    let mut plaintext = read_input(file.as_deref(), "plaintext")?;
+    let mut client = identity.connect(&server).await?;
+    let resp = client
+        .transit_encrypt(ekafleet::proto::TransitEncryptRequest {
+            key_name: key,
+            plaintext: std::mem::take(&mut *plaintext),
+        })
+        .await?
+        .into_inner();
+    println!("{}", resp.ciphertext);
+    Ok(())
+}
+
+pub async fn cmd_transit_decrypt(
+    key: String,
+    file: Option<std::path::PathBuf>,
+    identity: ClientIdentity,
+    server: String,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+    let input = read_input(file.as_deref(), "ciphertext")?;
+    let ciphertext = std::str::from_utf8(&input)
+        .map_err(|_| anyhow::anyhow!("ciphertext is not text"))?
+        .trim()
+        .to_string();
+    let mut client = identity.connect(&server).await?;
+    let plaintext = zeroize::Zeroizing::new(
+        client
+            .transit_decrypt(ekafleet::proto::TransitDecryptRequest {
+                key_name: key,
+                ciphertext,
+            })
+            .await?
+            .into_inner()
+            .plaintext,
+    );
+    let mut out = std::io::stdout().lock();
+    out.write_all(&plaintext)?;
+    out.flush()?;
     Ok(())
 }
 
