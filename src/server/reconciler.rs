@@ -1349,6 +1349,7 @@ mod tests {
             signature_policy: None,
             alerts: vec![],
             secret_engines: HashMap::new(),
+            external_services: HashMap::new(),
         }
     }
 
