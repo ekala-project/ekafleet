@@ -223,6 +223,11 @@ pub fn schedule(
             }
         })
         .collect();
+    // Machines and services come from hash maps, whose order changes from
+    // one process (or parsed config) to the next. Order both by name so
+    // equal scores always resolve the same way and instances don't move
+    // around between reconciliations.
+    candidates.sort_by(|a, b| a.name.cmp(&b.name));
 
     // Pre-compute pool algorithms for quick lookup
     let pool_algorithms: HashMap<String, &SchedulerAlgorithm> = node_pools
@@ -241,7 +246,7 @@ pub fn schedule(
         .map(|(name, cfg)| (name.as_str(), cfg))
         .collect();
 
-    service_list.sort_by(|(_, a), (_, b)| {
+    service_list.sort_by(|(a_name, a), (b_name, b)| {
         // Higher priority first
         b.scheduling
             .priority
@@ -257,6 +262,7 @@ pub fn schedule(
                 };
                 type_order(&a.scheduling.job_type).cmp(&type_order(&b.scheduling.job_type))
             })
+            .then_with(|| a_name.cmp(b_name))
     });
 
     for (service_name, service_cfg) in service_list {
