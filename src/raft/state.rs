@@ -1311,6 +1311,11 @@ impl FleetStateMachine {
     }
 
     /// The mesh address assigned to `node_id`, if any.
+    /// Nodes holding a mesh address: every node that has joined the mesh.
+    pub async fn mesh_nodes(&self) -> Vec<String> {
+        self.inner.read().await.mesh_ips.keys().cloned().collect()
+    }
+
     pub async fn mesh_ip(&self, node_id: &str) -> Option<Ipv4Addr> {
         self.inner.read().await.mesh_ips.get(node_id).copied()
     }

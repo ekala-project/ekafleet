@@ -10,6 +10,18 @@ Services have a `priority` field (1–100, default 50). Higher priority services
 scheduling.priority = 80;  # high priority — scheduled before default (50)
 ```
 
+## Eligible Machines
+
+The scheduler places services on the fleet configuration's machines (and cloud-provisioned ones) whose agent has joined, minus nodes being drained.
+
+**Counts as joined:** a machine that connected since the server started, holds a mesh address, or has services recorded on it.
+
+**Effects:**
+
+- A machine declared before its agent joins gets nothing until it joins. Joining triggers a reconcile.
+- A node that disconnects keeps its services.
+- After a server restart, nodes that have not reconnected yet keep their services too.
+
 ## Phase 1: Filter
 
 Machines that don't satisfy hard requirements are eliminated. A machine must:
