@@ -19,6 +19,17 @@ service RaftInternal {
   // What a peer knows of the cluster; a server checks its peers with it
   // before forming a new cluster.
   rpc Status(RaftStatusRequest) returns (RaftStatusResponse);
+  // The fleet key, to a server whose copy a rotation replaced; served only
+  // when this server's key has the requested check value.
+  rpc FleetKey(FleetKeyRequest) returns (FleetKeyResponse);
+}
+
+message FleetKeyRequest {
+  bytes check = 1;
+}
+
+message FleetKeyResponse {
+  bytes key = 1;
 }
 
 // An openraft request, or the JSON of its Result, as JSON.

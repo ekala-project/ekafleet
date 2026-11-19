@@ -16,6 +16,7 @@ pub mod dynamic;
 pub mod events;
 pub mod external;
 pub mod federation;
+pub mod fleetkey;
 pub mod identity;
 pub mod images;
 pub mod ingress;

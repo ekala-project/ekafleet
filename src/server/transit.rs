@@ -99,6 +99,7 @@ impl FleetControlService {
 
     async fn seal_new_transit_key(&self, name: &str, version: u32) -> Result<Vec<u8>, Status> {
         let material = transit::generate_key().map_err(|e| Status::internal(e.to_string()))?;
+        super::fleetkey::ensure_current(&self.raft_state, &*self.fleet_key.read().await).await?;
         let store = self.secret_store.read().await;
         store
             .seal(SEAL_SCOPE, &seal_name(name, version), material.as_ref())
