@@ -16,6 +16,7 @@ pub mod bootstrap;
 pub mod closures;
 mod handlers;
 mod helpers;
+mod latest;
 mod types;
 
 pub(crate) use helpers::now_epoch;
@@ -555,6 +556,24 @@ impl Components {
             shutdown.child_token(),
         );
 
+        // Service closures are fetched off the message loop (a fetch can
+        // take minutes); a desired state is applied once its closures are
+        // here, and a newer one waiting for the fetch replaces an older one.
+        let mut fetches = latest::Latest::new(|mut ds: crate::proto::DesiredState| {
+            let client = &client;
+            async move {
+                let previous = local_state.read().await.desired_services.clone();
+                ds.services = handlers::fetch_service_closures(
+                    client,
+                    std::mem::take(&mut ds.services),
+                    &ds.cache_public_key,
+                    &previous,
+                )
+                .await;
+                ds
+            }
+        });
+
         // Process incoming server messages until stream ends or shutdown
         loop {
             tokio::select! {
@@ -589,10 +608,36 @@ impl Components {
                     )
                     .await;
                 }
+                ds = fetches.next() => {
+                    handlers::handle_server_message(
+                        crate::proto::server_message::Payload::DesiredState(ds),
+                        supervisor,
+                        local_state,
+                        workload_mgr,
+                        pending_keys,
+                        node_identity,
+                        secret_injector,
+                        dns,
+                        templates,
+                        peer_manager,
+                        policy_enforcer,
+                        health_checker,
+                        netns_manager,
+                        volumes,
+                        images,
+                        &tx,
+                        node_id,
+                    )
+                    .await;
+                }
                 result = inbound.message() => {
                     match result? {
                         Some(msg) => {
-                            if let Some(payload) = msg.payload {
+                            if let Some(crate::proto::server_message::Payload::DesiredState(ds)) =
+                                msg.payload
+                            {
+                                fetches.submit(ds);
+                            } else if let Some(payload) = msg.payload {
                                 handlers::handle_server_message(
                                     payload,
                                     supervisor,
@@ -611,7 +656,6 @@ impl Components {
                                     images,
                                     &tx,
                                     node_id,
-                                    &client,
                                 )
                                 .await;
                             }
