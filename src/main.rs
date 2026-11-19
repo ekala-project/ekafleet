@@ -90,6 +90,15 @@ enum Command {
         /// Ingress routes file written by the agent
         #[arg(long, default_value = ekafleet::proxy::routes::ROUTES_FILE)]
         routes_file: PathBuf,
+
+        /// HTTPS listen address for routes with `tls` (none: not served
+        /// over HTTPS)
+        #[arg(long, env = "EKAFLEET_PROXY_TLS_LISTEN")]
+        tls_listen: Option<String>,
+
+        /// Route certificates written by the agent
+        #[arg(long, default_value = ekafleet::proxy::tls::TLS_DIR)]
+        tls_dir: PathBuf,
     },
 
     /// Standalone CA signing daemon (process-isolated, no network)
@@ -1313,7 +1322,19 @@ async fn main() -> anyhow::Result<()> {
             trust_domain,
             data_dir,
             routes_file,
-        } => commands::cmd_proxy(listen, trust_domain, data_dir, routes_file).await?,
+            tls_listen,
+            tls_dir,
+        } => {
+            commands::cmd_proxy(ekafleet::proxy::standalone::ProxyConfig {
+                listen: listen.parse()?,
+                tls_listen: tls_listen.map(|l| l.parse()).transpose()?,
+                trust_domain,
+                data_dir,
+                routes_file,
+                tls_dir,
+            })
+            .await?
+        }
 
         Command::CaSigner {
             data_dir,

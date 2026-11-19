@@ -10,6 +10,8 @@
 | 53 | UDP/TCP | Server + Agent | DNS (authority on server, resolver on agent) |
 | 51820 | UDP | Server + Agent | WireGuard mesh |
 | 8080 | TCP (HTTP) | Agent (ingress) | Ingress proxy (`proxyListen`; opened by `proxyOpenFirewall`) |
+| — | TCP (HTTPS) | Agent (ingress) | Ingress proxy TLS listener (`proxyTlsListen`, unset by default; opened by `proxyOpenFirewall`) |
+| `tcpPort` | TCP | Agent (ingress) | TCP ingress routes (not opened automatically) |
 
 ## Unix Sockets
 

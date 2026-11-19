@@ -1201,9 +1201,21 @@ let
   };
 
   # `ExternalServiceConfig`.
+  ingressSplit = strictSubmodule {
+    service = mkOption {
+      type = types.str;
+      description = "Default-namespace service declaring the route's port.";
+    };
+    weight = mkOption {
+      type = types.ints.between 1 100;
+      description = "Percent of the route's traffic sent to this service.";
+    };
+  };
+
   ingressRoute = strictSubmodule {
     host = mkOption {
       type = types.str;
+      default = "*";
       example = "www.example.com";
       description = "Host header to match (without port), or `*` for any host.";
     };
@@ -1230,6 +1242,61 @@ let
       type = types.listOf types.str;
       default = [ ];
       description = "Serve the route on these nodes. With neither `pools` nor `nodes`, every node serves it.";
+    };
+    split = mkOption {
+      type = types.listOf ingressSplit;
+      default = [ ];
+      example = [
+        {
+          service = "web-v2";
+          weight = 10;
+        }
+      ];
+      description = "Shares of the traffic sent to other services; `service` receives the rest.";
+    };
+    rateLimit = mkOption {
+      type = types.nullOr (strictSubmodule {
+        requestsPerSecond = mkOption {
+          type = types.either types.ints.positive types.float;
+          description = "Sustained requests per second per client IP.";
+        };
+        burst = mkOption {
+          type = types.ints.positive;
+          description = "Requests a client may make at once.";
+        };
+      });
+      default = null;
+      description = "Limit HTTP requests per client IP; over the limit the proxy answers 429.";
+    };
+    affinity = mkOption {
+      type = types.nullOr (types.enum [ "clientIp" ]);
+      default = null;
+      description = "Send each client IP to the same replica (and split share) while it serves.";
+    };
+    tcpPort = mkOption {
+      type = types.nullOr types.port;
+      default = null;
+      example = 5432;
+      description = "Forward TCP connections on this port of the proxy instead of routing HTTP; `host` and `path` must stay unset.";
+    };
+    tls = mkOption {
+      type = types.nullOr (strictSubmodule {
+        certSecret = mkOption {
+          type = types.str;
+          description = "`_fleet` secret holding the PEM certificate chain, leaf first.";
+        };
+        keySecret = mkOption {
+          type = types.str;
+          description = "`_fleet` secret holding the PEM private key.";
+        };
+      });
+      default = null;
+      description = "Serve the route over HTTPS on the proxy's TLS listener, choosing the certificate by SNI.";
+    };
+    allowedCallers = mkOption {
+      type = types.listOf types.str;
+      default = [ ];
+      description = "Accept only clients presenting the X.509-SVID of one of these services (requires `tls`).";
     };
   };
 
@@ -1443,7 +1510,7 @@ in
     ingress = mkOption {
       type = types.attrsOf ingressRoute;
       default = { };
-      description = "HTTP routes served by the ingress proxy of selected nodes, keyed by name.";
+      description = "HTTP and TCP routes served by the ingress proxy of selected nodes, keyed by name.";
     };
     federation = mkOption {
       type = federation;

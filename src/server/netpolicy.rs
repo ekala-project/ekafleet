@@ -63,10 +63,9 @@ pub fn build_policies(
             if route.served_by(node, pool)
                 && let Some(ip) = inputs.mesh_ips.get(node)
             {
-                proxies
-                    .entry(&route.service)
-                    .or_default()
-                    .insert(ip.to_string());
+                for service in route.services() {
+                    proxies.entry(service).or_default().insert(ip.to_string());
+                }
             }
         }
     }

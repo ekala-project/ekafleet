@@ -54,6 +54,67 @@ pub(super) async fn fetch_service_closures(
     kept
 }
 
+/// Write the routes the server assigned this node for the ingress proxy,
+/// with the certificates of TLS routes whose secrets have arrived.
+async fn apply_ingress(
+    update: &crate::proto::IngressUpdate,
+    secret_injector: &Arc<RwLock<SecretInjector>>,
+) {
+    use crate::proxy::tls::{CertDir, PROXY_GROUP, TLS_DIR, group_id};
+    let scope = crate::secrets::FLEET_SCOPE;
+    let certs = CertDir::new(std::path::Path::new(TLS_DIR), group_id(PROXY_GROUP));
+    let injector = secret_injector.read().await;
+    let mut tls = std::collections::HashMap::new();
+    let mut needed = std::collections::HashSet::new();
+    for route in update
+        .routes
+        .iter()
+        .filter(|r| !r.tls_cert_secret.is_empty())
+    {
+        needed.insert(route.tls_cert_secret.as_str());
+        needed.insert(route.tls_key_secret.as_str());
+        let cert = injector.read(scope, &route.tls_cert_secret).await;
+        let key = injector.read(scope, &route.tls_key_secret).await;
+        match (cert, key) {
+            (Ok(Some(cert)), Ok(Some(key))) => match certs.write(&route.name, &cert, key).await {
+                Ok(digest) => {
+                    tls.insert(route.name.clone(), digest);
+                }
+                Err(e) => {
+                    tracing::error!(route = %route.name, error = %e, "Cannot install route certificate")
+                }
+            },
+            (Err(e), _) | (_, Err(e)) => {
+                tracing::error!(route = %route.name, error = %e, "Cannot read route certificate")
+            }
+            _ => tracing::info!(
+                route = %route.name,
+                "Route waits for its certificate secrets ({scope}/{}, {scope}/{})",
+                route.tls_cert_secret,
+                route.tls_key_secret
+            ),
+        }
+    }
+    if let Err(e) = injector.retain_secrets(scope, &needed).await {
+        tracing::warn!(error = %e, "Cannot remove unused fleet secrets");
+    }
+    if let Err(e) = certs.retain(&tls.keys().cloned().collect()).await {
+        tracing::warn!(error = %e, "Cannot remove unused route certificates");
+    }
+    let routes = crate::proxy::routes::RoutesFile::from_update(update, &tls);
+    let path = std::path::Path::new(crate::proxy::routes::ROUTES_FILE);
+    match routes.write(path).await {
+        Ok(true) => tracing::info!(routes = routes.routes.len(), "Ingress routes updated"),
+        Ok(false) => {}
+        // A node serving no ingress (e.g. `ekafleet dev` without
+        // root) need not have the runtime directory.
+        Err(e) if routes.routes.is_empty() => {
+            tracing::debug!(error = %e, "Cannot write empty ingress routes")
+        }
+        Err(e) => tracing::error!(error = %e, "Cannot write ingress routes"),
+    }
+}
+
 /// Bring the supervisor's services in line with the desired state: drop
 /// secret files no service declares, provision and reclaim volumes, render
 /// templates, and (re)start services, except new ones still waiting for a
@@ -440,6 +501,39 @@ pub(super) async fn handle_server_message(
                 images,
             )
             .await;
+        }
+        ServerPayload::Secret(update) if update.service_name == crate::secrets::FLEET_SCOPE => {
+            // Fleet secrets reach nodes as ingress certificates only.
+            let changed = {
+                let injector = secret_injector.read().await;
+                if update.deleted {
+                    injector
+                        .remove(&update.service_name, &update.secret_name)
+                        .await
+                } else {
+                    injector
+                        .inject(
+                            &update.service_name,
+                            &update.secret_name,
+                            &update.encrypted_value,
+                        )
+                        .await
+                }
+            };
+            match changed {
+                Ok(true) => {
+                    let ingress = local_state.read().await.ingress.clone();
+                    if let Some(ingress) = ingress {
+                        apply_ingress(&ingress, secret_injector).await;
+                    }
+                }
+                Ok(false) => {}
+                Err(e) => tracing::error!(
+                    secret = %update.secret_name,
+                    error = %e,
+                    "Cannot apply fleet secret update"
+                ),
+            }
         }
         ServerPayload::Secret(update) => {
             let service = update.service_name.as_str();
@@ -982,18 +1076,8 @@ pub(super) async fn handle_server_message(
             respond(tx, cmd.correlation_id, error_message, None).await;
         }
         ServerPayload::Ingress(update) => {
-            let routes = crate::proxy::routes::RoutesFile::from_update(&update);
-            let path = std::path::Path::new(crate::proxy::routes::ROUTES_FILE);
-            match routes.write(path).await {
-                Ok(true) => tracing::info!(routes = routes.routes.len(), "Ingress routes updated"),
-                Ok(false) => {}
-                // A node serving no ingress (e.g. `ekafleet dev` without
-                // root) need not have the runtime directory.
-                Err(e) if routes.routes.is_empty() => {
-                    tracing::debug!(error = %e, "Cannot write empty ingress routes")
-                }
-                Err(e) => tracing::error!(error = %e, "Cannot write ingress routes"),
-            }
+            local_state.write().await.ingress = Some(update.clone());
+            apply_ingress(&update, secret_injector).await;
         }
         ServerPayload::VolumeSnapshotCommand(cmd) => {
             let tx = tx.clone();
