@@ -286,6 +286,7 @@ pub async fn serve(config: CaSignerConfig) -> anyhow::Result<()> {
     );
 
     let ca = super::persist::open_ca(&config.data_dir, &config.domain).await?;
+    super::persist::spawn_intermediate_renewal(ca.clone(), config.data_dir.clone());
     let jwt = super::persist::open_jwt_signer(&config.data_dir).await?;
     let keys = Arc::new((ca, jwt));
 

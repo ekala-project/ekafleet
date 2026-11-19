@@ -103,6 +103,38 @@ pub async fn open_jwt_signer(data_dir: &Path) -> anyhow::Result<JwtSigner> {
     Ok(signer)
 }
 
+/// How often a running CA checks whether its intermediate is due.
+pub const INTERMEDIATE_CHECK: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Replace the intermediate once it nears expiry, and persist the new one.
+/// Leaves issued from then on chain to it; earlier leaves keep chaining to
+/// the old one, which outlives them. Returns whether it rotated.
+pub async fn renew_intermediate_if_due(ca: &RootCa, data_dir: &Path) -> anyhow::Result<bool> {
+    if !ca.intermediate_due().await {
+        return Ok(false);
+    }
+    let stored = ca.intermediate_certificate_pem().await;
+    ca.rotate_intermediate().await?;
+    persist_intermediate_if_changed(ca, data_dir, stored.as_deref()).await?;
+    tracing::info!("Intermediate CA rotated before expiry");
+    Ok(true)
+}
+
+/// Check the intermediate every [`INTERMEDIATE_CHECK`] for as long as the
+/// process runs.
+pub fn spawn_intermediate_renewal(ca: RootCa, data_dir: std::path::PathBuf) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(INTERMEDIATE_CHECK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            if let Err(e) = renew_intermediate_if_due(&ca, &data_dir).await {
+                tracing::error!(error = %e, "Intermediate CA rotation failed; retrying later");
+            }
+        }
+    });
+}
+
 /// Persist the CA's current intermediate when it differs from `stored_cert`
 /// (first boot, or rotation on expiry).
 pub async fn persist_intermediate_if_changed(
@@ -184,5 +216,30 @@ mod tests {
         // in tests) must not be replaced by a freshly generated root.
         std::fs::write(dir.path().join(ROOT_KEY), b"EKAFSEAL\x01garbage").unwrap();
         assert!(open_ca(dir.path(), "test.internal").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_due_intermediate_is_rotated_and_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = open_ca(dir.path(), "test.internal").await.unwrap();
+        let first = ca.intermediate_certificate_pem().await.unwrap();
+        assert!(!renew_intermediate_if_due(&ca, dir.path()).await.unwrap());
+
+        ca.set_intermediate_expiry(1).await;
+        assert!(renew_intermediate_if_due(&ca, dir.path()).await.unwrap());
+        let second = ca.intermediate_certificate_pem().await.unwrap();
+        assert_ne!(first, second);
+        assert!(!ca.intermediate_due().await);
+
+        // A restart loads the rotated intermediate, under the same root.
+        let reopened = open_ca(dir.path(), "test.internal").await.unwrap();
+        assert_eq!(
+            reopened.intermediate_certificate_pem().await.unwrap(),
+            second
+        );
+        assert_eq!(
+            reopened.root_certificate_pem().await,
+            ca.root_certificate_pem().await
+        );
     }
 }
