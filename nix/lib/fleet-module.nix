@@ -218,12 +218,48 @@ let
     allowedCallers = mkOption {
       type = types.listOf types.str;
       default = [ ];
-      description = "SPIFFE IDs allowed to call this service.";
+      description = ''
+        Services allowed to call this service. When set, other nodes reach
+        its ports over the mesh only from nodes running one of them or
+        serving an ingress route to it (in a namespace: only from the
+        callers' replicas). Empty leaves it open.
+      '';
     };
     allowedTargets = mkOption {
       type = types.listOf types.str;
       default = [ ];
-      description = "SPIFFE IDs this service may call.";
+      description = "Services this service calls (orders deployments).";
+    };
+    egressRules = mkOption {
+      type = types.listOf egressRule;
+      default = [ ];
+      description = ''
+        Outbound traffic this service's processes may send. The first
+        matching rule decides; when any are set, unmatched traffic is
+        dropped (loopback and replies stay allowed).
+      '';
+    };
+  };
+
+  # `EgressRuleConfig`.
+  egressRule = strictSubmodule {
+    destCidr = mkOption {
+      type = types.str;
+      example = "10.0.0.0/8";
+      description = "IPv4 address or CIDR (`0.0.0.0/0` for anywhere).";
+    };
+    destPorts = mkOption {
+      type = types.listOf types.port;
+      default = [ ];
+      description = "TCP and UDP destination ports; empty for all.";
+    };
+    action = mkOption {
+      type = types.enum [
+        "allow"
+        "deny"
+      ];
+      default = "allow";
+      description = "Whether matching traffic is sent or dropped.";
     };
   };
 

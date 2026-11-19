@@ -610,6 +610,9 @@ in
           config.nix.package
           pkgs.iproute2
           pkgs.wireguard-tools
+          # Network policy: nft, and nsenter to apply it in namespace networks.
+          pkgs.nftables
+          pkgs.util-linux
         ];
 
         serviceConfig =

@@ -1,5 +1,43 @@
+//! Network policy enforcement with nftables.
+//!
+//! The agent keeps the latest [`PolicyUpdate`] from the server and renders
+//! it into an `inet ekafleet` table of its own: one in the host namespace
+//! for host-networked services, and one in each namespace network whose
+//! services have a policy. Every rule only ever drops traffic: the chains
+//! accept by default, so the host's own firewall (NixOS's) still decides
+//! everything else, and services without a policy stay as reachable as
+//! before.
+//!
+//! - **Ingress**: traffic to a protected service's ports from another node
+//!   (over `wg-fleet`, or into its namespace network) is dropped unless its
+//!   source is listed. Same-node traffic (loopback) is not filtered.
+//! - **Egress**: packets sent by a service's processes, matched by its
+//!   systemd unit's cgroup (`socket cgroupv2`), go through its rules in
+//!   order; unmatched ones are dropped. Loopback and replies on established
+//!   connections pass.
+//!
+//! nftables resolves a cgroup path when the rule is loaded, and a restarted
+//! unit gets a new cgroup, so [`PolicyEnforcer::refresh`] re-renders
+//! periodically and reloads whenever the set of cgroups changed. A
+//! service's egress rules wait until its cgroup exists.
+
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
+use std::path::Path;
 use std::process::Stdio;
+
+use tokio::sync::Mutex;
+
+use crate::proto::{EgressPolicy, IngressPolicy, PolicyUpdate};
+
+/// The table every rule lives in, in each network namespace.
+const TABLE: &str = "ekafleet";
+
+/// The mesh interface other nodes' traffic arrives on.
+const MESH_IFACE: &str = "wg-fleet";
+
+/// Where the unified cgroup hierarchy is mounted.
+const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
 #[derive(Debug, thiserror::Error)]
 pub enum NftError {
@@ -9,441 +47,454 @@ pub enum NftError {
     Io(#[from] std::io::Error),
 }
 
-/// Network policy enforcement via nftables.
-/// Generates and applies rules based on service identity contracts.
+/// Applies the node's network policy.
+#[derive(Default)]
 pub struct PolicyEnforcer {
-    table_name: String,
+    state: Mutex<EnforcerState>,
 }
 
-/// A network policy rule derived from service identity contracts.
-#[derive(Debug, Clone)]
-pub struct PolicyRule {
-    pub source_ip: Ipv4Addr,
-    pub dest_ip: Ipv4Addr,
-    pub dest_ports: Vec<u16>,
-    pub description: String,
+#[derive(Default)]
+struct EnforcerState {
+    policy: PolicyUpdate,
+    /// Whether the host table was loaded since the agent started (clearing
+    /// rules a previous run left behind).
+    host_loaded: bool,
+    /// What was last loaded into each namespace (`None`: the host's): the
+    /// ruleset and the cgroup inodes it resolved.
+    applied: BTreeMap<Option<String>, (String, Vec<u64>)>,
 }
 
-/// A DNAT port-forwarding rule for inbound traffic to namespace services.
-#[derive(Debug, Clone)]
-pub struct PortForwardRule {
-    /// External port on the host interface.
-    pub external_port: u16,
-    /// Internal namespace IP to forward to.
-    pub internal_ip: Ipv4Addr,
-    /// Internal port (usually same as external).
-    pub internal_port: u16,
-    /// Protocol: "tcp" or "udp".
-    pub protocol: String,
-    /// Human-readable description.
-    pub description: String,
-}
-
-/// An egress network policy rule controlling outbound traffic from a service.
-#[derive(Debug, Clone)]
-pub struct EgressRule {
-    pub source_ip: Ipv4Addr,
-    pub dest_cidr: String,
-    pub dest_ports: Vec<u16>,
-    pub action: EgressAction,
-    pub description: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EgressAction {
-    Allow,
-    Deny,
-}
-
-impl Default for PolicyEnforcer {
-    fn default() -> Self {
-        Self::new()
-    }
+/// A service's unit cgroup: path below [`CGROUP_ROOT`], depth, inode.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cgroup {
+    pub path: String,
+    pub level: usize,
+    pub inode: u64,
 }
 
 impl PolicyEnforcer {
     pub fn new() -> Self {
-        Self {
-            table_name: "ekafleet".to_string(),
-        }
+        Self::default()
     }
 
-    /// Initialize the nftables table and default-deny chain.
-    pub async fn initialize(&self) -> Result<(), NftError> {
-        let ruleset = format!(
-            r#"
-table inet {table} {{
-    chain input {{
-        type filter hook input priority 0; policy drop;
-        ct state established,related accept
-        iif lo accept
-        # Allow WireGuard
-        udp dport 51820 accept
-        # Allow gRPC
-        tcp dport 7400 accept
-        # Allow HTTP API
-        tcp dport 7402 accept
-        # Allow VXLAN namespace overlay (cross-node, arrives via WireGuard)
-        iifname "wg-fleet" udp dport 4789 accept
-    }}
-
-    chain output {{
-        type filter hook output priority 0; policy accept;
-        ct state established,related accept
-    }}
-
-    chain forward {{
-        type filter hook forward priority 0; policy drop;
-    }}
-}}
-"#,
-            table = self.table_name,
+    /// Replace the policy and apply it.
+    pub async fn set(&self, policy: PolicyUpdate) {
+        tracing::debug!(
+            ingress = policy.ingress.len(),
+            egress = policy.egress.len(),
+            "Received network policy"
         );
-
-        self.apply_ruleset(&ruleset).await?;
-        tracing::info!(table = %self.table_name, "nftables base rules initialized");
-        Ok(())
+        self.state.lock().await.policy = policy;
+        self.refresh().await;
     }
 
-    /// Apply policy rules derived from service identity contracts.
-    pub async fn apply_policies(&self, rules: &[PolicyRule]) -> Result<(), NftError> {
-        // Build nft rules from policy
-        let mut nft_rules = Vec::new();
+    /// Render the current policy and load each namespace's rules that
+    /// changed (including services whose cgroup appeared or was replaced).
+    pub async fn refresh(&self) {
+        let mut state = self.state.lock().await;
+        let policy = state.policy.clone();
+        let mut targets: BTreeMap<Option<String>, (Vec<&IngressPolicy>, Vec<&EgressPolicy>)> =
+            BTreeMap::new();
+        targets.entry(None).or_default();
+        for p in &policy.ingress {
+            targets
+                .entry(namespace_of(&p.namespace))
+                .or_default()
+                .0
+                .push(p);
+        }
+        for p in &policy.egress {
+            targets
+                .entry(namespace_of(&p.namespace))
+                .or_default()
+                .1
+                .push(p);
+        }
+        // Namespaces that had rules and no longer do get an empty ruleset.
+        let stale: Vec<Option<String>> = state
+            .applied
+            .keys()
+            .filter(|ns| !targets.contains_key(*ns))
+            .cloned()
+            .collect();
 
-        for rule in rules {
-            let ports: String = rule
-                .dest_ports
+        let mut loaded = Vec::new();
+        for (namespace, (ingress, egress)) in targets
+            .into_iter()
+            .chain(stale.into_iter().map(|ns| (ns, (Vec::new(), Vec::new()))))
+        {
+            let cgroups: Vec<Option<Cgroup>> = egress
                 .iter()
-                .map(|p| p.to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-
-            // Sanitize description to prevent nftables comment injection
-            let desc: String = rule
-                .description
-                .chars()
-                .filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '-' || *c == '_')
-                .take(128)
+                .map(|p| service_cgroup(Path::new(CGROUP_ROOT), &p.service))
                 .collect();
-
-            nft_rules.push(format!(
-                "add rule inet {table} input ip saddr {src} ip daddr {dst} tcp dport {{ {ports} }} accept comment \"{desc}\"",
-                table = self.table_name,
-                src = rule.source_ip,
-                dst = rule.dest_ip,
-            ));
-        }
-
-        if nft_rules.is_empty() {
-            return Ok(());
-        }
-
-        let ruleset = nft_rules.join("\n");
-        self.apply_ruleset(&ruleset).await?;
-
-        tracing::info!(rules = rules.len(), "Network policies applied");
-        Ok(())
-    }
-
-    /// Apply egress rules controlling outbound traffic from services.
-    pub async fn apply_egress(&self, rules: &[EgressRule]) -> Result<(), NftError> {
-        let mut nft_rules = Vec::new();
-
-        for rule in rules {
-            let action = match rule.action {
-                EgressAction::Allow => "accept",
-                EgressAction::Deny => "drop",
+            let with_cgroups: Vec<(&EgressPolicy, &Cgroup)> = egress
+                .iter()
+                .zip(&cgroups)
+                .filter_map(|(p, c)| c.as_ref().map(|c| (*p, c)))
+                .collect();
+            for (policy, cgroup) in egress.iter().zip(&cgroups) {
+                if cgroup.is_none() {
+                    tracing::debug!(service = %policy.service, "No cgroup yet; egress rules wait for it");
+                }
+            }
+            let ruleset = render(namespace.is_some(), &ingress, &with_cgroups);
+            let inodes: Vec<u64> = with_cgroups.iter().map(|(_, c)| c.inode).collect();
+            let unchanged = match state.applied.get(&namespace) {
+                Some(applied) => *applied == (ruleset.clone(), inodes.clone()),
+                // Nothing loaded: an empty ruleset changes nothing, except
+                // on the host once, for a previous run's leftovers.
+                None => ruleset == empty_ruleset() && (namespace.is_some() || state.host_loaded),
             };
+            if unchanged {
+                continue;
+            }
+            loaded.push((namespace, ruleset, inodes));
+        }
+        for (namespace, ruleset, inodes) in loaded {
+            let netns = namespace
+                .as_ref()
+                .map(|ns| format!("/run/netns/ekafleet-{ns}"));
+            if let Some(path) = &netns
+                && !Path::new(path).exists()
+            {
+                // Not set up yet (or gone with its rules): retry later.
+                state.applied.remove(&namespace);
+                continue;
+            }
+            match apply_ruleset(netns.as_deref(), &ruleset).await {
+                Ok(()) => {
+                    tracing::info!(namespace = ?namespace, "Network policy applied");
+                    if namespace.is_none() {
+                        state.host_loaded = true;
+                    }
+                    if ruleset == empty_ruleset() {
+                        state.applied.remove(&namespace);
+                    } else {
+                        state.applied.insert(namespace, (ruleset, inodes));
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(namespace = ?namespace, error = %e, "Network policy not applied");
+                }
+            }
+        }
+    }
+}
 
-            let desc: String = rule
-                .description
-                .chars()
-                .filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '-' || *c == '_')
-                .take(128)
-                .collect();
+fn namespace_of(namespace: &str) -> Option<String> {
+    (!crate::agent::netns::is_default_namespace(namespace)).then(|| namespace.to_string())
+}
 
-            if rule.dest_ports.is_empty() {
-                nft_rules.push(format!(
-                    "add rule inet {table} output ip saddr {src} ip daddr {dst} {action} comment \"{desc}\"",
-                    table = self.table_name,
-                    src = rule.source_ip,
-                    dst = rule.dest_cidr,
-                ));
-            } else {
-                let ports: String = rule
-                    .dest_ports
+/// The cgroup of the unit running `service`, in the default slice or the
+/// one units with resource controls use.
+pub fn service_cgroup(root: &Path, service: &str) -> Option<Cgroup> {
+    use std::os::unix::fs::MetadataExt;
+    if crate::ca::validate_identity_name(service).is_err() {
+        return None;
+    }
+    let unit = format!("ekafleet-{service}.service");
+    ["system.slice", "system.slice/system-ekafleet.slice"]
+        .iter()
+        .find_map(|slice| {
+            let path = format!("{slice}/{unit}");
+            let meta = std::fs::metadata(root.join(&path)).ok()?;
+            meta.is_dir().then(|| Cgroup {
+                level: path.split('/').count(),
+                path,
+                inode: meta.ino(),
+            })
+        })
+}
+
+/// A ruleset that removes the table.
+fn empty_ruleset() -> String {
+    format!("table inet {TABLE}\ndelete table inet {TABLE}\n")
+}
+
+/// A comment naming a service (names are validated; this keeps any other
+/// character out of the ruleset).
+fn comment(text: &str) -> String {
+    text.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.'))
+        .take(128)
+        .collect()
+}
+
+fn ports(ports: &[u32]) -> Option<String> {
+    let ports: BTreeSet<u16> = ports
+        .iter()
+        .filter_map(|p| u16::try_from(*p).ok().filter(|p| *p != 0))
+        .collect();
+    (!ports.is_empty()).then(|| {
+        ports
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    })
+}
+
+/// The ruleset replacing the table in one namespace, atomically. Addresses
+/// and CIDRs that do not parse are left out (a source that does not parse
+/// is not allowed).
+pub fn render(
+    namespaced: bool,
+    ingress: &[&IngressPolicy],
+    egress: &[(&EgressPolicy, &Cgroup)],
+) -> String {
+    if ingress.is_empty() && egress.is_empty() {
+        return empty_ruleset();
+    }
+    let mut out = empty_ruleset();
+    out.push_str(&format!("table inet {TABLE} {{\n"));
+
+    out.push_str(
+        "    chain ingress {\n        type filter hook input priority filter - 1; policy accept;\n",
+    );
+    if namespaced {
+        out.push_str("        iif \"lo\" accept\n");
+    }
+    for policy in ingress {
+        let Some(ports) = ports(&policy.ports) else {
+            continue;
+        };
+        let to = if namespaced {
+            match policy.dest_ip.parse::<Ipv4Addr>() {
+                Ok(ip) => format!("ip daddr {ip}"),
+                Err(_) => continue,
+            }
+        } else {
+            format!("iifname \"{MESH_IFACE}\"")
+        };
+        let sources: BTreeSet<Ipv4Addr> = policy
+            .allowed_sources
+            .iter()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        let except = if sources.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " ip saddr != {{ {} }}",
+                sources
                     .iter()
-                    .map(|p| p.to_string())
+                    .map(Ipv4Addr::to_string)
                     .collect::<Vec<_>>()
-                    .join(", ");
-                nft_rules.push(format!(
-                    "add rule inet {table} output ip saddr {src} ip daddr {dst} tcp dport {{ {ports} }} {action} comment \"{desc}\"",
-                    table = self.table_name,
-                    src = rule.source_ip,
-                    dst = rule.dest_cidr,
-                ));
-            }
-        }
-
-        if nft_rules.is_empty() {
-            return Ok(());
-        }
-
-        let ruleset = nft_rules.join("\n");
-        self.apply_ruleset(&ruleset).await?;
-
-        tracing::info!(rules = rules.len(), "Egress policies applied");
-        Ok(())
-    }
-
-    /// Initialize namespace NAT rules: masquerade for outbound traffic from
-    /// customer workload subnets (10.200.0.0/16) and optional DNAT port-forwarding
-    /// rules for inbound traffic.
-    pub async fn apply_namespace_nat(
-        &self,
-        port_forwards: &[PortForwardRule],
-    ) -> Result<(), NftError> {
-        let mut rules = String::new();
-
-        // Masquerade: customer workload subnets → outbound internet
-        rules.push_str(&format!(
-            r#"
-table inet {table} {{
-    chain ekafleet_postrouting {{
-        type nat hook postrouting priority 100;
-        ip saddr 10.200.0.0/16 masquerade
-    }}
-"#,
-            table = self.table_name,
+                    .join(", ")
+            )
+        };
+        out.push_str(&format!(
+            "        {to} meta l4proto {{ tcp, udp }} th dport {{ {ports} }}{except} drop comment \"{}\"\n",
+            comment(&policy.service)
         ));
-
-        // DNAT: inbound port-forwarding to namespace services
-        if !port_forwards.is_empty() {
-            rules.push_str(
-                r#"
-    chain ekafleet_prerouting {
-        type nat hook prerouting priority -100;
-"#,
-            );
-
-            for pf in port_forwards {
-                let desc: String = pf
-                    .description
-                    .chars()
-                    .filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '-' || *c == '_')
-                    .take(128)
-                    .collect();
-
-                let proto = if pf.protocol == "udp" { "udp" } else { "tcp" };
-                rules.push_str(&format!(
-                    "        {proto} dport {ext} dnat to {ip}:{int} comment \"{desc}\"\n",
-                    ext = pf.external_port,
-                    ip = pf.internal_ip,
-                    int = pf.internal_port,
-                ));
-            }
-
-            rules.push_str("    }\n");
-        }
-
-        rules.push_str("}\n");
-
-        self.apply_ruleset(&rules).await?;
-        tracing::info!(
-            port_forwards = port_forwards.len(),
-            "Namespace NAT rules applied"
-        );
-        Ok(())
     }
+    out.push_str("    }\n");
 
-    /// Flush all rules in the ekafleet table.
-    pub async fn flush(&self) -> Result<(), NftError> {
-        let cmd = format!("flush table inet {}", self.table_name);
-        self.apply_ruleset(&cmd).await
+    out.push_str(
+        "    chain egress {\n        type filter hook output priority filter - 1; policy accept;\n",
+    );
+    if !egress.is_empty() {
+        out.push_str("        oif \"lo\" accept\n        ct state established,related accept\n");
     }
-
-    /// Remove the ekafleet table entirely.
-    pub async fn teardown(&self) -> Result<(), NftError> {
-        let cmd = format!("delete table inet {}", self.table_name);
-        self.apply_ruleset(&cmd).await
-    }
-
-    /// Generate policy rules as nftables commands without applying them.
-    /// Useful for testing rule generation and sanitization.
-    #[cfg(test)]
-    fn generate_rules(&self, rules: &[PolicyRule]) -> Vec<String> {
-        let mut nft_rules = Vec::new();
-        for rule in rules {
-            let ports: String = rule
-                .dest_ports
-                .iter()
-                .map(|p| p.to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-
-            let desc: String = rule
-                .description
-                .chars()
-                .filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '-' || *c == '_')
-                .take(128)
-                .collect();
-
-            nft_rules.push(format!(
-                "add rule inet {table} input ip saddr {src} ip daddr {dst} tcp dport {{ {ports} }} accept comment \"{desc}\"",
-                table = self.table_name,
-                src = rule.source_ip,
-                dst = rule.dest_ip,
+    for (policy, cgroup) in egress {
+        let path: String = cgroup
+            .path
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | '\\'))
+            .collect();
+        let socket = format!("socket cgroupv2 level {} \"{path}\"", cgroup.level);
+        let name = comment(&policy.service);
+        for rule in &policy.rules {
+            let Ok((addr, len)) = crate::config::parse_ipv4_cidr(&rule.dest_cidr) else {
+                continue;
+            };
+            let dport = match ports(&rule.dest_ports) {
+                Some(ports) => format!(" meta l4proto {{ tcp, udp }} th dport {{ {ports} }}"),
+                None if rule.dest_ports.is_empty() => String::new(),
+                // Only invalid ports: matching every port would widen it.
+                None => continue,
+            };
+            let verdict = if rule.allow { "accept" } else { "drop" };
+            out.push_str(&format!(
+                "        {socket} ip daddr {addr}/{len}{dport} {verdict} comment \"{name}\"\n"
             ));
         }
-        nft_rules
+        out.push_str(&format!(
+            "        {socket} drop comment \"{name} default\"\n"
+        ));
     }
+    out.push_str("    }\n}\n");
+    out
+}
 
-    async fn apply_ruleset(&self, ruleset: &str) -> Result<(), NftError> {
-        use tokio::io::AsyncWriteExt;
+/// Load `ruleset` with `nft -f -`, inside the network namespace at `netns`
+/// if given. `nsenter` switches only the network namespace, so cgroup paths
+/// still resolve against the host's cgroup mount.
+async fn apply_ruleset(netns: Option<&str>, ruleset: &str) -> Result<(), NftError> {
+    use tokio::io::AsyncWriteExt;
 
-        let mut child = tokio::process::Command::new("nft")
-            .args(["-f", "-"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(ruleset.as_bytes()).await?;
-            // Drop stdin to close the pipe so nft sees EOF
+    let mut command = match netns {
+        Some(netns) => {
+            let mut c = tokio::process::Command::new("nsenter");
+            c.arg(format!("--net={netns}")).args(["nft", "-f", "-"]);
+            c
         }
-
-        let output = child.wait_with_output().await?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(NftError::Command(stderr.to_string()));
+        None => {
+            let mut c = tokio::process::Command::new("nft");
+            c.args(["-f", "-"]);
+            c
         }
-
-        Ok(())
+    };
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(ruleset.as_bytes()).await?;
     }
+    let output = child.wait_with_output().await?;
+    if !output.status.success() {
+        return Err(NftError::Command(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::EgressRuleSpec;
 
-    fn rule(desc: &str) -> PolicyRule {
-        PolicyRule {
-            source_ip: Ipv4Addr::new(10, 100, 1, 1),
-            dest_ip: Ipv4Addr::new(10, 100, 2, 1),
-            dest_ports: vec![8080, 8443],
-            description: desc.to_string(),
+    fn ingress(service: &str, dest_ip: &str, ports: &[u32], sources: &[&str]) -> IngressPolicy {
+        IngressPolicy {
+            service: service.into(),
+            namespace: String::new(),
+            dest_ip: dest_ip.into(),
+            ports: ports.to_vec(),
+            allowed_sources: sources.iter().map(|s| s.to_string()).collect(),
         }
     }
 
     #[test]
-    fn sanitize_removes_dangerous_chars_from_description() {
-        let enforcer = PolicyEnforcer::new();
-        let rules = enforcer.generate_rules(&[rule("allow web\" ; drop table")]);
-
-        assert_eq!(rules.len(), 1);
-        // Extract just the comment content between the comment delimiters
-        let comment_start = rules[0].find("comment \"").unwrap() + 9;
-        let comment_end = rules[0].rfind('"').unwrap();
-        let comment = &rules[0][comment_start..comment_end];
-
-        // The sanitized description must not contain quotes or semicolons
-        assert!(!comment.contains('"'), "quotes must be stripped");
-        assert!(!comment.contains(';'), "semicolons must be stripped");
-        // But should still contain the safe words
-        assert!(comment.contains("allow"), "safe words should remain");
-        assert!(comment.contains("web"), "safe words should remain");
-    }
-
-    #[test]
-    fn sanitize_preserves_safe_characters() {
-        let enforcer = PolicyEnforcer::new();
-        let rules = enforcer.generate_rules(&[rule("allow frontend-to-backend_v2")]);
-
-        assert!(rules[0].contains("allow frontend-to-backend_v2"));
-    }
-
-    #[test]
-    fn sanitize_truncates_long_descriptions() {
-        let enforcer = PolicyEnforcer::new();
-        let long_desc = "a".repeat(256);
-        let rules = enforcer.generate_rules(&[rule(&long_desc)]);
-
-        // Extract the comment content
-        let comment_start = rules[0].find("comment \"").unwrap() + 9;
-        let comment_end = rules[0].rfind('"').unwrap();
-        let comment = &rules[0][comment_start..comment_end];
-
+    fn host_rules_drop_mesh_traffic_from_unlisted_sources() {
+        let db = ingress(
+            "db",
+            "",
+            &[5432, 5433, 0, 70000],
+            &["10.100.0.4", "10.100.0.2", "junk\""],
+        );
+        let closed = ingress("cache", "", &[6379], &[]);
+        let ruleset = render(false, &[&db, &closed], &[]);
+        assert!(ruleset.starts_with("table inet ekafleet\ndelete table inet ekafleet\n"));
         assert!(
-            comment.len() <= 128,
-            "description must be truncated to 128 chars"
+            ruleset.contains(
+                "iifname \"wg-fleet\" meta l4proto { tcp, udp } th dport { 5432, 5433 } \
+             ip saddr != { 10.100.0.2, 10.100.0.4 } drop comment \"db\""
+            ),
+            "{ruleset}"
+        );
+        // No caller anywhere: nothing from other nodes gets in.
+        assert!(ruleset.contains(
+            "iifname \"wg-fleet\" meta l4proto { tcp, udp } th dport { 6379 } drop comment \"cache\""
+        ), "{ruleset}");
+        assert!(!ruleset.contains("junk"));
+        assert!(ruleset.contains("policy accept"));
+        assert!(!ruleset.contains("policy drop"));
+    }
+
+    #[test]
+    fn namespace_rules_match_the_replica_and_let_local_traffic_through() {
+        let cache = ingress("cache", "10.200.0.2", &[6379], &["10.200.0.3"]);
+        let ruleset = render(true, &[&cache], &[]);
+        assert!(ruleset.contains("iif \"lo\" accept"));
+        assert!(
+            ruleset.contains(
+                "ip daddr 10.200.0.2 meta l4proto { tcp, udp } th dport { 6379 } \
+             ip saddr != { 10.200.0.3 } drop comment \"cache\""
+            ),
+            "{ruleset}"
         );
     }
 
     #[test]
-    fn rule_generation_with_multiple_ports() {
-        let enforcer = PolicyEnforcer::new();
-        let r = PolicyRule {
-            source_ip: Ipv4Addr::new(10, 0, 0, 1),
-            dest_ip: Ipv4Addr::new(10, 0, 0, 2),
-            dest_ports: vec![80, 443, 8080],
-            description: "web traffic".into(),
+    fn egress_rules_match_the_unit_cgroup_and_drop_the_rest() {
+        let policy = EgressPolicy {
+            service: "db".into(),
+            namespace: String::new(),
+            rules: vec![
+                EgressRuleSpec {
+                    dest_cidr: "10.0.0.0/8".into(),
+                    dest_ports: vec![443],
+                    allow: true,
+                },
+                EgressRuleSpec {
+                    dest_cidr: "10.9.9.9".into(),
+                    dest_ports: vec![],
+                    allow: false,
+                },
+                EgressRuleSpec {
+                    dest_cidr: "nope".into(),
+                    dest_ports: vec![],
+                    allow: true,
+                },
+                EgressRuleSpec {
+                    dest_cidr: "0.0.0.0/0".into(),
+                    dest_ports: vec![0],
+                    allow: true,
+                },
+            ],
         };
-        let rules = enforcer.generate_rules(&[r]);
-
-        assert!(rules[0].contains("80, 443, 8080"));
-        assert!(rules[0].contains("10.0.0.1"));
-        assert!(rules[0].contains("10.0.0.2"));
-    }
-
-    #[test]
-    fn empty_rules_produces_empty_output() {
-        let enforcer = PolicyEnforcer::new();
-        let rules = enforcer.generate_rules(&[]);
-        assert!(rules.is_empty());
-    }
-
-    #[test]
-    fn port_forward_rule_fields() {
-        let pf = PortForwardRule {
-            external_port: 25565,
-            internal_ip: Ipv4Addr::new(10, 200, 1, 2),
-            internal_port: 25565,
-            protocol: "tcp".into(),
-            description: "customer-a-minecraft".into(),
+        let cgroup = Cgroup {
+            path: "system.slice/ekafleet-db.service".into(),
+            level: 2,
+            inode: 7,
         };
-        assert_eq!(pf.external_port, 25565);
-        assert_eq!(pf.internal_ip, Ipv4Addr::new(10, 200, 1, 2));
+        let ruleset = render(false, &[], &[(&policy, &cgroup)]);
+        let socket = "socket cgroupv2 level 2 \"system.slice/ekafleet-db.service\"";
+        let lines: Vec<&str> = ruleset
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("socket"))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                format!(
+                    "{socket} ip daddr 10.0.0.0/8 meta l4proto {{ tcp, udp }} th dport {{ 443 }} accept comment \"db\""
+                ),
+                format!("{socket} ip daddr 10.9.9.9/32 drop comment \"db\""),
+                format!("{socket} drop comment \"db default\""),
+            ]
+        );
+        assert!(ruleset.contains("oif \"lo\" accept"));
+        assert!(ruleset.contains("ct state established,related accept"));
     }
 
     #[test]
-    fn shell_metacharacters_stripped() {
-        let enforcer = PolicyEnforcer::new();
-        let dangerous_descs = vec![
-            "$(rm -rf /)",
-            "`whoami`",
-            "foo\nbar",
-            "a && b",
-            "a || b",
-            "a | b",
-            "a > /etc/passwd",
-            "a < /dev/null",
-        ];
+    fn nothing_to_enforce_removes_the_table() {
+        assert_eq!(render(false, &[], &[]), empty_ruleset());
+    }
 
-        for desc in dangerous_descs {
-            let rules = enforcer.generate_rules(&[rule(desc)]);
-            let rule_str = &rules[0];
-
-            assert!(!rule_str.contains('$'), "$ must be stripped from: {desc}");
-            assert!(
-                !rule_str.contains('`'),
-                "backtick must be stripped from: {desc}"
-            );
-            assert!(!rule_str.contains('&'), "& must be stripped from: {desc}");
-            assert!(!rule_str.contains('|'), "| must be stripped from: {desc}");
-            assert!(!rule_str.contains('>'), "> must be stripped from: {desc}");
-            assert!(!rule_str.contains('<'), "< must be stripped from: {desc}");
-        }
+    #[test]
+    fn unit_cgroups_are_found_in_either_slice() {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+        assert!(service_cgroup(root.path(), "db").is_none());
+        let dir = root
+            .path()
+            .join("system.slice/system-ekafleet.slice/ekafleet-db.service");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(
+            service_cgroup(root.path(), "db"),
+            Some(Cgroup {
+                path: "system.slice/system-ekafleet.slice/ekafleet-db.service".into(),
+                level: 3,
+                inode: std::fs::metadata(&dir).unwrap().ino(),
+            })
+        );
+        assert!(service_cgroup(root.path(), "../etc").is_none());
     }
 }
