@@ -496,6 +496,68 @@ async fn apply_rollback_and_resume_after_a_crash() {
     assert_eq!(revisions.len(), 3);
 }
 
+/// `apply --follow`: the stream stays open after the applied revision
+/// converges, reports the later reconciliations that change something (a
+/// newer revision applied elsewhere), and skips the cycles that change
+/// nothing.
+#[tokio::test]
+async fn following_an_apply_streams_later_reconciliations() {
+    if !nix_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let flake = dir.path().join("fleet");
+    let server = start(dir.path()).await;
+    let mut admin = client(&server, dir.path(), ADMIN_TOKEN).await;
+    let identity = join_agent(&server, dir.path(), &dir.path().join("agent")).await;
+    let mut agent = connect_agent(&server, dir.path(), identity).await;
+
+    write_fleet(&flake, "/bin/v1");
+    commit(&flake);
+    let mut followed = admin
+        .apply(ApplyRequest {
+            flake_ref: flake.display().to_string(),
+            follow: true,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let mut next = async || {
+        tokio::time::timeout(Duration::from_secs(120), followed.message())
+            .await
+            .expect("follow stream stalled")
+            .unwrap()
+            .expect("follow stream ended")
+    };
+    let mut seen = Vec::new();
+    let first = loop {
+        let event = next().await;
+        seen.push(event.message.clone());
+        if event.status != ApplyStatus::ApplyInProgress as i32 {
+            break event;
+        }
+    };
+    assert_eq!(first.status, ApplyStatus::ApplySucceeded as i32, "{seen:?}");
+    assert_eq!(first.revision, 1);
+    agent.expect_command("/bin/v1").await;
+
+    // A revision applied by someone else shows up on the followed stream,
+    // and the idle cycles in between do not.
+    write_fleet(&flake, "/bin/v2");
+    let (status, revision, messages) = apply(&mut admin, &flake).await;
+    assert_eq!(status, ApplyStatus::ApplySucceeded, "{messages:?}");
+    assert_eq!(revision, 2);
+    let update = next().await;
+    assert_eq!(update.revision, 2, "{}", update.message);
+    assert_eq!(update.status, ApplyStatus::ApplySucceeded as i32);
+    assert!(update.message.contains("1 updates"), "{}", update.message);
+    agent.expect_command("/bin/v2").await;
+
+    // Nothing changes from here on: the stream stays open and quiet.
+    let quiet = tokio::time::timeout(Duration::from_secs(3), followed.message()).await;
+    assert!(quiet.is_err(), "unexpected event: {quiet:?}");
+}
+
 #[tokio::test]
 async fn viewers_cannot_apply_or_roll_back() {
     let dir = tempfile::tempdir().unwrap();
