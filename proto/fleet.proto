@@ -894,21 +894,43 @@ message WireguardPeer {
   string signing_cert_pem = 6;
 }
 
+// The complete network policy of one node; it replaces the previous one.
+// Only services that declare `allowedCallers` or `egressRules` appear.
 message PolicyUpdate {
-  repeated NetworkPolicy policies = 1;
+  reserved 1;
+  repeated IngressPolicy ingress = 2;
+  repeated EgressPolicy egress = 3;
 }
 
-message NetworkPolicy {
-  string source_service = 1;
-  string target_service = 2;
-  repeated uint32 allowed_ports = 3;
-  // Namespace this policy applies to.
-  string namespace = 4;
-  // Resolved IPs for cross-node enforcement. Empty in same-host phase
-  // (isolation is via separate netns, no rules needed). Populated for
-  // cross-node to allow specific remote namespace IPs through the tunnel.
-  string source_ip = 5;
-  string target_ip = 6;
+// Traffic from other nodes to a service's ports is dropped unless it comes
+// from one of `allowed_sources`.
+message IngressPolicy {
+  string service = 1;
+  // Non-default namespace of the replica, enforced inside its network
+  // namespace; empty for host-networked services (enforced on wg-fleet).
+  string namespace = 2;
+  // The replica's namespace IP (namespaced replicas only).
+  string dest_ip = 3;
+  repeated uint32 ports = 4;
+  // IPv4 addresses: mesh IPs of nodes running an allowed caller or serving
+  // an ingress route to the service, or namespace IPs of caller replicas.
+  repeated string allowed_sources = 5;
+}
+
+// Outbound traffic of a service's processes, matched by cgroup: the first
+// matching rule decides, and anything no rule matches is dropped.
+message EgressPolicy {
+  string service = 1;
+  string namespace = 2;
+  repeated EgressRuleSpec rules = 3;
+}
+
+message EgressRuleSpec {
+  // IPv4 address or CIDR.
+  string dest_cidr = 1;
+  // TCP and UDP destination ports; empty matches every port.
+  repeated uint32 dest_ports = 2;
+  bool allow = 3;
 }
 
 // --- Node Attestation ---
