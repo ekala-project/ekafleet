@@ -50,7 +50,15 @@ impl ServiceAssignments {
 pub struct CertIssuer {
     ca: Arc<dyn CaSigner>,
     assignments: ServiceAssignments,
+    /// Per-node bound on JWT-SVID signing. The agent caches a token per
+    /// audience set, so only a workload asking for ever new audiences
+    /// reaches it.
+    jwt_limits: crate::proxy::ratelimit::RateLimiter,
 }
+
+/// JWT-SVIDs a node may have signed at once, then per second.
+const JWT_SVID_BURST: u32 = 100;
+const JWT_SVID_PER_SECOND: f64 = 10.0;
 
 impl CertIssuer {
     pub fn new(ca: Arc<dyn CaSigner>) -> Self {
@@ -60,7 +68,16 @@ impl CertIssuer {
     /// Create an issuer that authorizes requests against a shared
     /// assignment table (normally `FleetState::service_assignments`).
     pub fn with_assignments(ca: Arc<dyn CaSigner>, assignments: ServiceAssignments) -> Self {
-        Self { ca, assignments }
+        Self {
+            ca,
+            assignments,
+            jwt_limits: crate::proxy::ratelimit::RateLimiter::new(
+                crate::proxy::ratelimit::RateLimitConfig {
+                    requests_per_second: JWT_SVID_PER_SECOND,
+                    burst: JWT_SVID_BURST,
+                },
+            ),
+        }
     }
 
     /// Replace the full set of services assigned to a node. Only assigned
@@ -155,6 +172,12 @@ impl CertIssuer {
             );
             return Err(CaError::AttestationFailed(format!(
                 "service '{service_name}' is not assigned to node '{node_id}'"
+            )));
+        }
+        if !self.jwt_limits.allow(node_id).await {
+            return Err(CaError::RateLimited(format!(
+                "node '{node_id}' asked for more than {JWT_SVID_BURST} JWT-SVIDs at once \
+                 ({JWT_SVID_PER_SECOND}/s after that); retry later"
             )));
         }
         tracing::info!(node_id = %node_id, service = %service_name, ?audience, "Issuing JWT-SVID");
@@ -415,5 +438,37 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn jwt_svids_are_rate_limited_per_node() {
+        let issuer = test_issuer().await;
+        for node in ["node-1", "node-2"] {
+            issuer.update_assignments(node, vec!["web".into()]).await;
+        }
+        for i in 0..JWT_SVID_BURST {
+            issuer
+                .issue_jwt_svid("node-1", "web", &[format!("aud-{i}")])
+                .await
+                .unwrap();
+        }
+        let refused = issuer
+            .issue_jwt_svid("node-1", "web", &["one-more".into()])
+            .await;
+        assert!(
+            matches!(refused, Err(CaError::RateLimited(_))),
+            "{refused:?}"
+        );
+        // Another node has its own allowance.
+        issuer
+            .issue_jwt_svid("node-2", "web", &["db".into()])
+            .await
+            .unwrap();
+        // The allowance refills.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        issuer
+            .issue_jwt_svid("node-1", "web", &["later".into()])
+            .await
+            .unwrap();
     }
 }

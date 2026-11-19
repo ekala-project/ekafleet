@@ -130,7 +130,7 @@ In addition to X.509-SVIDs, ekafleet issues JWT-SVIDs for token-based authentica
 ### Issuance
 
 1. A workload calls `FetchJWTSVID` with one or more audiences. The agent attests it exactly as for X.509 (`SO_PEERCRED` → cgroup → service). If the request names a `spiffe_id`, it must be the caller's own.
-2. The agent forwards a `JwtSvidRequest` over its control stream. The server signs only for services currently assigned to that (mTLS-authenticated) node.
+2. The agent forwards a `JwtSvidRequest` over its control stream. The server signs only for services currently assigned to that (mTLS-authenticated) node, and at most 100 tokens per node at once, refilling at 10 per second. Beyond that the workload gets an error and should retry.
 3. The token is signed with **ES256** by the CA signer, which holds the signing key next to the X.509 CA keys (`jwt-signing-key.pk8`, sealed at rest like them).
 4. The agent caches each token per (service, audience set) and fetches a fresh one once half its lifetime has passed.
 
