@@ -63,6 +63,11 @@ pub struct ServerConfig {
     /// Empty runs a one-server cluster.
     pub peers: std::collections::BTreeMap<crate::raft::consensus::NodeId, String>,
     pub grpc_listen: String,
+    /// The gRPC address other servers and agents reach this server on,
+    /// recorded in the Raft membership. Defaults to this server's entry
+    /// in `peers`, else `grpc_listen` (its host replaced by the hostname
+    /// when it is unspecified, like `0.0.0.0`).
+    pub raft_addr: Option<String>,
     pub http_listen: String,
     pub token: String,
     /// Trust domain for SPIFFE identities (e.g., "fleet.internal").
@@ -131,7 +136,10 @@ fn initial_members(
     String,
 )> {
     if config.peers.is_empty() {
-        let addr = config.grpc_listen.clone();
+        let addr = match &config.raft_addr {
+            Some(addr) => addr.clone(),
+            None => reachable_listen_addr(&config.grpc_listen, crate::agent::system_hostname)?,
+        };
         return Ok((
             [(config.node_id, openraft::BasicNode::new(&addr))].into(),
             addr,
@@ -143,12 +151,63 @@ fn initial_members(
             config.node_id
         )
     })?;
+    if let Some(raft_addr) = &config.raft_addr
+        && *raft_addr != addr
+    {
+        anyhow::bail!(
+            "--raft-addr {raft_addr} differs from this server's address {addr} in --peers"
+        );
+    }
     let members = config
         .peers
         .iter()
         .map(|(id, addr)| (*id, openraft::BasicNode::new(addr)))
         .collect();
     Ok((members, addr))
+}
+
+/// `listen` as others can dial it: an unspecified host (`0.0.0.0`, `[::]`)
+/// becomes `hostname()`.
+fn reachable_listen_addr(
+    listen: &str,
+    hostname: impl FnOnce() -> anyhow::Result<String>,
+) -> anyhow::Result<String> {
+    match listen.parse::<std::net::SocketAddr>() {
+        Ok(addr) if addr.ip().is_unspecified() => {
+            let host = hostname()?;
+            tracing::info!(
+                %listen,
+                advertised = %format!("{host}:{}", addr.port()),
+                "Advertising this server by hostname; set --raft-addr to choose the address"
+            );
+            Ok(format!("{host}:{}", addr.port()))
+        }
+        _ => Ok(listen.to_string()),
+    }
+}
+
+/// Correct this server's address in the Raft membership (on the leader):
+/// servers from before `--raft-addr` may have recorded `0.0.0.0`.
+async fn record_own_address(raft: &crate::raft::consensus::Raft, addr: &str) {
+    let metrics = raft.metrics().borrow().clone();
+    let recorded = metrics
+        .membership_config
+        .membership()
+        .get_node(&metrics.id)
+        .map(|n| n.addr.clone());
+    if recorded.as_deref().is_none_or(|r| r == addr) {
+        return;
+    }
+    let change =
+        openraft::ChangeMembers::SetNodes([(metrics.id, openraft::BasicNode::new(addr))].into());
+    match raft.change_membership(change, false).await {
+        Ok(_) => tracing::info!(
+            old = recorded.as_deref().unwrap_or_default(),
+            new = %addr,
+            "Recorded this server's address in the Raft membership"
+        ),
+        Err(e) => tracing::warn!(error = %e, "Could not record this server's address"),
+    }
 }
 
 pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
@@ -398,10 +457,13 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         );
         let federation_view = federation_view.clone();
         let (acl_tokens, join_tokens) = (token_store.clone(), grpc_config.join_token_store.clone());
+        let (own_raft, own_addr) = (raft.clone(), advertise.clone());
         Box::new(move |term: CancellationToken| {
             // Tokens persisted locally before they were replicated.
             let (acl_tokens, join_tokens) = (acl_tokens.clone(), join_tokens.clone());
+            let (own_raft, own_addr) = (own_raft.clone(), own_addr.clone());
             tokio::spawn(async move {
+                record_own_address(&own_raft, &own_addr).await;
                 if let Err(e) = acl_tokens.migrate_to_replicated().await {
                     tracing::warn!(error = %e, "Could not move ACL tokens into Raft");
                 }
@@ -714,5 +776,31 @@ fn get_server_id(data_dir: &Path) -> anyhow::Result<String> {
         }
         std::fs::write(&id_path, &id)?;
         Ok(id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unspecified_listen_hosts_are_advertised_by_hostname() {
+        let host = || Ok("s1.example".to_string());
+        assert_eq!(
+            reachable_listen_addr("0.0.0.0:7400", host).unwrap(),
+            "s1.example:7400"
+        );
+        assert_eq!(
+            reachable_listen_addr("[::]:7400", host).unwrap(),
+            "s1.example:7400"
+        );
+        assert_eq!(
+            reachable_listen_addr("10.0.0.1:7400", || unreachable!()).unwrap(),
+            "10.0.0.1:7400"
+        );
+        assert_eq!(
+            reachable_listen_addr("s1:7400", || unreachable!()).unwrap(),
+            "s1:7400"
+        );
     }
 }
