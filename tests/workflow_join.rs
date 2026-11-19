@@ -383,7 +383,10 @@ async fn embedded_agent_joins_its_own_server_with_a_node_svid() {
     // It joined with a node SVID for its name, persisted for restarts.
     let cert = std::fs::read_to_string(agent_dir.path().join("node-svid.pem")).unwrap();
     let mut reader = std::io::BufReader::new(cert.as_bytes());
-    let der = rustls_pemfile::certs(&mut reader).next().unwrap().unwrap();
+    let der = ekafleet::ca::pki::pem_certs(&mut reader)
+        .next()
+        .unwrap()
+        .unwrap();
     assert_eq!(
         ekafleet::proxy::mtls::SpiffeAuthorizer::extract_spiffe_id_from_der(&der).as_deref(),
         Some(format!("spiffe://{DOMAIN}/agent/embedded").as_str())

@@ -21,7 +21,7 @@ pub struct NodeIdentity {
 /// `cert_pem`.
 fn leaf_info(cert_pem: &str) -> Option<(Option<String>, u64, u64)> {
     let mut reader = std::io::BufReader::new(cert_pem.as_bytes());
-    let der = rustls_pemfile::certs(&mut reader).next()?.ok()?;
+    let der = crate::ca::pki::pem_certs(&mut reader).next()?.ok()?;
     let (_, cert) = x509_parser::parse_x509_certificate(&der).ok()?;
     let validity = cert.validity();
     let not_before = u64::try_from(validity.not_before.timestamp()).unwrap_or(0);

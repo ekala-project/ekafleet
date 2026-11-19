@@ -60,13 +60,13 @@ fn now() -> u64 {
 
 /// Parse a combined chain + key PEM.
 fn certified_key(pem: &str) -> Result<Arc<CertifiedKey>, IdentityError> {
-    let chain = rustls_pemfile::certs(&mut pem.as_bytes())
+    let chain = crate::ca::pki::pem_certs(&mut pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| IdentityError::Pem(e.to_string()))?;
     if chain.is_empty() {
         return Err(IdentityError::Pem("no certificate".into()));
     }
-    let key = rustls_pemfile::private_key(&mut pem.as_bytes())
+    let key = crate::ca::pki::pem_private_key(&mut pem.as_bytes())
         .map_err(|e| IdentityError::Pem(e.to_string()))?
         .ok_or_else(|| IdentityError::Pem("no private key".into()))?;
     let signing_key = provider()
