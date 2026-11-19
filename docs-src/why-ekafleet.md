@@ -54,7 +54,7 @@ ekafleet treats security as foundational architecture:
 
 **Defense in depth is the default posture.** Transport encryption via kernel WireGuard tunnels between all fleet machines. Service identity via mTLS with SPIFFE SVIDs. Network policy via nftables rules generated from identity contracts. Secrets encrypted at rest with AES-256-GCM. Each layer operates independently — compromising one doesn't compromise the others.
 
-**Identity contracts enforce least-privilege networking.** Services declare `allowedCallers` and `allowedTargets`. The default posture is deny-all. ekafleet generates nftables rules that enforce these contracts at the kernel level. A compromised service cannot reach endpoints it wasn't explicitly authorized to contact.
+**Identity contracts enforce least-privilege networking.** Services declare `allowedCallers` and `egressRules`. ekafleet generates nftables rules that enforce these contracts at the kernel level, following placement as replicas move. A compromised service cannot reach endpoints its contract does not allow.
 
 ### System Orchestration First, Containers When Needed
 
@@ -104,7 +104,7 @@ A production fleet where:
 
 - Configuration is a single Nix expression, version-controlled and reproducible
 - Every workload has a cryptographic identity from its first second of life
-- Network policy is enforced at the kernel level by default
+- Network policy declared in identity contracts is enforced at the kernel level
 - Secrets are encrypted at rest and delivered over authenticated channels
 - The entire OS converges to declared state every 30 seconds
 - Rolling back means switching a Nix generation

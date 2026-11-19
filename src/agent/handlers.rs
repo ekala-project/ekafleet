@@ -583,20 +583,7 @@ pub(super) async fn handle_server_message(
             }
         }
         ServerPayload::Policy(update) => {
-            tracing::info!(policies = update.policies.len(), "Received policy update");
-            let rules: Vec<crate::policy::nftables::PolicyRule> = update
-                .policies
-                .iter()
-                .map(|p| crate::policy::nftables::PolicyRule {
-                    source_ip: std::net::Ipv4Addr::UNSPECIFIED,
-                    dest_ip: std::net::Ipv4Addr::UNSPECIFIED,
-                    dest_ports: p.allowed_ports.iter().map(|&port| port as u16).collect(),
-                    description: format!("{} -> {}", p.source_service, p.target_service),
-                })
-                .collect();
-            if let Err(e) = policy_enforcer.apply_policies(&rules).await {
-                tracing::error!(error = %e, "Policy application failed");
-            }
+            policy_enforcer.set(update).await;
         }
         ServerPayload::AttestChallenge(challenge) => {
             tracing::debug!(

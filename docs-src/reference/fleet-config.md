@@ -135,9 +135,14 @@ Resolvable as `<name>.external.<domain>`; see [DNS](../operations/dns.md#externa
 ```nix
 identity = {
   allowedCallers = [ "service-a" "service-b" ];  # Services that may call this one
-  allowedTargets = [ "service-c" ];               # Services this one may call
+  allowedTargets = [ "service-c" ];               # Services this one may call (not enforced by nftables)
+  egressRules = [                                 # Outbound allow/deny list; anything else is dropped
+    { destCidr = "0.0.0.0/0"; destPorts = [ 443 ]; action = "allow"; }
+  ];
 };
 ```
+
+Both are opt-in; see [Network Policy](../operations/network-policy.md).
 
 ## ResourceConfig
 

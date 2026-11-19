@@ -24,6 +24,7 @@ pub mod keybundle;
 pub mod leadership;
 mod membership;
 pub mod mesh;
+pub mod netpolicy;
 pub mod nix;
 pub mod policy;
 pub mod raft_rpc;
@@ -504,6 +505,8 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
                 .with_federation(federation_view.clone())
                 .spawn(term.child_token());
             ingress::IngressPublisher::new(fleet_state.clone(), raft_state.clone())
+                .spawn(term.child_token());
+            netpolicy::PolicyPublisher::new(fleet_state.clone(), raft_state.clone())
                 .spawn(term.child_token());
             autoscaler::Autoscaler {
                 raft_state: raft_state.clone(),
