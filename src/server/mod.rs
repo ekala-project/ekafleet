@@ -81,9 +81,9 @@ pub struct ServerConfig {
 }
 
 /// The in-process agent of `ekafleet server --embedded-agent` and
-/// `ekafleet dev`. It joins its own server over loopback like any other
-/// node: the server mints a short-lived join token for it when it has no
-/// valid node SVID, and it then authenticates with that SVID over mTLS.
+/// `ekafleet dev`. It connects to its own server over loopback like any
+/// other node, authenticating over mTLS with a node SVID the server signs
+/// for it directly when it has no valid one (no join token involved).
 pub struct EmbeddedAgentConfig {
     pub node_name: String,
     pub data_dir: PathBuf,
