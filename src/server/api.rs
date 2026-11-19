@@ -2248,6 +2248,24 @@ impl FleetControl for FleetControlService {
         Ok(Response::new(super::leadership::raft_status(raft)))
     }
 
+    async fn raft_add_member(
+        &self,
+        request: Request<crate::proto::RaftAddMemberRequest>,
+    ) -> Result<Response<crate::proto::RaftStatusResponse>, Status> {
+        self.handle_raft_add_member(request)
+            .await
+            .map(Response::new)
+    }
+
+    async fn raft_remove_member(
+        &self,
+        request: Request<crate::proto::RaftRemoveMemberRequest>,
+    ) -> Result<Response<crate::proto::RaftStatusResponse>, Status> {
+        self.handle_raft_remove_member(request)
+            .await
+            .map(Response::new)
+    }
+
     async fn delete_transit_key(
         &self,
         request: Request<crate::proto::DeleteTransitKeyRequest>,

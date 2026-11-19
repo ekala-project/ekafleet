@@ -66,6 +66,8 @@ pub enum AuditAction {
     NodeJoin,
     NodeLeave,
     ConfigValidate,
+    /// A server added to or removed from the Raft cluster.
+    ClusterMembership,
     /// A request whose credentials were missing, invalid or not accepted.
     Authenticate,
     /// An authenticated request refused by RBAC or namespace scope.

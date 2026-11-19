@@ -10,13 +10,15 @@ service FleetBootstrap {
   rpc Attest(NodeAttestationRequest) returns (NodeAttestationResult);
 }
 
-// Bidirectional streaming control channel between server and agents.
 // Raft consensus between control-plane servers. Only callers presenting a
 // server SVID of this trust domain are served; bearer tokens never are.
 service RaftInternal {
   rpc AppendEntries(RaftMessage) returns (RaftMessage);
   rpc Vote(RaftMessage) returns (RaftMessage);
   rpc InstallSnapshot(RaftMessage) returns (RaftMessage);
+  // What a peer knows of the cluster; a server checks its peers with it
+  // before forming a new cluster.
+  rpc Status(RaftStatusRequest) returns (RaftStatusResponse);
 }
 
 // An openraft request, or the JSON of its Result, as JSON.
@@ -24,6 +26,7 @@ message RaftMessage {
   bytes data = 1;
 }
 
+// Bidirectional streaming control channel between server and agents.
 service FleetControl {
   // Long-lived bidirectional stream for agent ↔ server communication.
   rpc StreamControl(stream AgentMessage) returns (stream ServerMessage);
@@ -173,6 +176,21 @@ service FleetControl {
   // or not; every other RPC is refused by followers with UNAVAILABLE and
   // the leader's address in the `x-ekafleet-leader` header.
   rpc RaftStatus(RaftStatusRequest) returns (RaftStatusResponse);
+  // Add a server to the cluster: it replicates as a learner until it has
+  // caught up, then becomes a voter. Admin only.
+  rpc RaftAddMember(RaftAddMemberRequest) returns (RaftStatusResponse);
+  // Remove a server from the cluster. Admin only.
+  rpc RaftRemoveMember(RaftRemoveMemberRequest) returns (RaftStatusResponse);
+}
+
+message RaftAddMemberRequest {
+  uint64 id = 1;
+  // The gRPC address (`host:port`) the other servers reach it on.
+  string addr = 2;
+}
+
+message RaftRemoveMemberRequest {
+  uint64 id = 1;
 }
 
 message RaftStatusRequest {}
