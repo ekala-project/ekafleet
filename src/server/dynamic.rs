@@ -238,19 +238,23 @@ impl LeaseManager {
         // Sealed and stored under the fleet key lock, so a rotation can't
         // miss the new value.
         let stored = {
-            let _fleet_key = self.fleet_key.read().await;
-            let sealed = self
-                .secret_store
-                .read()
-                .await
-                .seal(service, name, &credentials.to_json());
+            let fleet_key = self.fleet_key.read().await;
+            let sealed = if super::fleetkey::is_current(&self.raft_state, &fleet_key.key).await {
+                self.secret_store
+                    .read()
+                    .await
+                    .seal(service, name, &credentials.to_json())
+                    .map_err(|e| e.to_string())
+            } else {
+                Err("this server's fleet key is out of date after a rotation".to_string())
+            };
             match sealed {
                 Ok(sealed) => self
                     .raft_state
                     .issue_dynamic_secret(service, name, sealed, lease.clone())
                     .await
                     .map_err(|e| e.to_string()),
-                Err(e) => Err(e.to_string()),
+                Err(e) => Err(e),
             }
         };
         let version = match stored {

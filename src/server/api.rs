@@ -2735,7 +2735,22 @@ pub async fn serve_grpc(
         service.audit_log.clone(),
     );
 
-    let raft_service = super::raft_rpc::RaftService::new(service.raft_state.clone(), &domain);
+    let raft_service = super::raft_rpc::RaftService::new(service.raft_state.clone(), &domain)
+        .with_fleet_key(service.fleet_key.clone());
+    super::fleetkey::FleetKeySync {
+        raft_state: service.raft_state.clone(),
+        fleet_key: service.fleet_key.clone(),
+        secret_store: service.secret_store.clone(),
+        network: super::raft_rpc::GrpcNetwork::new(
+            tls.identity.clone(),
+            &tls.ca_cert_pem,
+            &domain,
+        )?,
+        state: service.state.clone(),
+        data_dir: service.data_dir.clone(),
+        domain: domain.clone(),
+    }
+    .spawn(shutdown.clone());
     let incoming = grpc_incoming(listener, tls_config, shutdown.clone());
     tonic::transport::Server::builder()
         .http2_keepalive_interval(Some(Duration::from_secs(20)))
