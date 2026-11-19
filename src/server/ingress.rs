@@ -18,7 +18,9 @@ use super::dns::DnsInputs;
 use super::state::FleetState;
 use crate::config::FleetConfig;
 use crate::proto::server_message::Payload as ServerPayload;
-use crate::proto::{IngressRoute, IngressUpdate, ServerMessage};
+use crate::proto::{
+    IngressRateLimit, IngressRoute, IngressSplitBackends, IngressUpdate, ServerMessage,
+};
 use crate::raft::state::FleetStateMachine;
 
 /// How often routes are recomputed.
@@ -65,15 +67,49 @@ pub fn build_routes(
                 .iter()
                 .filter_map(|name| {
                     let route = &config.ingress[*name];
+                    let serving = |service: &str| -> Vec<String> {
+                        backends
+                            .get(service)
+                            .and_then(|ports| ports.get(route.port.as_str()))
+                            .map(|b| b.iter().cloned().collect())
+                            .unwrap_or_default()
+                    };
                     route.served_by(node, pool).then(|| IngressRoute {
                         name: name.to_string(),
                         host: route.host.clone(),
                         path_prefix: route.path.clone(),
-                        backends: backends
-                            .get(route.service.as_str())
-                            .and_then(|ports| ports.get(route.port.as_str()))
-                            .map(|b| b.iter().cloned().collect())
+                        backends: serving(&route.service),
+                        split: route
+                            .split
+                            .iter()
+                            .map(|s| IngressSplitBackends {
+                                service: s.service.clone(),
+                                weight: s.weight,
+                                backends: serving(&s.service),
+                            })
+                            .collect(),
+                        tcp_port: route.tcp_port.map(u32::from).unwrap_or_default(),
+                        rate_limit: route.rate_limit.as_ref().map(|l| IngressRateLimit {
+                            requests_per_second: l.requests_per_second,
+                            burst: l.burst,
+                        }),
+                        client_ip_affinity: route.affinity
+                            == Some(crate::config::IngressAffinity::ClientIp),
+                        tls_cert_secret: route
+                            .tls
+                            .as_ref()
+                            .map(|t| t.cert_secret.clone())
                             .unwrap_or_default(),
+                        tls_key_secret: route
+                            .tls
+                            .as_ref()
+                            .map(|t| t.key_secret.clone())
+                            .unwrap_or_default(),
+                        allowed_callers: route
+                            .allowed_callers
+                            .iter()
+                            .map(|c| format!("spiffe://{}/service/{c}", config.domain))
+                            .collect(),
                     })
                 })
                 .collect();
@@ -86,14 +122,17 @@ pub fn build_routes(
 pub struct IngressPublisher {
     state: FleetState,
     raft_state: FleetStateMachine,
+    /// PEM of the fleet root CA, for routes with allowed callers.
+    client_ca: String,
     sent: Mutex<HashMap<String, (Vec<IngressRoute>, Instant)>>,
 }
 
 impl IngressPublisher {
-    pub fn new(state: FleetState, raft_state: FleetStateMachine) -> Self {
+    pub fn new(state: FleetState, raft_state: FleetStateMachine, client_ca: String) -> Self {
         Self {
             state,
             raft_state,
+            client_ca,
             sent: Mutex::default(),
         }
     }
@@ -135,6 +174,7 @@ impl IngressPublisher {
             let msg = ServerMessage {
                 payload: Some(ServerPayload::Ingress(IngressUpdate {
                     routes: set.clone(),
+                    client_ca: self.client_ca.clone(),
                 })),
             };
             if self.state.send_to_agent(&node, msg).await {
@@ -234,6 +274,7 @@ mod tests {
                 host: "www.example.com".into(),
                 path_prefix: "/".into(),
                 backends: vec!["10.100.0.1:8080".into(), "10.100.0.2:8080".into()],
+                ..Default::default()
             }]
         );
         assert_eq!(routes["b"].len(), 1);
@@ -243,6 +284,61 @@ mod tests {
             ["10.100.0.1:9000", "10.100.0.2:9000"]
         );
         assert!(routes["e"].is_empty());
+    }
+
+    #[test]
+    fn route_options_reach_the_node() {
+        let config: FleetConfig = serde_json::from_value(serde_json::json!({
+            "name": "t",
+            "domain": "fleet.test",
+            "services": {
+                "web": {"command": "/bin/web", "ports": {"http": {"port": 8080}}},
+                "web-v2": {"command": "/bin/web", "ports": {"http": {"port": 8080}}},
+            },
+            "ingress": {
+                "site": {"host": "www.example.com", "service": "web", "port": "http",
+                         "split": [{"service": "web-v2", "weight": 10}],
+                         "rateLimit": {"requestsPerSecond": 2.5, "burst": 5}, "affinity": "clientIp",
+                         "tls": {"certSecret": "www-crt", "keySecret": "www-key"},
+                         "allowedCallers": ["web"]},
+                "db": {"service": "web", "port": "http", "tcpPort": 5432},
+            },
+        }))
+        .unwrap();
+        let inputs = DnsInputs {
+            assignments: BTreeMap::from([("a".into(), vec![spec("web-v2", "")])]),
+            mesh_ips: BTreeMap::from([("a".into(), Ipv4Addr::new(10, 100, 0, 1))]),
+            serving: [("a".to_string(), "web-v2".to_string())].into(),
+            ..Default::default()
+        };
+        let nodes = BTreeMap::from([("a".to_string(), "default".to_string())]);
+        let routes = build_routes(&config, &nodes, &inputs);
+        let [db, site] = &routes["a"][..] else {
+            panic!("{:?}", routes["a"]);
+        };
+        assert_eq!(db.tcp_port, 5432);
+        assert!(site.backends.is_empty());
+        assert_eq!(
+            site.split,
+            [IngressSplitBackends {
+                service: "web-v2".into(),
+                weight: 10,
+                backends: vec!["10.100.0.1:8080".into()],
+            }]
+        );
+        assert_eq!(
+            site.rate_limit,
+            Some(IngressRateLimit {
+                requests_per_second: 2.5,
+                burst: 5
+            })
+        );
+        assert!(site.client_ip_affinity);
+        assert_eq!(
+            (site.tls_cert_secret.as_str(), site.tls_key_secret.as_str()),
+            ("www-crt", "www-key")
+        );
+        assert_eq!(site.allowed_callers, ["spiffe://fleet.test/service/web"]);
     }
 
     #[test]

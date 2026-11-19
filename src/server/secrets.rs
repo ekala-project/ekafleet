@@ -90,12 +90,16 @@ impl SecretPublisher {
         let connections = self.state.connections().await;
         let mut sent = self.sent.lock().await;
         sent.retain(|node, _| connections.iter().any(|(n, _)| n == node));
+        let ingress = self.ingress_secrets().await;
 
         let mut count = 0;
         for (node, connection_id) in connections {
-            let Some(desired) = self.state.assigned_desired_state(&node).await else {
-                continue;
-            };
+            // A node serving ingress may run no services.
+            let desired = self
+                .state
+                .assigned_desired_state(&node)
+                .await
+                .unwrap_or_default();
             let entry = sent.entry(node.clone()).or_default();
             if entry.connection_id != connection_id {
                 *entry = NodeSent {
@@ -107,14 +111,23 @@ impl SecretPublisher {
 
             let mut wanted = HashSet::new();
             let mut updates = Vec::new();
-            for spec in &desired.services {
-                for name in &spec.secrets {
-                    let key = (spec.name.clone(), name.clone());
-                    let update = match stored.get(&spec.name).and_then(|s| s.get(name)) {
+            let declared = desired
+                .services
+                .iter()
+                .flat_map(|spec| spec.secrets.iter().map(|name| (spec.name.as_str(), name)));
+            let certificates = ingress
+                .get(&node)
+                .into_iter()
+                .flatten()
+                .map(|name| (crate::secrets::FLEET_SCOPE, name));
+            for (service, name) in declared.chain(certificates) {
+                {
+                    let key = (service.to_string(), name.clone());
+                    let update = match stored.get(service).and_then(|s| s.get(name)) {
                         Some((sealed, version)) if entry.secrets.get(&key) != Some(version) => {
-                            match store.seal_for_agent(&spec.name, name, sealed, &agent_id) {
+                            match store.seal_for_agent(service, name, sealed, &agent_id) {
                                 Ok(encrypted_value) => Some(SecretUpdate {
-                                    service_name: spec.name.clone(),
+                                    service_name: service.to_string(),
                                     secret_name: name.clone(),
                                     encrypted_value,
                                     version: *version,
@@ -122,7 +135,7 @@ impl SecretPublisher {
                                 }),
                                 Err(e) => {
                                     tracing::error!(
-                                        service = %spec.name,
+                                        service = %service,
                                         secret = %name,
                                         error = %e,
                                         "Cannot re-encrypt secret for agent"
@@ -132,7 +145,7 @@ impl SecretPublisher {
                             }
                         }
                         None if entry.secrets.get(&key) != Some(&0) => Some(SecretUpdate {
-                            service_name: spec.name.clone(),
+                            service_name: service.to_string(),
                             secret_name: name.clone(),
                             deleted: true,
                             ..Default::default()
@@ -177,6 +190,35 @@ impl SecretPublisher {
             }
         }
         count
+    }
+
+    /// The `_fleet` secrets (certificates and keys) of the TLS ingress
+    /// routes each connected node serves.
+    async fn ingress_secrets(&self) -> HashMap<String, Vec<String>> {
+        let Some(config) = self
+            .raft
+            .current_config()
+            .await
+            .and_then(|revision| revision.config().ok())
+        else {
+            return HashMap::new();
+        };
+        let (statuses, _, _) = self.state.fleet_status().await;
+        statuses
+            .into_iter()
+            .map(|node| {
+                let mut names: Vec<String> = config
+                    .ingress
+                    .values()
+                    .filter(|route| route.served_by(&node.node_id, &node.pool))
+                    .filter_map(|route| route.tls.as_ref())
+                    .flat_map(|tls| [tls.cert_secret.clone(), tls.key_secret.clone()])
+                    .collect();
+                names.sort();
+                names.dedup();
+                (node.node_id, names)
+            })
+            .collect()
     }
 
     /// Publish on every assignment or secret change, and every
@@ -239,6 +281,22 @@ pub async fn missing_secret_warnings(
                 engine.admin_url_secret,
                 crate::secrets::FLEET_SCOPE,
                 engine.admin_url_secret
+            ));
+        }
+    }
+    let mut certificates: Vec<(&String, &String)> = config
+        .ingress
+        .iter()
+        .filter_map(|(name, route)| Some((name, route.tls.as_ref()?)))
+        .flat_map(|(name, tls)| [(name, &tls.cert_secret), (name, &tls.key_secret)])
+        .collect();
+    certificates.sort();
+    for (route, secret) in certificates {
+        if !fleet.is_some_and(|s| s.contains_key(secret)) {
+            warnings.push(format!(
+                "ingress '{route}' reads its certificate from secret '{secret}', which has no \
+                 value; it is served over plain HTTP until `ekafleet secret set {} {secret}`",
+                crate::secrets::FLEET_SCOPE
             ));
         }
     }
@@ -864,6 +922,59 @@ mod tests {
         };
         assert_eq!(update.version, 3);
         assert_eq!(open(update, "n1").await, b"v3");
+    }
+
+    #[tokio::test]
+    async fn nodes_serving_tls_routes_get_their_certificates() {
+        let state = FleetState::new();
+        let raft = FleetStateMachine::new();
+        let config = serde_json::json!({
+            "name": "t",
+            "domain": "fleet.test",
+            "nodePools": {"edge": {}},
+            "services": {"web": {"command": "/bin/web", "ports": {"http": {"port": 8080}}}},
+            "ingress": {"site": {
+                "host": "www.example.com", "service": "web", "port": "http", "pools": ["edge"],
+                "tls": {"certSecret": "www-crt", "keySecret": "www-key"},
+            }},
+        });
+        raft.apply_config(crate::raft::state::Command::ApplyConfig {
+            flake_ref: "/f".into(),
+            config_json: config.to_string(),
+            applied_at: 0,
+            applied_by: "test".into(),
+            rollback_of: None,
+            closures: Default::default(),
+            images: Default::default(),
+        })
+        .await
+        .unwrap();
+        put(&raft, crate::secrets::FLEET_SCOPE, "www-crt", b"CERT").await;
+        put(&raft, crate::secrets::FLEET_SCOPE, "www-key", b"KEY").await;
+        put(&raft, crate::secrets::FLEET_SCOPE, "pg-admin", b"x").await;
+        // The edge node runs no services; the other serves no route.
+        let (_, mut edge) = state
+            .register_agent_connection("e1", "10.0.0.1:1".into(), "edge".into())
+            .await;
+        let (_, mut other) = state
+            .register_agent_connection("n1", "10.0.0.2:1".into(), "default".into())
+            .await;
+
+        let publisher = publisher(&state, &raft);
+        assert_eq!(publisher.publish().await, 2);
+        let sent = drain(&mut edge);
+        let [
+            ServerPayload::FleetKey(_),
+            ServerPayload::Secret(crt),
+            ServerPayload::Secret(key),
+        ] = &sent[..]
+        else {
+            panic!("expected key then two secrets, got {sent:?}");
+        };
+        assert_eq!(crt.service_name, crate::secrets::FLEET_SCOPE);
+        assert_eq!(open(crt, "e1").await, b"CERT");
+        assert_eq!(open(key, "e1").await, b"KEY");
+        assert!(drain(&mut other).is_empty());
     }
 
     #[tokio::test]

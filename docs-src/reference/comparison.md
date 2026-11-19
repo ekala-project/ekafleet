@@ -101,18 +101,18 @@ ekafleet is a single binary that consolidates capabilities from 10+ separate too
 |---------|----------|------------|----------------|-------|
 | Service discovery (DNS) | **Yes** | **Yes** (CoreDNS) | **Yes** | A + SRV records, health-aware |
 | Mesh encryption | **Yes** (WireGuard) | **Yes** (CNI) | **Yes** (mTLS) | Kernel-level WireGuard tunnel |
-| Ingress proxy (L7 HTTP) | **Yes** | **Yes** (Ingress/Gateway) | **Yes** (Envoy) | All methods, headers, body |
-| L4 TCP proxy | **Yes** | **Yes** (Service type LB) | **Yes** (Envoy) | Raw byte forwarding for databases, gRPC |
-| Network policy (ingress) | **Yes** | **Yes** (NetworkPolicy) | **Yes** (Intentions) | nftables rules from identity contracts |
-| Network policy (egress) | **Yes** | **Yes** (NetworkPolicy) | **Yes** (Intentions) | nftables output chain rules |
+| Ingress proxy (L7 HTTP) | **Yes** | **Yes** (Ingress/Gateway) | **Yes** (Envoy) | All methods, headers, body; TLS by SNI from fleet secrets |
+| L4 TCP proxy | **Yes** | **Yes** (Service type LB) | **Yes** (Envoy) | `tcpPort` ingress routes |
+| Network policy (ingress) | **Yes** | **Yes** (NetworkPolicy) | **Yes** (Intentions) | Opt-in nftables rules from `allowedCallers` |
+| Network policy (egress) | **Yes** | **Yes** (NetworkPolicy) | **Yes** (Intentions) | `egressRules`, matched by unit cgroup |
 | Circuit breaking | **Yes** | No (needs Istio) | **Yes** (via Envoy) | Closed/Open/HalfOpen state machine |
 | Retry logic | **Yes** | No (needs Istio) | **Yes** (via Envoy) | Exponential backoff |
-| Rate limiting | **Yes** | No (needs Istio) | **Yes** (via Envoy) | Token bucket per-service |
+| Rate limiting | **Yes** | No (needs Istio) | **Yes** (via Envoy) | Token bucket per ingress route and client IP |
 | Session affinity | **Yes** | **Yes** (sessionAffinity) | No | Client IP-based sticky sessions |
-| Traffic splitting | **Yes** | *Partial* (Gateway API) | **Yes** (resolver) | Weighted canary traffic |
+| Traffic splitting | **Yes** | *Partial* (Gateway API) | **Yes** (resolver) | Weighted `split` across services per ingress route |
 | External service registration | **Yes** | **Yes** (ExternalName) | **Yes** | Non-fleet services in DNS catalog |
 | Distributed tracing | **Yes** | No (needs Istio) | **Yes** (via Envoy) | W3C Trace Context propagation |
-| mTLS enforcement | **Yes** | No (needs Istio) | **Yes** | SPIFFE ID-based caller authorization |
+| mTLS enforcement | **Yes** | No (needs Istio) | **Yes** | Ingress `allowedCallers` require a caller SVID |
 | Gossip-based discovery | No | No | **Yes** (Serf) | Server-authoritative catalog over the agent stream |
 | Multi-region federation | **Yes** | *Partial* (Federation v2) | **Yes** (WAN) | Peer clusters share trust bundles and discover exported services |
 
@@ -194,9 +194,9 @@ ekafleet is a single binary that consolidates capabilities from 10+ separate too
 
 | Feature | ekafleet | Kubernetes | Nomad + Consul | Notes |
 |---------|----------|------------|----------------|-------|
-| Consensus (server HA) | *Planned* | **Yes** (etcd/Raft) | **Yes** (Raft) | Single-node with durable state; multi-node Raft planned |
+| Consensus (server HA) | **Yes** | **Yes** (etcd/Raft) | **Yes** (Raft) | 3 or 5 servers replicate the encrypted log (openraft) |
 | Gossip protocol | No | No | **Yes** (Serf/SWIM) | Failure detection via agent heartbeats |
-| Leader election | *Planned* | **Yes** (etcd) | **Yes** (Raft) | `--peers` parsed, not yet wired |
+| Leader election | **Yes** | **Yes** (etcd) | **Yes** (Raft) | Leader-only control plane; agents and CLI follow the leader |
 | Graceful degradation | **Yes** | **Yes** | **Yes** | Agents continue when server unreachable |
 | State snapshots | **Yes** | **Yes** (etcd backup) | **Yes** (snapshot) | Raft snapshot/restore |
 | Disaster recovery CLI | **Yes** | **Yes** (etcdctl) | **Yes** (snapshot save/restore) | `ekafleet snapshot` / `ekafleet restore` |
