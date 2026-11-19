@@ -601,41 +601,114 @@ pub async fn boot<N: openraft::RaftNetworkFactory<TypeConfig>>(
     Ok(raft)
 }
 
+/// What a server forming a cluster learns of one of the other servers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerState {
+    /// Not reachable (yet).
+    Unreachable,
+    /// Reachable and in no cluster.
+    Empty,
+    /// Already a member of a cluster.
+    Clustered,
+}
+
+/// What a server with empty storage does about the cluster of `members`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bootstrap {
+    /// Form it now.
+    Form,
+    /// Ask the others again later: too few are reachable to be sure no
+    /// cluster exists.
+    Retry,
+    /// Wait for the cluster's leader to add this server.
+    AwaitAdd,
+}
+
+/// Whether the server `node_id` forms the new cluster of `members`. One
+/// server forms it, the lowest-numbered one, and only once a majority of
+/// the servers (itself included) are reachable and none of them is part of
+/// a cluster already: since any existing cluster holds a majority, a
+/// server whose disk was replaced then always meets one of its members,
+/// and must be added back with `ekafleet raft add` rather than start a
+/// rival cluster, even while the others are unreachable.
+pub fn bootstrap_decision(
+    node_id: NodeId,
+    members: &BTreeMap<NodeId, BasicNode>,
+    peer: impl Fn(NodeId) -> PeerState,
+) -> Bootstrap {
+    if members.keys().next() != Some(&node_id) {
+        return Bootstrap::AwaitAdd;
+    }
+    let others: Vec<PeerState> = members
+        .keys()
+        .filter(|id| **id != node_id)
+        .map(|id| peer(*id))
+        .collect();
+    if others.contains(&PeerState::Clustered) {
+        return Bootstrap::AwaitAdd;
+    }
+    let reachable = 1 + others.iter().filter(|s| **s == PeerState::Empty).count();
+    if reachable > members.len() / 2 {
+        Bootstrap::Form
+    } else {
+        Bootstrap::Retry
+    }
+}
+
+/// How often the forming server asks the others again.
+pub const FORM_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Form a cluster of `members` if `raft` was never initialized and
-/// [`should_bootstrap`] agrees, asking each other member
-/// `peer_has_cluster`. Returns whether it formed one.
+/// [`bootstrap_decision`] says so, asking each other member with `peer`
+/// (again every [`FORM_RETRY`] until enough are reachable). Returns
+/// whether it formed one.
 pub async fn form_cluster<F, Fut>(
     raft: &Raft,
     members: BTreeMap<NodeId, BasicNode>,
-    peer_has_cluster: F,
+    peer: F,
 ) -> Result<bool, RaftError>
 where
     F: Fn(NodeId, BasicNode) -> Fut,
-    Fut: std::future::Future<Output = bool>,
+    Fut: std::future::Future<Output = PeerState>,
 {
     let node_id = raft.metrics().borrow().id;
-    let initialized = raft
-        .is_initialized()
-        .await
-        .map_err(|e| RaftError::Consensus(e.to_string()))?;
-    if initialized {
-        return Ok(false);
-    }
-    // Only the lowest-numbered server needs to ask.
-    let lowest = members.keys().next() == Some(&node_id);
-    let mut clustered = std::collections::BTreeSet::new();
-    for (id, node) in members.iter().filter(|(id, _)| lowest && **id != node_id) {
-        if peer_has_cluster(*id, node.clone()).await {
-            clustered.insert(*id);
+    let mut logged = false;
+    loop {
+        let initialized = raft
+            .is_initialized()
+            .await
+            .map_err(|e| RaftError::Consensus(e.to_string()))?;
+        if initialized {
+            return Ok(false);
         }
-    }
-    if !should_bootstrap(node_id, &members, |id| clustered.contains(&id)) {
-        tracing::info!(
-            node_id,
-            ?clustered,
-            "Waiting for the cluster leader to add this server"
-        );
-        return Ok(false);
+        let lowest = members.keys().next() == Some(&node_id);
+        let mut states = BTreeMap::new();
+        for (id, node) in members.iter().filter(|(id, _)| lowest && **id != node_id) {
+            states.insert(*id, peer(*id, node.clone()).await);
+        }
+        let state_of = |id| states.get(&id).copied().unwrap_or(PeerState::Unreachable);
+        match bootstrap_decision(node_id, &members, state_of) {
+            Bootstrap::Form => break,
+            Bootstrap::AwaitAdd => {
+                tracing::info!(
+                    node_id,
+                    ?states,
+                    "Waiting for the cluster leader to add this server"
+                );
+                return Ok(false);
+            }
+            Bootstrap::Retry => {
+                if !logged {
+                    tracing::info!(
+                        node_id,
+                        ?states,
+                        "Waiting for a majority of the servers before forming the cluster"
+                    );
+                    logged = true;
+                }
+                tokio::time::sleep(FORM_RETRY).await;
+            }
+        }
     }
     let servers = members.len();
     raft.initialize(members)
@@ -643,23 +716,6 @@ where
         .map_err(|e| RaftError::Consensus(e.to_string()))?;
     tracing::info!(node_id, servers, "Formed a new Raft cluster");
     Ok(true)
-}
-
-/// Whether the server `node_id` should form a new cluster of `members`
-/// when its storage is empty. One server forms it, the lowest-numbered
-/// one, and only if none of the others (`peer_has_cluster` for each) is
-/// already part of one: a server whose disk was replaced must be added
-/// back with `ekafleet raft add` rather than start a rival cluster.
-pub fn should_bootstrap(
-    node_id: NodeId,
-    members: &BTreeMap<NodeId, BasicNode>,
-    peer_has_cluster: impl Fn(NodeId) -> bool,
-) -> bool {
-    members.keys().next() == Some(&node_id)
-        && members
-            .keys()
-            .filter(|id| **id != node_id)
-            .all(|id| !peer_has_cluster(*id))
 }
 
 /// Wait until this node leads and has applied every committed entry, so
@@ -847,14 +903,50 @@ mod tests {
 
     #[test]
     fn only_the_lowest_server_forms_a_cluster_and_never_beside_one() {
+        use PeerState::*;
         let members: BTreeMap<NodeId, BasicNode> = (1..=3)
             .map(|id| (id, BasicNode::new(format!("s{id}:7400"))))
             .collect();
-        assert!(should_bootstrap(1, &members, |_| false));
-        assert!(!should_bootstrap(2, &members, |_| false));
-        assert!(!should_bootstrap(1, &members, |peer| peer == 3));
+        assert_eq!(bootstrap_decision(1, &members, |_| Empty), Bootstrap::Form);
+        assert_eq!(
+            bootstrap_decision(2, &members, |_| Empty),
+            Bootstrap::AwaitAdd
+        );
+        assert_eq!(
+            bootstrap_decision(1, &members, |peer| if peer == 3 {
+                Clustered
+            } else {
+                Empty
+            }),
+            Bootstrap::AwaitAdd
+        );
+        // A majority reachable is enough.
+        assert_eq!(
+            bootstrap_decision(1, &members, |peer| if peer == 3 {
+                Unreachable
+            } else {
+                Empty
+            }),
+            Bootstrap::Form
+        );
+        // A replaced first server with the others down could be beside a
+        // cluster it cannot see: it waits.
+        assert_eq!(
+            bootstrap_decision(1, &members, |_| Unreachable),
+            Bootstrap::Retry
+        );
         let alone: BTreeMap<NodeId, BasicNode> = [(4, BasicNode::new("s4:7400"))].into();
-        assert!(should_bootstrap(4, &alone, |_| true));
+        assert_eq!(
+            bootstrap_decision(4, &alone, |_| Clustered),
+            Bootstrap::Form
+        );
+        let two: BTreeMap<NodeId, BasicNode> = (1..=2)
+            .map(|id| (id, BasicNode::new(format!("s{id}:7400"))))
+            .collect();
+        assert_eq!(
+            bootstrap_decision(1, &two, |_| Unreachable),
+            Bootstrap::Retry
+        );
     }
 
     #[test]
