@@ -113,8 +113,15 @@ enum Command {
         #[arg(long, default_value = "/var/lib/ekafleet")]
         data_dir: PathBuf,
 
-        /// Comma-separated list of peer server addresses for HA
-        #[arg(long)]
+        /// This server's Raft node id (a positive integer, unique among
+        /// the servers)
+        #[arg(long, env = "EKAFLEET_NODE_ID", default_value_t = ekafleet::server::DEFAULT_NODE_ID)]
+        node_id: u64,
+
+        /// The servers of a new HA cluster, this one included, as
+        /// `<node-id>=<host:port>,...` (their gRPC addresses). Read on first
+        /// boot only; change membership later with `ekafleet raft`
+        #[arg(long, env = "EKAFLEET_PEERS")]
         peers: Option<String>,
 
         /// gRPC listen address
@@ -536,6 +543,12 @@ enum Command {
         action: TransitAction,
     },
 
+    /// Servers of the HA control plane (Raft cluster)
+    Raft {
+        #[command(subcommand)]
+        action: RaftAction,
+    },
+
     /// Persistent volumes of stateful services
     Volume {
         #[command(subcommand)]
@@ -870,6 +883,35 @@ enum TransitAction {
         /// Private key for --cert
         #[arg(long = "key-file", id = "key_file", requires = "cert")]
         key_file: Option<std::path::PathBuf>,
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum RaftAction {
+    /// Show the servers, the leader and replication progress
+    Status {
+        /// Server address (any server answers)
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+    /// Add a server: it catches up as a learner, then votes. Start it
+    /// first with `--node-id <id>`
+    Add {
+        /// The new server's node id
+        id: u64,
+        /// Its gRPC address as the other servers reach it (`host:port`)
+        addr: String,
+        /// Server address
+        #[arg(long, default_value = "127.0.0.1:7400")]
+        server: String,
+    },
+    /// Remove a server from the cluster
+    Remove {
+        /// The server's node id
+        id: u64,
         /// Server address
         #[arg(long, default_value = "127.0.0.1:7400")]
         server: String,
@@ -1250,6 +1292,7 @@ async fn main() -> anyhow::Result<()> {
 
         Command::Server {
             data_dir,
+            node_id,
             peers,
             listen,
             http_listen,
@@ -1284,7 +1327,8 @@ async fn main() -> anyhow::Result<()> {
             };
             commands::cmd_server(ekafleet::server::ServerConfig {
                 data_dir,
-                peers: commands::peer_list(peers),
+                node_id,
+                peers: ekafleet::server::parse_peers(peers.as_deref().unwrap_or_default())?,
                 grpc_listen: listen,
                 http_listen,
                 token: commands::secret_arg(token, token_file)?
@@ -1510,6 +1554,13 @@ async fn main() -> anyhow::Result<()> {
             } => commands::cmd_secret_revoke(service, name, server).await?,
         },
 
+        Command::Raft { action } => match action {
+            RaftAction::Status { server } => commands::cmd_raft_status(server).await?,
+            RaftAction::Add { id, addr, server } => {
+                commands::cmd_raft_add(id, addr, server).await?
+            }
+            RaftAction::Remove { id, server } => commands::cmd_raft_remove(id, server).await?,
+        },
         Command::Transit { action } => match action {
             TransitAction::Key { action } => match action {
                 TransitKeyAction::Create { name, server } => {

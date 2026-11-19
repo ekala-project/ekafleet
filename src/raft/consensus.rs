@@ -581,14 +581,13 @@ pub async fn migrate_legacy(
 
 /// Start this server's Raft node over `storage` and route `state`'s
 /// writes through it. Migrates pre-consensus storage first. A node that
-/// was never initialized forms a cluster of `members` when it is the only
-/// one; otherwise it waits to be joined (see `ekafleet raft`).
+/// was never initialized waits for a leader to replicate to it, or forms
+/// a new cluster with [`form_cluster`].
 pub async fn boot<N: openraft::RaftNetworkFactory<TypeConfig>>(
     state: &FleetStateMachine,
     storage: Arc<RaftStorage>,
     node_id: NodeId,
     addr: &str,
-    members: BTreeMap<NodeId, BasicNode>,
     network: N,
     config: openraft::Config,
 ) -> Result<Raft, RaftError> {
@@ -598,18 +597,69 @@ pub async fn boot<N: openraft::RaftNetworkFactory<TypeConfig>>(
     let raft = Raft::new(node_id, Arc::new(config), network, log, machine)
         .await
         .map_err(|e| RaftError::Consensus(e.to_string()))?;
+    state.attach(raft.clone());
+    Ok(raft)
+}
+
+/// Form a cluster of `members` if `raft` was never initialized and
+/// [`should_bootstrap`] agrees, asking each other member
+/// `peer_has_cluster`. Returns whether it formed one.
+pub async fn form_cluster<F, Fut>(
+    raft: &Raft,
+    members: BTreeMap<NodeId, BasicNode>,
+    peer_has_cluster: F,
+) -> Result<bool, RaftError>
+where
+    F: Fn(NodeId, BasicNode) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let node_id = raft.metrics().borrow().id;
     let initialized = raft
         .is_initialized()
         .await
         .map_err(|e| RaftError::Consensus(e.to_string()))?;
-    if !initialized && members.len() == 1 && members.contains_key(&node_id) {
-        raft.initialize(members)
-            .await
-            .map_err(|e| RaftError::Consensus(e.to_string()))?;
-        tracing::info!(node_id, "Formed a single-server Raft cluster");
+    if initialized {
+        return Ok(false);
     }
-    state.attach(raft.clone());
-    Ok(raft)
+    // Only the lowest-numbered server needs to ask.
+    let lowest = members.keys().next() == Some(&node_id);
+    let mut clustered = std::collections::BTreeSet::new();
+    for (id, node) in members.iter().filter(|(id, _)| lowest && **id != node_id) {
+        if peer_has_cluster(*id, node.clone()).await {
+            clustered.insert(*id);
+        }
+    }
+    if !should_bootstrap(node_id, &members, |id| clustered.contains(&id)) {
+        tracing::info!(
+            node_id,
+            ?clustered,
+            "Waiting for the cluster leader to add this server"
+        );
+        return Ok(false);
+    }
+    let servers = members.len();
+    raft.initialize(members)
+        .await
+        .map_err(|e| RaftError::Consensus(e.to_string()))?;
+    tracing::info!(node_id, servers, "Formed a new Raft cluster");
+    Ok(true)
+}
+
+/// Whether the server `node_id` should form a new cluster of `members`
+/// when its storage is empty. One server forms it, the lowest-numbered
+/// one, and only if none of the others (`peer_has_cluster` for each) is
+/// already part of one: a server whose disk was replaced must be added
+/// back with `ekafleet raft add` rather than start a rival cluster.
+pub fn should_bootstrap(
+    node_id: NodeId,
+    members: &BTreeMap<NodeId, BasicNode>,
+    peer_has_cluster: impl Fn(NodeId) -> bool,
+) -> bool {
+    members.keys().next() == Some(&node_id)
+        && members
+            .keys()
+            .filter(|id| **id != node_id)
+            .all(|id| !peer_has_cluster(*id))
 }
 
 /// Wait until this node leads and has applied every committed entry, so
@@ -793,6 +843,18 @@ mod tests {
             let (_, log, machine) = stores(dir.path()).await;
             Ok((dir, log, machine))
         }
+    }
+
+    #[test]
+    fn only_the_lowest_server_forms_a_cluster_and_never_beside_one() {
+        let members: BTreeMap<NodeId, BasicNode> = (1..=3)
+            .map(|id| (id, BasicNode::new(format!("s{id}:7400"))))
+            .collect();
+        assert!(should_bootstrap(1, &members, |_| false));
+        assert!(!should_bootstrap(2, &members, |_| false));
+        assert!(!should_bootstrap(1, &members, |peer| peer == 3));
+        let alone: BTreeMap<NodeId, BasicNode> = [(4, BasicNode::new("s4:7400"))].into();
+        assert!(should_bootstrap(4, &alone, |_| true));
     }
 
     #[test]
