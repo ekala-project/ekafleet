@@ -57,8 +57,11 @@ impl ProxyRouter {
         tracing::info!(routes = state.routes.len(), "Proxy routes updated");
     }
 
-    /// Resolve a request to a backend service.
+    /// Resolve a request to a backend service. `hostname` is the Host
+    /// header; any port is ignored and it matches case-insensitively.
     pub async fn resolve(&self, hostname: &str, path: &str) -> Option<ResolvedRoute> {
+        let hostname = host_without_port(hostname).to_ascii_lowercase();
+        let hostname = hostname.as_str();
         let state = self.inner.read().await;
 
         // Find matching routes, sorted by path specificity (longest prefix first)
@@ -70,7 +73,8 @@ impl ProxyRouter {
             })
             .collect();
 
-        matches.sort_by_key(|a| std::cmp::Reverse(a.path_prefix.len()));
+        // Longest prefix first; for equal prefixes an exact host beats `*`.
+        matches.sort_by_key(|a| (std::cmp::Reverse(a.path_prefix.len()), a.hostname == "*"));
 
         matches.first().map(|r| ResolvedRoute {
             service_name: r.service_name.clone(),
@@ -90,6 +94,17 @@ impl ProxyRouter {
     }
 }
 
+/// `host[:port]` or `[v6][:port]` → host.
+fn host_without_port(host: &str) -> &str {
+    if let Some(rest) = host.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    match host.rsplit_once(':') {
+        Some((h, port)) if port.bytes().all(|b| b.is_ascii_digit()) => h,
+        _ => host,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PortRoute {
     pub hostname: String,
@@ -103,4 +118,48 @@ pub struct ResolvedRoute {
     pub service_name: String,
     pub port: u16,
     pub weight: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn route(host: &str, prefix: &str) -> Vec<PortRoute> {
+        vec![PortRoute {
+            hostname: host.into(),
+            path_prefix: prefix.into(),
+            port: 0,
+            weight: 100,
+        }]
+    }
+
+    #[tokio::test]
+    async fn longest_prefix_wins_and_host_port_is_ignored() {
+        let router = ProxyRouter::new();
+        router
+            .update_routes(&HashMap::from([
+                ("site".to_string(), route("www.example.com", "/")),
+                ("api".to_string(), route("www.example.com", "/api")),
+                ("any".to_string(), route("*", "/")),
+            ]))
+            .await;
+        let name = |host: &'static str, path: &'static str| {
+            let router = router.clone();
+            async move { router.resolve(host, path).await.map(|r| r.service_name) }
+        };
+        assert_eq!(name("www.example.com", "/").await.as_deref(), Some("site"));
+        assert_eq!(
+            name("WWW.example.com:8080", "/api/v1").await.as_deref(),
+            Some("api")
+        );
+        assert_eq!(name("other.test", "/x").await.as_deref(), Some("any"));
+    }
+
+    #[test]
+    fn ports_are_stripped_from_hosts() {
+        assert_eq!(host_without_port("a.test:80"), "a.test");
+        assert_eq!(host_without_port("a.test"), "a.test");
+        assert_eq!(host_without_port("[::1]:80"), "::1");
+        assert_eq!(host_without_port("[::1]"), "::1");
+    }
 }

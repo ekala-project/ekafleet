@@ -5,6 +5,7 @@ pub mod listener;
 pub mod mtls;
 pub mod ratelimit;
 pub mod router;
+pub mod routes;
 pub mod splitting;
 pub mod standalone;
 pub mod tracing_ctx;

@@ -1003,6 +1003,20 @@ pub(super) async fn handle_server_message(
             };
             respond(tx, cmd.correlation_id, error_message, None).await;
         }
+        ServerPayload::Ingress(update) => {
+            let routes = crate::proxy::routes::RoutesFile::from_update(&update);
+            let path = std::path::Path::new(crate::proxy::routes::ROUTES_FILE);
+            match routes.write(path).await {
+                Ok(true) => tracing::info!(routes = routes.routes.len(), "Ingress routes updated"),
+                Ok(false) => {}
+                // A node serving no ingress (e.g. `ekafleet dev` without
+                // root) need not have the runtime directory.
+                Err(e) if routes.routes.is_empty() => {
+                    tracing::debug!(error = %e, "Cannot write empty ingress routes")
+                }
+                Err(e) => tracing::error!(error = %e, "Cannot write ingress routes"),
+            }
+        }
         ServerPayload::VolumeSnapshotCommand(cmd) => {
             let tx = tx.clone();
             let ctx = (

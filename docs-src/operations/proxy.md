@@ -1,168 +1,84 @@
-# Reverse Proxy & Ingress
+# Ingress Proxy
 
-ekafleet includes a built-in reverse proxy supporting both L7 (HTTP) and L4 (TCP) proxying for routing external traffic to services.
+Every agent node runs `ekafleet-proxy`, an unprivileged HTTP reverse proxy. It routes traffic from outside the fleet to fleet services, along the `ingress` routes of the fleet configuration.
+
+## Routes
+
+```nix
+ingress = {
+  site = {
+    host = "www.example.com";   # Host header, without port; "*" matches any host
+    service = "web";            # default-namespace service
+    port = "http";              # name of one of the service's ports
+    pools = [ "edge" ];         # serve on nodes of these pools ...
+  };
+  api = {
+    host = "www.example.com";
+    path = "/api";              # path prefix (default "/")
+    service = "api";
+    port = "http";
+    nodes = [ "edge-1" ];       # ... and/or on these nodes
+  };
+};
+```
+
+**Where a route is served:**
+
+- on nodes that match its `pools` or `nodes`;
+- on every node if it lists neither.
+
+**Matching:**
+
+- A request matches a route when its `Host` header matches (case-insensitive, any port ignored) and its path starts with the route's `path`.
+- The longest matching prefix wins.
+- Routes for an exact host take precedence over `*` only when their prefix is at least as long.
+- Two routes may not have the same host and path.
 
 ## How It Works
 
-The L7 proxy listener binds on HTTP ports (default 80/443) and routes requests based on hostname and path prefix, derived from service port contracts. All HTTP methods, headers, and request bodies are forwarded to upstreams via a hyper-based HTTP client.
-
 ```text
-Client → ekafleet proxy (80/443)
-    ↓ (hostname + path matching)
-Route resolved via ProxyRouter
-    ↓ (circuit breaker check)
-Circuit breaker allows request?
-    ↓ (round-robin selection)
-Upstream selected via UpstreamPool
-    ↓ (forwarded with retries)
-Backend service
+fleet config `ingress`
+    ↓ server, every 5 s: routes for each node + mesh addresses of serving replicas
+IngressUpdate (agent stream)
+    ↓ agent
+/run/ekafleet/ingress-routes.json  (0644, rewritten only on change)
+    ↓ proxy, polled every 2 s
+routing table + one upstream pool per route
+    ↓
+backend replica (over the WireGuard mesh)
 ```
 
-For non-HTTP protocols (databases, gRPC, AMQP), the L4 TCP proxy performs bidirectional byte forwarding without protocol inspection.
+- **Backends:** a route's backends are the replicas serving its service, in the same sense as DNS (running and not unhealthy). They are addressed by their node's mesh address and the port's number. A replica that stops serving leaves the pool within seconds.
+- **Network reachability:** the service has to listen on its node's mesh address (or `0.0.0.0`). The NixOS module trusts the `wg-fleet` interface by default (`services.ekafleet.agent.mesh.trustInterface`), so the proxy can reach it.
+- **Opening the ingress port:** the proxy listens on `services.ekafleet.agent.proxyListen` (default `0.0.0.0:8080`). On ingress nodes, set `services.ekafleet.agent.proxyOpenFirewall = true`.
+- **Missing or invalid file:** a missing routes file means no routes. An invalid one keeps the previous routes.
 
-## Port Contracts
+The proxy speaks plain HTTP. Terminate TLS in front of it, for example at a cloud load balancer.
 
-Services declare their ingress requirements in the fleet configuration:
+## Requests
 
-```nix
-services.web-frontend = {
-  ports.http = {
-    port = 8080;
-    hostname = "app.example.com";
-    healthCheck.path = "/ready";
-  };
-};
-```
-
-The proxy automatically:
-- Routes requests for `app.example.com` to port 8080
-- Performs health checks on `/ready`
-- Removes unhealthy backends from the pool
-- Marks backends as unhealthy on connection failure
-
-## Routing Rules
-
-Routes are matched in order of specificity (longest path prefix wins):
-
-| Priority | Rule |
-|----------|------|
-| 1 | Exact hostname + longest path prefix |
-| 2 | Exact hostname + shorter path prefix |
-| 3 | Wildcard hostname (`*`) + path prefix |
-
-## Traffic Splitting (Canary)
-
-For canary deployments, traffic can be split between stable and canary backends:
-
-```nix
-update = {
-  strategy = "canary";
-  canary = 1;
-};
-```
-
-The `TrafficSplitter` uses weighted random selection:
-- `weight = 90` → 90% of requests go to stable
-- `weight = 10` → 10% go to canary
-
-Weights are adjusted automatically during canary progression.
-
-## L4 TCP Proxy
-
-For non-HTTP services (databases, gRPC, message brokers), the L4 proxy binds a TCP listener and forwards raw bytes to an upstream selected from the same `UpstreamPool`:
-
-```nix
-services.postgres = {
-  command = "${pkgs.postgresql}/bin/postgres";
-  ports.tcp = {
-    port = 5432;
-    protocol = "tcp";
-  };
-};
-```
-
-The L4 proxy performs bidirectional `tokio::io::copy` between inbound and outbound connections, with no protocol awareness. Upstream selection uses the same round-robin health-aware pool as the L7 proxy.
-
-## Circuit Breaking
-
-The proxy includes a per-service circuit breaker that protects against cascading failures:
-
-| State | Behavior |
-|-------|----------|
-| **Closed** | Requests flow normally. Failures are counted. |
-| **Open** | All requests immediately return 503. Entered after `failure_threshold` consecutive failures. |
-| **Half-Open** | One probe request is allowed through. If it succeeds, the circuit closes; if it fails, the circuit re-opens. |
-
-Configuration defaults:
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `failure_threshold` | 5 | Consecutive failures to open the circuit |
-| `open_duration` | 30s | Time the circuit stays open before probing |
-| `success_threshold` | 2 | Successes in half-open state to close the circuit |
-
-## Retry Logic
-
-Failed upstream requests are automatically retried with exponential backoff:
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `max_retries` | 2 | Maximum retry attempts (0 = no retries) |
-| `base_delay` | 100ms | Initial delay between retries |
-| `max_delay` | 2s | Maximum delay (caps exponential growth) |
-
-The retry delay for attempt N is `min(base_delay * 2^N, max_delay)`. After all attempts fail, the circuit breaker records the failure and the upstream is marked unhealthy.
-
-Non-idempotent methods (`POST`, `PATCH`) are not retried after the first attempt to avoid duplicate side effects. Only idempotent methods (`GET`, `HEAD`, `PUT`, `DELETE`, `OPTIONS`) are eligible for retry.
-
-## Upstream Health
-
-The `UpstreamPool` tracks backend health:
-
-- **Round-robin** selection among healthy endpoints
-- Backends marked unhealthy on connection failure (502)
-- Backends recover when health checks pass again
-- Circuit breaker records success/failure for threshold tracking
-
-## Rate Limiting
-
-The proxy includes per-service rate limiting using a token bucket algorithm. Configure limits to prevent individual callers from overwhelming a service:
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `requests_per_second` | 100 | Sustained request rate |
-| `burst` | 200 | Maximum burst capacity |
-
-When the rate limit is exceeded, the proxy returns `429 Too Many Requests`. Each service has its own independent token bucket that refills at the configured rate.
-
-## Session Affinity
-
-For stateful applications that need sticky routing, the proxy supports client-IP-based session affinity:
-
-- Requests from the same client IP are routed to the same backend
-- Sessions expire after a configurable TTL (default 1 hour)
-- When a sticky backend becomes unhealthy, the session is cleared and a new backend is selected
-
-Session affinity works alongside round-robin — the first request from a client gets round-robin selection, and subsequent requests within the TTL go to the same backend.
-
-## mTLS Enforcement
-
-When the proxy receives a request from another fleet service (internal traffic), it can validate the caller's SPIFFE identity:
-
-1. Extract peer certificate from the mTLS connection
-2. Parse the SPIFFE ID from the certificate's SAN URI
-3. Check against the target service's `allowedCallers`
-4. Deny with 403 if unauthorized
-
-This enforces identity-based access control at the application layer.
-
-## Error Handling
+| Step | Behavior |
+|------|----------|
+| Forwarding | Method, headers (including the original `Host`), query and body (up to 10 MiB) are forwarded. |
+| Selection | Round-robin over the route's backends. |
+| Retries | Up to 2 retries with exponential backoff (100 ms doubling, capped at 2 s), for idempotent methods only (`GET`, `HEAD`, `PUT`, `DELETE`, `OPTIONS`). |
+| Ejection | A backend whose attempts all fail is skipped for 10 seconds. |
+| Circuit breaking | Each route has a circuit breaker. After 5 consecutive failures it opens for 30 seconds and answers 503. Then it lets probes through, and 2 successes close it. |
 
 | Scenario | Response |
 |----------|----------|
 | No matching route | 404 Not Found |
 | Circuit breaker open | 503 Service Unavailable |
-| All backends unhealthy | 503 Service Unavailable |
-| All retry attempts failed | 502 Bad Gateway (backend marked unhealthy) |
-| Rate limit exceeded | 429 Too Many Requests |
-| Unauthorized caller (mTLS) | 403 Forbidden |
+| No usable backend | 503 Service Unavailable |
+| All attempts failed | 502 Bad Gateway |
+
+## Not Yet Wired
+
+The `proxy` module contains these components, but the ingress proxy does not use them yet:
+
+- TLS termination;
+- L4 (TCP) proxying;
+- rate limiting;
+- session affinity;
+- weighted traffic splitting;
+- SPIFFE caller authorization.

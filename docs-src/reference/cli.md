@@ -87,7 +87,7 @@ ekafleet ca-signer [OPTIONS]
 
 ### `ekafleet proxy`
 
-Standalone service mesh proxy daemon. Runs the L7 reverse proxy with routing, circuit breaking, mTLS authorization, and upstream management. Runs unprivileged with only `CAP_NET_BIND_SERVICE`.
+Ingress proxy daemon. Serves the node's [ingress routes](../operations/proxy.md), with retries, backend ejection and circuit breaking. Runs unprivileged with only `CAP_NET_BIND_SERVICE`.
 
 ```
 ekafleet proxy [OPTIONS]
@@ -98,6 +98,7 @@ ekafleet proxy [OPTIONS]
 | `--listen` | `0.0.0.0:8080` | HTTP listen address for proxied traffic |
 | `--trust-domain` | `fleet.internal` | SPIFFE trust domain for mTLS authorization |
 | `--data-dir` | `/var/lib/ekafleet` | Data directory (for SVID material) |
+| `--routes-file` | `/run/ekafleet/ingress-routes.json` | Ingress routes written by the agent; polled for changes |
 
 ## Deployment
 

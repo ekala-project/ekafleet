@@ -1165,6 +1165,38 @@ let
   };
 
   # `ExternalServiceConfig`.
+  ingressRoute = strictSubmodule {
+    host = mkOption {
+      type = types.str;
+      example = "www.example.com";
+      description = "Host header to match (without port), or `*` for any host.";
+    };
+    path = mkOption {
+      type = types.str;
+      default = "/";
+      description = "Path prefix to match; the longest matching prefix wins.";
+    };
+    service = mkOption {
+      type = types.str;
+      description = "Default-namespace service receiving the traffic.";
+    };
+    port = mkOption {
+      type = types.str;
+      example = "http";
+      description = "Name of the service's port (`services.<svc>.ports.<name>`).";
+    };
+    pools = mkOption {
+      type = types.listOf types.str;
+      default = [ ];
+      description = "Serve the route on nodes of these pools.";
+    };
+    nodes = mkOption {
+      type = types.listOf types.str;
+      default = [ ];
+      description = "Serve the route on these nodes. With neither `pools` nor `nodes`, every node serves it.";
+    };
+  };
+
   federationPeer = strictSubmodule {
     endpoint = mkOption {
       type = types.str;
@@ -1371,6 +1403,11 @@ in
         Services outside the fleet, resolvable on every node as
         `<name>.external.<domain>`.
       '';
+    };
+    ingress = mkOption {
+      type = types.attrsOf ingressRoute;
+      default = { };
+      description = "HTTP routes served by the ingress proxy of selected nodes, keyed by name.";
     };
     federation = mkOption {
       type = federation;

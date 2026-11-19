@@ -52,6 +52,13 @@ impl ProxyListener {
 
     /// Start the HTTP proxy listener on the given address.
     pub async fn start(self, bind_addr: SocketAddr) -> Result<(), std::io::Error> {
+        let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+        self.serve(listener).await
+    }
+
+    /// Serve proxied traffic on `listener`.
+    pub async fn serve(self, listener: tokio::net::TcpListener) -> Result<(), std::io::Error> {
+        let bind_addr = listener.local_addr()?;
         let http_client = Client::builder(TokioExecutor::new()).build_http();
 
         let app = axum::Router::new()
@@ -68,7 +75,6 @@ impl ProxyListener {
 
         tracing::info!(addr = %bind_addr, "Proxy listener started");
 
-        let listener = tokio::net::TcpListener::bind(bind_addr).await?;
         axum::serve(listener, app)
             .await
             .map_err(std::io::Error::other)?;

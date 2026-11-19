@@ -14,6 +14,7 @@ Complete reference for the `fleet.nix` configuration schema.
     nodePools = { ... };       # Node pool definitions (optional)
     externalServices = { ... };# Services outside the fleet, in DNS (optional)
     federation = { ... };      # Peer clusters (optional)
+    ingress = { ... };         # HTTP routes of the ingress proxy (optional)
   };
 }
 ```
@@ -702,6 +703,21 @@ curl -H "Authorization: Bearer $TOKEN" http://server:7402/v1/alerts/silences
 # Remove a silence
 curl -X DELETE -H "Authorization: Bearer $TOKEN" http://server:7402/v1/alerts/silences/0
 ```
+
+## IngressRouteConfig
+
+```nix
+ingress.<name> = {
+  host = "www.example.com";  # Host header without port, or "*" (required)
+  path = "/";                # path prefix (default "/")
+  service = "web";           # default-namespace service (required)
+  port = "http";             # name of one of its ports (required)
+  pools = [ "edge" ];        # serve on nodes of these pools
+  nodes = [ "edge-1" ];      # and on these nodes; with neither, every node
+};
+```
+
+See [Ingress Proxy](../operations/proxy.md).
 
 ## FederationConfig
 
