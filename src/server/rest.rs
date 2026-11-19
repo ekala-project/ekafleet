@@ -1,3 +1,4 @@
+use super::identity::ServerIdentity;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -178,46 +179,23 @@ pub struct HttpApiState {
     pub instance_tracker: Option<super::cloud::instance_tracker::InstanceTracker>,
 }
 
-/// Start the HTTP API server with REST endpoints for all operations.
-/// The /health endpoint is public; all other endpoints require authentication via RBAC tokens.
-/// TLS material for serving the REST API over HTTPS. Both fields hold PEM;
-/// `cert_pem` may be a combined cert-chain + private-key bundle (as issued for
-/// the server SVID), in which case `key_pem` can be the same string.
-pub struct HttpTlsConfig {
-    pub cert_pem: String,
-    pub key_pem: String,
-}
-
-/// Build a rustls `ServerConfig` from PEM cert-chain and private key. The
-/// private key is read from `key_pem` (PKCS#8, PKCS#1, or SEC1); certificates
-/// come from `cert_pem`.
-fn build_rustls_config(tls: &HttpTlsConfig) -> anyhow::Result<rustls::ServerConfig> {
-    let mut cert_reader = std::io::BufReader::new(tls.cert_pem.as_bytes());
-    let certs = rustls_pemfile::certs(&mut cert_reader)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| anyhow::anyhow!("failed to parse HTTP TLS certificate: {e}"))?;
-    if certs.is_empty() {
-        anyhow::bail!("HTTP TLS certificate PEM contained no certificates");
-    }
-
-    let mut key_reader = std::io::BufReader::new(tls.key_pem.as_bytes());
-    let key = rustls_pemfile::private_key(&mut key_reader)
-        .map_err(|e| anyhow::anyhow!("failed to parse HTTP TLS private key: {e}"))?
-        .ok_or_else(|| anyhow::anyhow!("HTTP TLS key PEM contained no private key"))?;
-
-    // Pin the ring crypto provider to match the gRPC server (tonic tls-ring).
-    // When multiple providers are compiled in, rustls cannot pick a
-    // process-level default automatically, so we specify it explicitly.
+/// The REST API's HTTPS configuration: the server SVID, resolved on every
+/// handshake so renewals apply without a restart.
+fn build_rustls_config(identity: &ServerIdentity) -> anyhow::Result<rustls::ServerConfig> {
+    // Pin the ring crypto provider to match the gRPC server. When multiple
+    // providers are compiled in, rustls cannot pick a process-level default
+    // automatically, so we specify it explicitly.
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let config = rustls::ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|e| anyhow::anyhow!("failed to configure TLS protocol versions: {e}"))?
         .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|e| anyhow::anyhow!("invalid HTTP TLS cert/key: {e}"))?;
+        .with_cert_resolver(Arc::new(identity.clone()));
     Ok(config)
 }
 
+/// Start the HTTP API server with REST endpoints for all operations.
+/// The /health endpoint is public; all other endpoints require authentication via RBAC tokens.
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_http(
     addr: SocketAddr,
@@ -229,7 +207,7 @@ pub async fn serve_http(
     instance_tracker: Option<super::cloud::instance_tracker::InstanceTracker>,
     raft_state: crate::raft::state::FleetStateMachine,
     jwt_bundle: String,
-    tls: Option<HttpTlsConfig>,
+    tls: Option<ServerIdentity>,
     audit_log: super::audit::AuditLog,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<()> {

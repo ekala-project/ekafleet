@@ -67,7 +67,7 @@ The server operates a root CA that:
 - Signs CSRs without ever seeing the workload's private key
 - Performs workload attestation by verifying node-to-service assignment
 - Distributes trust bundles to all connected agents
-- The server itself has a SPIFFE SVID: `spiffe://<domain>/server/<server-id>`
+- The server itself has a SPIFFE SVID: `spiffe://<domain>/server/<server-id>`, renewed at two thirds of its lifetime
 
 ### CA Process Isolation
 
