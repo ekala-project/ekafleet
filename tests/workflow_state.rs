@@ -255,11 +255,13 @@ async fn unreadable_state_refuses_to_start() {
     assert!(kv_put(&server, ADMIN_TOKEN, "k", "v").await.is_success());
     server.crash();
 
-    let log_dir = dir.path().join("data/raft/log");
+    // The last consensus log entry: the write just acknowledged.
+    let log_dir = dir.path().join("data/raft/entries");
     let entry = std::fs::read_dir(&log_dir)
         .unwrap()
         .map(|e| e.unwrap().path())
-        .find(|p| p.extension().is_some_and(|e| e == "log"))
+        .filter(|p| p.extension().is_some_and(|e| e == "entry"))
+        .max()
         .expect("a log entry");
     let mut bytes = std::fs::read(&entry).unwrap();
     *bytes.last_mut().unwrap() ^= 0xff;

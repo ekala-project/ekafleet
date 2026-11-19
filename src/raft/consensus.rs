@@ -577,6 +577,112 @@ pub async fn migrate_legacy(
     Ok(true)
 }
 
+/// Start this server's Raft node over `storage` and route `state`'s
+/// writes through it. Migrates pre-consensus storage first. A node that
+/// was never initialized forms a cluster of `members` when it is the only
+/// one; otherwise it waits to be joined (see `ekafleet raft`).
+pub async fn boot<N: openraft::RaftNetworkFactory<TypeConfig>>(
+    state: &FleetStateMachine,
+    storage: Arc<RaftStorage>,
+    node_id: NodeId,
+    addr: &str,
+    members: BTreeMap<NodeId, BasicNode>,
+    network: N,
+    config: openraft::Config,
+) -> Result<Raft, RaftError> {
+    let log = LogStore::open(storage.clone()).await?;
+    let machine = StateMachineStore::open(state.clone(), storage.clone()).await?;
+    migrate_legacy(&storage, &log, &machine, node_id, addr).await?;
+    let raft = Raft::new(node_id, Arc::new(config), network, log, machine)
+        .await
+        .map_err(|e| RaftError::Consensus(e.to_string()))?;
+    let initialized = raft
+        .is_initialized()
+        .await
+        .map_err(|e| RaftError::Consensus(e.to_string()))?;
+    if !initialized && members.len() == 1 && members.contains_key(&node_id) {
+        raft.initialize(members)
+            .await
+            .map_err(|e| RaftError::Consensus(e.to_string()))?;
+        tracing::info!(node_id, "Formed a single-server Raft cluster");
+    }
+    state.attach(raft.clone());
+    Ok(raft)
+}
+
+/// Wait until this node leads and has applied every committed entry, so
+/// state reads are current. Gives up after `timeout`.
+pub async fn wait_leading(raft: &Raft, timeout: std::time::Duration) -> Result<(), RaftError> {
+    let id = raft.metrics().borrow().id;
+    raft.wait(Some(timeout))
+        .metrics(|m| m.current_leader == Some(id), "this node leads")
+        .await
+        .map_err(|e| RaftError::Consensus(e.to_string()))?;
+    raft.ensure_linearizable()
+        .await
+        .map_err(|e| RaftError::Consensus(e.to_string()))?;
+    Ok(())
+}
+
+/// A network without peers, for a server that runs alone.
+pub struct NoPeers;
+
+/// Every RPC from a [`NoPeers`] network fails as unreachable.
+pub struct NoPeer;
+
+impl openraft::RaftNetworkFactory<TypeConfig> for NoPeers {
+    type Network = NoPeer;
+
+    async fn new_client(&mut self, _target: NodeId, _node: &BasicNode) -> NoPeer {
+        NoPeer
+    }
+}
+
+fn no_peer<E: std::error::Error>() -> openraft::error::RPCError<NodeId, BasicNode, E> {
+    openraft::error::RPCError::Unreachable(openraft::error::Unreachable::new(
+        &std::io::Error::other("no Raft peers configured"),
+    ))
+}
+
+impl openraft::RaftNetwork<TypeConfig> for NoPeer {
+    async fn append_entries(
+        &mut self,
+        _rpc: openraft::raft::AppendEntriesRequest<TypeConfig>,
+        _option: openraft::network::RPCOption,
+    ) -> Result<
+        openraft::raft::AppendEntriesResponse<NodeId>,
+        openraft::error::RPCError<NodeId, BasicNode, openraft::error::RaftError<NodeId>>,
+    > {
+        Err(no_peer())
+    }
+
+    async fn install_snapshot(
+        &mut self,
+        _rpc: openraft::raft::InstallSnapshotRequest<TypeConfig>,
+        _option: openraft::network::RPCOption,
+    ) -> Result<
+        openraft::raft::InstallSnapshotResponse<NodeId>,
+        openraft::error::RPCError<
+            NodeId,
+            BasicNode,
+            openraft::error::RaftError<NodeId, openraft::error::InstallSnapshotError>,
+        >,
+    > {
+        Err(no_peer())
+    }
+
+    async fn vote(
+        &mut self,
+        _rpc: openraft::raft::VoteRequest<NodeId>,
+        _option: openraft::network::RPCOption,
+    ) -> Result<
+        openraft::raft::VoteResponse<NodeId>,
+        openraft::error::RPCError<NodeId, BasicNode, openraft::error::RaftError<NodeId>>,
+    > {
+        Err(no_peer())
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod testing {
     //! An in-process network joining [`Raft`] nodes for tests.
