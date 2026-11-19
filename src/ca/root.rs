@@ -637,7 +637,7 @@ fn generate_serial() -> Result<SerialNumber, CaError> {
 /// Extract DER bytes from a PEM-encoded certificate.
 fn pem_to_der(pem: &str) -> Result<Vec<u8>, CaError> {
     let mut reader = std::io::BufReader::new(pem.as_bytes());
-    let certs = rustls_pemfile::certs(&mut reader)
+    let certs = crate::ca::pki::pem_certs(&mut reader)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| CaError::KeyGeneration(format!("PEM parse error: {e}")))?;
     certs

@@ -133,7 +133,7 @@ fn cert_spki_der(cert_pem: &str) -> Result<Vec<u8>, AdvertError> {
     let pem_block = &cert_pem[cert_start..cert_end];
 
     let mut reader = std::io::BufReader::new(pem_block.as_bytes());
-    let certs = rustls_pemfile::certs(&mut reader)
+    let certs = crate::ca::pki::pem_certs(&mut reader)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| AdvertError::MalformedCert(e.to_string()))?;
     let der = certs

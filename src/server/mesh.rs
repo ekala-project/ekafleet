@@ -201,7 +201,7 @@ fn valid_public_key(key: &str) -> bool {
 /// DER of the first certificate in `pem`.
 fn pem_certificate_der(pem: &str) -> Option<Vec<u8>> {
     let mut reader = std::io::BufReader::new(pem.as_bytes());
-    rustls_pemfile::certs(&mut reader)
+    crate::ca::pki::pem_certs(&mut reader)
         .next()?
         .ok()
         .map(|der| der.to_vec())
