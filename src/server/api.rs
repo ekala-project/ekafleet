@@ -103,6 +103,7 @@ impl FleetControlService {
         token_store: TokenStore,
         data_dir: std::path::PathBuf,
     ) -> Self {
+        let mesh = super::mesh::MeshRegistry::new(raft_state.clone(), domain);
         let controller = super::controller::Controller::new(
             state.clone(),
             raft_state.clone(),
@@ -110,8 +111,8 @@ impl FleetControlService {
             join_token_store.clone(),
             event_store.clone(),
             grpc_addr,
-        );
-        let mesh = super::mesh::MeshRegistry::new(raft_state.clone(), domain);
+        )
+        .with_mesh(mesh.clone());
         state.set_trust_domain(domain.to_string());
         Self {
             controller,
