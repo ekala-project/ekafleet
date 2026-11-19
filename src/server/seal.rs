@@ -74,7 +74,7 @@ pub fn passphrase_from_env() -> anyhow::Result<Option<Zeroizing<String>>> {
 }
 
 /// Read a passphrase file, dropping one trailing newline.
-fn passphrase_from_file(path: &std::path::Path) -> anyhow::Result<Zeroizing<String>> {
+pub fn passphrase_from_file(path: &std::path::Path) -> anyhow::Result<Zeroizing<String>> {
     let mut pass = Zeroizing::new(std::fs::read_to_string(path).map_err(|e| {
         anyhow::anyhow!("cannot read seal passphrase file {}: {e}", path.display())
     })?);

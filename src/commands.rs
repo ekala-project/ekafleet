@@ -1729,6 +1729,45 @@ fn print_raft_status(status: &ekafleet::proto::RaftStatusResponse) {
     }
 }
 
+pub async fn cmd_keys_export(
+    data_dir: &std::path::Path,
+    ca_dir: Option<&std::path::Path>,
+    domain: &str,
+    passphrase_file: &std::path::Path,
+    out: &std::path::Path,
+) -> anyhow::Result<()> {
+    let passphrase = server::seal::passphrase_from_file(passphrase_file)?;
+    let bundle = server::keybundle::export(data_dir, ca_dir, domain, &passphrase).await?;
+    ekafleet::fsutil::write_atomic(out, &bundle, 0o600).await?;
+    println!(
+        "Key bundle for {domain} written to {}. Import it on each new server with \
+         `ekafleet keys import` before its first start.",
+        out.display()
+    );
+    Ok(())
+}
+
+pub async fn cmd_keys_import(
+    bundle: &std::path::Path,
+    data_dir: &std::path::Path,
+    scope: server::keybundle::Scope,
+    domain: Option<&str>,
+    passphrase_file: &std::path::Path,
+) -> anyhow::Result<()> {
+    let passphrase = server::seal::passphrase_from_file(passphrase_file)?;
+    let sealed = tokio::fs::read(bundle)
+        .await
+        .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", bundle.display()))?;
+    let report = server::keybundle::import(&sealed, &passphrase, data_dir, scope, domain).await?;
+    for what in &report.written {
+        println!("imported {what}");
+    }
+    for what in &report.kept {
+        println!("kept existing {what}");
+    }
+    Ok(())
+}
+
 pub async fn cmd_raft_status(server: String) -> anyhow::Result<()> {
     let mut client = connect_server(&server).await?;
     let status = client

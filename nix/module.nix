@@ -63,6 +63,31 @@ in
         '';
       };
 
+      keyBundleFile = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "/run/keys/ekafleet-key-bundle";
+        description = ''
+          A sealed key bundle from `ekafleet keys export` on an existing
+          server: the fleet key, binary cache key, root CA and JWT-SVID key
+          every server of a cluster shares. Imported before each start of
+          the server and CA signer (keys already present are kept; a server
+          that made its own refuses to start). Set it on every server added
+          to a cluster; the first server needs none.
+        '';
+      };
+
+      keyBundlePassphraseFile = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "/run/keys/ekafleet-key-bundle-passphrase";
+        description = ''
+          File holding the passphrase the key bundle was sealed with. Both
+          files are passed with systemd `LoadCredential`, so they may be
+          readable by root only.
+        '';
+      };
+
       nodeId = lib.mkOption {
         type = lib.types.ints.positive;
         default = 1;
@@ -361,21 +386,30 @@ in
     # The agent (root) owns /var/lib/ekafleet and /run/ekafleet.
     (lib.mkIf cfg.server.enable (
       let
-        sealCredential = lib.optionalAttrs (cfg.server.sealPassphraseFile != null) {
-          LoadCredential = [ "seal-passphrase:${cfg.server.sealPassphraseFile}" ];
-        };
         sealEnv = lib.optionalAttrs (cfg.server.sealPassphraseFile != null) {
           EKAFLEET_SEAL_PASSPHRASE_FILE = "%d/seal-passphrase";
         };
         sealCredentials = lib.optional (
           cfg.server.sealPassphraseFile != null
         ) "seal-passphrase:${cfg.server.sealPassphraseFile}";
+        hasKeyBundle = cfg.server.keyBundleFile != null;
+        keyBundleCredentials = lib.optionals hasKeyBundle [
+          "key-bundle:${cfg.server.keyBundleFile}"
+          "key-bundle-passphrase:${cfg.server.keyBundlePassphraseFile}"
+        ];
+        importKeys =
+          scope: dir:
+          "${cfg.server.package}/bin/ekafleet keys import --bundle %d/key-bundle --passphrase-file %d/key-bundle-passphrase --data-dir ${dir} --scope ${scope} --domain ${cfg.server.domain}";
       in
       {
         assertions = [
           {
             assertion = lib.hasPrefix "/var/lib/" cfg.server.dataDir;
             message = "services.ekafleet.server.dataDir must be under /var/lib/ (got ${cfg.server.dataDir}).";
+          }
+          {
+            assertion = (cfg.server.keyBundleFile == null) == (cfg.server.keyBundlePassphraseFile == null);
+            message = "services.ekafleet.server.keyBundleFile and keyBundlePassphraseFile must be set together.";
           }
         ];
 
@@ -431,8 +465,9 @@ in
             RestrictNamespaces = true;
             RestrictRealtime = true;
             IPAddressDeny = "any";
-          }
-          // sealCredential;
+            LoadCredential = sealCredentials ++ keyBundleCredentials;
+            ExecStartPre = lib.mkIf hasKeyBundle (importKeys "ca" "/var/lib/ekafleet-ca");
+          };
 
           environment = {
             RUST_LOG = "info";
@@ -489,7 +524,12 @@ in
               MemoryDenyWriteExecute = true;
               RestrictNamespaces = true;
               RestrictRealtime = true;
-              LoadCredential = [ "admin-token:${cfg.server.tokenFile}" ] ++ sealCredentials;
+              LoadCredential = [
+                "admin-token:${cfg.server.tokenFile}"
+              ]
+              ++ sealCredentials
+              ++ keyBundleCredentials;
+              ExecStartPre = lib.mkIf hasKeyBundle (importKeys "server" cfg.server.dataDir);
             };
 
           environment = {

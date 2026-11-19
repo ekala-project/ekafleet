@@ -19,6 +19,7 @@ pub mod federation;
 pub mod identity;
 pub mod images;
 pub mod ingress;
+pub mod keybundle;
 pub mod leadership;
 mod membership;
 pub mod mesh;

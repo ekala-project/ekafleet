@@ -27,7 +27,7 @@ use zeroize::Zeroizing;
 use crate::server::seal;
 
 /// File holding the (possibly sealed) PKCS#8 cache signing key.
-const CACHE_KEY: &str = "cache-signing-key.pk8";
+pub(crate) const CACHE_KEY: &str = "cache-signing-key.pk8";
 
 /// Size of the NAR chunks streamed to agents.
 const CHUNK_SIZE: usize = 64 * 1024;
