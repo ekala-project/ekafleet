@@ -16,6 +16,7 @@ pub mod dynamic;
 pub mod events;
 pub mod external;
 pub mod federation;
+pub mod identity;
 pub mod images;
 pub mod mesh;
 pub mod nix;
@@ -110,11 +111,16 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     let server_id = get_server_id(&config.data_dir)?;
     tracing::info!(server_id = %server_id, domain = %config.domain, "Server identity established");
 
-    // Issue a server SVID for gRPC TLS: spiffe://<domain>/server/<server-id>
-    let (server_cert_pem, ca_chain_pem, _expires_at) = ca.issue_server_svid(&server_id).await?;
+    // Issue a server SVID for gRPC TLS: spiffe://<domain>/server/<server-id>,
+    // renewed before it expires.
+    let (server_cert_pem, ca_chain_pem, expires_at) = ca.issue_server_svid(&server_id).await?;
+    let server_identity = identity::ServerIdentity::from_pem(
+        zeroize::Zeroizing::new(String::from_utf8(server_cert_pem)?),
+        expires_at,
+    )?;
 
     let tls = api::TlsConfig {
-        cert_pem: String::from_utf8(server_cert_pem)?,
+        identity: server_identity.clone(),
         ca_cert_pem: String::from_utf8(ca_chain_pem)?,
     };
 
@@ -125,10 +131,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         .map(|v| !v.is_empty() && v != "0")
         .unwrap_or(false)
     {
-        Some(rest::HttpTlsConfig {
-            cert_pem: tls.cert_pem.clone(),
-            key_pem: tls.cert_pem.clone(),
-        })
+        Some(server_identity.clone())
     } else {
         None
     };
@@ -222,6 +225,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
 
     // Create a cancellation token for graceful shutdown
     let shutdown = CancellationToken::new();
+    server_identity.spawn_renewal(ca.clone(), server_id.clone(), shutdown.child_token());
 
     let agent_ca_pem = trust_bundle_pem.clone();
 

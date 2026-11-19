@@ -5,7 +5,6 @@ use std::time::Duration;
 
 use tokio::sync::RwLock;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 use tonic::{Request, Response, Status, Streaming};
 
 use super::events::EventStore;
@@ -2350,11 +2349,80 @@ fn resolve_stream_node_id(authenticated: Option<&str>, claimed: &str) -> Result<
 
 /// TLS configuration for the gRPC server.
 pub struct TlsConfig {
-    /// Server certificate PEM (leaf cert + private key)
-    pub cert_pem: String,
+    /// The server SVID, renewed in place.
+    pub identity: super::identity::ServerIdentity,
     /// CA certificate PEM (for client verification in mTLS)
-    #[allow(dead_code)]
     pub ca_cert_pem: String,
+}
+
+/// rustls configuration of the gRPC listener: the server SVID is resolved
+/// on every handshake (so renewals apply to new connections), and client
+/// certificates are optional but must chain to the fleet CA when presented.
+fn grpc_tls_config(tls: &TlsConfig) -> anyhow::Result<rustls::ServerConfig> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut tls.ca_cert_pem.as_bytes()) {
+        roots.add(cert?)?;
+    }
+    if roots.is_empty() {
+        anyhow::bail!("the fleet CA PEM holds no certificate");
+    }
+    let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+        Arc::new(roots),
+        provider.clone(),
+    )
+    .allow_unauthenticated()
+    .build()?;
+    let mut config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()?
+        .with_client_cert_verifier(verifier)
+        .with_cert_resolver(Arc::new(tls.identity.clone()));
+    config.alpn_protocols = vec![b"h2".to_vec()];
+    Ok(config)
+}
+
+/// Longest a client may take to complete the TLS handshake.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+type GrpcTlsStream = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
+
+/// Accept connections on `listener` and complete their TLS handshakes
+/// concurrently, yielding established streams until `shutdown`.
+fn grpc_incoming(
+    listener: tokio::net::TcpListener,
+    config: rustls::ServerConfig,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> tokio_stream::wrappers::ReceiverStream<Result<GrpcTlsStream, std::io::Error>> {
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    tokio::spawn(async move {
+        loop {
+            let (tcp, peer) = tokio::select! {
+                _ = shutdown.cancelled() => return,
+                accepted = listener.accept() => match accepted {
+                    Ok(accepted) => accepted,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "gRPC accept failed");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                },
+            };
+            let _ = tcp.set_nodelay(true);
+            let acceptor = acceptor.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await {
+                    Ok(Ok(stream)) => {
+                        let _ = tx.send(Ok(stream)).await;
+                    }
+                    Ok(Err(e)) => tracing::debug!(%peer, error = %e, "gRPC TLS handshake failed"),
+                    Err(_) => tracing::debug!(%peer, "gRPC TLS handshake timed out"),
+                }
+            });
+        }
+    });
+    tokio_stream::wrappers::ReceiverStream::new(rx)
 }
 
 /// Configuration for starting the gRPC server.
@@ -2483,15 +2551,12 @@ pub async fn serve_grpc(
         Ok(req)
     };
 
-    let identity = Identity::from_pem(&tls.cert_pem, &tls.cert_pem);
     // Client certificates are optional at the TLS layer: agents present
     // their node SVID, while the CLI (bearer token) and joining agents
     // (FleetBootstrap.Attest) have none. A certificate that is presented
     // must chain to the fleet CA; authorization is per RPC.
-    let tls_config = ServerTlsConfig::new()
-        .identity(identity)
-        .client_ca_root(Certificate::from_pem(&tls.ca_cert_pem))
-        .client_auth_optional(true);
+    let tls_config = grpc_tls_config(&tls)?;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
 
     let addr_str = addr.to_string();
     let service = FleetControlService::new(
@@ -2547,18 +2612,17 @@ pub async fn serve_grpc(
         service.audit_log.clone(),
     );
 
+    let incoming = grpc_incoming(listener, tls_config, shutdown.clone());
     tonic::transport::Server::builder()
-        .tls_config(tls_config)?
         .http2_keepalive_interval(Some(Duration::from_secs(20)))
         .http2_keepalive_timeout(Some(Duration::from_secs(10)))
-        .tcp_keepalive(Some(Duration::from_secs(60)))
         .add_service(FleetBootstrapServer::new(bootstrap))
         .add_service(super::access_audit::AuditDenials::new(
             FleetControlServer::with_interceptor(service, interceptor),
             audit_log,
             service_token_store_for_audit,
         ))
-        .serve_with_shutdown(addr, shutdown.cancelled())
+        .serve_with_incoming_shutdown(incoming, shutdown.cancelled())
         .await?;
 
     Ok(())
