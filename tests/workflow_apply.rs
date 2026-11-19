@@ -715,14 +715,44 @@ async fn apply_builds_closures_and_serves_them_to_the_assigned_agent() {
             .count(),
         1
     );
+
+    // A server whose store lacks a revision's paths (a new leader, or one
+    // that collected them) rebuilds them from the locked flake reference:
+    // here the paths are deleted and the flake has moved on.
+    for root in std::fs::read_dir(dir.path().join("data/gcroots")).unwrap() {
+        std::fs::remove_dir_all(root.unwrap().path()).unwrap();
+    }
+    let deleted = Command::new("nix")
+        .args(["store", "delete"])
+        .args(&spec.store_paths)
+        .output()
+        .unwrap();
+    assert!(
+        deleted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&deleted.stderr)
+    );
+    assert!(spec.store_paths.iter().all(|p| !Path::new(p).exists()));
+
     let rollback = admin
         .rollback(RollbackRequest { to_revision: 1 })
         .await
         .unwrap()
         .into_inner();
     assert!(rollback.success, "{}", rollback.message);
-    let (spec, _) = agent.expect_command(&web).await;
-    assert_eq!(spec.store_paths.len(), 2);
+    let (rolled_back, _) = agent.expect_command(&web).await;
+    assert_eq!(rolled_back.store_paths, spec.store_paths);
+    assert!(
+        spec.store_paths.iter().all(|p| Path::new(p).exists()),
+        "the recorded paths were rebuilt"
+    );
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("data/gcroots"))
+            .unwrap()
+            .count(),
+        1,
+        "and rooted again"
+    );
 }
 
 /// Commit changes to an existing flake repository.
