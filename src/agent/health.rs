@@ -68,6 +68,9 @@ impl HealthResult {
 pub struct ProbeConfig {
     /// Address the service listens on: loopback, or its namespace IP.
     pub host: String,
+    /// Network namespace to connect from (`/run/netns/...`), for services
+    /// in a non-default namespace.
+    pub netns: Option<String>,
     /// Liveness probe spec (or the unified health check).
     pub liveness: Option<HealthCheckSpec>,
     /// Readiness probe spec (defaults to liveness if not set).
@@ -94,15 +97,19 @@ impl ProbeConfig {
         if liveness.is_none() && readiness.is_none() && startup.is_none() {
             return None;
         }
-        let host = if !crate::agent::netns::is_default_namespace(&spec.namespace)
+        let (host, netns) = if !crate::agent::netns::is_default_namespace(&spec.namespace)
             && !spec.namespace_ip.is_empty()
         {
-            spec.namespace_ip.clone()
+            (
+                spec.namespace_ip.clone(),
+                Some(format!("/run/netns/ekafleet-{}", spec.namespace)),
+            )
         } else {
-            "127.0.0.1".into()
+            ("127.0.0.1".into(), None)
         };
         Some(Self {
             host,
+            netns,
             liveness,
             readiness,
             startup,
@@ -161,7 +168,10 @@ impl HealthChecker {
             if let Some(spec) = spec {
                 tokio::spawn(self.clone().probe_loop(
                     service.to_string(),
-                    probes.host.clone(),
+                    Target {
+                        host: probes.host.clone(),
+                        netns: probes.netns.clone(),
+                    },
                     kind,
                     spec,
                     has_startup,
@@ -199,7 +209,7 @@ impl HealthChecker {
     async fn probe_loop(
         self,
         svc: String,
-        host: String,
+        target: Target,
         kind: Kind,
         spec: HealthCheckSpec,
         has_startup: bool,
@@ -226,7 +236,7 @@ impl HealthChecker {
 
             let check = tokio::select! {
                 _ = cancel.cancelled() => return,
-                check = run_check(&spec, &host, timeout) => check,
+                check = run_check(&spec, &target, timeout) => check,
             };
             let mut results = self.results.write().await;
             // A replaced configuration may have reset the result meanwhile.
@@ -320,6 +330,52 @@ impl HealthChecker {
     }
 }
 
+/// Where a probe connects.
+struct Target {
+    host: String,
+    netns: Option<String>,
+}
+
+impl Target {
+    /// A TCP connection to `port`, made from the target's network namespace.
+    async fn connect(&self, port: u16, timeout: Duration) -> Result<TcpStream, String> {
+        let Some(netns) = self.netns.clone() else {
+            return match tokio::time::timeout(timeout, TcpStream::connect((&*self.host, port)))
+                .await
+            {
+                Ok(connected) => connected.map_err(|e| e.to_string()),
+                Err(_) => Err("timeout".into()),
+            };
+        };
+        let addr: std::net::SocketAddr = (
+            self.host
+                .parse::<std::net::IpAddr>()
+                .map_err(|e| format!("bad address {}: {e}", self.host))?,
+            port,
+        )
+            .into();
+        // setns affects only the calling thread, so connect on a throwaway
+        // one; the socket stays in the namespace it was made in.
+        let stream =
+            tokio::task::spawn_blocking(move || -> std::io::Result<std::net::TcpStream> {
+                use std::os::fd::AsRawFd;
+                let ns = std::fs::File::open(&netns)?;
+                // SAFETY: `ns` is an open namespace file descriptor; setns only
+                // changes this (throwaway) thread's network namespace.
+                if unsafe { libc::setns(ns.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let stream = std::net::TcpStream::connect_timeout(&addr, timeout)?;
+                stream.set_nonblocking(true)?;
+                Ok(stream)
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        TcpStream::from_std(stream).map_err(|e| e.to_string())
+    }
+}
+
 fn threshold(configured: u32) -> u32 {
     if configured > 0 { configured } else { 3 }
 }
@@ -372,32 +428,38 @@ fn update_probe_status(
 /// Execute a single health check probe.
 async fn run_check(
     spec: &HealthCheckSpec,
-    host: &str,
+    target: &Target,
     timeout: Duration,
 ) -> Result<String, String> {
     use crate::proto::health_check_spec::Probe;
 
     match &spec.probe {
-        Some(Probe::Http(http)) => check_http(host, http.port as u16, &http.path, timeout).await,
-        Some(Probe::Tcp(tcp)) => check_tcp(host, tcp.port as u16, timeout).await,
+        Some(Probe::Http(http)) => check_http(target, http.port as u16, &http.path, timeout).await,
+        Some(Probe::Tcp(tcp)) => check_tcp(target, tcp.port as u16, timeout).await,
         Some(Probe::Exec(exec)) => check_exec(&exec.command, timeout).await,
-        Some(Probe::Grpc(grpc)) => check_grpc(host, grpc.port as u16, &grpc.service, timeout).await,
+        // tonic dials from the agent's own namespace; inside another one a
+        // TCP connect is the best available check.
+        Some(Probe::Grpc(grpc)) if target.netns.is_some() => {
+            check_tcp(target, grpc.port as u16, timeout).await
+        }
+        Some(Probe::Grpc(grpc)) => {
+            check_grpc(&target.host, grpc.port as u16, &grpc.service, timeout).await
+        }
         None => Err("no probe configured".into()),
     }
 }
 
 async fn check_http(
-    host: &str,
+    target: &Target,
     port: u16,
     path: &str,
     timeout: Duration,
 ) -> Result<String, String> {
+    let host = &target.host;
     let url = format!("http://{host}:{port}{path}");
 
     let result = tokio::time::timeout(timeout, async {
-        let stream = TcpStream::connect((host, port))
-            .await
-            .map_err(|e| e.to_string())?;
+        let stream = target.connect(port, timeout).await?;
 
         // Simple HTTP/1.1 GET
         let request =
@@ -437,11 +499,10 @@ async fn check_http(
     }
 }
 
-async fn check_tcp(host: &str, port: u16, timeout: Duration) -> Result<String, String> {
-    match tokio::time::timeout(timeout, TcpStream::connect((host, port))).await {
-        Ok(Ok(_)) => Ok(format!("tcp:{port} → connected")),
-        Ok(Err(e)) => Err(format!("tcp:{port} → {e}")),
-        Err(_) => Err(format!("tcp:{port} → timeout")),
+async fn check_tcp(target: &Target, port: u16, timeout: Duration) -> Result<String, String> {
+    match target.connect(port, timeout).await {
+        Ok(_) => Ok(format!("tcp:{port} → connected")),
+        Err(e) => Err(format!("tcp:{port} → {e}")),
     }
 }
 
@@ -526,6 +587,7 @@ mod tests {
     fn probes(liveness: Option<HealthCheckSpec>, startup: Option<HealthCheckSpec>) -> ProbeConfig {
         ProbeConfig {
             host: "127.0.0.1".into(),
+            netns: None,
             readiness: liveness.clone(),
             liveness,
             startup,
@@ -567,6 +629,7 @@ mod tests {
         );
         assert_eq!(p.startup, Some(tcp(3)));
         assert_eq!(p.host, "10.200.0.5");
+        assert_eq!(p.netns.as_deref(), Some("/run/netns/ekafleet-tenant"));
 
         spec.liveness_probe = None;
         spec.startup_probe = None;
