@@ -83,6 +83,9 @@ pub struct EmbeddedAgentConfig {
 /// How long the embedded agent's join token stays valid.
 const EMBEDDED_JOIN_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// This server's Raft node id while servers run alone.
+const RAFT_NODE_ID: crate::raft::consensus::NodeId = 1;
+
 pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     tracing::info!(
         data_dir = %config.data_dir.display(),
@@ -193,8 +196,24 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("initialize Raft storage: {e}"))?;
         Arc::new(storage)
     };
-    let raft_state = FleetStateMachine::with_log(raft_storage.clone());
-    raft_state.load().await.map_err(|e| {
+    // Every write goes through Raft consensus. A server without peers is a
+    // one-member cluster.
+    let raft_state = FleetStateMachine::new();
+    let raft = crate::raft::consensus::boot(
+        &raft_state,
+        raft_storage.clone(),
+        RAFT_NODE_ID,
+        &config.grpc_listen,
+        [(
+            RAFT_NODE_ID,
+            openraft::BasicNode::new(config.grpc_listen.clone()),
+        )]
+        .into(),
+        crate::raft::consensus::NoPeers,
+        crate::raft::consensus::raft_config(&config.domain)?,
+    )
+    .await
+    .map_err(|e| {
         anyhow::anyhow!(
             "cannot load fleet state from {}: {e}. Refusing to start with empty state; \
              restore the data directory from backup, or move {} aside to start over",
@@ -202,6 +221,9 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
             config.data_dir.join("raft").display(),
         )
     })?;
+    crate::raft::consensus::wait_leading(&raft, std::time::Duration::from_secs(30))
+        .await
+        .map_err(|e| anyhow::anyhow!("Raft did not elect this server: {e}"))?;
 
     // A fleet key rotation interrupted by a crash leaves its key staged.
     let staged_key = if config.data_dir.join(secrets::NEXT_FLEET_KEY_FILE).exists() {
@@ -340,6 +362,9 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         }
     }
 
+    if let Err(e) = raft.shutdown().await {
+        tracing::warn!(error = %e, "Raft did not shut down cleanly");
+    }
     Ok(())
 }
 
