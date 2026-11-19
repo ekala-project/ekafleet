@@ -328,4 +328,13 @@ async fn servers_fail_over_with_replicated_state_and_shared_keys() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     sealed.unwrap();
+
+    // The key version carries over, and the two survivors are a majority
+    // of the three servers: the next rotation is staged and committed.
+    let rotated = admin
+        .rotate_fleet_key(RotateFleetKeyRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!((rotated.previous_version, rotated.new_version), (2, 3));
 }
