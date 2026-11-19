@@ -50,6 +50,43 @@ pub struct FleetConfig {
     /// service records with.
     #[serde(default)]
     pub federation: FederationConfig,
+    /// HTTP routes served by the ingress proxy of selected nodes.
+    #[serde(default)]
+    pub ingress: HashMap<String, IngressRouteConfig>,
+}
+
+/// An HTTP route from the ingress proxy to a fleet service.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct IngressRouteConfig {
+    /// Host header to match (without port), or `*` for any host.
+    pub host: String,
+    /// Path prefix to match; the longest matching prefix wins.
+    #[serde(default = "default_ingress_path")]
+    pub path: String,
+    /// Default-namespace service receiving the traffic.
+    pub service: String,
+    /// Name of the service's port (`services.<svc>.ports.<name>`).
+    pub port: String,
+    /// Serve the route on nodes of these pools ...
+    #[serde(default)]
+    pub pools: Vec<String>,
+    /// ... and on these nodes. With neither, every node serves it.
+    #[serde(default)]
+    pub nodes: Vec<String>,
+}
+
+fn default_ingress_path() -> String {
+    "/".to_string()
+}
+
+impl IngressRouteConfig {
+    /// Whether a node named `node` in `pool` serves this route.
+    pub fn served_by(&self, node: &str, pool: &str) -> bool {
+        (self.pools.is_empty() && self.nodes.is_empty())
+            || self.nodes.iter().any(|n| n == node)
+            || self.pools.iter().any(|p| p == pool)
+    }
 }
 
 /// Federation with other ekafleet clusters.
@@ -1653,6 +1690,70 @@ fn validate_federation(config: &FleetConfig, errors: &mut Vec<String>) {
     }
 }
 
+fn validate_ingress(config: &FleetConfig, errors: &mut Vec<String>) {
+    let mut pools: std::collections::HashSet<&str> =
+        config.node_pools.keys().map(String::as_str).collect();
+    pools.insert("default");
+    pools.extend(config.machines.values().map(|m| m.pool.as_str()));
+
+    let mut routes: Vec<_> = config.ingress.iter().collect();
+    routes.sort_by_key(|(name, _)| name.as_str());
+    let mut matches = std::collections::HashMap::new();
+    for (name, route) in routes {
+        let at = format!("ingress '{name}'");
+        if !is_dns_label(name) {
+            errors.push(format!("{at}: name must be a DNS label (a-z, 0-9, '-')"));
+        }
+        if route.host != "*" && !is_hostname(&route.host) {
+            errors.push(format!(
+                "{at}: host '{}' must be a lower-case host name (no port) or '*'",
+                route.host
+            ));
+        }
+        if !route.path.starts_with('/') || route.path.contains(['?', '#']) {
+            errors.push(format!("{at}: path '{}' must start with '/'", route.path));
+        }
+        if let Some(other) = matches.insert((route.host.as_str(), route.path.as_str()), name) {
+            errors.push(format!(
+                "ingress '{other}' and '{name}' both route {}{}",
+                route.host, route.path
+            ));
+        }
+        match config.services.get(&route.service) {
+            None => errors.push(format!("{at}: service '{}' is not defined", route.service)),
+            Some(service) => {
+                if !crate::agent::netns::is_default_namespace(&service.namespace) {
+                    errors.push(format!(
+                        "{at}: service '{}' is in namespace '{}': ingress reaches default-namespace services only",
+                        route.service, service.namespace
+                    ));
+                }
+                if !service.ports.contains_key(&route.port) {
+                    errors.push(format!(
+                        "{at}: service '{}' declares no port '{}'",
+                        route.service, route.port
+                    ));
+                }
+            }
+        }
+        for pool in &route.pools {
+            if !pools.contains(pool.as_str()) {
+                errors.push(format!("{at}: pool '{pool}' is not defined"));
+            }
+        }
+        for node in &route.nodes {
+            if node.is_empty() {
+                errors.push(format!("{at}: node names must not be empty"));
+            }
+        }
+    }
+}
+
+/// Whether `host` is a lower-case DNS host name.
+fn is_hostname(host: &str) -> bool {
+    host.len() <= 253 && host.split('.').all(is_dns_label)
+}
+
 /// `host:port` with a non-empty host and a non-zero port.
 fn validate_endpoint(endpoint: &str) -> Result<(), String> {
     let (host, port) = endpoint
@@ -1690,6 +1791,7 @@ pub fn validate(config: &FleetConfig) -> Result<(), Vec<String>> {
     validate_secret_engines(config, &mut errors);
     validate_external_services(config, &mut errors);
     validate_federation(config, &mut errors);
+    validate_ingress(config, &mut errors);
 
     validate_alerts(config, &mut errors);
     validate_namespaces_and_admission(config, &mut errors);
@@ -2163,6 +2265,59 @@ mod nix_module_tests {
             "peers 'Bad' and 'dup' have the same trust domain 'b.test'",
             "peer 'nocert': caCert holds no PEM certificate",
             "'X..test' is not a trust domain",
+        ] {
+            assert!(errors.contains(expected), "{expected}: {errors}");
+        }
+    }
+
+    #[test]
+    fn ingress_is_validated() {
+        let config = |ingress: serde_json::Value| -> FleetConfig {
+            serde_json::from_value(serde_json::json!({
+                "name": "t",
+                "domain": "fleet.test",
+                "nodePools": {"edge": {}},
+                "services": {
+                    "web": {"command": "/bin/web", "ports": {"http": {"port": 8080}}},
+                    "shop": {"command": "/bin/shop", "namespace": "tenant", "ports": {"http": {"port": 80}}},
+                },
+                "ingress": ingress,
+            }))
+            .unwrap()
+        };
+        let ok = config(serde_json::json!({
+            "site": {"host": "www.example.com", "service": "web", "port": "http", "pools": ["edge"]},
+            "api": {"host": "www.example.com", "path": "/api", "service": "web", "port": "http"},
+            "any": {"host": "*", "service": "web", "port": "http", "nodes": ["n1"]},
+        }));
+        assert!(validate(&ok).is_ok(), "{:?}", validate(&ok));
+        assert_eq!(ok.ingress["site"].path, "/");
+        assert!(ok.ingress["site"].served_by("x", "edge"));
+        assert!(!ok.ingress["site"].served_by("x", "default"));
+        assert!(ok.ingress["api"].served_by("x", "default"));
+        assert!(ok.ingress["any"].served_by("n1", "default"));
+        assert!(!ok.ingress["any"].served_by("n2", "default"));
+
+        let bad = config(serde_json::json!({
+            "Bad": {"host": "a.test", "service": "web", "port": "http"},
+            "port-in-host": {"host": "a.test:80", "service": "web", "port": "http"},
+            "rel": {"host": "b.test", "path": "api", "service": "web", "port": "http"},
+            "dup": {"host": "a.test", "service": "web", "port": "http"},
+            "missing": {"host": "c.test", "service": "nope", "port": "http"},
+            "namespaced": {"host": "d.test", "service": "shop", "port": "http"},
+            "noport": {"host": "e.test", "service": "web", "port": "grpc"},
+            "nopool": {"host": "f.test", "service": "web", "port": "http", "pools": ["gpu"]},
+        }));
+        let errors = validate(&bad).unwrap_err().join("\n");
+        for expected in [
+            "ingress 'Bad': name must be a DNS label",
+            "host 'a.test:80' must be a lower-case host name",
+            "path 'api' must start with '/'",
+            "ingress 'Bad' and 'dup' both route a.test/",
+            "service 'nope' is not defined",
+            "ingress reaches default-namespace services only",
+            "declares no port 'grpc'",
+            "pool 'gpu' is not defined",
         ] {
             assert!(errors.contains(expected), "{expected}: {errors}");
         }

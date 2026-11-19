@@ -84,6 +84,10 @@ enum Command {
         /// Data directory (for SVID material)
         #[arg(long, default_value = "/var/lib/ekafleet")]
         data_dir: PathBuf,
+
+        /// Ingress routes file written by the agent
+        #[arg(long, default_value = ekafleet::proxy::routes::ROUTES_FILE)]
+        routes_file: PathBuf,
     },
 
     /// Standalone CA signing daemon (process-isolated, no network)
@@ -1208,7 +1212,8 @@ async fn main() -> anyhow::Result<()> {
             listen,
             trust_domain,
             data_dir,
-        } => commands::cmd_proxy(listen, trust_domain, data_dir).await?,
+            routes_file,
+        } => commands::cmd_proxy(listen, trust_domain, data_dir, routes_file).await?,
 
         Command::CaSigner {
             data_dir,

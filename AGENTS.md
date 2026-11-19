@@ -89,6 +89,7 @@ src/
 │   ├── identity.rs      # Server SVID, renewed at 2/3 lifetime, resolved per TLS handshake
 │   ├── dns.rs           # Builds per-node DNS records (services, nodes, external, federation)
 │   ├── external.rs      # Health checks for `externalServices`
+│   ├── ingress.rs       # Per-node ingress routes + serving backends → IngressUpdate
 │   ├── dynamic.rs       # Lease manager: issue/renew/drop dynamic DB users; lease RPCs
 │   ├── rebalance.rs     # Stateful drift: `ekafleet rebalance` move plan/apply + settle
 │   ├── secrets.rs       # Secret RPCs, delivery to agents, fleet key rotation + reseal
@@ -164,6 +165,7 @@ src/
 ├── proxy/
 │   ├── mod.rs           # Proxy module
 │   ├── router.rs        # L7 HTTP reverse proxy
+│   ├── routes.rs        # Ingress routes file (agent writes, proxy polls)
 │   ├── l4.rs            # L4 TCP proxy
 │   ├── circuit.rs       # Circuit breaker
 │   ├── ratelimit.rs     # Rate limiting
@@ -226,8 +228,8 @@ tests/
 - Auth: `Bearer <token>` in `authorization` header, or mTLS with SPIFFE SVID (SPIFFE ID extracted from peer cert SAN, mapped to role: `/server/*`→Admin, `/agent/*`→Agent, `/service/*`→Workload (transit only))
 - RBAC: every handler calls `require_permission()` — see `Permission` enum in `rbac.rs`
 - Proto module carries `#![allow(clippy::result_large_err)]` in `lib.rs`
-- `ServerMessage` has 19 variants: 10 fire-and-forget + 9 correlated commands
-- `AgentMessage` has 8 variants: 7 reports + `AgentCommandResponse` (with nested result oneof)
+- `ServerMessage` has 25 variants: 13 fire-and-forget + 12 correlated commands
+- `AgentMessage` has 10 variants: 9 reports/requests + `AgentCommandResponse` (with nested result oneof)
 - Request-response pattern: server sends command with `correlation_id`, agent returns
   `AgentCommandResponse` with the same ID. Correlation managed by `FleetState::send_command()`
 

@@ -50,3 +50,9 @@ The WireGuard mesh provides encryption at the network layer. Combined with mTLS 
 - **WireGuard** — Encrypts all traffic between machines
 - **mTLS** — Authenticates and encrypts service-to-service traffic
 - **nftables** — Enforces network policy as a third layer
+
+## Firewall
+
+Fleet DNS answers and ingress backends are mesh addresses, so nodes connect to each other's service ports over `wg-fleet`. The NixOS module therefore trusts that interface by default (`services.ekafleet.agent.mesh.trustInterface`). Only peers whose WireGuard keys were advertised under a valid node SVID can send on it.
+
+With `trustInterface = false`, only the volume-migration port (TCP 7403) is open on the mesh. Service ports then have to be listed in `networking.firewall.interfaces.wg-fleet.allowedTCPPorts`.

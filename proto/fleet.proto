@@ -367,7 +367,24 @@ message ServerMessage {
     MeshAssignment mesh = 22;
     ExportVolumesCommand export_volumes_command = 23;
     VolumeSnapshotCommand volume_snapshot_command = 24;
+    IngressUpdate ingress = 25;
   }
+}
+
+// The HTTP routes this node's ingress proxy serves. Each update replaces
+// the previous set; an empty set serves nothing.
+message IngressUpdate {
+  repeated IngressRoute routes = 1;
+}
+
+message IngressRoute {
+  // Route name (`ingress.<name>` in the fleet configuration).
+  string name = 1;
+  // Host header to match, or "*".
+  string host = 2;
+  string path_prefix = 3;
+  // Serving replicas as "ip:port" (mesh addresses).
+  repeated string backends = 4;
 }
 
 // The node's WireGuard mesh address, allocated by the server. Sent on

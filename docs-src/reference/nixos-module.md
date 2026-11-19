@@ -88,7 +88,9 @@ than 24 hours needs a new token.
 | `dataDir` | path | `/var/lib/ekafleet` | Data directory for persistent state |
 | `domain` | string | `fleet.internal` | SPIFFE trust domain |
 | `caCert` | path or null | `null` | CA certificate PEM for TLS verification |
-| `proxyListen` | string | `0.0.0.0:8080` | Proxy listen address |
+| `proxyListen` | string | `0.0.0.0:8080` | Ingress proxy listen address |
+| `proxyOpenFirewall` | bool | `false` | Open the ingress proxy's port in the firewall (for nodes serving `ingress` routes) |
+| `mesh.trustInterface` | bool | `true` | Trust `wg-fleet` in the firewall, so nodes reach each other's service ports over the mesh |
 
 ## Combined Node (Server + Agent)
 
