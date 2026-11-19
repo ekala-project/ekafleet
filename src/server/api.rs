@@ -2018,7 +2018,8 @@ impl FleetControl for FleetControlService {
 
         self.token_store
             .register_with_opts(&token, role, &req.description, None, namespace)
-            .await;
+            .await
+            .map_err(super::membership::write_failed)?;
 
         tracing::info!(
             role = %req.role,
@@ -2051,7 +2052,11 @@ impl FleetControl for FleetControlService {
         let token = request.get_ref().token.clone();
         tracing::info!(token_prefix = %&token[..8.min(token.len())], "ACL token revoke requested");
 
-        let revoked = self.token_store.revoke(&token).await;
+        let revoked = self
+            .token_store
+            .revoke(&token)
+            .await
+            .map_err(super::membership::write_failed)?;
         self.audit(
             &request,
             super::audit::AuditAction::TokenRevoke,

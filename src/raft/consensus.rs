@@ -409,7 +409,7 @@ impl StateMachineStore {
         restored.last_applied_log = meta.last_log_id;
         restored.last_applied = meta.last_log_id.map_or(0, |l| l.index);
         restored.last_membership = meta.last_membership.clone();
-        *self.state.inner.write().await = restored;
+        *self.state.write().await = restored;
         Ok(())
     }
 }
@@ -456,7 +456,7 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         I: IntoIterator<Item = Entry<TypeConfig>> + OptionalSend,
         I::IntoIter: OptionalSend,
     {
-        let mut state = self.state.inner.write().await;
+        let mut state = self.state.write().await;
         let mut applied = Vec::new();
         for entry in entries {
             let index = entry.log_id.index;

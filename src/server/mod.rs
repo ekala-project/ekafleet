@@ -89,9 +89,6 @@ pub struct EmbeddedAgentConfig {
     pub dns: crate::dns::agent::DnsSettings,
 }
 
-/// How long the embedded agent's join token stays valid.
-const EMBEDDED_JOIN_TTL: std::time::Duration = std::time::Duration::from_secs(300);
-
 /// The node id of a server not given `--node-id`.
 pub const DEFAULT_NODE_ID: crate::raft::consensus::NodeId = 1;
 
@@ -239,7 +236,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         tracing::warn!(error = %e, "Failed to load persisted tokens, starting fresh");
     }
     token_store
-        .register(&config.token, rbac::Role::Admin, "initial admin token")
+        .register(&config.token, rbac::Role::Admin, rbac::INITIAL_ADMIN_TOKEN)
         .await;
 
     // Initialize Raft state machine and cloud infrastructure.
@@ -310,6 +307,8 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("Raft did not elect this server: {e}"))?;
     }
     let leadership = leadership::Leadership::new(raft.clone());
+    // Tokens created through the API live in Raft; `--token` stays local.
+    let token_store = token_store.with_replication(raft_state.clone());
 
     // A fleet key rotation interrupted by a crash leaves its key staged.
     let staged_key = if config.data_dir.join(secrets::NEXT_FLEET_KEY_FILE).exists() {
@@ -328,7 +327,8 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         secrets::settle_fleet_key(&config.data_dir, fleet_key, staged_key, &raft_state).await?;
 
     let instance_tracker = cloud::instance_tracker::InstanceTracker::new(raft_state.clone());
-    let join_token_store = JoinTokenStore::with_persistence(&config.data_dir);
+    let join_token_store =
+        JoinTokenStore::with_persistence(&config.data_dir).with_replication(raft_state.clone());
     if let Err(e) = join_token_store.load().await {
         tracing::warn!(error = %e, "Failed to load persisted join tokens, starting fresh");
     }
@@ -395,7 +395,18 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
             alert_evaluator.clone(),
         );
         let federation_view = federation_view.clone();
+        let (acl_tokens, join_tokens) = (token_store.clone(), grpc_config.join_token_store.clone());
         Box::new(move |term: CancellationToken| {
+            // Tokens persisted locally before they were replicated.
+            let (acl_tokens, join_tokens) = (acl_tokens.clone(), join_tokens.clone());
+            tokio::spawn(async move {
+                if let Err(e) = acl_tokens.migrate_to_replicated().await {
+                    tracing::warn!(error = %e, "Could not move ACL tokens into Raft");
+                }
+                if let Err(e) = join_tokens.migrate_to_replicated().await {
+                    tracing::warn!(error = %e, "Could not move join tokens into Raft");
+                }
+            });
             let external_health = external::ExternalHealth::new();
             external::ExternalChecker {
                 raft_state: raft_state.clone(),
@@ -431,7 +442,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
             agent,
             grpc_addr,
             agent_ca_pem,
-            grpc_config.join_token_store.clone(),
+            grpc_config.ca.clone(),
             shutdown.child_token(),
         )
         .await?;
@@ -476,7 +487,7 @@ async fn spawn_embedded_agent(
     agent: EmbeddedAgentConfig,
     grpc_addr: std::net::SocketAddr,
     ca_cert_pem: String,
-    join_tokens: JoinTokenStore,
+    ca: Arc<dyn CaSigner>,
     stop: CancellationToken,
 ) -> anyhow::Result<()> {
     // Dial the listener on loopback when it is bound to every address.
@@ -491,20 +502,31 @@ async fn spawn_embedded_agent(
     let joined = identity.load().await
         && identity.certifies_node(&agent.node_name)
         && identity.has_valid_svid();
-    let join_token = if joined {
-        None
-    } else {
-        let (token, _) = join_tokens
-            .create(&agent.node_name, Some(EMBEDDED_JOIN_TTL))
+    // The server signs its own agent's node SVID: no join token, which a
+    // follower could not record.
+    if !joined {
+        let csr = crate::ca::csr::generate_node_csr(None, &agent.node_name)
+            .map_err(|e| anyhow::anyhow!("embedded agent CSR: {e}"))?;
+        let subject = crate::ca::SvidSubject::Agent(agent.node_name.clone());
+        let (cert, chain, _) = ca
+            .sign_csr(&csr.csr_der, &subject, None)
             .await
-            .map_err(|e| anyhow::anyhow!("join token for the embedded agent: {e}"))?;
-        Some(Zeroizing::new(token))
-    };
+            .map_err(|e| anyhow::anyhow!("embedded agent node SVID: {e}"))?;
+        let cert = String::from_utf8(cert)?;
+        let chain = String::from_utf8(chain)?;
+        identity
+            .install(
+                format!("{}\n{chain}", cert.trim_end()),
+                Zeroizing::new(csr.keypair.serialize_pem()),
+            )
+            .await?;
+        tracing::info!(node = %agent.node_name, "Issued the embedded agent's node SVID");
+    }
 
     let config = crate::agent::AgentConfig {
         server_addr: server_addr.to_string(),
         token: None,
-        join_token,
+        join_token: None,
         node_name: agent.node_name.clone(),
         data_dir: agent.data_dir,
         ca_cert_pem: Some(ca_cert_pem),

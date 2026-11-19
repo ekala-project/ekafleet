@@ -3,7 +3,7 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard};
+use tokio::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use super::RaftError;
 use super::consensus::{Proposal, Raft};
@@ -33,6 +33,56 @@ pub struct FleetStateMachine {
     /// Serializes proposals, so a helper's check and its write see no
     /// other write from this server in between.
     propose: Arc<Mutex<()>>,
+    /// The ACL tokens as of the latest write, readable without awaiting
+    /// (the gRPC interceptor authenticates synchronously).
+    acl: AclView,
+}
+
+/// ACL token digest → entry; see [`crate::server::rbac::TokenStore`].
+pub type AclTokens = BTreeMap<String, crate::server::rbac::TokenEntry>;
+
+/// A synchronously readable copy of the state's ACL tokens.
+pub type AclView = Arc<std::sync::RwLock<Arc<AclTokens>>>;
+
+/// A join token, by the hex SHA-256 of the token (never the token).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinTokenRecord {
+    /// The only node name it attests.
+    pub node_name: String,
+    pub created_at: u64,
+    pub expires_at: u64,
+    /// When it was used; consumed tokens are kept until they would have
+    /// expired, so replays are reported as such.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consumed_at: Option<u64>,
+}
+
+/// Write access to the state; refreshes the [`AclView`] when dropped.
+pub(super) struct StateWrite<'a> {
+    guard: RwLockWriteGuard<'a, StateMachineInner>,
+    acl: &'a AclView,
+}
+
+impl std::ops::Deref for StateWrite<'_> {
+    type Target = StateMachineInner;
+    fn deref(&self) -> &StateMachineInner {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for StateWrite<'_> {
+    fn deref_mut(&mut self) -> &mut StateMachineInner {
+        &mut self.guard
+    }
+}
+
+impl Drop for StateWrite<'_> {
+    fn drop(&mut self) {
+        let mut view = self.acl.write().unwrap_or_else(|e| e.into_inner());
+        if **view != self.guard.acl_tokens {
+            *view = Arc::new(self.guard.acl_tokens.clone());
+        }
+    }
 }
 
 /// One proposer's exclusive turn: read state, then commit. `commit` takes
@@ -112,6 +162,12 @@ pub(super) struct StateMachineInner {
     /// Cluster membership as of the last applied membership entry.
     #[serde(default)]
     pub(super) last_membership: openraft::StoredMembership<u64, openraft::BasicNode>,
+    /// API-created ACL tokens, by digest.
+    #[serde(default)]
+    acl_tokens: AclTokens,
+    /// Join tokens, by digest.
+    #[serde(default)]
+    join_tokens: BTreeMap<String, JoinTokenRecord>,
 }
 
 /// A transit encryption key: its namespace and every version, oldest
@@ -394,6 +450,30 @@ pub enum Command {
     RestoreState {
         data: Vec<u8>,
     },
+    /// Register (or replace) the ACL token with digest `key`.
+    AclTokenPut {
+        key: String,
+        entry: crate::server::rbac::TokenEntry,
+    },
+    AclTokenRevoke {
+        key: String,
+    },
+    /// A join token for `node_name`, created when proposed.
+    JoinTokenPut {
+        hash: String,
+        node_name: String,
+        expires_at: u64,
+    },
+    /// Mark a join token used, when proposed.
+    JoinTokenConsume {
+        hash: String,
+    },
+    /// Undo [`Command::JoinTokenConsume`].
+    JoinTokenRelease {
+        hash: String,
+    },
+    /// Drop join tokens and ACL tokens expired when proposed.
+    ExpireTokens,
 }
 
 /// The WireGuard mesh network, `10.100.0.0/16`.
@@ -426,6 +506,7 @@ impl FleetStateMachine {
             log: None,
             raft: Default::default(),
             propose: Default::default(),
+            acl: Default::default(),
         }
     }
 
@@ -437,6 +518,7 @@ impl FleetStateMachine {
             log: Some(storage),
             raft: Default::default(),
             propose: Default::default(),
+            acl: Default::default(),
         }
     }
 
@@ -508,6 +590,19 @@ impl FleetStateMachine {
         self.raft.get()
     }
 
+    /// Exclusive write access to the state.
+    pub(super) async fn write(&self) -> StateWrite<'_> {
+        StateWrite {
+            guard: self.inner.write().await,
+            acl: &self.acl,
+        }
+    }
+
+    /// The ACL tokens, read without awaiting.
+    pub fn acl_tokens(&self) -> Arc<AclTokens> {
+        self.acl.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
     async fn turn(&self) -> Turn<'_> {
         Turn {
             machine: self,
@@ -525,7 +620,7 @@ impl FleetStateMachine {
                 .map_err(RaftError::from_client_write)?;
             return Ok(response.log_id.index);
         }
-        let mut state = self.inner.write().await;
+        let mut state = self.write().await;
         self.commit_locked(&mut state, command).await
     }
 
@@ -552,7 +647,7 @@ impl FleetStateMachine {
     /// Apply a command to the state machine at an explicit index (used when
     /// replaying a persisted log at boot).
     pub async fn apply(&self, index: u64, command: Command) {
-        let mut state = self.inner.write().await;
+        let mut state = self.write().await;
         if index <= state.last_applied {
             return; // Already applied
         }
@@ -869,6 +964,41 @@ impl FleetStateMachine {
             Command::ReleaseMeshIp { node_id } => {
                 state.mesh_ips.remove(&node_id);
             }
+            Command::AclTokenPut { key, entry } => {
+                state.acl_tokens.insert(key, entry);
+            }
+            Command::AclTokenRevoke { key } => {
+                state.acl_tokens.remove(&key);
+            }
+            Command::JoinTokenPut {
+                hash,
+                node_name,
+                expires_at,
+            } => {
+                state.join_tokens.insert(
+                    hash,
+                    JoinTokenRecord {
+                        node_name,
+                        created_at: now,
+                        expires_at,
+                        consumed_at: None,
+                    },
+                );
+            }
+            Command::JoinTokenConsume { hash } => {
+                if let Some(token) = state.join_tokens.get_mut(&hash) {
+                    token.consumed_at.get_or_insert(now);
+                }
+            }
+            Command::JoinTokenRelease { hash } => {
+                if let Some(token) = state.join_tokens.get_mut(&hash) {
+                    token.consumed_at = None;
+                }
+            }
+            Command::ExpireTokens => {
+                state.join_tokens.retain(|_, t| t.expires_at > now);
+                state.acl_tokens.retain(|_, t| !t.expired_at(now));
+            }
             Command::RestoreState { data } => {
                 match serde_json::from_slice::<StateMachineInner>(&data) {
                     Ok(mut restored) => {
@@ -885,6 +1015,37 @@ impl FleetStateMachine {
         }
 
         state.last_applied = index;
+    }
+
+    /// The join token with digest `hash`.
+    pub async fn join_token(&self, hash: &str) -> Option<JoinTokenRecord> {
+        self.inner.read().await.join_tokens.get(hash).cloned()
+    }
+
+    /// Every join token, by digest.
+    pub async fn join_tokens(&self) -> BTreeMap<String, JoinTokenRecord> {
+        self.inner.read().await.join_tokens.clone()
+    }
+
+    /// Mark the join token `hash` used if `usable` accepts it as it stands,
+    /// in one turn so no other use of it can come in between. Returns what
+    /// `usable` decided.
+    pub async fn consume_join_token<E>(
+        &self,
+        hash: &str,
+        usable: impl FnOnce(Option<&JoinTokenRecord>) -> Result<(), E>,
+    ) -> Result<Result<(), E>, RaftError> {
+        let mut turn = self.turn().await;
+        let state = turn.read().await;
+        let verdict = usable(state.join_tokens.get(hash));
+        drop(state);
+        if verdict.is_ok() {
+            turn.commit(Command::JoinTokenConsume {
+                hash: hash.to_string(),
+            })
+            .await?;
+        }
+        Ok(verdict)
     }
 
     /// Get the current deployment state for a service.
@@ -971,7 +1132,7 @@ impl FleetStateMachine {
     /// Restore from a snapshot as-is (boot-time load).
     pub async fn restore(&self, data: &[u8]) -> Result<(), serde_json::Error> {
         let restored: StateMachineInner = serde_json::from_slice(data)?;
-        let mut state = self.inner.write().await;
+        let mut state = self.write().await;
         *state = restored;
         Ok(())
     }
