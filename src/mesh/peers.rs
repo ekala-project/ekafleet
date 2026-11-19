@@ -268,7 +268,7 @@ fn leaf_certificate_pem(pem: &str) -> Option<String> {
 /// The PKCS#8 DER inside a `PRIVATE KEY` PEM block.
 fn pkcs8_der(pem: &str) -> Option<Zeroizing<Vec<u8>>> {
     let mut reader = std::io::BufReader::new(pem.as_bytes());
-    match rustls_pemfile::private_key(&mut reader).ok()?? {
+    match crate::ca::pki::pem_private_key(&mut reader).ok()?? {
         rustls_pki_types::PrivateKeyDer::Pkcs8(key) => {
             Some(Zeroizing::new(key.secret_pkcs8_der().to_vec()))
         }

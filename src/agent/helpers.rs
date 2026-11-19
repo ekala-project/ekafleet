@@ -122,7 +122,7 @@ pub(super) async fn install_node_svid(
 /// Whether the first certificate in `cert_pem` certifies `keypair`'s public key.
 pub(super) fn cert_certifies_key(cert_pem: &str, keypair: &rcgen::KeyPair) -> bool {
     let mut reader = std::io::BufReader::new(cert_pem.as_bytes());
-    let Some(Ok(der)) = rustls_pemfile::certs(&mut reader).next() else {
+    let Some(Ok(der)) = crate::ca::pki::pem_certs(&mut reader).next() else {
         return false;
     };
     let Ok((_, cert)) = x509_parser::parse_x509_certificate(&der) else {

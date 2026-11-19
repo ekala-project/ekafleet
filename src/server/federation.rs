@@ -132,7 +132,7 @@ pub(crate) fn is_server_of(cert: &CertificateDer<'_>, trust_domain: &str) -> boo
 
 pub(crate) fn roots_from_pem(pem: &str) -> Result<RootCertStore, String> {
     let mut roots = RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut pem.as_bytes()) {
+    for cert in crate::ca::pki::pem_certs(&mut pem.as_bytes()) {
         roots
             .add(cert.map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
@@ -628,10 +628,10 @@ async fn fetch_inner(
     let tls_err = |e: &dyn std::fmt::Display| FederationError::Tls(e.to_string());
     let roots = roots_from_pem(&peer.ca_cert).map_err(|e| tls_err(&e))?;
     let pem = identity.pem();
-    let chain = rustls_pemfile::certs(&mut pem.as_bytes())
+    let chain = crate::ca::pki::pem_certs(&mut pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| tls_err(&e))?;
-    let key = rustls_pemfile::private_key(&mut pem.as_bytes())
+    let key = crate::ca::pki::pem_private_key(&mut pem.as_bytes())
         .map_err(|e| tls_err(&e))?
         .ok_or_else(|| FederationError::Tls("no server SVID key".into()))?;
     let verifier = PeerServerVerifier {

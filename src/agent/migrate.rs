@@ -79,14 +79,14 @@ async fn material(
         return Err(TransferError::NoIdentity);
     };
     let tls = |e: std::io::Error| TransferError::Tls(e.to_string());
-    let chain = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+    let chain = crate::ca::pki::pem_certs(&mut cert_pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .map_err(tls)?;
-    let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
+    let key = crate::ca::pki::pem_private_key(&mut key_pem.as_bytes())
         .map_err(tls)?
         .ok_or(TransferError::NoIdentity)?;
     let mut roots = RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut ca_pem.as_bytes()) {
+    for cert in crate::ca::pki::pem_certs(&mut ca_pem.as_bytes()) {
         roots
             .add(cert.map_err(tls)?)
             .map_err(|e| TransferError::Tls(e.to_string()))?;

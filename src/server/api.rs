@@ -2409,7 +2409,7 @@ pub struct TlsConfig {
 pub(super) fn grpc_tls_config(tls: &TlsConfig) -> anyhow::Result<rustls::ServerConfig> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut tls.ca_cert_pem.as_bytes()) {
+    for cert in crate::ca::pki::pem_certs(&mut tls.ca_cert_pem.as_bytes()) {
         roots.add(cert?)?;
     }
     if roots.is_empty() {

@@ -698,7 +698,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let chain = rustls_pemfile::certs(&mut cert.as_slice())
+        let chain = crate::ca::pki::pem_certs(&mut cert.as_slice())
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         let key = rustls::pki_types::PrivateKeyDer::try_from(csr.keypair.serialize_der()).unwrap();

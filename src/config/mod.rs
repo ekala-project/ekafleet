@@ -554,7 +554,7 @@ fn parse_cert_bundle_pem(
 
     let mut reader = std::io::BufReader::new(pem.as_bytes());
     let mut out = Vec::new();
-    for cert in rustls_pemfile::certs(&mut reader) {
+    for cert in crate::ca::pki::pem_certs(&mut reader) {
         let cert = cert.map_err(|e| SignatureError::InvalidKey(format!("invalid CA PEM: {e}")))?;
         out.push(cert.as_ref().to_vec());
     }
@@ -1679,7 +1679,7 @@ fn validate_federation(config: &FleetConfig, errors: &mut Vec<String>) {
                 peer.trust_domain
             ));
         }
-        let certs = rustls_pemfile::certs(&mut peer.ca_cert.as_bytes())
+        let certs = crate::ca::pki::pem_certs(&mut peer.ca_cert.as_bytes())
             .collect::<Result<Vec<_>, _>>()
             .unwrap_or_default();
         if certs.is_empty() {

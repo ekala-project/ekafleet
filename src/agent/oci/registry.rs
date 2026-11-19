@@ -113,7 +113,7 @@ impl RegistryClient {
         let mut roots = Self::platform_root_store();
         let mut reader = std::io::BufReader::new(ca_bundle_pem);
         let mut added = 0usize;
-        for cert in rustls_pemfile::certs(&mut reader) {
+        for cert in crate::ca::pki::pem_certs(&mut reader) {
             let cert = cert.map_err(|e| RegistryError::Tls(format!("invalid CA PEM: {e}")))?;
             roots
                 .add(cert)

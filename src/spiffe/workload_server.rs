@@ -85,7 +85,7 @@ fn trust_domain_id(domain: &str) -> String {
 /// Decode every certificate in `pem` to DER.
 fn pem_certs_der(pem: &str) -> Result<Vec<Vec<u8>>, String> {
     let mut reader = std::io::BufReader::new(pem.as_bytes());
-    rustls_pemfile::certs(&mut reader)
+    crate::ca::pki::pem_certs(&mut reader)
         .map(|c| c.map(|c| c.to_vec()).map_err(|e| e.to_string()))
         .collect()
 }
@@ -93,7 +93,7 @@ fn pem_certs_der(pem: &str) -> Result<Vec<Vec<u8>>, String> {
 /// Decode a PKCS#8 private key PEM to DER.
 fn pem_pkcs8_der(pem: &str) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
     let mut reader = std::io::BufReader::new(pem.as_bytes());
-    match rustls_pemfile::private_key(&mut reader) {
+    match crate::ca::pki::pem_private_key(&mut reader) {
         Ok(Some(rustls_pki_types::PrivateKeyDer::Pkcs8(key))) => {
             Ok(zeroize::Zeroizing::new(key.secret_pkcs8_der().to_vec()))
         }
