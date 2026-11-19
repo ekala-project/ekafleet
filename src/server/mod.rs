@@ -18,6 +18,7 @@ pub mod external;
 pub mod federation;
 pub mod identity;
 pub mod images;
+pub mod ingress;
 pub mod mesh;
 pub mod nix;
 pub mod policy;
@@ -284,6 +285,8 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     dns::DnsPublisher::new(fleet_state.clone())
         .with_external(grpc_config.raft_state.clone(), external_health)
         .with_federation(federation_view)
+        .spawn(shutdown.child_token());
+    ingress::IngressPublisher::new(fleet_state.clone(), grpc_config.raft_state.clone())
         .spawn(shutdown.child_token());
     autoscaler::Autoscaler {
         raft_state: grpc_config.raft_state.clone(),

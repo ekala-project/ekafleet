@@ -9,8 +9,7 @@
 | 7404 | TCP (HTTPS, mutual TLS) | Server | Federation listener (`--federation-listen`, off by default) |
 | 53 | UDP/TCP | Server + Agent | DNS (authority on server, resolver on agent) |
 | 51820 | UDP | Server + Agent | WireGuard mesh |
-| 80 | TCP | Agent (ingress) | L7 proxy HTTP |
-| 443 | TCP | Agent (ingress) | L7 proxy HTTPS |
+| 8080 | TCP (HTTP) | Agent (ingress) | Ingress proxy (`proxyListen`; opened by `proxyOpenFirewall`) |
 
 ## Unix Sockets
 
@@ -40,9 +39,11 @@ Each server must reach every peer's federation listener (e.g. TCP 7404). Clients
 
 ### External Access (Ingress Nodes)
 
-Nodes designated for ingress need:
-- TCP 80 (HTTP)
-- TCP 443 (HTTPS)
+Nodes serving `ingress` routes need the ingress proxy's port open (TCP 8080 by default; `services.ekafleet.agent.proxyOpenFirewall`).
+
+### Service Ports Over the Mesh
+
+Fleet DNS addresses and ingress backends are mesh addresses, so nodes reach each other's service ports over `wg-fleet`. The NixOS module trusts that interface (`services.ekafleet.agent.mesh.trustInterface`, default on); with it off, open service ports with `networking.firewall.interfaces.wg-fleet.allowedTCPPorts`.
 
 ## Mesh Network
 

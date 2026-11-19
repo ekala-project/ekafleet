@@ -207,7 +207,16 @@ in
       proxyListen = lib.mkOption {
         type = lib.types.str;
         default = "0.0.0.0:8080";
-        description = "Listen address for the service mesh proxy.";
+        description = "Listen address of the ingress proxy.";
+      };
+
+      proxyOpenFirewall = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Open the ingress proxy's port in the firewall. Enable on nodes
+          that serve `ingress` routes.
+        '';
       };
 
       keepGenerations = lib.mkOption {
@@ -262,6 +271,19 @@ in
           type = lib.types.bool;
           default = true;
           description = "Open the mesh port in the firewall.";
+        };
+
+        trustInterface = lib.mkOption {
+          type = lib.types.bool;
+          default = true;
+          description = ''
+            Trust the `wg-fleet` interface in the firewall, so fleet nodes
+            reach each other's service ports over the mesh (fleet DNS
+            addresses, ingress backends). Only nodes holding a mesh key
+            advertised under a node SVID can send on it. When disabled,
+            open service ports with
+            `networking.firewall.interfaces.wg-fleet.allowedTCPPorts`.
+          '';
         };
       };
 
@@ -482,6 +504,12 @@ in
       # server named).
       networking.firewall.interfaces."wg-fleet".allowedTCPPorts = lib.mkIf cfg.agent.mesh.enable [
         7403
+      ];
+      networking.firewall.trustedInterfaces = lib.mkIf (
+        cfg.agent.mesh.enable && cfg.agent.mesh.trustInterface
+      ) [ "wg-fleet" ];
+      networking.firewall.allowedTCPPorts = lib.mkIf cfg.agent.proxyOpenFirewall [
+        (lib.toInt (lib.last (lib.splitString ":" cfg.agent.proxyListen)))
       ];
 
       assertions = [

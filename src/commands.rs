@@ -192,12 +192,14 @@ pub async fn cmd_proxy(
     listen: String,
     trust_domain: String,
     data_dir: PathBuf,
+    routes_file: PathBuf,
 ) -> anyhow::Result<()> {
     let listen_addr = listen.parse()?;
     ekafleet::proxy::standalone::run_standalone(ekafleet::proxy::standalone::ProxyConfig {
         listen: listen_addr,
         trust_domain,
         data_dir,
+        routes_file,
     })
     .await
 }

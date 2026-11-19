@@ -1351,6 +1351,7 @@ mod tests {
             secret_engines: HashMap::new(),
             external_services: HashMap::new(),
             federation: Default::default(),
+            ingress: HashMap::new(),
         }
     }
 
