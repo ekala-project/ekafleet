@@ -173,6 +173,10 @@ pub(super) struct StateMachineInner {
     /// is out of date.
     #[serde(default)]
     fleet_key_check: Option<Vec<u8>>,
+    /// The current fleet key's version: 1 when its check was first
+    /// recorded, one more with each rotation.
+    #[serde(default)]
+    fleet_key_version: u64,
 }
 
 /// A transit encryption key: its namespace and every version, oldest
@@ -764,6 +768,9 @@ impl FleetStateMachine {
                 }
             }
             Command::SetFleetKeyCheck { check } => {
+                if state.fleet_key_check.as_ref() != Some(&check) {
+                    state.fleet_key_version = state.fleet_key_version.max(1);
+                }
                 state.fleet_key_check = Some(check);
             }
             Command::ResealSecrets {
@@ -772,7 +779,8 @@ impl FleetStateMachine {
                 transit,
                 key_check,
             } => {
-                if key_check.is_some() {
+                if key_check.is_some() && key_check != state.fleet_key_check {
+                    state.fleet_key_version = state.fleet_key_version.max(1) + 1;
                     state.fleet_key_check = key_check;
                 }
                 for (name, versions) in transit {
@@ -1291,6 +1299,11 @@ impl FleetStateMachine {
         })
         .await
         .map(drop)
+    }
+
+    /// The current fleet key's version (0 before its check is recorded).
+    pub async fn fleet_key_version(&self) -> u64 {
+        self.inner.read().await.fleet_key_version
     }
 
     /// The check value of the current fleet key, once recorded.

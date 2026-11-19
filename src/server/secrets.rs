@@ -697,7 +697,7 @@ impl FleetControlService {
             .map_err(|e| Status::internal(format!("failed to commit rotated key: {e}")))?;
 
         let prev_version = fleet_key.version;
-        fleet_key.version += 1;
+        fleet_key.version = (prev_version + 1).max(self.raft_state.fleet_key_version().await);
         fleet_key.key = Zeroizing::new(new_key.to_vec());
         *store = new_store;
         let new_version = fleet_key.version;
