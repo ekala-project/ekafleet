@@ -216,6 +216,10 @@ After attestation, agents authenticate to the server using mutual TLS:
 - **Server presents**: Server SVID (`spiffe://<domain>/server/<server-id>`)
 - **Both verify**: Against the fleet CA trust bundle
 
+The server SVID is short-lived like every other SVID, and the server renews
+it two thirds of the way through its lifetime. The gRPC and HTTPS listeners
+pick up the renewed certificate on new connections without a restart.
+
 The CLI connects with server-authenticated TLS and a bearer token (no client
 certificate). Agents must use a node SVID; bearer-token agents are only
 accepted by `ekafleet dev`.
