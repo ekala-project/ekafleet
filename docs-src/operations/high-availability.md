@@ -66,7 +66,7 @@ services.ekafleet.server = {
 };
 ```
 
-`--peers` is read on first boot only. The server with the lowest id forms the cluster, unless a peer already belongs to one. The others join the cluster it forms. Addresses are the gRPC addresses servers reach each other on, and they must not be `0.0.0.0`.
+`--peers` is read on first boot only. The server with the lowest id forms the cluster once a majority of the listed servers (itself included) answer and none of them belongs to a cluster yet; until then it serves as a follower and keeps asking. The others join the cluster it forms. Because an existing cluster always holds a majority, a server whose disk was replaced always meets a member of it and waits to be added with `ekafleet raft add`, rather than forming a rival cluster, even while the others are down. Addresses are the gRPC addresses servers reach each other on, and they must not be `0.0.0.0`.
 
 ## Changing membership
 
@@ -83,4 +83,3 @@ To replace a failed server, remove it, then add the replacement under a new id.
 ## Limits
 
 - The fleet key version that agents are sent is kept in memory on each server, so it restarts from 1 on a new leader. Agents use the key itself, not the version.
-- If a replacement for the lowest-id server starts with `--peers` while every other peer is unreachable, it forms a new cluster of its own. Use `ekafleet raft add` for replacements instead of `--peers`.
