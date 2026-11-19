@@ -39,7 +39,8 @@ ekafleet server [OPTIONS]
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--data-dir` | `/var/lib/ekafleet` | Data directory for persistent state |
-| `--peers` | | Comma-separated peer server addresses for HA |
+| `--node-id` | `1` | This server's Raft node id, unique among the servers (`EKAFLEET_NODE_ID`) |
+| `--peers` | | The servers of a new HA cluster, this one included: `<id>=<host:port>,...` (`EKAFLEET_PEERS`); first boot only, see [High Availability](../operations/high-availability.md) |
 | `--listen` | `0.0.0.0:7400` | gRPC listen address |
 | `--http-listen` | `0.0.0.0:7402` | HTTP API listen address |
 | `--federation-listen` | | Federation listener for peer clusters (`EKAFLEET_FEDERATION_LISTEN`); off unless set |
@@ -289,6 +290,29 @@ ekafleet restore <INPUT> [OPTIONS]
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--server` | `127.0.0.1:7400` | Server address |
+
+## High Availability
+
+See [High Availability](../operations/high-availability.md).
+
+### `ekafleet raft`
+
+```
+ekafleet raft status [--server 127.0.0.1:7400]      # any server answers
+ekafleet raft add <ID> <HOST:PORT> [--server ...]   # learner first, then voter
+ekafleet raft remove <ID> [--server ...]
+```
+
+`add` and `remove` need the `admin` role. Start a new server with `--node-id <ID>` and the cluster's key bundle before adding it.
+
+### `ekafleet keys`
+
+```
+ekafleet keys export --passphrase-file <FILE> --out <FILE> [--data-dir ...] [--ca-dir ...] [--domain ...]
+ekafleet keys import --bundle <FILE> --passphrase-file <FILE> [--data-dir ...] [--scope all|server|ca] [--domain ...]
+```
+
+`export` seals the keys every server of a cluster shares (fleet key, binary cache key, root CA, JWT-SVID key) under a passphrase of at least 12 characters. `import` installs them before a new server's first start; `--scope server` and `--scope ca` split them between a server and its `ekafleet ca-signer`.
 
 ### `ekafleet validate`
 
