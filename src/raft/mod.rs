@@ -1,3 +1,4 @@
+pub mod consensus;
 pub mod state;
 pub mod storage;
 
@@ -14,4 +15,6 @@ pub enum RaftError {
     Crypto(&'static str),
     #[error("raft storage file {path} is unreadable: {reason}")]
     Corrupt { path: PathBuf, reason: String },
+    #[error("raft storage is inconsistent: {0}")]
+    Inconsistent(String),
 }
