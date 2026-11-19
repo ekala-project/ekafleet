@@ -526,14 +526,18 @@ mod tests {
         // The second server already answers for the cluster it will join,
         // which is still empty: the first forms it.
         assert!(
-            consensus::form_cluster(&rafts[0], members.clone(), |_, _| async { false })
-                .await
-                .unwrap()
+            consensus::form_cluster(&rafts[0], members.clone(), |_, _| async {
+                consensus::PeerState::Empty
+            })
+            .await
+            .unwrap()
         );
         assert!(
-            !consensus::form_cluster(&rafts[1], members, |_, _| async { false })
-                .await
-                .unwrap()
+            !consensus::form_cluster(&rafts[1], members, |_, _| async {
+                consensus::PeerState::Empty
+            })
+            .await
+            .unwrap()
         );
         let leader = rafts[0]
             .wait(Some(Duration::from_secs(10)))
