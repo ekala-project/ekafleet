@@ -455,6 +455,15 @@ impl Supervisor {
         self.managed_units.keys().cloned().collect()
     }
 
+    /// Restart a managed service (its liveness probe failed). Services
+    /// this supervisor does not run are left alone.
+    pub async fn restart(&self, service_name: &str) -> Result<(), SupervisorError> {
+        match self.managed_units.get(service_name) {
+            Some(unit) => systemctl(&["restart", &unit.unit_name]).await,
+            None => Ok(()),
+        }
+    }
+
     /// Check if a specific service is running.
     pub async fn is_running(&self, service_name: &str) -> bool {
         if let Some(state) = self.managed_units.get(service_name) {

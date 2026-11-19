@@ -394,17 +394,15 @@ pub(super) async fn handle_server_message(
                 }
             }
 
-            // Start health checking for services with health_check configured
+            // Probe the services that declare probes; stop probing the rest.
+            let mut probed = std::collections::HashSet::new();
             for svc in &ds.services {
-                if svc.health_check.is_some() {
-                    let instance_id = format!("{}-{}", svc.name, node_id);
-                    health_checker.start_checking(
-                        svc.name.clone(),
-                        instance_id,
-                        svc.health_check.clone().unwrap(),
-                    );
+                if let Some(probes) = crate::agent::health::ProbeConfig::for_service(svc) {
+                    health_checker.ensure(&svc.name, probes).await;
+                    probed.insert(svc.name.as_str());
                 }
             }
+            health_checker.retain(|name| probed.contains(name)).await;
 
             converge_services(
                 supervisor,
