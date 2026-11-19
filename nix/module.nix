@@ -63,10 +63,26 @@ in
         '';
       };
 
+      nodeId = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 1;
+        description = "This server's Raft node id, unique among the servers.";
+      };
+
       peers = lib.mkOption {
-        type = lib.types.listOf lib.types.str;
-        default = [ ];
-        description = "List of peer server addresses for HA.";
+        type = lib.types.attrsOf lib.types.str;
+        default = { };
+        example = {
+          "1" = "10.0.0.1:7400";
+          "2" = "10.0.0.2:7400";
+          "3" = "10.0.0.3:7400";
+        };
+        description = ''
+          The servers of a new HA cluster by node id, this one included: the
+          gRPC addresses the servers reach each other on. Read on first boot
+          only; change membership afterwards with `ekafleet raft add/remove`.
+          Empty runs a single server.
+        '';
       };
 
       grpcListen = lib.mkOption {
@@ -442,9 +458,11 @@ in
 
           serviceConfig =
             let
-              peersArg = lib.optionalString (
-                cfg.server.peers != [ ]
-              ) "--peers ${lib.concatStringsSep "," cfg.server.peers}";
+              peersArg =
+                lib.optionalString (cfg.server.peers != { })
+                  "--peers ${
+                    lib.concatStringsSep "," (lib.mapAttrsToList (id: addr: "${id}=${addr}") cfg.server.peers)
+                  }";
               federationArg = lib.optionalString (
                 cfg.server.federationListen != null
               ) "--federation-listen ${cfg.server.federationListen}";
@@ -454,7 +472,7 @@ in
               Restart = "on-failure";
               RestartSec = 5;
 
-              ExecStart = "${cfg.server.package}/bin/ekafleet server --data-dir ${cfg.server.dataDir} --listen ${cfg.server.grpcListen} --http-listen ${cfg.server.httpListen} --domain ${cfg.server.domain} --ca-socket ${cfg.server.caSocketPath} ${peersArg} ${federationArg}";
+              ExecStart = "${cfg.server.package}/bin/ekafleet server --data-dir ${cfg.server.dataDir} --listen ${cfg.server.grpcListen} --http-listen ${cfg.server.httpListen} --domain ${cfg.server.domain} --ca-socket ${cfg.server.caSocketPath} --node-id ${toString cfg.server.nodeId} ${peersArg} ${federationArg}";
 
               # The control plane does not hold the CA key (that's in ca-signer).
               User = "ekafleet";

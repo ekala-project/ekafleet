@@ -114,6 +114,14 @@ impl RaftInternal for RaftService {
         let rpc: InstallSnapshotRequest<TypeConfig> = decode(request.into_inner())?;
         encode(&raft.install_snapshot(rpc).await)
     }
+
+    async fn status(
+        &self,
+        request: Request<crate::proto::RaftStatusRequest>,
+    ) -> Result<Response<crate::proto::RaftStatusResponse>, Status> {
+        let raft = self.raft(&request)?;
+        Ok(Response::new(super::leadership::raft_status(raft)))
+    }
 }
 
 /// Dials Raft peers over mTLS with this server's SVID.
@@ -183,6 +191,20 @@ impl GrpcNetwork {
             }
         });
         Ok(endpoint.connect_with_connector_lazy(connector))
+    }
+}
+
+impl GrpcNetwork {
+    /// What the server at `addr` knows of the cluster.
+    pub async fn status(&self, addr: &str) -> anyhow::Result<crate::proto::RaftStatusResponse> {
+        let channel = self.channel(addr).map_err(anyhow::Error::msg)?;
+        let status = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            RaftInternalClient::new(channel).status(crate::proto::RaftStatusRequest {}),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("{addr} did not answer"))??;
+        Ok(status.into_inner())
     }
 }
 
@@ -385,7 +407,6 @@ mod tests {
                 storage,
                 i as NodeId + 1,
                 &server.addr.to_string(),
-                members.clone(),
                 network,
                 config(),
             )
@@ -393,7 +414,18 @@ mod tests {
             .unwrap();
             rafts.push(raft);
         }
-        rafts[0].initialize(members).await.unwrap();
+        // The second server already answers for the cluster it will join,
+        // which is still empty: the first forms it.
+        assert!(
+            consensus::form_cluster(&rafts[0], members.clone(), |_, _| async { false })
+                .await
+                .unwrap()
+        );
+        assert!(
+            !consensus::form_cluster(&rafts[1], members, |_, _| async { false })
+                .await
+                .unwrap()
+        );
         let leader = rafts[0]
             .wait(Some(Duration::from_secs(10)))
             .metrics(|m| m.current_leader.is_some(), "leader")
@@ -419,6 +451,13 @@ mod tests {
             }
             assert_eq!(value.as_deref(), Some(&b"replicated"[..]));
         }
+        // Peers report the cluster to each other's server SVIDs.
+        let network =
+            GrpcNetwork::new(servers[0].identity.clone(), &servers[0].ca_pem, DOMAIN).unwrap();
+        let status = network.status(&servers[1].addr.to_string()).await.unwrap();
+        assert_eq!(status.node_id, 2);
+        assert_eq!(status.leader_id, leader);
+        assert_eq!(status.members.len(), 2);
         for raft in rafts {
             raft.shutdown().await.unwrap();
         }

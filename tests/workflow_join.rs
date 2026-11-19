@@ -46,7 +46,8 @@ async fn start_server_with(
     let grpc = free_addr();
     let config = ekafleet::server::ServerConfig {
         data_dir: dir.path().to_path_buf(),
-        peers: Vec::new(),
+        node_id: ekafleet::server::DEFAULT_NODE_ID,
+        peers: Default::default(),
         grpc_listen: grpc.to_string(),
         http_listen: free_addr().to_string(),
         token: ADMIN_TOKEN.into(),

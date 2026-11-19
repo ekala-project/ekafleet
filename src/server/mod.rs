@@ -20,6 +20,7 @@ pub mod identity;
 pub mod images;
 pub mod ingress;
 pub mod leadership;
+mod membership;
 pub mod mesh;
 pub mod nix;
 pub mod policy;
@@ -52,7 +53,13 @@ use crate::raft::state::FleetStateMachine;
 
 pub struct ServerConfig {
     pub data_dir: PathBuf,
-    pub peers: Vec<String>,
+    /// This server's Raft node id.
+    pub node_id: crate::raft::consensus::NodeId,
+    /// The servers of a new cluster, this one included, by node id: their
+    /// gRPC addresses as the others reach them. Only read on first boot;
+    /// afterwards membership lives in the Raft log (`ekafleet raft`).
+    /// Empty runs a one-server cluster.
+    pub peers: std::collections::BTreeMap<crate::raft::consensus::NodeId, String>,
     pub grpc_listen: String,
     pub http_listen: String,
     pub token: String,
@@ -85,12 +92,70 @@ pub struct EmbeddedAgentConfig {
 /// How long the embedded agent's join token stays valid.
 const EMBEDDED_JOIN_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// This server's Raft node id while servers run alone.
-const RAFT_NODE_ID: crate::raft::consensus::NodeId = 1;
+/// The node id of a server not given `--node-id`.
+pub const DEFAULT_NODE_ID: crate::raft::consensus::NodeId = 1;
+
+/// `1=10.0.0.1:7400,2=10.0.0.2:7400` → node id → address.
+pub fn parse_peers(
+    peers: &str,
+) -> anyhow::Result<std::collections::BTreeMap<crate::raft::consensus::NodeId, String>> {
+    let mut parsed = std::collections::BTreeMap::new();
+    for entry in peers.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        let (id, addr) = entry
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("peer '{entry}' is not <node-id>=<host:port>"))?;
+        let id: crate::raft::consensus::NodeId = id
+            .trim()
+            .parse()
+            .ok()
+            .filter(|id| *id > 0)
+            .ok_or_else(|| anyhow::anyhow!("peer '{entry}': node ids are positive integers"))?;
+        let addr = addr.trim();
+        if addr
+            .rsplit_once(':')
+            .is_none_or(|(host, port)| host.is_empty() || port.parse::<u16>().is_err())
+        {
+            anyhow::bail!("peer '{entry}': address must be host:port");
+        }
+        if parsed.insert(id, addr.to_string()).is_some() {
+            anyhow::bail!("peer node id {id} is listed twice");
+        }
+    }
+    Ok(parsed)
+}
+
+/// The Raft members of a new cluster, and this server's address in it.
+fn initial_members(
+    config: &ServerConfig,
+) -> anyhow::Result<(
+    std::collections::BTreeMap<crate::raft::consensus::NodeId, openraft::BasicNode>,
+    String,
+)> {
+    if config.peers.is_empty() {
+        let addr = config.grpc_listen.clone();
+        return Ok((
+            [(config.node_id, openraft::BasicNode::new(&addr))].into(),
+            addr,
+        ));
+    }
+    let addr = config.peers.get(&config.node_id).cloned().ok_or_else(|| {
+        anyhow::anyhow!(
+            "--peers must list this server's own node id {} with its address",
+            config.node_id
+        )
+    })?;
+    let members = config
+        .peers
+        .iter()
+        .map(|(id, addr)| (*id, openraft::BasicNode::new(addr)))
+        .collect();
+    Ok((members, addr))
+}
 
 pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     tracing::info!(
         data_dir = %config.data_dir.display(),
+        node_id = config.node_id,
         peers = ?config.peers,
         grpc = %config.grpc_listen,
         http = %config.http_listen,
@@ -201,17 +266,15 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     // Every write goes through Raft consensus. A server without peers is a
     // one-member cluster.
     let raft_state = FleetStateMachine::new();
+    let (members, advertise) = initial_members(&config)?;
+    let network =
+        raft_rpc::GrpcNetwork::new(server_identity.clone(), &tls.ca_cert_pem, &config.domain)?;
     let raft = crate::raft::consensus::boot(
         &raft_state,
         raft_storage.clone(),
-        RAFT_NODE_ID,
-        &config.grpc_listen,
-        [(
-            RAFT_NODE_ID,
-            openraft::BasicNode::new(config.grpc_listen.clone()),
-        )]
-        .into(),
-        raft_rpc::GrpcNetwork::new(server_identity.clone(), &tls.ca_cert_pem, &config.domain)?,
+        config.node_id,
+        &advertise,
+        network.clone(),
         crate::raft::consensus::raft_config(&config.domain)?,
     )
     .await
@@ -223,9 +286,29 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
             config.data_dir.join("raft").display(),
         )
     })?;
-    crate::raft::consensus::wait_leading(&raft, std::time::Duration::from_secs(30))
-        .await
-        .map_err(|e| anyhow::anyhow!("Raft did not elect this server: {e}"))?;
+    let alone = members.len() == 1;
+    crate::raft::consensus::form_cluster(&raft, members, |id, node| {
+        let network = network.clone();
+        async move {
+            match network.status(&node.addr).await {
+                // Any member or log means it belongs to a cluster already.
+                Ok(status) => !status.members.is_empty() || status.last_log_index > 0,
+                Err(e) => {
+                    tracing::info!(peer = id, addr = %node.addr, error = %e, "Peer not reachable");
+                    false
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("form the Raft cluster: {e}"))?;
+    // A one-server cluster leads at once; serve only once it does. With
+    // peers, this server serves whichever role the election gives it.
+    if alone {
+        crate::raft::consensus::wait_leading(&raft, std::time::Duration::from_secs(30))
+            .await
+            .map_err(|e| anyhow::anyhow!("Raft did not elect this server: {e}"))?;
+    }
     let leadership = leadership::Leadership::new(raft.clone());
 
     // A fleet key rotation interrupted by a crash leaves its key staged.

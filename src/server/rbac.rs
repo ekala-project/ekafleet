@@ -182,6 +182,8 @@ pub enum Permission {
     ReadAudit,
     /// Encrypt and decrypt with transit keys
     Transit,
+    /// Change the servers of the Raft cluster (Admin only)
+    ManageCluster,
 }
 
 impl Role {

@@ -217,7 +217,8 @@ pub async fn cmd_dev(
 
     let config = server::ServerConfig {
         data_dir,
-        peers: Vec::new(),
+        node_id: server::DEFAULT_NODE_ID,
+        peers: Default::default(),
         grpc_listen: listen,
         http_listen,
         token: dev_token.to_string(),
@@ -263,13 +264,6 @@ pub async fn cmd_ca_signer(
 
 pub async fn cmd_server(config: server::ServerConfig) -> anyhow::Result<()> {
     server::run(config).await
-}
-
-/// `a,b,c` → `["a", "b", "c"]`.
-pub fn peer_list(peers: Option<String>) -> Vec<String> {
-    peers
-        .map(|p| p.split(',').map(String::from).collect())
-        .unwrap_or_default()
 }
 
 /// Read a secret given inline or as a file (trailing whitespace dropped).
@@ -1698,6 +1692,72 @@ pub async fn cmd_transit_key_delete(name: String, yes: bool, server: String) -> 
     } else {
         println!("No transit key {name}.");
     }
+    Ok(())
+}
+
+fn print_raft_status(status: &ekafleet::proto::RaftStatusResponse) {
+    let leader = match status.leader_id {
+        0 => "none".to_string(),
+        id => format!("{id} ({})", status.leader_addr),
+    };
+    println!(
+        "Leader: {leader}  term {}  (answered by server {}, {}, applied {}/{})",
+        status.term, status.node_id, status.state, status.last_applied, status.last_log_index
+    );
+    println!(
+        "{:>4}  {:<28}  {:<8}  {:>8}",
+        "ID", "ADDRESS", "ROLE", "MATCHED"
+    );
+    for member in &status.members {
+        let role = if member.id == status.leader_id {
+            "leader"
+        } else if member.voter {
+            "voter"
+        } else {
+            "learner"
+        };
+        // Replication progress is only known to the leader.
+        let matched = if status.node_id == status.leader_id {
+            member.matched.to_string()
+        } else {
+            "-".to_string()
+        };
+        println!(
+            "{:>4}  {:<28}  {:<8}  {:>8}",
+            member.id, member.addr, role, matched
+        );
+    }
+}
+
+pub async fn cmd_raft_status(server: String) -> anyhow::Result<()> {
+    let mut client = connect_server(&server).await?;
+    let status = client
+        .raft_status(ekafleet::proto::RaftStatusRequest {})
+        .await?
+        .into_inner();
+    print_raft_status(&status);
+    Ok(())
+}
+
+pub async fn cmd_raft_add(id: u64, addr: String, server: String) -> anyhow::Result<()> {
+    let mut client = connect_server(&server).await?;
+    println!("Adding server {id} at {addr}; it votes once it has caught up...");
+    let status = client
+        .raft_add_member(ekafleet::proto::RaftAddMemberRequest { id, addr })
+        .await?
+        .into_inner();
+    print_raft_status(&status);
+    Ok(())
+}
+
+pub async fn cmd_raft_remove(id: u64, server: String) -> anyhow::Result<()> {
+    let mut client = connect_server(&server).await?;
+    let status = client
+        .raft_remove_member(ekafleet::proto::RaftRemoveMemberRequest { id })
+        .await?
+        .into_inner();
+    println!("Server {id} removed.");
+    print_raft_status(&status);
     Ok(())
 }
 
