@@ -85,7 +85,10 @@ src/
 │   ├── events.rs        # Fleet event timeline and deployment history
 │   ├── policy.rs        # Organizational policy engine for admission control
 │   ├── webhook.rs       # Outbound webhook notifications
-│   ├── federation.rs    # Multi-region cluster federation
+│   ├── federation.rs    # Peer clusters: mTLS document exchange, federated bundles, exported services
+│   ├── identity.rs      # Server SVID, renewed at 2/3 lifetime, resolved per TLS handshake
+│   ├── dns.rs           # Builds per-node DNS records (services, nodes, external, federation)
+│   ├── external.rs      # Health checks for `externalServices`
 │   ├── dynamic.rs       # Lease manager: issue/renew/drop dynamic DB users; lease RPCs
 │   ├── rebalance.rs     # Stateful drift: `ekafleet rebalance` move plan/apply + settle
 │   ├── secrets.rs       # Secret RPCs, delivery to agents, fleet key rotation + reseal
@@ -152,8 +155,7 @@ src/
 │   ├── mod.rs           # DNS module
 │   ├── authority.rs     # Authoritative DNS server for fleet domain (namespace-scoped zones)
 │   ├── resolver.rs      # Caching resolver (agent-side, namespace-scoped lookups)
-│   ├── listener.rs      # UDP DNS listener
-│   └── external.rs      # External service DNS registration
+│   └── listener.rs      # UDP DNS listener
 ├── mesh/
 │   ├── mod.rs           # Mesh module
 │   ├── wireguard.rs     # Kernel WireGuard interface management (Zeroizing keys)
@@ -190,8 +192,7 @@ src/
     ├── workload_api.rs  # Workload API manager (SVID store, trust bundles)
     ├── workload_server.rs # gRPC Workload API v2 server
     ├── workload_attestor.rs # Cgroup-based PID→service attestation (no env var fallback)
-    ├── socket.rs        # Unix domain socket management
-    └── federation.rs    # Trust domain federation
+    └── socket.rs        # Unix domain socket management
 
 nix/
 ├── module.nix           # NixOS module (server + agent + ca-signer + workload-api + proxy services)

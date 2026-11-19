@@ -114,7 +114,7 @@ ekafleet is a single binary that consolidates capabilities from 10+ separate too
 | Distributed tracing | **Yes** | No (needs Istio) | **Yes** (via Envoy) | W3C Trace Context propagation |
 | mTLS enforcement | **Yes** | No (needs Istio) | **Yes** | SPIFFE ID-based caller authorization |
 | Gossip-based discovery | No | No | **Yes** (Serf) | Server-authoritative catalog over the agent stream |
-| Multi-region federation | **Yes** | *Partial* (Federation v2) | **Yes** (WAN) | Cross-cluster service discovery |
+| Multi-region federation | **Yes** | *Partial* (Federation v2) | **Yes** (WAN) | Peer clusters share trust bundles and discover exported services |
 
 ## Security & Identity
 
@@ -127,7 +127,7 @@ ekafleet is a single binary that consolidates capabilities from 10+ separate too
 | Node attestation | **Yes** | **Yes** (kubelet) | **Yes** (Consul) | Join token attestation (one-time use) |
 | mTLS everywhere | **Yes** | No (needs Istio) | **Yes** (Connect) | Agent-server and service-to-service |
 | Identity contracts | **Yes** | No (needs NetworkPolicy) | **Yes** (Intentions) | allowedCallers/allowedTargets per service |
-| Trust domain federation | **Yes** | No (needs SPIRE) | No (needs SPIRE) | Cross-cluster SPIFFE trust |
+| Trust domain federation | **Yes** | No (needs SPIRE) | No (needs SPIRE) | Peer bundles served from the Workload API |
 | PKI for arbitrary domains | **Yes** | **Yes** (cert-manager) | **Yes** (Vault PKI) | Issue TLS certs for custom domain names |
 | CSR flow (key never leaves workload) | **Yes** | No (needs SPIRE) | No | ECDSA P-256, PKCS#10 CSR signed by CA |
 

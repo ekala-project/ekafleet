@@ -1165,6 +1165,47 @@ let
   };
 
   # `ExternalServiceConfig`.
+  federationPeer = strictSubmodule {
+    endpoint = mkOption {
+      type = types.str;
+      example = "fleet-east.example.com:7404";
+      description = "`host:port` of the peer server's federation listener.";
+    };
+    trustDomain = mkOption {
+      type = types.str;
+      example = "east.internal";
+      description = "The peer's SPIFFE trust domain.";
+    };
+    caCert = mkOption {
+      type = types.str;
+      description = ''
+        PEM of the peer's root CA certificate (its CA signer's
+        `ca-cert.pem`, by default `/var/lib/ekafleet-ca/ca-cert.pem`). The
+        peer's servers must chain to it.
+      '';
+    };
+  };
+
+  federation = strictSubmodule {
+    exportServices = mkOption {
+      type = types.listOf types.str;
+      default = [ ];
+      description = ''
+        Default-namespace services that peers may discover, as
+        `<svc>.<this fleet's name for the peer>.federation.<domain>` on their side.
+      '';
+    };
+    peers = mkOption {
+      type = types.attrsOf federationPeer;
+      default = { };
+      description = ''
+        Peer clusters, keyed by a local name. Their services resolve as
+        `<svc>.<name>.federation.<domain>`, and their trust bundles are
+        served to workloads.
+      '';
+    };
+  };
+
   externalService = strictSubmodule {
     addresses = mkOption {
       type = types.nonEmptyListOf types.str;
@@ -1330,6 +1371,11 @@ in
         Services outside the fleet, resolvable on every node as
         `<name>.external.<domain>`.
       '';
+    };
+    federation = mkOption {
+      type = federation;
+      default = { };
+      description = "Trust and service discovery shared with peer clusters.";
     };
     webhooks = mkOption {
       type = types.listOf eventWebhook;

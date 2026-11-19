@@ -54,6 +54,7 @@ async fn start_server_with(
         ca_socket: None,
         allow_bearer_agents: false,
         embedded_agent,
+        federation_listen: None,
     };
     tokio::spawn(async move {
         if let Err(e) = ekafleet::server::run(config).await {

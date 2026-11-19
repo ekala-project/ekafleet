@@ -42,6 +42,7 @@ ekafleet server [OPTIONS]
 | `--peers` | | Comma-separated peer server addresses for HA |
 | `--listen` | `0.0.0.0:7400` | gRPC listen address |
 | `--http-listen` | `0.0.0.0:7402` | HTTP API listen address |
+| `--federation-listen` | | Federation listener for peer clusters (`EKAFLEET_FEDERATION_LISTEN`); off unless set |
 | `--token` | | Initial admin bearer token (`EKAFLEET_TOKEN`); prefer `--token-file` |
 | `--token-file` | | File holding the admin token (`EKAFLEET_TOKEN_FILE`); one of `--token`/`--token-file` is required |
 | `--domain` | `fleet.internal` | SPIFFE trust domain for fleet identities |

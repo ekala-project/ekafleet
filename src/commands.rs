@@ -181,6 +181,7 @@ pub async fn cmd_dev(
         ca_socket: None,
         allow_bearer_agents: true,
         embedded_agent,
+        federation_listen: None,
     };
 
     server::run(config).await?;

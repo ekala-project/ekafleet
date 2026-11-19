@@ -62,6 +62,21 @@ impl MeshRegistry {
         }
     }
 
+    /// The IPv4 underlay address (WireGuard endpoint) each node advertised.
+    pub async fn underlay_addresses(&self) -> BTreeMap<String, std::net::Ipv4Addr> {
+        self.peers
+            .read()
+            .await
+            .iter()
+            .filter_map(
+                |(node, peer)| match peer.endpoint.parse::<std::net::SocketAddr>() {
+                    Ok(std::net::SocketAddr::V4(addr)) => Some((node.clone(), *addr.ip())),
+                    _ => None,
+                },
+            )
+            .collect()
+    }
+
     /// The node's mesh address, allocated on first use. `None` (logged) if
     /// the mesh network is full or Raft refused the allocation.
     pub async fn assignment(&self, node_id: &str) -> Option<MeshAssignment> {

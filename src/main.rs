@@ -119,6 +119,11 @@ enum Command {
         #[arg(long, default_value = "0.0.0.0:7402")]
         http_listen: String,
 
+        /// Federation listen address, where peer clusters fetch this
+        /// cluster's trust bundles and exported services (off by default)
+        #[arg(long, env = "EKAFLEET_FEDERATION_LISTEN")]
+        federation_listen: Option<std::net::SocketAddr>,
+
         /// Admin bearer token for the API. Prefer --token-file: argv is
         /// readable by every local user.
         #[arg(long, env = "EKAFLEET_TOKEN", required_unless_present = "token_file")]
@@ -1240,6 +1245,7 @@ async fn main() -> anyhow::Result<()> {
             peers,
             listen,
             http_listen,
+            federation_listen,
             token,
             token_file,
             domain,
@@ -1280,6 +1286,7 @@ async fn main() -> anyhow::Result<()> {
                 ca_socket,
                 allow_bearer_agents: false,
                 embedded_agent: agent,
+                federation_listen,
             })
             .await?
         }

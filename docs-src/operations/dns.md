@@ -35,6 +35,7 @@ All names are relative to the fleet domain.
 | `<svc>.service` | A: mesh addresses of nodes with a serving replica; SRV: `<port> <node>.node` per declared port | everyone (default-namespace services) |
 | `<svc>.service` | A: overlay addresses of serving replicas; SRV: `<port> <svc>.service` | nodes running something in the service's namespace |
 | `<name>.external` | A: healthy addresses of the external service; SRV: `<port> <name>.external` | everyone |
+| `<svc>.<peer>.federation` | A: underlay addresses of the peer's nodes serving the exported service; SRV: `<port> <svc>.<peer>.federation` | everyone |
 
 Namespace records take precedence over fleet-wide records with the same name, and are hidden outside their namespace.
 
@@ -72,3 +73,14 @@ How health checks work:
 - **When all addresses fail:** the name answers NXDOMAIN.
 - **Without a `healthCheck`:** every address is always served.
 - **Events:** health changes are recorded as `external.unhealthy` and `external.healthy` fleet events, which [event webhooks](../reference/fleet-config.md#eventwebhook) can subscribe to.
+
+## Federated Services
+
+Services that a [federation peer](spiffe.md#trust-domain-federation) exports resolve under the local name of that peer:
+
+```bash
+dig api.east.federation.fleet.internal       # A: east's nodes serving api
+dig api.east.federation.fleet.internal SRV   # its declared ports
+```
+
+The addresses come from the peer's last federation document, which is fetched every 30 seconds. If the peer has not answered for 5 minutes, its names answer NXDOMAIN.
