@@ -72,6 +72,9 @@ struct FleetStateInner {
     /// that are currently disconnected. Replayed when a node (re)connects and
     /// amended in place when a deployment updates a service's store path.
     assigned: HashMap<String, crate::proto::DesiredState>,
+    /// Every node that has connected since the server started, including
+    /// ones that have disconnected since.
+    joined: std::collections::HashSet<String>,
 }
 
 struct NodeInfo {
@@ -118,6 +121,7 @@ impl FleetState {
                 service_requests: HashMap::new(),
                 next_connection_id: 0,
                 assigned: HashMap::new(),
+                joined: Default::default(),
             })),
             reconcile: ReconcileTrigger::new(),
             pending_canaries: super::deployer::PendingCanaryStore::new(),
@@ -313,6 +317,7 @@ impl FleetState {
         let mut state = self.inner.write().await;
         state.next_connection_id += 1;
         let connection_id = state.next_connection_id;
+        state.joined.insert(node_id.to_string());
         let (schedulable, draining) = state.nodes.get(node_id).map_or((true, false), |existing| {
             (existing.schedulable, existing.draining)
         });
@@ -343,6 +348,9 @@ impl FleetState {
         );
 
         tracing::info!(node_id, connection_id, "Agent registered");
+        drop(state);
+        // Services may be waiting for this node to join.
+        self.reconcile.trigger();
         (connection_id, rx)
     }
 
@@ -705,6 +713,11 @@ impl FleetState {
         state.nodes.keys().map(|id| id.to_string()).collect()
     }
 
+    /// Nodes that have connected since the server started, connected or not.
+    pub async fn joined_nodes(&self) -> std::collections::HashSet<String> {
+        self.inner.read().await.joined.clone()
+    }
+
     /// Set whether a node is eligible for new scheduling.
     /// Use `false` during maintenance windows to prevent new placements
     /// without draining existing workloads.
@@ -1045,6 +1058,10 @@ mod tests {
         state
             .register_agent("node-1", "127.0.0.1:5000".into(), "default".into())
             .await;
+        // Joining fires it: services may be waiting for the node.
+        tokio::time::timeout(Duration::from_millis(100), trigger.notified())
+            .await
+            .expect("registration should fire the reconcile trigger");
 
         // First report: running — must not fire.
         state

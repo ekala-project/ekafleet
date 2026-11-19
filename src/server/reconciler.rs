@@ -180,6 +180,22 @@ pub async fn scheduling_inputs(
     for node in state.draining_nodes().await {
         machines.remove(&node);
     }
+    // Only machines whose agent has joined: a deploy to one that never
+    // connected fails the apply. A node that joined and is briefly away
+    // keeps its services, and so do nodes the services were recorded on
+    // (which, after a server restart, may not have reconnected yet).
+    let mut joined = state.joined_nodes().await;
+    joined.extend(raft_state.mesh_nodes().await);
+    for (_, deployment) in raft_state.all_deployments().await {
+        joined.extend(deployment.placements.iter().map(|p| p.machine_name.clone()));
+    }
+    machines.retain(|name, _| {
+        let known = joined.contains(name);
+        if !known {
+            tracing::debug!(machine = %name, "Not scheduling on a machine whose agent has not joined");
+        }
+        known
+    });
 
     // Build current placements from Raft state for data-locality scoring
     let mut current_placements: CurrentPlacements = HashMap::new();
@@ -1755,6 +1771,72 @@ mod tests {
             .unwrap();
         super::super::rebalance::settle(&config, &plan, &["db".into()], &raft, Some(&events)).await;
         assert!(raft.placement_moves().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn only_machines_whose_agent_joined_are_scheduled() {
+        let state = FleetState::new();
+        let mut config = empty_fleet_config();
+        for node in ["alpha", "beta"] {
+            config.machines.insert(
+                node.into(),
+                MachineConfig {
+                    target_host: node.into(),
+                    labels: HashMap::new(),
+                    capacity: CapacityConfig {
+                        cpu: 4000,
+                        memory: 8192,
+                        disk: 0,
+                    },
+                    pool: "default".into(),
+                    reserved: CapacityConfig::default(),
+                    taints: vec![],
+                    extended_resources: HashMap::new(),
+                },
+            );
+        }
+        let mut web = simple_service();
+        web.scheduling.replicas = 2;
+        config.services.insert("web".into(), web);
+        let raft = FleetStateMachine::new();
+        let placed = |plan: &ReconcilePlan| -> BTreeSet<String> {
+            plan.creates
+                .iter()
+                .chain(&plan.updates)
+                .flat_map(|op| op.placements.iter().map(|p| p.machine_name.clone()))
+                .collect()
+        };
+
+        let (_, _alpha_rx) = state
+            .register_agent_connection("alpha", "127.0.0.1:5000".into(), "default".into())
+            .await;
+        let plan = compute_plan(&config, &[], &state, None, &raft).await;
+        assert_eq!(placed(&plan), BTreeSet::from(["alpha".to_string()]));
+
+        // A node that joined and dropped off keeps its place.
+        let (beta, _beta_rx) = state
+            .register_agent_connection("beta", "127.0.0.1:5001".into(), "default".into())
+            .await;
+        state.deregister_agent("beta", beta).await;
+        let plan = compute_plan(&config, &[], &state, None, &raft).await;
+        assert_eq!(placed(&plan).len(), 2);
+
+        // After a server restart, recorded placements and mesh addresses
+        // stand for nodes that have not reconnected yet.
+        let restarted = FleetState::new();
+        raft.apply_next(crate::raft::state::Command::Deploy {
+            service_name: "web".into(),
+            store_path: String::new(),
+            placements: vec![crate::raft::state::PlacementRecord {
+                instance_id: "web-0".into(),
+                machine_name: "alpha".into(),
+            }],
+        })
+        .await
+        .unwrap();
+        raft.ensure_mesh_ip("beta").await.unwrap();
+        let plan = compute_plan(&config, &[], &restarted, None, &raft).await;
+        assert_eq!(placed(&plan).len(), 2);
     }
 
     /// Agents report what they run on their heartbeat. A stateful service
