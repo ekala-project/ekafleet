@@ -62,12 +62,9 @@ let
     }
   );
 
-  # `extra` holds more attribute definitions for the fleet. beta is declared only once
-  # it has joined: the scheduler places on declared machines whether or not
-  # their agent is connected.
+  # `extra` holds more attribute definitions for the fleet.
   mkFleet =
     {
-      withBeta ? false,
       extra ? "",
     }:
     pkgs.writeText "flake.nix" ''
@@ -80,13 +77,13 @@ let
               targetHost = "alpha";
               capacity = { cpu = 2000; memory = 1024; };
             };
-            ${lib.optionalString withBeta ''
-              machines.beta = {
-                targetHost = "beta";
-                pool = "edge";
-                capacity = { cpu = 2000; memory = 1024; };
-              };
-            ''}
+            # Declared from the start, but joins later: nothing is placed
+            # on it until then.
+            machines.beta = {
+              targetHost = "beta";
+              pool = "edge";
+              capacity = { cpu = 2000; memory = 1024; };
+            };
             nodePools.edge = { };
 
             webhooks = [
@@ -158,7 +155,6 @@ let
     '';
 
   baseFleet = mkFleet { };
-  fullFleet = mkFleet { withBeta = true; };
   # Rejected by the admission webhook.
   forbiddenFleet = mkFleet {
     extra = ''
@@ -368,9 +364,9 @@ pkgs.testers.nixosTest {
       with subtest("rebalance moves the stateful service to the joined edge node"):
           join("beta")
           beta.succeed("printf 'queue_depth 5\\n' > /srv/worker/metrics")
-          status, out = apply("${fullFleet}")
-          assert status == 0, out
-          # Its data keeps db on alpha, though it prefers the edge pool.
+          # Joining triggers a reconcile; its data keeps db on alpha,
+          # though it prefers the edge pool.
+          beta.sleep(10)
           assert running_on("db") == ["alpha"]
           plan = server.succeed(f"{CLI} rebalance 2>&1")
           assert "db" in plan and "alpha -> beta" in plan, plan
