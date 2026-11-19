@@ -22,6 +22,7 @@ pub mod ingress;
 pub mod mesh;
 pub mod nix;
 pub mod policy;
+pub mod raft_rpc;
 pub mod rbac;
 pub mod rebalance;
 pub mod reconciler;
@@ -209,7 +210,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
             openraft::BasicNode::new(config.grpc_listen.clone()),
         )]
         .into(),
-        crate::raft::consensus::NoPeers,
+        raft_rpc::GrpcNetwork::new(server_identity.clone(), &tls.ca_cert_pem, &config.domain)?,
         crate::raft::consensus::raft_config(&config.domain)?,
     )
     .await

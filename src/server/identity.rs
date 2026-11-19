@@ -181,6 +181,21 @@ impl ResolvesServerCert for ServerIdentity {
     }
 }
 
+/// Servers present their SVID as the client certificate too (Raft).
+impl rustls::client::ResolvesClientCert for ServerIdentity {
+    fn resolve(
+        &self,
+        _root_hint_subjects: &[&[u8]],
+        _sigschemes: &[rustls::SignatureScheme],
+    ) -> Option<Arc<CertifiedKey>> {
+        Some(self.certified_key())
+    }
+
+    fn has_certs(&self) -> bool {
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

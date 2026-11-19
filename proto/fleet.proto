@@ -11,6 +11,19 @@ service FleetBootstrap {
 }
 
 // Bidirectional streaming control channel between server and agents.
+// Raft consensus between control-plane servers. Only callers presenting a
+// server SVID of this trust domain are served; bearer tokens never are.
+service RaftInternal {
+  rpc AppendEntries(RaftMessage) returns (RaftMessage);
+  rpc Vote(RaftMessage) returns (RaftMessage);
+  rpc InstallSnapshot(RaftMessage) returns (RaftMessage);
+}
+
+// An openraft request, or the JSON of its Result, as JSON.
+message RaftMessage {
+  bytes data = 1;
+}
+
 service FleetControl {
   // Long-lived bidirectional stream for agent ↔ server communication.
   rpc StreamControl(stream AgentMessage) returns (stream ServerMessage);
