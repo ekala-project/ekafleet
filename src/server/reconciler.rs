@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
 
 use super::cloud::instance_tracker::InstanceTracker;
@@ -280,12 +280,27 @@ pub async fn compute_plan(
     let mut destroys = Vec::new();
     let mut reschedules = Vec::new();
 
+    // Where each service runs now: where agents report it, and where its
+    // last completed rollout placed it. Agents report on their heartbeat, so
+    // a service deployed moments ago may not be reported yet; its recorded
+    // placement still says where its volumes are, so a move migrates them.
     let (_, current_services, _) = state.fleet_status().await;
-    let current_service_names: Vec<&str> =
-        current_services.iter().map(|s| s.name.as_str()).collect();
+    let mut current_by_service: HashMap<String, BTreeSet<String>> = HashMap::new();
+    for svc in &current_services {
+        current_by_service
+            .entry(svc.name.clone())
+            .or_default()
+            .extend(svc.instances.iter().map(|i| i.node_id.clone()));
+    }
+    for (_, deployment) in raft_state.all_deployments().await {
+        current_by_service
+            .entry(deployment.service_name.clone())
+            .or_default()
+            .extend(deployment.placements.iter().map(|p| p.machine_name.clone()));
+    }
 
     for (service_name, placements) in &placements_by_service {
-        if current_service_names.contains(&service_name.as_str()) {
+        if current_by_service.contains_key(service_name) {
             updates.push(ServiceOp {
                 service_name: service_name.clone(),
                 placements: placements.clone(),
@@ -316,12 +331,8 @@ pub async fn compute_plan(
 
     // Detect reschedules (same service, different placement)
     for (service_name, desired_placements) in &placements_by_service {
-        if let Some(current_svc) = current_services.iter().find(|s| &s.name == service_name) {
-            let current_nodes: Vec<&str> = current_svc
-                .instances
-                .iter()
-                .map(|i| i.node_id.as_str())
-                .collect();
+        if let Some(current) = current_by_service.get(service_name) {
+            let current_nodes: Vec<&str> = current.iter().map(String::as_str).collect();
             let desired_nodes: Vec<&str> = desired_placements
                 .iter()
                 .map(|p| p.machine_name.as_str())
@@ -1744,6 +1755,80 @@ mod tests {
             .unwrap();
         super::super::rebalance::settle(&config, &plan, &["db".into()], &raft, Some(&events)).await;
         assert!(raft.placement_moves().await.is_empty());
+    }
+
+    /// Agents report what they run on their heartbeat. A stateful service
+    /// moved before its node reported it still takes its data along: its
+    /// recorded placement says where the volume is.
+    #[tokio::test]
+    async fn moves_before_the_first_report_migrate_from_the_recorded_node() {
+        let state = FleetState::new();
+        let mut config = empty_fleet_config();
+        let mut receivers = Vec::new();
+        for node in ["alpha", "beta"] {
+            receivers.push(
+                state
+                    .register_agent(node, "127.0.0.1:5000".into(), "default".into())
+                    .await,
+            );
+            config.machines.insert(
+                node.into(),
+                MachineConfig {
+                    target_host: node.into(),
+                    labels: HashMap::new(),
+                    capacity: CapacityConfig {
+                        cpu: 4000,
+                        memory: 8192,
+                        disk: 0,
+                    },
+                    pool: "default".into(),
+                    reserved: CapacityConfig::default(),
+                    taints: vec![],
+                    extended_resources: HashMap::new(),
+                },
+            );
+        }
+        let mut db = simple_service();
+        db.scheduling.job_type = config::JobType::Stateful;
+        db.volumes = vec![
+            serde_json::from_value(serde_json::json!({
+                "name": "data",
+                "mountPath": "/var/lib/db",
+            }))
+            .unwrap(),
+        ];
+        config.services.insert("db".into(), db);
+        // Placed on alpha, which has not reported it yet.
+        let raft = FleetStateMachine::new();
+        raft.apply_next(crate::raft::state::Command::Deploy {
+            service_name: "db".into(),
+            store_path: String::new(),
+            placements: vec![crate::raft::state::PlacementRecord {
+                instance_id: "db-0".into(),
+                machine_name: "alpha".into(),
+            }],
+        })
+        .await
+        .unwrap();
+        let plan = compute_plan(&config, &[], &state, None, &raft).await;
+        assert!(plan.creates.is_empty(), "{:?}", plan.creates);
+        assert!(plan.reschedules.is_empty());
+
+        raft.set_placement_move("db", "db-0", "beta").await.unwrap();
+        let plan = compute_plan(&config, &[], &state, None, &raft).await;
+        let [op] = plan.reschedules.as_slice() else {
+            panic!("expected one reschedule, got {:?}", plan.reschedules);
+        };
+        let [migration] = op.migrations.as_slice() else {
+            panic!("expected one migration, got {:?}", op.migrations);
+        };
+        assert_eq!(
+            (
+                migration.source_machine.as_str(),
+                migration.dest_machine.as_str()
+            ),
+            ("alpha", "beta")
+        );
     }
 
     fn simple_service() -> ServiceConfig {
