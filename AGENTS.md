@@ -62,6 +62,7 @@ src/
 ├── commands.rs          # CLI command implementations (plan, apply, status, drain, acl, etc.)
 ├── client_config.rs     # Client-side connection config
 ├── lib.rs               # Re-exports all modules for integration tests
+├── fsutil.rs            # Shared filesystem helpers (atomic writes)
 ├── types.rs             # Shared type definitions
 ├── config/
 │   ├── mod.rs           # FleetConfig, ServiceConfig, MachineConfig (serde, from nix eval JSON)
@@ -79,8 +80,7 @@ src/
 │   ├── scheduler/       # Filter + score placement (constraints, affinity, spread, preemption)
 │   ├── scaling.rs       # Service + pool autoscaling logic
 │   ├── nix.rs           # nix eval/build/copy subprocess wrapper (configurable timeouts)
-│   ├── namespace.rs     # Namespace registry with resource quotas
-│   ├── quota.rs         # Per-pool/namespace resource quota enforcement
+│   ├── admission.rs     # Admission of applied configs: policies + namespace/pool quotas
 │   ├── audit.rs         # Structured audit trail with actor attribution
 │   ├── events.rs        # Fleet event timeline and deployment history
 │   ├── policy.rs        # Organizational policy engine for admission control
@@ -95,6 +95,21 @@ src/
 │   ├── secrets.rs       # Secret RPCs, delivery to agents, fleet key rotation + reseal
 │   ├── transit.rs       # Transit key RPCs; workload SVIDs limited to declared `transitKeys`
 │   ├── agent_msg.rs     # Inbound agent message dispatch
+│   ├── access_audit.rs  # Audits refused gRPC/HTTP requests (coalesced)
+│   ├── alerts.rs        # Alert rule evaluation + Alertmanager webhooks
+│   ├── autoscaler.rs    # Service autoscaling on cgroup usage + exported metrics
+│   ├── bootstrap.rs     # FleetBootstrap: join-token attestation → node SVID
+│   ├── cache.rs         # ed25519-signed binary cache for service closures (CacheGet)
+│   ├── controller.rs    # Server-owned reconciliation of config revisions (leader)
+│   ├── images.rs        # Pins container image tags to verified digests at apply
+│   ├── mesh.rs          # Mesh IP assignment + signed WireGuard peer distribution
+│   ├── netpolicy.rs     # Per-node nftables policy from allowedCallers/egressRules
+│   ├── volumes.rs       # Volume snapshot RPCs routed to the holding node
+│   ├── leadership.rs    # Leader-only control plane, forwarding to the leader
+│   ├── membership.rs    # RaftAddMember/RaftRemoveMember
+│   ├── raft_rpc.rs      # Raft RPCs between servers over the gRPC mTLS listener
+│   ├── keybundle.rs     # Shared cluster keys, sealed for new servers
+│   ├── fleetkey.rs      # Keeps every server's fleet key current (staged rotation)
 │   └── cloud/
 │       ├── mod.rs       # Cloud provider registry
 │       ├── actuator.rs  # Scaling actuator (provision/destroy VMs)
@@ -112,14 +127,19 @@ src/
 │   ├── health.rs        # Liveness/readiness/startup probes (HTTP, TCP, exec)
 │   ├── activation.rs    # NixOS system closure activation, generation pruning
 │   ├── types.rs         # Agent-side state types (LocalState, NodeIdentity)
+│   ├── bootstrap.rs     # Exchanges a join token for a node SVID
+│   ├── closures.rs      # Fetches service closures from the server's binary cache
+│   ├── images.rs        # Container images by pinned digest
+│   ├── metrics.rs       # Ships node + service metrics to the server
+│   ├── templates.rs     # Renders config templates visible only to their service
+│   ├── latest.rs        # One job at a time, latest submission wins
 │   ├── helpers.rs       # SVID installation helpers
 │   ├── netns.rs         # Per-namespace network isolation (netns, bridge, veth, VXLAN overlay)
 │   ├── template.rs      # Config file template rendering
 │   ├── exec.rs          # Remote command execution in service cgroups
 │   ├── logs.rs          # Journal log streaming
 │   ├── storage.rs       # Persistent volume provisioning
-│   ├── migrate.rs       # Volume data migration (rsync)
-│   ├── snapshot.rs      # Volume snapshots
+│   ├── migrate.rs       # Volume data migration (tar stream over the mesh, node-SVID mTLS)
 │   └── oci/
 │       ├── mod.rs       # OCI container lifecycle (pull, unpack, run via nspawn)
 │       ├── registry.rs  # OCI registry client with TLS + custom CA bundle
@@ -143,6 +163,8 @@ src/
 │   ├── csr.rs           # CSR generation (ECDSA P-256)
 │   ├── signer.rs        # Direct + remote (Unix socket) CA signer implementations
 │   ├── client.rs        # CA client for remote signer
+│   ├── jwt.rs           # ES256 JWT-SVIDs
+│   ├── persist.rs       # Loading + persisting CA key material
 │   └── pki.rs           # PKI utilities
 ├── secrets/
 │   ├── mod.rs           # Secrets module
@@ -166,7 +188,9 @@ src/
 │   ├── mod.rs           # Proxy module
 │   ├── router.rs        # L7 HTTP reverse proxy
 │   ├── routes.rs        # Ingress routes file (agent writes, proxy polls)
-│   ├── l4.rs            # L4 TCP proxy
+│   ├── ingress.rs       # Per-route options: split, client-IP affinity, rate limit, callers
+│   ├── tls.rs           # Route certificates (agent writes, proxy serves by SNI)
+│   ├── l4.rs            # L4 TCP routes (tcpPort)
 │   ├── circuit.rs       # Circuit breaker
 │   ├── ratelimit.rs     # Rate limiting
 │   ├── affinity.rs      # Session affinity
@@ -178,7 +202,7 @@ src/
 │   └── tracing_ctx.rs   # Distributed tracing context propagation
 ├── policy/
 │   ├── mod.rs           # Policy module
-│   └── nftables.rs      # nftables rule generation, namespace NAT, VXLAN input rules
+│   └── nftables.rs      # Opt-in `inet ekafleet` tables: allowedCallers + egressRules per network
 ├── metrics/
 │   ├── mod.rs           # Metrics module
 │   ├── aggregator.rs    # Fleet-wide metrics aggregation
@@ -187,6 +211,7 @@ src/
 │   └── node.rs          # Node-level resource metrics (/proc)
 ├── raft/
 │   ├── mod.rs           # Raft module
+│   ├── consensus.rs     # openraft consensus over the encrypted storage
 │   ├── state.rs         # FleetStateMachine (deployments, secrets, DNS, KV, cloud instances, namespace IPs)
 │   └── storage.rs       # Encrypted log + snapshot persistence (AES-256-GCM)
 └── spiffe/
@@ -216,7 +241,11 @@ examples/
 
 tests/
 ├── cli.rs               # CLI integration tests (assert_cmd)
-└── server_agent.rs      # gRPC workflow integration tests (TLS, auth, RBAC, streaming)
+├── server_agent.rs      # gRPC workflow integration tests (TLS, auth, RBAC, streaming)
+├── workflow_apply.rs    # Apply/rollback/closures through the production server
+├── workflow_join.rs     # Join-token bootstrap, node identity
+├── workflow_state.rs    # Durable state across restarts
+└── workflow_ha.rs       # 3-server failover
 ```
 
 ## gRPC / Proto
@@ -235,12 +264,14 @@ tests/
 
 ## Testing
 
-- Unit tests: inline `#[cfg(test)]` modules (448+ tests across state, reconciler, scheduler,
+- Unit tests: inline `#[cfg(test)]` modules (660+ tests across state, reconciler, scheduler,
   policy, config, rbac, secrets, CA, seal, supervisor, attestor, OCI, etc.)
-- Integration tests: `tests/cli.rs` (assert_cmd, 37 tests) and `tests/server_agent.rs`
-  (gRPC workflows with TLS + RBAC, 23 tests)
+- Integration tests: `tests/cli.rs` (assert_cmd, 40 tests), `tests/server_agent.rs`
+  (gRPC workflows with TLS + RBAC, 26 tests) and `tests/workflow_*.rs` (apply, join, state,
+  HA — these boot the production server path)
 - NixOS VM tests: `nix/tests/` (module-basic, rest-api, cli-operations, server-agent,
-  lifecycle, fleet-module, oci-container)
+  lifecycle, fleet-module, oci-container, oci-registry, colocated, deploy-closure, dns, mesh,
+  metrics-alerts, secrets, volumes, fleet-operations)
 - Helpers: `free_port()` (bind port 0), `start_server()` (spawn with tempdir + Role::Admin
   in interceptor for RBAC)
 - Always use `tempfile::tempdir()` for isolation — never write to fixed paths
