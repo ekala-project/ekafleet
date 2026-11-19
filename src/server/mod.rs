@@ -235,6 +235,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     } else {
         tracing::info!("Using in-process CA (embedded mode)");
         let root_ca = crate::ca::persist::open_ca(&config.data_dir, &config.domain).await?;
+        crate::ca::persist::spawn_intermediate_renewal(root_ca.clone(), config.data_dir.clone());
         let jwt = crate::ca::persist::open_jwt_signer(&config.data_dir).await?;
         Arc::new(DirectCaSigner::new(root_ca, jwt))
     };
