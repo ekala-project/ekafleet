@@ -21,14 +21,14 @@ pub type SecretHistory = HashMap<String, HashMap<String, Vec<(u64, Vec<u8>)>>>;
 /// Stores all persistent fleet state: deployments, secrets, DNS, scheduling plans.
 #[derive(Clone)]
 pub struct FleetStateMachine {
-    inner: Arc<RwLock<StateMachineInner>>,
+    pub(super) inner: Arc<RwLock<StateMachineInner>>,
     /// Durable log. When set, every command is persisted before it is
     /// applied, so an acknowledged write survives a crash.
     log: Option<Arc<RaftStorage>>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
-struct StateMachineInner {
+pub(super) struct StateMachineInner {
     /// Current deployed services and their placements
     deployments: HashMap<String, DeploymentState>,
     /// Static secrets: service → name → value sealed under the fleet key
@@ -79,7 +79,13 @@ struct StateMachineInner {
     #[serde(default)]
     config_revisions: Vec<ConfigRevision>,
     /// Last applied log index
-    last_applied: u64,
+    pub(super) last_applied: u64,
+    /// Consensus position of `last_applied` (absent before consensus).
+    #[serde(default)]
+    pub(super) last_applied_log: Option<openraft::LogId<u64>>,
+    /// Cluster membership as of the last applied membership entry.
+    #[serde(default)]
+    pub(super) last_membership: openraft::StoredMembership<u64, openraft::BasicNode>,
 }
 
 /// A transit encryption key: its namespace and every version, oldest
@@ -363,6 +369,14 @@ pub enum Command {
 pub const MESH_NETWORK: Ipv4Addr = Ipv4Addr::new(10, 100, 0, 0);
 pub const MESH_PREFIX_LEN: u8 = 16;
 
+/// Seconds since the Unix epoch.
+pub(super) fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 /// Allocation key for one replica of a service in a namespace network.
 pub fn namespace_ip_holder(service_name: &str, node: &str) -> String {
     format!("{service_name}@{node}")
@@ -463,7 +477,7 @@ impl FleetStateMachine {
             })
             .await?;
         }
-        Self::apply_locked(state, index, command);
+        Self::apply_locked(state, index, command, unix_now());
         Ok(index)
     }
 
@@ -474,21 +488,23 @@ impl FleetStateMachine {
         if index <= state.last_applied {
             return; // Already applied
         }
-        Self::apply_locked(&mut state, index, command);
+        Self::apply_locked(&mut state, index, command, unix_now());
     }
 
-    fn apply_locked(state: &mut StateMachineInner, index: u64, command: Command) {
+    /// Apply `command` as entry `index`, proposed at `now` (Unix seconds).
+    /// Deterministic, so every replica and every replay agrees.
+    pub(super) fn apply_locked(
+        state: &mut StateMachineInner,
+        index: u64,
+        command: Command,
+        now: u64,
+    ) {
         match command {
             Command::Deploy {
                 service_name,
                 store_path,
                 placements,
             } => {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-
                 match state.deployments.get_mut(&service_name) {
                     // Same revision, new placements (scale, reschedule).
                     Some(current) if current.store_path == store_path => {
@@ -720,12 +736,7 @@ impl FleetStateMachine {
             } => {
                 if let Some(inst) = state.cloud_instances.get_mut(&instance_id) {
                     inst.fleet_node_id = Some(fleet_node_id);
-                    inst.joined_at = Some(
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs(),
-                    );
+                    inst.joined_at = Some(now);
                 }
             }
             Command::UntrackCloudInstance { instance_id } => {

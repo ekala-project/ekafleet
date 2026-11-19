@@ -83,6 +83,9 @@ libc = "0.2"
 flate2 = "1"
 tar = "0.4"
 
+# Consensus (server HA)
+openraft = { version = "0.9", features = ["serde", "storage-v2"] }
+
 # Database drivers (for dynamic secrets)
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "mysql"], default-features = false }
 
