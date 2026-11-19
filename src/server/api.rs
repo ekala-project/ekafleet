@@ -86,6 +86,8 @@ pub struct FleetControlService {
     pub(super) mesh: super::mesh::MeshRegistry,
     /// Bundles and services learned from federation peers.
     pub(super) federation: super::federation::FederationView,
+    /// Dials the other servers (a rotation stages its key on them).
+    pub(super) raft_network: Option<super::raft_rpc::GrpcNetwork>,
 }
 
 impl FleetControlService {
@@ -137,7 +139,14 @@ impl FleetControlService {
             webhook_client: super::webhook::WebhookClient::new(),
             allow_bearer_agents: false,
             binary_cache: None,
+            raft_network: None,
         }
+    }
+
+    /// Reach the other servers of the cluster through `network`.
+    pub fn with_raft_network(mut self, network: super::raft_rpc::GrpcNetwork) -> Self {
+        self.raft_network = Some(network);
+        self
     }
 
     /// Serve service closures from `cache` and advertise its key to agents.
@@ -2628,7 +2637,12 @@ pub async fn serve_grpc(
     .with_bearer_agents(allow_bearer_agents)
     .with_metrics(metrics)
     .with_audit_log(audit_log.clone())
-    .with_federation(federation.clone());
+    .with_federation(federation.clone())
+    .with_raft_network(super::raft_rpc::GrpcNetwork::new(
+        tls.identity.clone(),
+        &tls.ca_cert_pem,
+        &domain,
+    )?);
     let service = match binary_cache {
         Some(cache) => service.with_binary_cache(cache),
         None => service,
@@ -2762,16 +2776,15 @@ pub async fn serve_grpc(
     );
 
     let raft_service = super::raft_rpc::RaftService::new(service.raft_state.clone(), &domain)
-        .with_fleet_key(service.fleet_key.clone());
+        .with_fleet_key(service.fleet_key.clone(), &service.data_dir);
     super::fleetkey::FleetKeySync {
         raft_state: service.raft_state.clone(),
         fleet_key: service.fleet_key.clone(),
         secret_store: service.secret_store.clone(),
-        network: super::raft_rpc::GrpcNetwork::new(
-            tls.identity.clone(),
-            &tls.ca_cert_pem,
-            &domain,
-        )?,
+        network: service
+            .raft_network
+            .clone()
+            .expect("serve_grpc sets the Raft network"),
         state: service.state.clone(),
         data_dir: service.data_dir.clone(),
         domain: domain.clone(),

@@ -293,6 +293,13 @@ async fn sealed_probe(raft: &FleetStateMachine) -> Option<(String, String, Vec<u
 /// Finish or undo a fleet key rotation interrupted by a crash: a staged key
 /// is adopted if the stored secrets were already resealed under it (or
 /// there are none) and discarded otherwise. Returns the fleet key to use.
+///
+/// Once the replicated state records the current key's check value, that
+/// decides: the staged key is adopted if it is the current one, dropped if
+/// the key already in use is, and otherwise kept for [`FleetKeySync`] (a
+/// rotation staged here by the leader, not replicated here yet).
+///
+/// [`FleetKeySync`]: super::fleetkey::FleetKeySync
 pub async fn settle_fleet_key(
     data_dir: &std::path::Path,
     current: Zeroizing<Vec<u8>>,
@@ -303,6 +310,19 @@ pub async fn settle_fleet_key(
         return Ok(current);
     };
     let next = data_dir.join(NEXT_FLEET_KEY_FILE);
+    if let Some(check) = raft.fleet_key_check().await {
+        use super::fleetkey::has_check;
+        if has_check(&staged, &check) {
+            tracing::warn!("Completing an interrupted fleet key rotation");
+            tokio::fs::rename(&next, data_dir.join("fleet-key")).await?;
+            return Ok(staged);
+        }
+        if has_check(&current, &check) {
+            tracing::warn!("Discarding a fleet key rotation that did not complete");
+            tokio::fs::remove_file(&next).await?;
+        }
+        return Ok(current);
+    }
     let as_array = |key: &[u8]| -> anyhow::Result<[u8; 32]> {
         key.try_into()
             .map_err(|_| anyhow::anyhow!("fleet key must be 32 bytes"))
@@ -647,6 +667,16 @@ impl FleetControlService {
         super::seal::write_maybe_sealed(&staged, hex.as_bytes(), "staged fleet encryption key")
             .await
             .map_err(|e| Status::internal(format!("failed to stage rotated key: {e}")))?;
+        // The rotation must not leave the only copy of the key here.
+        if let Some(network) = &self.raft_network
+            && let Err(e) =
+                super::fleetkey::stage_on_peers(&self.raft_state, network, new_key.as_ref()).await
+        {
+            let _ = tokio::fs::remove_file(&staged).await;
+            return Err(Status::unavailable(format!(
+                "fleet key not rotated: {e}; retry once the servers are reachable"
+            )));
+        }
         if let Err(e) = self
             .raft_state
             .reseal_under(
@@ -904,5 +934,47 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn a_recorded_check_names_the_key_a_restart_keeps() {
+        use super::super::fleetkey::key_check;
+        let dir = tempfile::tempdir().unwrap();
+        let old = Zeroizing::new(vec![1u8; 32]);
+        let new = Zeroizing::new(vec![2u8; 32]);
+        let stage = || std::fs::write(dir.path().join(NEXT_FLEET_KEY_FILE), "staged").unwrap();
+        let staged = dir.path().join(NEXT_FLEET_KEY_FILE);
+        let raft = FleetStateMachine::new();
+        let record = |key: &[u8]| crate::raft::state::Command::SetFleetKeyCheck {
+            check: key_check(key),
+        };
+
+        // The rotation committed: the staged key is adopted.
+        raft.apply_next(record(&new)).await.unwrap();
+        stage();
+        let key = settle_fleet_key(dir.path(), old.clone(), Some(new.clone()), &raft)
+            .await
+            .unwrap();
+        assert_eq!(*key, *new);
+        assert!(!staged.exists());
+
+        // It never did: the staged key is dropped.
+        raft.apply_next(record(&old)).await.unwrap();
+        stage();
+        let key = settle_fleet_key(dir.path(), old.clone(), Some(new.clone()), &raft)
+            .await
+            .unwrap();
+        assert_eq!(*key, *old);
+        assert!(!staged.exists());
+
+        // A later rotation this server has not seen yet: both are kept, the
+        // staged key for the sync to adopt.
+        raft.apply_next(record(&[3u8; 32])).await.unwrap();
+        stage();
+        let key = settle_fleet_key(dir.path(), old.clone(), Some(new.clone()), &raft)
+            .await
+            .unwrap();
+        assert_eq!(*key, *old);
+        assert!(staged.exists());
     }
 }

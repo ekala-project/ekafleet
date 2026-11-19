@@ -73,6 +73,8 @@ pub struct RaftService {
     raft_state: FleetStateMachine,
     domain: String,
     fleet_key: Option<Arc<tokio::sync::RwLock<super::api::FleetKeyState>>>,
+    /// Where a staged fleet key is kept.
+    data_dir: Option<std::path::PathBuf>,
 }
 
 impl RaftService {
@@ -81,15 +83,19 @@ impl RaftService {
             raft_state,
             domain: domain.to_string(),
             fleet_key: None,
+            data_dir: None,
         }
     }
 
-    /// Serve `fleet_key` to peers whose copy is out of date.
+    /// Serve `fleet_key` to peers whose copy is out of date, and stage the
+    /// keys a rotating leader sends under `data_dir`.
     pub fn with_fleet_key(
         mut self,
         fleet_key: Arc<tokio::sync::RwLock<super::api::FleetKeyState>>,
+        data_dir: &std::path::Path,
     ) -> Self {
         self.fleet_key = Some(fleet_key);
+        self.data_dir = Some(data_dir.to_path_buf());
         self
     }
 
@@ -141,21 +147,48 @@ impl RaftInternal for RaftService {
         request: Request<crate::proto::FleetKeyRequest>,
     ) -> Result<Response<crate::proto::FleetKeyResponse>, Status> {
         let peer = server_peer(&request, &self.domain)?;
-        let fleet_key = self
-            .fleet_key
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("no fleet key here"))?
-            .read()
-            .await;
-        if !super::fleetkey::has_check(&fleet_key.key, &request.get_ref().check) {
-            return Err(Status::failed_precondition(
-                "this server does not hold the requested fleet key",
-            ));
-        }
+        let (Some(fleet_key), Some(data_dir)) = (&self.fleet_key, &self.data_dir) else {
+            return Err(Status::unavailable("no fleet key here"));
+        };
+        let check = &request.get_ref().check;
+        let current = Zeroizing::new(fleet_key.read().await.key.to_vec());
+        // A key staged but not adopted yet serves as well, once the check
+        // names it.
+        let key = if super::fleetkey::has_check(&current, check) {
+            current
+        } else {
+            match super::fleetkey::read_staged(data_dir).await {
+                Some(staged) if super::fleetkey::has_check(&staged, check) => staged,
+                _ => {
+                    return Err(Status::failed_precondition(
+                        "this server does not hold the requested fleet key",
+                    ));
+                }
+            }
+        };
         tracing::info!(%peer, "Sending the current fleet key to a peer");
         Ok(Response::new(crate::proto::FleetKeyResponse {
-            key: fleet_key.key.to_vec(),
+            key: key.to_vec(),
         }))
+    }
+
+    async fn stage_fleet_key(
+        &self,
+        request: Request<crate::proto::StageFleetKeyRequest>,
+    ) -> Result<Response<crate::proto::StageFleetKeyResponse>, Status> {
+        let peer = server_peer(&request, &self.domain)?;
+        let Some(data_dir) = &self.data_dir else {
+            return Err(Status::unavailable("this server cannot stage a fleet key"));
+        };
+        let key = Zeroizing::new(std::mem::take(&mut request.into_inner().key));
+        if key.len() != 32 {
+            return Err(Status::invalid_argument("a fleet key is 32 bytes"));
+        }
+        super::fleetkey::write_staged(data_dir, &key)
+            .await
+            .map_err(|e| Status::internal(format!("cannot stage the fleet key: {e}")))?;
+        tracing::info!(%peer, "Staged the fleet key a rotation will switch to");
+        Ok(Response::new(crate::proto::StageFleetKeyResponse {}))
     }
 }
 
@@ -240,6 +273,19 @@ impl GrpcNetwork {
         .await
         .map_err(|_| anyhow::anyhow!("{addr} did not answer"))??;
         Ok(status.into_inner())
+    }
+
+    /// Stage `key` on the server at `addr` ahead of a rotation.
+    pub async fn stage_fleet_key(&self, addr: &str, key: &[u8]) -> anyhow::Result<()> {
+        let channel = self.channel(addr).map_err(anyhow::Error::msg)?;
+        tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            RaftInternalClient::new(channel)
+                .stage_fleet_key(crate::proto::StageFleetKeyRequest { key: key.to_vec() }),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("{addr} did not answer"))??;
+        Ok(())
     }
 
     /// The fleet key with check value `check`, from the server at `addr`.
@@ -381,6 +427,7 @@ mod tests {
         ca_pem: String,
         state: FleetStateMachine,
         fleet_key: Arc<tokio::sync::RwLock<super::super::api::FleetKeyState>>,
+        data_dir: tempfile::TempDir,
         _shutdown: tokio_util::sync::DropGuard,
     }
 
@@ -409,8 +456,10 @@ mod tests {
             key: Zeroizing::new(vec![1; 32]),
             version: 1,
         }));
+        let data_dir = tempfile::tempdir().unwrap();
         let service = RaftInternalServer::new(
-            RaftService::new(state.clone(), DOMAIN).with_fleet_key(fleet_key.clone()),
+            RaftService::new(state.clone(), DOMAIN)
+                .with_fleet_key(fleet_key.clone(), data_dir.path()),
         );
         let stop = shutdown.clone();
         tokio::spawn(async move {
@@ -426,6 +475,7 @@ mod tests {
             ca_pem: tls.ca_cert_pem,
             state,
             fleet_key,
+            data_dir,
             _shutdown: shutdown.drop_guard(),
         }
     }
@@ -531,7 +581,6 @@ mod tests {
             }))
             .await
             .unwrap();
-        let key_dir = tempfile::tempdir().unwrap();
         let sync = FleetKeySync {
             raft_state: stale.state.clone(),
             fleet_key: stale.fleet_key.clone(),
@@ -540,7 +589,7 @@ mod tests {
             )),
             network: GrpcNetwork::new(stale.identity.clone(), &stale.ca_pem, DOMAIN).unwrap(),
             state: super::super::state::FleetState::new(),
-            data_dir: key_dir.path().to_path_buf(),
+            data_dir: stale.data_dir.path().to_path_buf(),
             domain: DOMAIN.into(),
         };
         for _ in 0..100 {
@@ -551,7 +600,7 @@ mod tests {
         }
         assert_eq!(stale.fleet_key.read().await.key[..], [2; 32]);
         assert_eq!(stale.fleet_key.read().await.version, 2);
-        assert!(key_dir.path().join("fleet-key").exists());
+        assert!(stale.data_dir.path().join("fleet-key").exists());
         // Only the key asked for is served.
         let other = network
             .fleet_key(&servers[1].addr.to_string(), &key_check(&[9; 32]))
@@ -559,9 +608,48 @@ mod tests {
             .unwrap_err();
         assert!(other.to_string().contains("does not hold"), "{other}");
 
-        for raft in rafts {
-            raft.shutdown().await.unwrap();
+        // The next rotation is staged on both servers before it commits, so
+        // the other server adopts its own copy even with the leader gone.
+        let leader_network =
+            GrpcNetwork::new(rotated.identity.clone(), &rotated.ca_pem, DOMAIN).unwrap();
+        super::super::fleetkey::stage_on_peers(&rotated.state, &leader_network, &[4; 32])
+            .await
+            .unwrap();
+        rafts[(leader - 1) as usize]
+            .client_write(Proposal::new(Command::SetFleetKeyCheck {
+                check: key_check(&[4; 32]),
+            }))
+            .await
+            .unwrap();
+        // Served while staged, to a peer asking for it by its check.
+        let served = leader_network
+            .fleet_key(&stale.addr.to_string(), &key_check(&[4; 32]))
+            .await
+            .unwrap();
+        assert_eq!(served[..], [4; 32]);
+        rafts[(leader - 1) as usize].shutdown().await.unwrap();
+        for _ in 0..100 {
+            if stale.state.fleet_key_check().await == Some(key_check(&[4; 32])) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        assert!(sync.sync().await);
+        assert_eq!(stale.fleet_key.read().await.key[..], [4; 32]);
+        assert!(
+            super::super::fleetkey::read_staged(stale.data_dir.path())
+                .await
+                .is_none(),
+            "the adopted key is no longer staged"
+        );
+        // A key of the wrong size is refused.
+        let short = leader_network
+            .stage_fleet_key(&stale.addr.to_string(), &[1; 8])
+            .await
+            .unwrap_err();
+        assert!(short.to_string().contains("32 bytes"), "{short}");
+
+        rafts[(2 - leader) as usize].shutdown().await.unwrap();
     }
 
     /// Send a Vote RPC to `server` over `tls`, with an optional bearer token.

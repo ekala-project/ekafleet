@@ -22,7 +22,16 @@ service RaftInternal {
   // The fleet key, to a server whose copy a rotation replaced; served only
   // when this server's key has the requested check value.
   rpc FleetKey(FleetKeyRequest) returns (FleetKeyResponse);
+  // Hold a fleet key the leader is about to rotate to; the leader commits
+  // the rotation only once a majority of the servers hold it.
+  rpc StageFleetKey(StageFleetKeyRequest) returns (StageFleetKeyResponse);
 }
+
+message StageFleetKeyRequest {
+  bytes key = 1;
+}
+
+message StageFleetKeyResponse {}
 
 message FleetKeyRequest {
   bytes check = 1;
