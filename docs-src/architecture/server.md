@@ -54,6 +54,8 @@ Server state is stored in `--data-dir` (default: `/var/lib/ekafleet`):
 
 With an external `ca-signer`, the `ca-*.pem` files live in its own data directory (`/var/lib/ekafleet-ca` under the NixOS module) instead.
 
+The intermediate CA is valid for 90 days. The CA (in-process or `ca-signer`) checks it hourly and replaces it once it has less than 7 days left. SVIDs issued from then on chain to the new intermediate. Older SVIDs expire before the old intermediate does. Each server of an HA cluster has its own intermediate under the shared root.
+
 ¹ When `EKAFLEET_SEAL_PASSPHRASE` (or `EKAFLEET_SEAL_PASSPHRASE_FILE`, a file holding it) is set, key files are encrypted at rest using PBKDF2-HMAC-SHA256 + AES-256-GCM envelope encryption. Without it, they are stored as plaintext with a warning. In-memory copies of all key material are wrapped in `Zeroizing<T>` so they are cleared on drop.
 
 A snapshot is taken roughly every 100 minutes; it replaces older snapshots and the log entries it covers are removed. Data directories created before `raft-key` existed (Raft storage encrypted with the fleet key) are read once with the fleet key and re-encrypted under `raft-key` on boot.

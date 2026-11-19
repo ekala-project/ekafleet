@@ -207,6 +207,21 @@ impl RootCa {
         Ok((cert, key))
     }
 
+    /// Whether the intermediate is within [`INTERMEDIATE_RENEW_BEFORE`] of
+    /// expiry (or missing), so leaves would soon outlive it.
+    pub async fn intermediate_due(&self) -> bool {
+        let state = self.inner.read().await;
+        state.intermediate_keypair.is_none()
+            || state.intermediate_expires_at
+                <= unix_now().saturating_add(INTERMEDIATE_RENEW_BEFORE.as_secs())
+    }
+
+    /// Pretend the current intermediate expires at `expires_at`.
+    #[cfg(test)]
+    pub(crate) async fn set_intermediate_expiry(&self, expires_at: u64) {
+        self.inner.write().await.intermediate_expires_at = expires_at;
+    }
+
     /// Mint a fresh intermediate CA certificate signed by the root, and store
     /// it in `state`. The root must already be present.
     fn mint_intermediate(state: &mut CaState) -> Result<(), CaError> {
