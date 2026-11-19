@@ -283,15 +283,64 @@ Agents receive the authoritative trust domain from the server's `TrustBundleUpda
 
 ## Trust Domain Federation
 
-ekafleet supports SPIFFE trust domain federation for cross-cluster mTLS. This allows services in different clusters (each with their own CA and trust domain) to authenticate each other without sharing a single CA.
+Clusters with their own CAs and trust domains can federate. Each cluster then trusts the other's SVIDs and can discover the services the other exports. No CA is shared, and no keys leave a cluster.
 
-To federate with a peer cluster:
+### 1. Name the peers
 
-1. Exchange CA bundles between clusters
-2. Register the foreign trust domain on each side
-3. Services with SPIFFE IDs from either trust domain will be accepted during mTLS verification
+Each side lists the other in its fleet configuration, with the peer's root CA certificate. A cluster's root CA is its CA signer's `ca-cert.pem` (by default `/var/lib/ekafleet-ca/ca-cert.pem`).
 
-The combined trust bundle (local CA + all federated foreign CAs) is used for TLS verification, so services can transparently communicate across cluster boundaries.
+```nix
+# In cluster "west" (domain west.internal)
+federation = {
+  exportServices = [ "api" ];            # default-namespace services peers may discover
+  peers.east = {
+    endpoint = "east-server.example.com:7404";
+    trustDomain = "east.internal";
+    caCert = builtins.readFile ./east-ca.pem;
+  };
+};
+```
+
+### 2. Enable the federation listener
+
+Each server runs a federation listener (`--federation-listen`, or `services.ekafleet.server.federationListen` in the NixOS module). It must be reachable from the peer's servers.
+
+### How syncing works
+
+Every 30 seconds, each server fetches every peer's federation document over mutual TLS. Both sides check each other:
+
+| Side | It presents | It is accepted only if |
+|------|-------------|------------------------|
+| Peer's server | Its certificate | The certificate chains to the configured `caCert` and has a `spiffe://<peer trust domain>/server/*` ID |
+| This server | Its own server SVID | The peer listed this trust domain, with a CA it chains to |
+
+The trust domain of the client certificate selects which CA it is checked against. A CA that claims another peer's trust domain is therefore refused. So are agent and workload SVIDs.
+
+The document carries:
+
+- the peer's X.509 and JWT bundles;
+- for each exported service, the WireGuard underlay address of every node serving a healthy replica, along with the declared ports.
+
+### What clusters get from a peer
+
+**Trust bundles.** Agents receive every peer's bundles along with the local one. The Workload API serves them, keyed by `spiffe://<trust domain>`, in:
+
+- `FetchX509SVID` (`federated_bundles`);
+- `FetchX509Bundles`;
+- `FetchJWTBundles`.
+
+Workloads using a SPIFFE library can then verify SVIDs from both trust domains.
+
+**Services.** Exported services resolve as `<svc>.<peer>.federation.<domain>`; see [DNS](dns.md#federated-services). Clients connect to the serving nodes' underlay addresses, so the service's ports must be reachable from the other cluster.
+
+**Peer events.** An unreachable peer is recorded as a `federation.peer.unreachable` event, and `federation.peer.synced` marks its recovery.
+
+**Outages.** If a peer has not answered for 5 minutes, its services leave DNS. Its last bundles stay trusted for as long as the peer remains in the configuration.
+
+### Not covered
+
+- `ValidateJWTSVID` validates only local JWT-SVIDs.
+- The mesh proxy does not accept SVIDs from federated trust domains.
 
 ## PKI for Arbitrary Domains
 

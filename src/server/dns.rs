@@ -19,6 +19,9 @@
 //! - `<name>.external`: the addresses of an `externalServices` entry that
 //!   pass its health check (see `server::external`), plus SRV records
 //!   `<port> <name>.external`.
+//! - `<svc>.<peer>.federation`: the underlay addresses a federation peer
+//!   exports for its service (see `server::federation`), plus SRV records
+//!   `<port> <svc>.<peer>.federation`.
 //!
 //! A replica is serving when its node reports it running and not unhealthy.
 
@@ -30,6 +33,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use super::external::ExternalHealth;
+use super::federation::{ExportedService, FederationView};
 use super::state::FleetState;
 use crate::proto::server_message::Payload as ServerPayload;
 use crate::proto::{
@@ -57,6 +61,8 @@ pub struct DnsInputs {
     pub serving: HashSet<(String, String)>,
     /// Serving addresses of each external service.
     pub external: BTreeMap<String, Vec<SocketAddrV4>>,
+    /// Services federation peers export, by (peer, service).
+    pub federated: BTreeMap<(String, String), ExportedService>,
 }
 
 impl DnsInputs {
@@ -170,6 +176,31 @@ pub fn build_records(inputs: &DnsInputs) -> BTreeMap<String, Vec<DnsRecord>> {
             "",
         ));
     }
+    for ((peer, service), exported) in &inputs.federated {
+        if exported.addresses.is_empty() {
+            continue;
+        }
+        let name = format!("{service}.{peer}.federation");
+        fleet.push(record(
+            name.clone(),
+            DnsRecordType::A,
+            exported.addresses.iter().map(Ipv4Addr::to_string).collect(),
+            "",
+        ));
+        let srv: BTreeSet<String> = exported
+            .ports
+            .iter()
+            .map(|p| format!("{} {name}", p.port))
+            .collect();
+        if !srv.is_empty() {
+            fleet.push(record(
+                name,
+                DnsRecordType::Srv,
+                srv.into_iter().collect(),
+                "",
+            ));
+        }
+    }
     for (name, (ips, srv)) in hosted {
         if !ips.is_empty() {
             let name = format!("{name}.service");
@@ -224,6 +255,7 @@ pub fn build_records(inputs: &DnsInputs) -> BTreeMap<String, Vec<DnsRecord>> {
 pub struct DnsPublisher {
     state: FleetState,
     external: Option<(FleetStateMachine, ExternalHealth)>,
+    federation: Option<FederationView>,
     sent: Mutex<HashMap<String, (Vec<DnsRecord>, Instant)>>,
 }
 
@@ -232,6 +264,7 @@ impl DnsPublisher {
         Self {
             state,
             external: None,
+            federation: None,
             sent: Mutex::default(),
         }
     }
@@ -239,6 +272,12 @@ impl DnsPublisher {
     /// Also publish the external services of the current configuration.
     pub fn with_external(mut self, raft_state: FleetStateMachine, health: ExternalHealth) -> Self {
         self.external = Some((raft_state, health));
+        self
+    }
+
+    /// Also publish the services federation peers export.
+    pub fn with_federation(mut self, view: FederationView) -> Self {
+        self.federation = Some(view);
         self
     }
 
@@ -251,6 +290,9 @@ impl DnsPublisher {
                 Ok(config) => inputs.external = health.serving(&config).await,
                 Err(e) => tracing::error!(error = %e, "Cannot read external services"),
             }
+        }
+        if let Some(view) = &self.federation {
+            inputs.federated = view.services(crate::agent::now_epoch()).await;
         }
         inputs
     }
@@ -328,6 +370,51 @@ mod tests {
         records
             .iter()
             .find(|r| r.name == name && r.record_type == kind as i32)
+    }
+
+    #[test]
+    fn federated_services_resolve_under_their_peer() {
+        use crate::server::federation::ExportedPort;
+        let inputs = DnsInputs {
+            mesh_ips: BTreeMap::from([("a".into(), Ipv4Addr::new(10, 100, 0, 1))]),
+            federated: BTreeMap::from([
+                (
+                    ("west".into(), "api".into()),
+                    ExportedService {
+                        name: "api".into(),
+                        addresses: vec![Ipv4Addr::new(203, 0, 113, 7)],
+                        ports: vec![ExportedPort {
+                            name: "http".into(),
+                            port: 8080,
+                        }],
+                    },
+                ),
+                (
+                    ("west".into(), "idle".into()),
+                    ExportedService {
+                        name: "idle".into(),
+                        addresses: vec![],
+                        ports: vec![],
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+        let records = build_records(&inputs);
+        let a = &records["a"];
+        assert_eq!(
+            find(a, "api.west.federation", DnsRecordType::A)
+                .unwrap()
+                .values,
+            ["203.0.113.7"]
+        );
+        assert_eq!(
+            find(a, "api.west.federation", DnsRecordType::Srv)
+                .unwrap()
+                .values,
+            ["8080 api.west.federation"]
+        );
+        assert!(!a.iter().any(|r| r.name == "idle.west.federation"));
     }
 
     #[test]

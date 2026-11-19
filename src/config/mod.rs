@@ -46,6 +46,36 @@ pub struct FleetConfig {
     /// endpoints), resolvable as `<name>.external.<domain>`.
     #[serde(default)]
     pub external_services: HashMap<String, ExternalServiceConfig>,
+    /// Other ekafleet clusters this one exchanges trust bundles and
+    /// service records with.
+    #[serde(default)]
+    pub federation: FederationConfig,
+}
+
+/// Federation with other ekafleet clusters.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct FederationConfig {
+    /// Default-namespace services that peers may discover.
+    #[serde(default)]
+    pub export_services: Vec<String>,
+    /// Peer clusters, keyed by the name their services resolve under
+    /// (`<svc>.<peer>.federation.<domain>`).
+    #[serde(default)]
+    pub peers: HashMap<String, FederationPeer>,
+}
+
+/// A peer cluster.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct FederationPeer {
+    /// `host:port` of the peer server's federation listener.
+    pub endpoint: String,
+    /// The peer's trust domain (its fleet `domain`).
+    pub trust_domain: String,
+    /// PEM of the peer's root CA (its trust bundle), which its server
+    /// certificate must chain to.
+    pub ca_cert: String,
 }
 
 /// A service outside the fleet that fleet DNS answers for.
@@ -1557,6 +1587,93 @@ fn validate_external_services(config: &FleetConfig, errors: &mut Vec<String>) {
     }
 }
 
+fn validate_federation(config: &FleetConfig, errors: &mut Vec<String>) {
+    let federation = &config.federation;
+    let mut exported = std::collections::HashSet::new();
+    for name in &federation.export_services {
+        if !exported.insert(name.as_str()) {
+            errors.push(format!("federation exports service '{name}' twice"));
+        }
+        match config.services.get(name) {
+            None => errors.push(format!(
+                "federation exports service '{name}', which is not defined"
+            )),
+            Some(service) => {
+                if !crate::agent::netns::is_default_namespace(&service.namespace) {
+                    errors.push(format!(
+                        "federation exports service '{name}', which is in namespace '{}': only default-namespace services can be exported",
+                        service.namespace
+                    ));
+                }
+                if !is_dns_label(name) {
+                    errors.push(format!(
+                        "federation exports service '{name}', whose name is not a DNS label"
+                    ));
+                }
+            }
+        }
+    }
+
+    let mut peers: Vec<_> = federation.peers.iter().collect();
+    peers.sort_by_key(|(name, _)| name.as_str());
+    let mut trust_domains = std::collections::HashMap::new();
+    for (name, peer) in peers {
+        if !is_dns_label(name) {
+            errors.push(format!(
+                "federation peer '{name}': name must be a DNS label (a-z, 0-9, '-')"
+            ));
+        }
+        if let Err(e) = validate_endpoint(&peer.endpoint) {
+            errors.push(format!("federation peer '{name}': endpoint {e}"));
+        }
+        if !is_trust_domain(&peer.trust_domain) {
+            errors.push(format!(
+                "federation peer '{name}': '{}' is not a trust domain",
+                peer.trust_domain
+            ));
+        } else if peer.trust_domain == config.domain {
+            errors.push(format!(
+                "federation peer '{name}': trust domain '{}' is this fleet's own",
+                peer.trust_domain
+            ));
+        } else if let Some(other) = trust_domains.insert(peer.trust_domain.as_str(), name) {
+            errors.push(format!(
+                "federation peers '{other}' and '{name}' have the same trust domain '{}'",
+                peer.trust_domain
+            ));
+        }
+        let certs = rustls_pemfile::certs(&mut peer.ca_cert.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_default();
+        if certs.is_empty() {
+            errors.push(format!(
+                "federation peer '{name}': caCert holds no PEM certificate"
+            ));
+        }
+    }
+}
+
+/// `host:port` with a non-empty host and a non-zero port.
+fn validate_endpoint(endpoint: &str) -> Result<(), String> {
+    let (host, port) = endpoint
+        .rsplit_once(':')
+        .ok_or_else(|| format!("'{endpoint}' is not host:port"))?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.is_empty() || host.contains(['/', ' ', '@']) {
+        return Err(format!("'{endpoint}' has no valid host"));
+    }
+    match port.parse::<u16>() {
+        Ok(p) if p != 0 => Ok(()),
+        _ => Err(format!("'{endpoint}' has no valid port")),
+    }
+}
+
+/// Whether `domain` is a SPIFFE trust domain name: lower-case DNS labels
+/// joined by dots.
+pub fn is_trust_domain(domain: &str) -> bool {
+    domain.len() <= 255 && domain.split('.').all(is_dns_label)
+}
+
 /// Whether `name` is a lower-case DNS label.
 pub fn is_dns_label(name: &str) -> bool {
     !name.is_empty()
@@ -1572,6 +1689,7 @@ pub fn validate(config: &FleetConfig) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
     validate_secret_engines(config, &mut errors);
     validate_external_services(config, &mut errors);
+    validate_federation(config, &mut errors);
 
     validate_alerts(config, &mut errors);
     validate_namespaces_and_admission(config, &mut errors);
@@ -1994,6 +2112,57 @@ mod nix_module_tests {
             "path must start with '/'",
             "path is for http checks",
             "interval and timeout must be positive",
+        ] {
+            assert!(errors.contains(expected), "{expected}: {errors}");
+        }
+    }
+
+    #[test]
+    fn federation_is_validated() {
+        let ca = rcgen::generate_simple_self_signed(vec!["ca".into()])
+            .unwrap()
+            .cert
+            .pem();
+        let config = |federation: serde_json::Value| -> FleetConfig {
+            serde_json::from_value(serde_json::json!({
+                "name": "t",
+                "domain": "fleet.test",
+                "services": {
+                    "web": {"command": "/bin/web"},
+                    "shop": {"command": "/bin/shop", "namespace": "tenant"},
+                },
+                "federation": federation,
+            }))
+            .unwrap()
+        };
+        let ok = config(serde_json::json!({
+            "exportServices": ["web"],
+            "peers": {"east": {"endpoint": "east.example.com:7404", "trustDomain": "east.test", "caCert": ca}},
+        }));
+        assert!(validate(&ok).is_ok(), "{:?}", validate(&ok));
+
+        let bad = config(serde_json::json!({
+            "exportServices": ["web", "web", "missing", "shop"],
+            "peers": {
+                "Bad": {"endpoint": "b:1", "trustDomain": "b.test", "caCert": ca},
+                "noport": {"endpoint": "host", "trustDomain": "c.test", "caCert": ca},
+                "self": {"endpoint": "s:1", "trustDomain": "fleet.test", "caCert": ca},
+                "dup": {"endpoint": "d:1", "trustDomain": "b.test", "caCert": ca},
+                "nocert": {"endpoint": "n:1", "trustDomain": "n.test", "caCert": "junk"},
+                "baddomain": {"endpoint": "x:1", "trustDomain": "X..test", "caCert": ca},
+            },
+        }));
+        let errors = validate(&bad).unwrap_err().join("\n");
+        for expected in [
+            "exports service 'web' twice",
+            "'missing', which is not defined",
+            "'shop', which is in namespace 'tenant'",
+            "peer 'Bad': name must be a DNS label",
+            "'host' is not host:port",
+            "trust domain 'fleet.test' is this fleet's own",
+            "peers 'Bad' and 'dup' have the same trust domain 'b.test'",
+            "peer 'nocert': caCert holds no PEM certificate",
+            "'X..test' is not a trust domain",
         ] {
             assert!(errors.contains(expected), "{expected}: {errors}");
         }

@@ -6,6 +6,7 @@
 |------|----------|---------|---------|
 | 7400 | TCP (gRPC) | Server + Agent | Server API, agent ↔ server communication, node join (`FleetBootstrap`) |
 | 7402 | TCP (HTTP) | Server | HTTP API (health, metrics) |
+| 7404 | TCP (HTTPS, mutual TLS) | Server | Federation listener (`--federation-listen`, off by default) |
 | 53 | UDP/TCP | Server + Agent | DNS (authority on server, resolver on agent) |
 | 51820 | UDP | Server + Agent | WireGuard mesh |
 | 80 | TCP | Agent (ingress) | L7 proxy HTTP |
@@ -32,6 +33,10 @@ Servers must be able to reach agents on:
 
 All fleet nodes (servers and agents) need mutual connectivity on:
 - UDP 51820 (WireGuard)
+
+### Between Federated Clusters
+
+Each server must reach every peer's federation listener (e.g. TCP 7404). Clients of exported services must reach the serving nodes' underlay addresses on the service ports.
 
 ### External Access (Ingress Nodes)
 

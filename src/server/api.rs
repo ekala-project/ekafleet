@@ -36,7 +36,7 @@ use crate::proto::{
     ScaleResponse, ServerMessage, SnapshotRequest, SnapshotResponse, StatusRequest,
     SwitchGenerationRequest, SwitchGenerationResponse, SystemGcRequest, SystemGcResponse,
     SystemRebootRequest, SystemRebootResponse, SystemRebuildRequest, SystemRebuildResponse,
-    TopRequest, TopResponse, TrustBundleUpdate, UpdateNodeRequest, UpdateNodeResponse,
+    TopRequest, TopResponse, UpdateNodeRequest, UpdateNodeResponse,
 };
 use crate::raft::state::FleetStateMachine;
 use crate::secrets::store::SecretStore;
@@ -84,6 +84,8 @@ pub struct FleetControlService {
     pub(super) binary_cache: Option<super::cache::BinaryCache>,
     /// Mesh address assignments and verified WireGuard peers.
     pub(super) mesh: super::mesh::MeshRegistry,
+    /// Bundles and services learned from federation peers.
+    pub(super) federation: super::federation::FederationView,
 }
 
 impl FleetControlService {
@@ -112,6 +114,7 @@ impl FleetControlService {
         Self {
             controller,
             mesh,
+            federation: super::federation::FederationView::new(),
             state,
             cert_issuer: None,
             ca: None,
@@ -141,6 +144,13 @@ impl FleetControlService {
     /// Record audit entries in `audit_log` (persisted by the server).
     pub fn with_audit_log(mut self, audit_log: super::audit::AuditLog) -> Self {
         self.audit_log = audit_log;
+        self
+    }
+
+    /// Share `view` of the federation peers (sent to agents with the
+    /// trust bundle).
+    pub fn with_federation(mut self, view: super::federation::FederationView) -> Self {
+        self.federation = view;
         self
     }
 
@@ -464,18 +474,12 @@ impl FleetControl for FleetControlService {
 
         // Push trust bundle to newly connected agent
         if let Some(bundle_pem) = &self.trust_bundle_pem {
-            let bundle_msg = ServerMessage {
-                payload: Some(ServerPayload::TrustBundle(TrustBundleUpdate {
-                    trust_domain: self.domain.clone(),
-                    ca_certificate_pem: bundle_pem.as_bytes().to_vec(),
-                    jwt_bundle_jwks: self
-                        .jwt_bundle
-                        .as_deref()
-                        .unwrap_or_default()
-                        .as_bytes()
-                        .to_vec(),
-                })),
-            };
+            let bundle_msg = super::federation::trust_bundle_message(
+                &self.domain,
+                bundle_pem,
+                self.jwt_bundle.as_deref().unwrap_or_default(),
+                self.federation.bundles().await,
+            );
             let _ = self.state.send_to_agent(&node_id, bundle_msg).await;
         }
 
@@ -2447,6 +2451,11 @@ pub struct GrpcServerConfig {
     /// Where agent metrics are aggregated.
     pub metrics: MetricsAggregator,
     pub audit_log: super::audit::AuditLog,
+    /// What federation peers told this server.
+    pub federation: super::federation::FederationView,
+    /// Where peers fetch this cluster's federation document; `None` serves
+    /// none (peers can still be fetched).
+    pub federation_listen: Option<std::net::SocketAddr>,
 }
 
 /// Start the gRPC server with TLS and RBAC-based authentication.
@@ -2474,6 +2483,8 @@ pub async fn serve_grpc(
         binary_cache,
         metrics,
         audit_log,
+        federation,
+        federation_listen,
     } = config;
 
     tracing::info!(%addr, domain = %domain, "gRPC server listening (TLS + RBAC + SPIFFE)");
@@ -2575,7 +2586,8 @@ pub async fn serve_grpc(
     .with_fleet_key(fleet_key)
     .with_bearer_agents(allow_bearer_agents)
     .with_metrics(metrics)
-    .with_audit_log(audit_log.clone());
+    .with_audit_log(audit_log.clone())
+    .with_federation(federation.clone());
     let service = match binary_cache {
         Some(cache) => service.with_binary_cache(cache),
         None => service,
@@ -2601,6 +2613,41 @@ pub async fn serve_grpc(
         secret_store: service.secret_store.clone(),
     }
     .spawn(shutdown.clone());
+    let trusted_peers = super::federation::TrustedPeers::default();
+    let local_jwks = service.jwt_bundle.clone().unwrap_or_default();
+    super::federation::FederationManager {
+        raft_state: service.raft_state.clone(),
+        view: federation,
+        trusted: trusted_peers.clone(),
+        identity: tls.identity.clone(),
+        state: service.state.clone(),
+        events: service.event_store.clone(),
+        domain: domain.clone(),
+        bundle_pem: trust_bundle_pem.clone(),
+        jwks: local_jwks.clone(),
+    }
+    .spawn(shutdown.clone());
+    if let Some(listen) = federation_listen {
+        let listener = tokio::net::TcpListener::bind(listen).await?;
+        let exporter = super::federation::Exporter {
+            domain: domain.clone(),
+            bundle_pem: trust_bundle_pem.clone(),
+            jwks: local_jwks,
+            raft_state: service.raft_state.clone(),
+            state: service.state.clone(),
+            mesh: service.mesh.clone(),
+        };
+        let identity = tls.identity.clone();
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                super::federation::serve(listener, identity, trusted_peers, exporter, shutdown)
+                    .await
+            {
+                tracing::error!(error = %e, "Federation listener failed");
+            }
+        });
+    }
     if allow_bearer_agents {
         tracing::warn!("Accepting bearer-token agents (development mode)");
     }

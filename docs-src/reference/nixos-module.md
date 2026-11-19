@@ -36,6 +36,7 @@ Enable `services.ekafleet.server` to deploy the control plane. This creates two 
 | `peers` | list of string | `[]` | Peer server addresses for HA |
 | `grpcListen` | string | `0.0.0.0:7400` | gRPC listen address |
 | `httpListen` | string | `0.0.0.0:7402` | HTTP API listen address |
+| `federationListen` | null or string | `null` | Federation listener for peer clusters, e.g. `0.0.0.0:7404` |
 | `domain` | string | `fleet.internal` | SPIFFE trust domain |
 | `caSocketPath` | string | `/run/ekafleet-ca/ca.sock` | Unix socket for CA signer (group `ekafleet-ca`, mode 0660) |
 
