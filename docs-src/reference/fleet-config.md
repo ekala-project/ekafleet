@@ -72,7 +72,7 @@ ports.<name> = {
 
 When `liveness`, `readiness`, or `startup` probes are specified, they take precedence over the unified `healthCheck`. If only `healthCheck` is specified, it is used for both liveness and readiness. A `liveness` probe without a `readiness` probe also serves as the readiness probe.
 
-Probes check the port that declares them (the first port by name that declares any), on loopback, or on the service's namespace IP in a non-default namespace. How each probe acts:
+Probes check the port that declares them (the first port by name that declares any), on loopback, or on the service's namespace IP (from inside its network namespace) in a non-default namespace. How each probe acts:
 
 - Each run of `unhealthy_threshold` consecutive liveness failures restarts the service.
 - A startup probe holds back liveness and readiness until it passes, after the first start and after every restart.
