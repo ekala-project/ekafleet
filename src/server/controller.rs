@@ -45,6 +45,8 @@ pub struct Controller {
     grpc_addr: String,
     trigger: ReconcileTrigger,
     updates: broadcast::Sender<ReconcileUpdate>,
+    /// Departed nodes are removed from the mesh after each cycle.
+    mesh: Option<super::mesh::MeshRegistry>,
 }
 
 impl Controller {
@@ -66,7 +68,33 @@ impl Controller {
             grpc_addr: grpc_addr.to_string(),
             trigger,
             updates: broadcast::channel(64).0,
+            mesh: None,
         }
+    }
+
+    /// Remove departed nodes from `mesh` after each cycle.
+    pub fn with_mesh(mut self, mesh: super::mesh::MeshRegistry) -> Self {
+        self.mesh = Some(mesh);
+        self
+    }
+
+    /// Forget the mesh peers of nodes neither `config` nor the cloud
+    /// tracker knows and that are not connected.
+    async fn prune_mesh(&self, config: &FleetConfig) {
+        let Some(mesh) = &self.mesh else {
+            return;
+        };
+        let cloud: std::collections::HashSet<String> = self
+            .tracker
+            .all()
+            .await
+            .into_values()
+            .filter_map(|i| i.fleet_node_id)
+            .collect();
+        mesh.prune(&self.state, |node| {
+            config.machines.contains_key(node) || cloud.contains(node)
+        })
+        .await;
     }
 
     /// Receive the outcome of every later reconcile cycle.
@@ -248,6 +276,7 @@ impl Controller {
         .await
         {
             Ok(plan) => {
+                self.prune_mesh(&config).await;
                 for block in &plan.policy_blocked {
                     self.events
                         .emit_detail(
