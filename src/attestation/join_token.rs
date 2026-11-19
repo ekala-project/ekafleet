@@ -14,6 +14,10 @@
 //! - consumed on first use, with a consumption record kept until the token
 //!   would have expired anyway, so replays are reported as such;
 //! - guarded by a per-source failure rate limit.
+//!
+//! On a server the tokens are kept in the replicated fleet state
+//! ([`JoinTokenStore::with_replication`]), so a token created on one server
+//! is accepted, and consumed once, cluster-wide. Failure counts stay local.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -25,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 
 use super::{AttestationError, AttestationResult};
+use crate::raft::state::{Command, FleetStateMachine};
 
 /// Lifetime of a join token when none is requested.
 pub const DEFAULT_TTL: Duration = Duration::from_secs(3600);
@@ -44,6 +49,9 @@ pub struct JoinTokenStore {
     persist_path: Option<PathBuf>,
     /// Serializes writes of the persisted file.
     persist_lock: Arc<Mutex<()>>,
+    /// Where the tokens live when replicated (then `inner` keeps only the
+    /// failure counts).
+    replicated: Option<FleetStateMachine>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -102,7 +110,55 @@ impl JoinTokenStore {
             inner: Arc::new(RwLock::new(State::default())),
             persist_path: None,
             persist_lock: Arc::new(Mutex::new(())),
+            replicated: None,
         }
+    }
+
+    /// Keep the tokens in `state`, replicated to every server.
+    pub fn with_replication(mut self, state: FleetStateMachine) -> Self {
+        self.replicated = Some(state);
+        self
+    }
+
+    /// Move the tokens loaded from a pre-replication `join_tokens.json` into
+    /// the replicated state and remove the file. Call on the leader.
+    pub async fn migrate_to_replicated(&self) -> Result<usize, crate::raft::RaftError> {
+        let (Some(state), Some(path)) = (&self.replicated, &self.persist_path) else {
+            return Ok(0);
+        };
+        let (tokens, consumed) = {
+            let mut local = self.inner.write().await;
+            (
+                std::mem::take(&mut local.tokens),
+                std::mem::take(&mut local.consumed),
+            )
+        };
+        let count = tokens.len() + consumed.len();
+        for (hash, entry) in tokens {
+            state
+                .apply_next(Command::JoinTokenPut {
+                    hash,
+                    node_name: entry.node_name,
+                    expires_at: entry.expires_at,
+                })
+                .await?;
+        }
+        for (hash, record) in consumed {
+            state
+                .apply_next(Command::JoinTokenPut {
+                    hash: hash.clone(),
+                    node_name: record.node_name,
+                    expires_at: record.expires_at,
+                })
+                .await?;
+            state.apply_next(Command::JoinTokenConsume { hash }).await?;
+        }
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => tracing::info!(count, "Moved join tokens from join_tokens.json into Raft"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(error = %e, "Could not remove the migrated join_tokens.json"),
+        }
+        Ok(count)
     }
 
     /// A store persisted to `join_tokens.json` under `data_dir`.
@@ -139,6 +195,9 @@ impl JoinTokenStore {
         let Some(path) = &self.persist_path else {
             return;
         };
+        if self.replicated.is_some() {
+            return;
+        }
         let _guard = self.persist_lock.lock().await;
         let data = {
             let state = self.inner.read().await;
@@ -173,6 +232,20 @@ impl JoinTokenStore {
         let token = generate_token();
         let now = now_epoch();
         let expires_at = now + ttl.as_secs();
+        if let Some(state) = &self.replicated {
+            state
+                .apply_next(Command::JoinTokenPut {
+                    hash: token_hash(&token),
+                    node_name: node_name.to_string(),
+                    expires_at,
+                })
+                .await
+                .map_err(|e| {
+                    AttestationError::Failed(format!("could not record the join token: {e}"))
+                })?;
+            tracing::info!(node = %node_name, expires_at, "Join token created");
+            return Ok((token, expires_at));
+        }
         self.inner.write().await.tokens.insert(
             token_hash(&token),
             TokenEntry {
@@ -190,6 +263,32 @@ impl JoinTokenStore {
     /// tokens expired.
     pub async fn expire(&self) -> usize {
         let now = now_epoch();
+        if let Some(state) = &self.replicated {
+            let tokens = state.join_tokens().await;
+            let removed = tokens
+                .values()
+                .filter(|t| t.expires_at <= now && t.consumed_at.is_none())
+                .count();
+            let stale = tokens.values().any(|t| t.expires_at <= now)
+                || state.acl_tokens().values().any(|t| t.expired_at(now));
+            if !stale {
+                return 0;
+            }
+            return match state.apply_next(Command::ExpireTokens).await {
+                Ok(_) => {
+                    if removed > 0 {
+                        tracing::info!(removed, "Expired unused join tokens");
+                    }
+                    removed
+                }
+                // The leader expires them.
+                Err(crate::raft::RaftError::NotLeader { .. }) => 0,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Could not expire tokens");
+                    0
+                }
+            };
+        }
         let (removed, changed) = {
             let mut state = self.inner.write().await;
             let tokens = state.tokens.len();
@@ -231,21 +330,46 @@ impl JoinTokenStore {
             }
         }
 
-        let failure = match state.tokens.get(&hash) {
-            _ if state.consumed.contains_key(&hash) => "join token already used",
-            None => "unknown join token",
-            Some(entry) if entry.expires_at <= now => "join token expired",
-            Some(entry) if entry.node_name != node_name => {
-                tracing::warn!(
-                    bound = %entry.node_name,
-                    presented = %node_name,
-                    "Join token presented for a different node name"
-                );
-                "join token is bound to a different node name"
+        let verdict = match &self.replicated {
+            Some(replicated) => {
+                // Not held across the commit: only failure counts live here.
+                drop(state);
+                let verdict = replicated
+                    .consume_join_token(&hash, |record| {
+                        check(
+                            record.map(|r| (r.consumed_at.is_some(), &*r.node_name, r.expires_at)),
+                            node_name,
+                            now,
+                        )
+                    })
+                    .await
+                    .map_err(|e| {
+                        AttestationError::Failed(format!("could not record the join token: {e}"))
+                    })?;
+                state = self.inner.write().await;
+                if verdict.is_ok() {
+                    drop(state);
+                    tracing::info!(node = %node_name, "Join token consumed");
+                    return Ok(());
+                }
+                verdict
             }
-            Some(_) => "",
+            None => check(
+                state
+                    .tokens
+                    .get(&hash)
+                    .map(|e| (false, &*e.node_name, e.expires_at))
+                    .or_else(|| {
+                        state
+                            .consumed
+                            .get(&hash)
+                            .map(|c| (true, &*c.node_name, c.expires_at))
+                    }),
+                node_name,
+                now,
+            ),
         };
-        if !failure.is_empty() {
+        if let Err(failure) = verdict {
             if state.failures.len() >= RATE_LIMIT_MAX_SOURCES {
                 state
                     .failures
@@ -278,6 +402,16 @@ impl JoinTokenStore {
     /// token. Only a consumed, unexpired token is restored.
     pub async fn release(&self, token: &str) {
         let hash = token_hash(token.trim());
+        if let Some(state) = &self.replicated {
+            let usable = state
+                .join_token(&hash)
+                .await
+                .is_some_and(|t| t.consumed_at.is_some() && t.expires_at > now_epoch());
+            if usable && let Err(e) = state.apply_next(Command::JoinTokenRelease { hash }).await {
+                tracing::warn!(error = %e, "Could not release the join token");
+            }
+            return;
+        }
         let restored = {
             let mut state = self.inner.write().await;
             match state.consumed.remove(&hash) {
@@ -302,7 +436,34 @@ impl JoinTokenStore {
 
     /// Number of live (unconsumed) tokens.
     pub async fn count(&self) -> usize {
-        self.inner.read().await.tokens.len()
+        match &self.replicated {
+            Some(state) => state
+                .join_tokens()
+                .await
+                .values()
+                .filter(|t| t.consumed_at.is_none())
+                .count(),
+            None => self.inner.read().await.tokens.len(),
+        }
+    }
+}
+
+/// Whether a token found as `(consumed, bound node name, expiry)` attests
+/// `node_name` at `now`, or why not.
+fn check(token: Option<(bool, &str, u64)>, node_name: &str, now: u64) -> Result<(), &'static str> {
+    match token {
+        Some((true, ..)) => Err("join token already used"),
+        None => Err("unknown join token"),
+        Some((_, _, expires_at)) if expires_at <= now => Err("join token expired"),
+        Some((_, bound, _)) if bound != node_name => {
+            tracing::warn!(
+                bound = %bound,
+                presented = %node_name,
+                "Join token presented for a different node name"
+            );
+            Err("join token is bound to a different node name")
+        }
+        Some(_) => Ok(()),
     }
 }
 
@@ -458,6 +619,92 @@ mod tests {
         // Releasing an unknown token is a no-op.
         store.release("unknown").await;
         assert_eq!(store.count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn replicated_tokens_are_consumed_once_cluster_wide() {
+        use crate::raft::consensus::testing::{Router, node};
+        use openraft::BasicNode;
+        use std::collections::BTreeMap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let router = Router::default();
+        let mut nodes = Vec::new();
+        for id in 1..=2u64 {
+            let (raft, state) = node(&router, id, dir.path().join(id.to_string()).as_path()).await;
+            state.attach(raft.clone());
+            nodes.push((raft, state));
+        }
+        nodes[0]
+            .0
+            .initialize(BTreeMap::from([
+                (1, BasicNode::new("s1:7400")),
+                (2, BasicNode::new("s2:7400")),
+            ]))
+            .await
+            .unwrap();
+        nodes[0]
+            .0
+            .wait(Some(Duration::from_secs(10)))
+            .metrics(|m| m.current_leader == Some(1), "leader")
+            .await
+            .unwrap();
+
+        // Tokens from a join_tokens.json written before replication move in.
+        let legacy = JoinTokenStore::with_persistence(dir.path());
+        let (old_used, _) = legacy.create("old-1", None).await.unwrap();
+        let (old_live, _) = legacy.create("old-2", None).await.unwrap();
+        attest(&legacy, old_used.as_bytes(), "old-1", SRC)
+            .await
+            .unwrap();
+        let leader =
+            JoinTokenStore::with_persistence(dir.path()).with_replication(nodes[0].1.clone());
+        leader.load().await.unwrap();
+        assert_eq!(leader.migrate_to_replicated().await.unwrap(), 2);
+        assert!(!dir.path().join("join_tokens.json").exists());
+
+        let (token, _) = leader.create("web-1", None).await.unwrap();
+        assert_eq!(leader.count().await, 2);
+        // Consumed through the leader once; then refused everywhere.
+        attest(&leader, token.as_bytes(), "web-1", SRC)
+            .await
+            .unwrap();
+        let follower = JoinTokenStore::new().with_replication(nodes[1].1.clone());
+        let mut replay = Ok(());
+        for _ in 0..100 {
+            replay = follower
+                .replicated
+                .as_ref()
+                .unwrap()
+                .join_token(&token_hash(&token))
+                .await
+                .and_then(|t| t.consumed_at)
+                .map_or(Ok(()), |_| Err(()));
+            if replay.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(replay.is_err(), "consumption replicated");
+        let again = attest(&leader, token.as_bytes(), "web-1", SRC).await;
+        assert!(matches!(again, Err(AttestationError::Failed(e)) if e.contains("already used")));
+        let replayed = attest(&leader, old_used.as_bytes(), "old-1", SRC).await;
+        assert!(matches!(replayed, Err(AttestationError::Failed(e)) if e.contains("already used")));
+        let wrong = attest(&leader, old_live.as_bytes(), "web-9", SRC).await;
+        assert!(matches!(wrong, Err(AttestationError::Failed(e)) if e.contains("different node")));
+
+        // Released after a failed issuance: usable again.
+        leader.release(&token).await;
+        attest(&leader, token.as_bytes(), "web-1", SRC)
+            .await
+            .unwrap();
+        // A follower cannot consume: it would race the leader.
+        let refused = attest(&follower, old_live.as_bytes(), "old-2", SRC).await;
+        assert!(matches!(refused, Err(AttestationError::Failed(e)) if e.contains("leader")));
+        assert_eq!(follower.expire().await, 0);
+        for (raft, _) in nodes {
+            raft.shutdown().await.unwrap();
+        }
     }
 
     #[tokio::test]

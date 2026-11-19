@@ -23,7 +23,7 @@ use crate::raft::consensus::{NodeId, Raft};
 
 /// A membership change refused or failed by Raft, as a gRPC status: a
 /// server that lost leadership meanwhile names the new leader.
-fn change_failed(e: RaftError) -> Status {
+pub(super) fn change_failed(e: RaftError) -> Status {
     match e {
         RaftError::NotLeader {
             leader_addr: Some(addr),
@@ -41,6 +41,14 @@ fn change_failed(e: RaftError) -> Status {
         }
         RaftError::NotLeader { .. } => Status::unavailable(e.to_string()),
         e => Status::failed_precondition(e.to_string()),
+    }
+}
+
+/// A fleet state write refused or failed by Raft, as a gRPC status.
+pub(super) fn write_failed(e: RaftError) -> Status {
+    match e {
+        RaftError::NotLeader { .. } => change_failed(e),
+        e => Status::internal(e.to_string()),
     }
 }
 

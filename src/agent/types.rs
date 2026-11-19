@@ -83,7 +83,7 @@ impl NodeIdentity {
 
     /// Replace the node SVID (in memory and on disk, atomically per file;
     /// the key is written first and is 0400).
-    pub(super) async fn install(
+    pub(crate) async fn install(
         &mut self,
         cert_pem: String,
         key_pem: zeroize::Zeroizing<String>,
