@@ -2362,7 +2362,7 @@ pub struct TlsConfig {
 /// rustls configuration of the gRPC listener: the server SVID is resolved
 /// on every handshake (so renewals apply to new connections), and client
 /// certificates are optional but must chain to the fleet CA when presented.
-fn grpc_tls_config(tls: &TlsConfig) -> anyhow::Result<rustls::ServerConfig> {
+pub(super) fn grpc_tls_config(tls: &TlsConfig) -> anyhow::Result<rustls::ServerConfig> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut roots = rustls::RootCertStore::empty();
     for cert in rustls_pemfile::certs(&mut tls.ca_cert_pem.as_bytes()) {
@@ -2392,7 +2392,7 @@ type GrpcTlsStream = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
 
 /// Accept connections on `listener` and complete their TLS handshakes
 /// concurrently, yielding established streams until `shutdown`.
-fn grpc_incoming(
+pub(super) fn grpc_incoming(
     listener: tokio::net::TcpListener,
     config: rustls::ServerConfig,
     shutdown: tokio_util::sync::CancellationToken,
@@ -2659,11 +2659,17 @@ pub async fn serve_grpc(
         service.audit_log.clone(),
     );
 
+    let raft_service = super::raft_rpc::RaftService::new(service.raft_state.clone(), &domain);
     let incoming = grpc_incoming(listener, tls_config, shutdown.clone());
     tonic::transport::Server::builder()
         .http2_keepalive_interval(Some(Duration::from_secs(20)))
         .http2_keepalive_timeout(Some(Duration::from_secs(10)))
         .add_service(FleetBootstrapServer::new(bootstrap))
+        .add_service(
+            crate::proto::raft_internal_server::RaftInternalServer::new(raft_service)
+                .max_decoding_message_size(super::raft_rpc::MAX_MESSAGE)
+                .max_encoding_message_size(super::raft_rpc::MAX_MESSAGE),
+        )
         .add_service(super::access_audit::AuditDenials::new(
             FleetControlServer::with_interceptor(service, interceptor),
             audit_log,

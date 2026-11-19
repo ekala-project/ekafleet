@@ -529,6 +529,8 @@ pub fn raft_config(cluster: &str) -> Result<openraft::Config, RaftError> {
         election_timeout_max: 2000,
         snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(1000),
         max_in_snapshot_log_to_keep: 100,
+        // JSON-encoded, a chunk stays well inside a gRPC message.
+        snapshot_max_chunk_size: 1024 * 1024,
         ..Default::default()
     }
     .validate()
@@ -622,65 +624,6 @@ pub async fn wait_leading(raft: &Raft, timeout: std::time::Duration) -> Result<(
         .await
         .map_err(|e| RaftError::Consensus(e.to_string()))?;
     Ok(())
-}
-
-/// A network without peers, for a server that runs alone.
-pub struct NoPeers;
-
-/// Every RPC from a [`NoPeers`] network fails as unreachable.
-pub struct NoPeer;
-
-impl openraft::RaftNetworkFactory<TypeConfig> for NoPeers {
-    type Network = NoPeer;
-
-    async fn new_client(&mut self, _target: NodeId, _node: &BasicNode) -> NoPeer {
-        NoPeer
-    }
-}
-
-fn no_peer<E: std::error::Error>() -> openraft::error::RPCError<NodeId, BasicNode, E> {
-    openraft::error::RPCError::Unreachable(openraft::error::Unreachable::new(
-        &std::io::Error::other("no Raft peers configured"),
-    ))
-}
-
-impl openraft::RaftNetwork<TypeConfig> for NoPeer {
-    async fn append_entries(
-        &mut self,
-        _rpc: openraft::raft::AppendEntriesRequest<TypeConfig>,
-        _option: openraft::network::RPCOption,
-    ) -> Result<
-        openraft::raft::AppendEntriesResponse<NodeId>,
-        openraft::error::RPCError<NodeId, BasicNode, openraft::error::RaftError<NodeId>>,
-    > {
-        Err(no_peer())
-    }
-
-    async fn install_snapshot(
-        &mut self,
-        _rpc: openraft::raft::InstallSnapshotRequest<TypeConfig>,
-        _option: openraft::network::RPCOption,
-    ) -> Result<
-        openraft::raft::InstallSnapshotResponse<NodeId>,
-        openraft::error::RPCError<
-            NodeId,
-            BasicNode,
-            openraft::error::RaftError<NodeId, openraft::error::InstallSnapshotError>,
-        >,
-    > {
-        Err(no_peer())
-    }
-
-    async fn vote(
-        &mut self,
-        _rpc: openraft::raft::VoteRequest<NodeId>,
-        _option: openraft::network::RPCOption,
-    ) -> Result<
-        openraft::raft::VoteResponse<NodeId>,
-        openraft::error::RPCError<NodeId, BasicNode, openraft::error::RaftError<NodeId>>,
-    > {
-        Err(no_peer())
-    }
 }
 
 #[cfg(test)]

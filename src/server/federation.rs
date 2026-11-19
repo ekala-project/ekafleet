@@ -122,7 +122,7 @@ pub fn split_spiffe_id(id: &str) -> Option<(&str, &str)> {
 }
 
 /// Whether `cert` carries a server SVID of `trust_domain`.
-fn is_server_of(cert: &CertificateDer<'_>, trust_domain: &str) -> bool {
+pub(crate) fn is_server_of(cert: &CertificateDer<'_>, trust_domain: &str) -> bool {
     SpiffeAuthorizer::extract_spiffe_id_from_der(cert.as_ref()).is_some_and(|id| {
         split_spiffe_id(&id).is_some_and(|(domain, path)| {
             domain == trust_domain && path.starts_with("/server/") && path.len() > "/server/".len()
@@ -130,7 +130,7 @@ fn is_server_of(cert: &CertificateDer<'_>, trust_domain: &str) -> bool {
     })
 }
 
-fn roots_from_pem(pem: &str) -> Result<RootCertStore, String> {
+pub(crate) fn roots_from_pem(pem: &str) -> Result<RootCertStore, String> {
     let mut roots = RootCertStore::empty();
     for cert in rustls_pemfile::certs(&mut pem.as_bytes()) {
         roots
@@ -262,10 +262,21 @@ impl ClientCertVerifier for PeerClientVerifier {
 /// CA and carries a server SVID of its trust domain (SVIDs have no DNS
 /// names to check).
 #[derive(Debug)]
-struct PeerServerVerifier {
+pub(crate) struct PeerServerVerifier {
     roots: Arc<RootCertStore>,
     trust_domain: String,
     provider: Arc<CryptoProvider>,
+}
+
+impl PeerServerVerifier {
+    /// Accept server SVIDs of `trust_domain` chaining to `roots`.
+    pub(crate) fn new(roots: Arc<RootCertStore>, trust_domain: &str) -> Self {
+        Self {
+            roots,
+            trust_domain: trust_domain.to_string(),
+            provider: provider(),
+        }
+    }
 }
 
 impl ServerCertVerifier for PeerServerVerifier {
