@@ -290,7 +290,7 @@ pub fn effective_namespace(namespace: &str) -> &str {
 }
 
 /// Metadata for a registered token.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenEntry {
     role: Role,
     description: String,
@@ -306,19 +306,26 @@ pub struct TokenEntry {
 
 impl TokenEntry {
     fn is_expired(&self) -> bool {
-        if let Some(exp) = self.expires_at {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            now >= exp
-        } else {
-            false
-        }
+        self.expired_at(now_epoch())
+    }
+
+    /// Whether it had expired at `now` (Unix seconds).
+    pub fn expired_at(&self, now: u64) -> bool {
+        self.expires_at.is_some_and(|exp| now >= exp)
     }
 }
 
-/// Token store that maps bearer tokens to roles with persistence.
+/// Description of the token from a server's `--token`.
+pub const INITIAL_ADMIN_TOKEN: &str = "initial admin token";
+
+/// Token store that maps bearer tokens to roles.
+///
+/// Tokens created through the API (`ekafleet acl token create`) are
+/// replicated through Raft when the store is backed by the fleet state
+/// ([`Self::with_replication`]), so every server accepts them. Tokens
+/// from a server's own configuration (`--token`) are local to that server.
+/// Without replication (`ekafleet dev`, tests) every token is local,
+/// optionally persisted to `tokens.json`.
 #[derive(Clone)]
 pub struct TokenStore {
     // A std lock: the gRPC interceptor authenticates synchronously, and no
@@ -327,6 +334,7 @@ pub struct TokenStore {
     persist_path: Option<PathBuf>,
     // Serializes snapshot+write so the last write on disk is the newest state.
     persist_lock: Arc<tokio::sync::Mutex<()>>,
+    replicated: Option<crate::raft::state::FleetStateMachine>,
 }
 
 impl Default for TokenStore {
@@ -348,15 +356,67 @@ impl TokenStore {
             tokens: Arc::new(RwLock::new(HashMap::new())),
             persist_path: None,
             persist_lock: Arc::default(),
+            replicated: None,
         }
+    }
+
+    /// Keep API-created tokens in `state`, replicated to every server.
+    pub fn with_replication(mut self, state: crate::raft::state::FleetStateMachine) -> Self {
+        self.replicated = Some(state);
+        self
+    }
+
+    /// Move the tokens loaded from a pre-replication `tokens.json` into the
+    /// replicated state and remove the file. Call on the leader.
+    pub async fn migrate_to_replicated(&self) -> Result<usize, crate::raft::RaftError> {
+        let (Some(state), Some(path)) = (&self.replicated, &self.persist_path) else {
+            return Ok(0);
+        };
+        let loaded: HashMap<String, TokenEntry> = match tokio::fs::read_to_string(path).await {
+            Ok(data) => match serde_json::from_str(&data) {
+                Ok(loaded) => loaded,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Unreadable tokens.json; not migrating it");
+                    return Ok(0);
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => {
+                tracing::warn!(error = %e, "Cannot read tokens.json; not migrating it");
+                return Ok(0);
+            }
+        };
+        let mut count = 0;
+        for (key, entry) in loaded {
+            // The configured admin token is registered locally at each boot.
+            if entry.is_expired() || entry.description == INITIAL_ADMIN_TOKEN {
+                continue;
+            }
+            state
+                .apply_next(crate::raft::state::Command::AclTokenPut {
+                    key: key.clone(),
+                    entry: entry.clone(),
+                })
+                .await?;
+            let mut local = self.write_tokens();
+            if local.get(&key) == Some(&entry) {
+                local.remove(&key);
+            }
+            count += 1;
+        }
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => tracing::info!(count, "Moved ACL tokens from tokens.json into Raft"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(error = %e, "Could not remove the migrated tokens.json"),
+        }
+        Ok(count)
     }
 
     /// Create a token store that persists tokens to the given directory.
     pub fn with_persistence(data_dir: &Path) -> Self {
         Self {
-            tokens: Arc::new(RwLock::new(HashMap::new())),
             persist_path: Some(data_dir.join("tokens.json")),
-            persist_lock: Arc::default(),
+            ..Self::new()
         }
     }
 
@@ -392,11 +452,15 @@ impl TokenStore {
         Ok(())
     }
 
-    /// Persist current tokens to disk.
+    /// Persist current tokens to disk (unless replicated: then the local
+    /// tokens come from configuration).
     async fn persist(&self) {
         let Some(path) = &self.persist_path else {
             return;
         };
+        if self.replicated.is_some() {
+            return;
+        }
         let _persisting = self.persist_lock.lock().await;
         let serialized = serde_json::to_string_pretty(&*self.read_tokens());
         match serialized {
@@ -411,13 +475,13 @@ impl TokenStore {
         }
     }
 
-    /// Register a token with a role. The initial admin token is registered at startup.
+    /// Register a token local to this server (e.g. the configured admin
+    /// token).
     pub async fn register(&self, token: &str, role: Role, description: &str) {
-        self.register_with_opts(token, role, description, None, None)
-            .await;
+        self.register_with_ttl(token, role, description, None).await;
     }
 
-    /// Register a token with a role and optional TTL in seconds.
+    /// Register a local token with a role and optional TTL in seconds.
     pub async fn register_with_ttl(
         &self,
         token: &str,
@@ -425,13 +489,32 @@ impl TokenStore {
         description: &str,
         ttl_secs: Option<u64>,
     ) {
-        self.register_with_opts(token, role, description, ttl_secs, None)
-            .await;
+        let entry = Self::entry(role, description, ttl_secs, None);
+        self.write_tokens().insert(token_key(token), entry);
+        tracing::info!(role = ?role, description = %description, "Token registered");
+        self.persist().await;
     }
 
-    /// Register a token with a role, optional TTL, and optional namespace binding.
-    /// When `namespace` is `Some`, the token can only access resources within that
-    /// namespace. `None` means fleet-wide (unrestricted) access.
+    fn entry(
+        role: Role,
+        description: &str,
+        ttl_secs: Option<u64>,
+        namespace: Option<String>,
+    ) -> TokenEntry {
+        let now = now_epoch();
+        TokenEntry {
+            role,
+            description: description.to_string(),
+            created_at: now,
+            expires_at: ttl_secs.map(|ttl| now + ttl),
+            namespace,
+        }
+    }
+
+    /// Create a token with a role, optional TTL, and optional namespace
+    /// binding, replicated when the store is. When `namespace` is `Some`,
+    /// the token can only access resources within that namespace. `None`
+    /// means fleet-wide (unrestricted) access.
     pub async fn register_with_opts(
         &self,
         token: &str,
@@ -439,26 +522,37 @@ impl TokenStore {
         description: &str,
         ttl_secs: Option<u64>,
         namespace: Option<String>,
-    ) {
-        let now = now_epoch();
-        let entry = TokenEntry {
-            role,
-            description: description.to_string(),
-            created_at: now,
-            expires_at: ttl_secs.map(|ttl| now + ttl),
-            namespace,
-        };
-        self.write_tokens().insert(token_key(token), entry);
+    ) -> Result<(), crate::raft::RaftError> {
+        let entry = Self::entry(role, description, ttl_secs, namespace);
+        match &self.replicated {
+            Some(state) => {
+                state
+                    .apply_next(crate::raft::state::Command::AclTokenPut {
+                        key: token_key(token),
+                        entry,
+                    })
+                    .await?;
+            }
+            None => {
+                self.write_tokens().insert(token_key(token), entry);
+                self.persist().await;
+            }
+        }
         tracing::info!(role = ?role, description = %description, "Token registered");
-        self.persist().await;
+        Ok(())
     }
 
     /// Authenticate a bearer token, returning its role and a stable,
     /// non-secret identity for audit logging. `None` for unknown or expired
     /// tokens. Synchronous so the gRPC interceptor can call it.
     pub fn authenticate_identity(&self, token: &str) -> Option<(Role, TokenIdentity)> {
-        let tokens = self.read_tokens();
-        let entry = tokens.get(&token_key(token))?;
+        let key = token_key(token);
+        let local = self.read_tokens().get(&key).cloned();
+        let entry = local.or_else(|| {
+            self.replicated
+                .as_ref()
+                .and_then(|state| state.acl_tokens().get(&key).cloned())
+        })?;
         if entry.is_expired() {
             return None;
         }
@@ -476,19 +570,35 @@ impl TokenStore {
         self.authenticate_identity(token).map(|(role, _)| role)
     }
 
-    /// Revoke a token.
-    pub async fn revoke(&self, token: &str) -> bool {
-        let removed = self.write_tokens().remove(&token_key(token)).is_some();
+    /// Revoke a token. A configured token is revoked on this server until
+    /// it restarts.
+    pub async fn revoke(&self, token: &str) -> Result<bool, crate::raft::RaftError> {
+        let key = token_key(token);
+        let mut removed = self.write_tokens().remove(&key).is_some();
         if removed {
             self.persist().await;
         }
-        removed
+        if let Some(state) = &self.replicated
+            && state.acl_tokens().contains_key(&key)
+        {
+            state
+                .apply_next(crate::raft::state::Command::AclTokenRevoke { key })
+                .await?;
+            removed = true;
+        }
+        Ok(removed)
     }
 
     /// List all tokens (returns description, role, and optional namespace).
     pub async fn list(&self) -> Vec<(String, Role, Option<String>)> {
+        let replicated = self
+            .replicated
+            .as_ref()
+            .map(|state| state.acl_tokens())
+            .unwrap_or_default();
         self.read_tokens()
             .values()
+            .chain(replicated.values())
             .filter(|e| !e.is_expired())
             .map(|e| (e.description.clone(), e.role, e.namespace.clone()))
             .collect()
@@ -555,9 +665,95 @@ mod tests {
     async fn token_store_revoke() {
         let store = TokenStore::new();
         store.register("tok", Role::Operator, "ci pipeline").await;
-        assert!(store.revoke("tok").await);
+        assert!(store.revoke("tok").await.unwrap());
         assert!(store.authenticate("tok").is_none());
-        assert!(!store.revoke("tok").await);
+        assert!(!store.revoke("tok").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn api_tokens_replicate_and_configured_tokens_stay_local() {
+        use crate::raft::consensus::testing::{Router, node};
+        use openraft::BasicNode;
+        use std::collections::BTreeMap;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let router = Router::default();
+        let mut nodes = Vec::new();
+        for id in 1..=2u64 {
+            let (raft, state) = node(&router, id, dir.path().join(id.to_string()).as_path()).await;
+            state.attach(raft.clone());
+            nodes.push((raft, state));
+        }
+        nodes[0]
+            .0
+            .initialize(BTreeMap::from([
+                (1, BasicNode::new("s1:7400")),
+                (2, BasicNode::new("s2:7400")),
+            ]))
+            .await
+            .unwrap();
+        nodes[0]
+            .0
+            .wait(Some(Duration::from_secs(10)))
+            .metrics(|m| m.current_leader == Some(1), "leader")
+            .await
+            .unwrap();
+
+        // A tokens.json from before replication moves into Raft.
+        let legacy = TokenStore::with_persistence(dir.path());
+        legacy.register("legacy", Role::Viewer, "old").await;
+        legacy
+            .register("old-admin", Role::Admin, INITIAL_ADMIN_TOKEN)
+            .await;
+        let leader = TokenStore::with_persistence(dir.path()).with_replication(nodes[0].1.clone());
+        leader.load().await.unwrap();
+        assert_eq!(leader.migrate_to_replicated().await.unwrap(), 1);
+        assert!(!dir.path().join("tokens.json").exists());
+
+        leader.register("configured", Role::Admin, "--token").await;
+        leader
+            .register_with_opts("ci", Role::Operator, "ci", None, Some("team-a".into()))
+            .await
+            .unwrap();
+        let follower = TokenStore::new().with_replication(nodes[1].1.clone());
+        let mut seen = None;
+        for _ in 0..100 {
+            seen = follower.authenticate_identity("ci");
+            if seen.is_some() && follower.authenticate("legacy").is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let (role, identity) = seen.expect("replicated token");
+        assert_eq!(role, Role::Operator);
+        assert_eq!(identity.namespace.as_deref(), Some("team-a"));
+        assert_eq!(follower.authenticate("legacy"), Some(Role::Viewer));
+        assert!(follower.authenticate("configured").is_none());
+        assert!(follower.authenticate("old-admin").is_none());
+        // legacy + ci replicated; configured + old-admin local.
+        assert_eq!(leader.list().await.len(), 4);
+
+        assert!(leader.revoke("ci").await.unwrap());
+        for _ in 0..100 {
+            if follower.authenticate("ci").is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(follower.authenticate("ci").is_none());
+        // Followers cannot write: the leader is named instead.
+        let refused = follower
+            .register_with_opts("x", Role::Viewer, "x", None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(refused, crate::raft::RaftError::NotLeader { .. }),
+            "{refused:?}"
+        );
+        for (raft, _) in nodes {
+            raft.shutdown().await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -747,7 +943,8 @@ mod tests {
                 None,
                 Some("team-a".into()),
             )
-            .await;
+            .await
+            .unwrap();
 
         let (role, identity) = store.authenticate_identity("ns-tok").expect("known token");
         assert_eq!(role, Role::Operator);
