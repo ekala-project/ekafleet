@@ -60,6 +60,7 @@ pub struct FleetConfig {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct IngressRouteConfig {
     /// Host header to match (without port), or `*` for any host.
+    #[serde(default = "default_ingress_host")]
     pub host: String,
     /// Path prefix to match; the longest matching prefix wins.
     #[serde(default = "default_ingress_path")]
@@ -74,10 +75,66 @@ pub struct IngressRouteConfig {
     /// ... and on these nodes. With neither, every node serves it.
     #[serde(default)]
     pub nodes: Vec<String>,
+    /// Send these shares of the traffic (percent) to other services; the
+    /// rest goes to `service`.
+    #[serde(default)]
+    pub split: Vec<IngressSplit>,
+    /// Requests per client IP (HTTP routes).
+    #[serde(default)]
+    pub rate_limit: Option<IngressRateLimit>,
+    /// Send each client to the same replica while it serves.
+    #[serde(default)]
+    pub affinity: Option<IngressAffinity>,
+    /// Forward TCP connections on this port instead of routing HTTP.
+    #[serde(default)]
+    pub tcp_port: Option<u16>,
+    /// Serve the route over HTTPS with this certificate.
+    #[serde(default)]
+    pub tls: Option<IngressTls>,
+    /// Accept only clients presenting the SVID of one of these services
+    /// (requires `tls`).
+    #[serde(default)]
+    pub allowed_callers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct IngressSplit {
+    /// Default-namespace service declaring the route's port.
+    pub service: String,
+    /// Percent of the traffic, 1-100.
+    pub weight: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct IngressRateLimit {
+    pub requests_per_second: f64,
+    pub burst: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum IngressAffinity {
+    ClientIp,
+}
+
+/// Names of static secrets in the `_fleet` scope holding PEM.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct IngressTls {
+    /// The certificate chain, leaf first.
+    pub cert_secret: String,
+    /// The private key (PKCS#8, PKCS#1 or SEC1).
+    pub key_secret: String,
 }
 
 fn default_ingress_path() -> String {
     "/".to_string()
+}
+
+fn default_ingress_host() -> String {
+    "*".to_string()
 }
 
 impl IngressRouteConfig {
@@ -86,6 +143,12 @@ impl IngressRouteConfig {
         (self.pools.is_empty() && self.nodes.is_empty())
             || self.nodes.iter().any(|n| n == node)
             || self.pools.iter().any(|p| p == pool)
+    }
+
+    /// The services receiving the route's traffic: `service`, then those
+    /// of `split`.
+    pub fn services(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.service.as_str()).chain(self.split.iter().map(|s| s.service.as_str()))
     }
 }
 
@@ -1744,6 +1807,8 @@ fn validate_ingress(config: &FleetConfig, errors: &mut Vec<String>) {
     let mut routes: Vec<_> = config.ingress.iter().collect();
     routes.sort_by_key(|(name, _)| name.as_str());
     let mut matches = std::collections::HashMap::new();
+    let mut tcp_ports = std::collections::HashMap::new();
+    let mut certificates = std::collections::HashMap::new();
     for (name, route) in routes {
         let at = format!("ingress '{name}'");
         if !is_dns_label(name) {
@@ -1758,27 +1823,95 @@ fn validate_ingress(config: &FleetConfig, errors: &mut Vec<String>) {
         if !route.path.starts_with('/') || route.path.contains(['?', '#']) {
             errors.push(format!("{at}: path '{}' must start with '/'", route.path));
         }
-        if let Some(other) = matches.insert((route.host.as_str(), route.path.as_str()), name) {
+        if let Some(port) = route.tcp_port {
+            if port == 0 {
+                errors.push(format!("{at}: tcpPort must not be 0"));
+            }
+            if let Some(other) = tcp_ports.insert(port, name) {
+                errors.push(format!(
+                    "ingress '{other}' and '{name}' both use tcpPort {port}"
+                ));
+            }
+            if route.host != "*" || route.path != "/" {
+                errors.push(format!("{at}: a tcpPort route matches no host or path"));
+            }
+            for (set, option) in [
+                (route.rate_limit.is_some(), "rateLimit"),
+                (route.tls.is_some(), "tls"),
+                (!route.allowed_callers.is_empty(), "allowedCallers"),
+            ] {
+                if set {
+                    errors.push(format!(
+                        "{at}: {option} applies to HTTP routes, not tcpPort"
+                    ));
+                }
+            }
+        } else if let Some(other) = matches.insert((route.host.as_str(), route.path.as_str()), name)
+        {
             errors.push(format!(
                 "ingress '{other}' and '{name}' both route {}{}",
                 route.host, route.path
             ));
         }
-        match config.services.get(&route.service) {
-            None => errors.push(format!("{at}: service '{}' is not defined", route.service)),
-            Some(service) => {
-                if !crate::agent::netns::is_default_namespace(&service.namespace) {
-                    errors.push(format!(
-                        "{at}: service '{}' is in namespace '{}': ingress reaches default-namespace services only",
-                        route.service, service.namespace
-                    ));
+        let mut seen = std::collections::HashSet::new();
+        for target in route.services() {
+            if !seen.insert(target) {
+                errors.push(format!("{at}: service '{target}' is listed twice"));
+                continue;
+            }
+            match config.services.get(target) {
+                None => errors.push(format!("{at}: service '{target}' is not defined")),
+                Some(service) => {
+                    if !crate::agent::netns::is_default_namespace(&service.namespace) {
+                        errors.push(format!(
+                            "{at}: service '{target}' is in namespace '{}': ingress reaches default-namespace services only",
+                            service.namespace
+                        ));
+                    }
+                    if !service.ports.contains_key(&route.port) {
+                        errors.push(format!(
+                            "{at}: service '{target}' declares no port '{}'",
+                            route.port
+                        ));
+                    }
                 }
-                if !service.ports.contains_key(&route.port) {
-                    errors.push(format!(
-                        "{at}: service '{}' declares no port '{}'",
-                        route.service, route.port
-                    ));
+            }
+        }
+        if route.split.iter().any(|s| s.weight == 0 || s.weight > 100) {
+            errors.push(format!("{at}: split weights must be 1-100"));
+        } else if route.split.iter().map(|s| s.weight).sum::<u32>() > 100 {
+            errors.push(format!("{at}: split weights must add up to at most 100"));
+        }
+        if let Some(limit) = &route.rate_limit
+            && (!limit.requests_per_second.is_finite()
+                || limit.requests_per_second <= 0.0
+                || limit.burst == 0)
+        {
+            errors.push(format!(
+                "{at}: rateLimit needs requestsPerSecond > 0 and burst >= 1"
+            ));
+        }
+        if let Some(tls) = &route.tls {
+            for secret in [&tls.cert_secret, &tls.key_secret] {
+                if let Err(e) = crate::secrets::validate_name("secret", secret) {
+                    errors.push(format!("{at}: tls: {e}"));
                 }
+            }
+            if let Some((other, other_tls)) = certificates.insert(route.host.as_str(), (name, tls))
+                && other_tls != tls
+            {
+                errors.push(format!(
+                    "ingress '{other}' and '{name}' serve host {} with different certificates",
+                    route.host
+                ));
+            }
+        }
+        if !route.allowed_callers.is_empty() && route.tls.is_none() {
+            errors.push(format!("{at}: allowedCallers requires tls"));
+        }
+        for caller in &route.allowed_callers {
+            if !config.services.contains_key(caller) {
+                errors.push(format!("{at}: allowed caller '{caller}' is not a service"));
             }
         }
         for pool in &route.pools {
@@ -2334,6 +2467,7 @@ mod nix_module_tests {
                 "nodePools": {"edge": {}},
                 "services": {
                     "web": {"command": "/bin/web", "ports": {"http": {"port": 8080}}},
+                    "web-v2": {"command": "/bin/web", "ports": {"http": {"port": 8081}}},
                     "shop": {"command": "/bin/shop", "namespace": "tenant", "ports": {"http": {"port": 80}}},
                 },
                 "ingress": ingress,
@@ -2344,6 +2478,11 @@ mod nix_module_tests {
             "site": {"host": "www.example.com", "service": "web", "port": "http", "pools": ["edge"]},
             "api": {"host": "www.example.com", "path": "/api", "service": "web", "port": "http"},
             "any": {"host": "*", "service": "web", "port": "http", "nodes": ["n1"]},
+            "canary": {"host": "c.example.com", "service": "web", "port": "http",
+                       "split": [{"service": "web-v2", "weight": 10}],
+                       "rateLimit": {"requestsPerSecond": 5.5, "burst": 10}, "affinity": "clientIp",
+                       "tls": {"certSecret": "c-crt", "keySecret": "c-key"}, "allowedCallers": ["web"]},
+            "db": {"service": "web", "port": "http", "tcpPort": 5432, "affinity": "clientIp"},
         }));
         assert!(validate(&ok).is_ok(), "{:?}", validate(&ok));
         assert_eq!(ok.ingress["site"].path, "/");
@@ -2362,6 +2501,20 @@ mod nix_module_tests {
             "namespaced": {"host": "d.test", "service": "shop", "port": "http"},
             "noport": {"host": "e.test", "service": "web", "port": "grpc"},
             "nopool": {"host": "f.test", "service": "web", "port": "http", "pools": ["gpu"]},
+            "heavy": {"host": "g.test", "service": "web", "port": "http",
+                      "split": [{"service": "web2", "weight": 60}, {"service": "web3", "weight": 50}]},
+            "self": {"host": "h.test", "service": "web", "port": "http",
+                     "split": [{"service": "web", "weight": 10}]},
+            "tcp-a": {"service": "web", "port": "http", "tcpPort": 5432},
+            "tcp-b": {"service": "web", "port": "http", "tcpPort": 5432, "host": "i.test",
+                      "rateLimit": {"requestsPerSecond": 1, "burst": 1}},
+            "slow": {"host": "j.test", "service": "web", "port": "http",
+                     "rateLimit": {"requestsPerSecond": 0, "burst": 1}},
+            "plain-callers": {"host": "k.test", "service": "web", "port": "http", "allowedCallers": ["nobody"]},
+            "cert-a": {"host": "l.test", "service": "web", "port": "http",
+                       "tls": {"certSecret": "a-crt", "keySecret": "a-key"}},
+            "cert-b": {"host": "l.test", "path": "/b", "service": "web", "port": "http",
+                       "tls": {"certSecret": "b-crt", "keySecret": "b-key"}},
         }));
         let errors = validate(&bad).unwrap_err().join("\n");
         for expected in [
@@ -2373,6 +2526,16 @@ mod nix_module_tests {
             "ingress reaches default-namespace services only",
             "declares no port 'grpc'",
             "pool 'gpu' is not defined",
+            "service 'web2' is not defined",
+            "'heavy': split weights must add up to at most 100",
+            "'self': service 'web' is listed twice",
+            "ingress 'tcp-a' and 'tcp-b' both use tcpPort 5432",
+            "'tcp-b': a tcpPort route matches no host or path",
+            "'tcp-b': rateLimit applies to HTTP routes, not tcpPort",
+            "'slow': rateLimit needs requestsPerSecond > 0",
+            "'plain-callers': allowedCallers requires tls",
+            "allowed caller 'nobody' is not a service",
+            "ingress 'cert-a' and 'cert-b' serve host l.test with different certificates",
         ] {
             assert!(errors.contains(expected), "{expected}: {errors}");
         }

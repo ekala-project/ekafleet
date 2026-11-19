@@ -456,6 +456,9 @@ message ServerMessage {
 // the previous set; an empty set serves nothing.
 message IngressUpdate {
   repeated IngressRoute routes = 1;
+  // PEM of the fleet root CA, which client SVIDs of routes with
+  // allowed_callers chain to.
+  string client_ca = 2;
 }
 
 message IngressRoute {
@@ -466,6 +469,33 @@ message IngressRoute {
   string path_prefix = 3;
   // Serving replicas as "ip:port" (mesh addresses).
   repeated string backends = 4;
+  // Other services taking a share of the traffic; `backends` take the
+  // rest (100 minus their weights).
+  repeated IngressSplitBackends split = 5;
+  // Forward TCP connections on this port; host and path_prefix unused.
+  uint32 tcp_port = 6;
+  // Per client IP; absent: unlimited.
+  IngressRateLimit rate_limit = 7;
+  bool client_ip_affinity = 8;
+  // Names of `_fleet` secrets holding the certificate chain and key; the
+  // values reach the node as secret updates.
+  string tls_cert_secret = 9;
+  string tls_key_secret = 10;
+  // SPIFFE IDs a client certificate must carry; empty: no client
+  // certificate needed.
+  repeated string allowed_callers = 11;
+}
+
+message IngressSplitBackends {
+  string service = 1;
+  // Percent of the route's traffic.
+  uint32 weight = 2;
+  repeated string backends = 3;
+}
+
+message IngressRateLimit {
+  double requests_per_second = 1;
+  uint32 burst = 2;
 }
 
 // The node's WireGuard mesh address, allocated by the server. Sent on

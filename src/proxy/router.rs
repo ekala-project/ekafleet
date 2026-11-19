@@ -95,7 +95,7 @@ impl ProxyRouter {
 }
 
 /// `host[:port]` or `[v6][:port]` → host.
-fn host_without_port(host: &str) -> &str {
+pub(crate) fn host_without_port(host: &str) -> &str {
     if let Some(rest) = host.strip_prefix('[') {
         return rest.split(']').next().unwrap_or(rest);
     }

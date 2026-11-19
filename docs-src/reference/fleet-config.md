@@ -719,12 +719,18 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" http://server:7402/v1/alerts/si
 
 ```nix
 ingress.<name> = {
-  host = "www.example.com";  # Host header without port, or "*" (required)
+  host = "www.example.com";  # Host header without port, or "*" (default "*")
   path = "/";                # path prefix (default "/")
   service = "web";           # default-namespace service (required)
   port = "http";             # name of one of its ports (required)
   pools = [ "edge" ];        # serve on nodes of these pools
   nodes = [ "edge-1" ];      # and on these nodes; with neither, every node
+  split = [ { service = "web-v2"; weight = 10; } ];    # percent to other services
+  affinity = "clientIp";                               # sticky replica per client IP
+  rateLimit = { requestsPerSecond = 20; burst = 40; }; # per client IP (HTTP only)
+  tcpPort = null;            # forward TCP on this port instead (host/path unset)
+  tls = { certSecret = "www-crt"; keySecret = "www-key"; };  # `_fleet` secrets (PEM)
+  allowedCallers = [ "backoffice" ];                   # require these services' SVIDs (needs tls)
 };
 ```
 

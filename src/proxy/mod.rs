@@ -1,5 +1,6 @@
 pub mod affinity;
 pub mod circuit;
+pub mod ingress;
 pub mod l4;
 pub mod listener;
 pub mod mtls;
@@ -8,5 +9,6 @@ pub mod router;
 pub mod routes;
 pub mod splitting;
 pub mod standalone;
+pub mod tls;
 pub mod tracing_ctx;
 pub mod upstream;

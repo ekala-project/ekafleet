@@ -101,6 +101,22 @@ impl UpstreamPool {
     }
 
     /// Eject an endpoint that failed for [`EJECT_FOR`].
+    /// The endpoints of `service_name` that may take traffic now.
+    pub async fn usable_endpoints(&self, service_name: &str) -> Vec<SocketAddr> {
+        let state = self.inner.read().await;
+        let now = Instant::now();
+        state
+            .services
+            .get(service_name)
+            .map_or_else(Vec::new, |pool| {
+                pool.endpoints
+                    .iter()
+                    .filter(|e| e.usable(now))
+                    .map(|e| e.addr)
+                    .collect()
+            })
+    }
+
     pub async fn mark_unhealthy(&self, service_name: &str, addr: SocketAddr) {
         let mut state = self.inner.write().await;
         if let Some(pool) = state.services.get_mut(service_name) {
