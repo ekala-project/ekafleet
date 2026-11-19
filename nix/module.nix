@@ -262,12 +262,25 @@ in
         description = "Listen address of the ingress proxy.";
       };
 
+      proxyTlsListen = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "0.0.0.0:443";
+        description = ''
+          HTTPS listen address of the ingress proxy, for routes with `tls`.
+          When set, plain-HTTP requests for those routes are redirected
+          here. Unset: TLS routes are served over plain HTTP.
+        '';
+      };
+
       proxyOpenFirewall = lib.mkOption {
         type = lib.types.bool;
         default = false;
         description = ''
-          Open the ingress proxy's port in the firewall. Enable on nodes
-          that serve `ingress` routes.
+          Open the ingress proxy's ports (HTTP, and HTTPS when
+          `proxyTlsListen` is set) in the firewall. Enable on nodes that
+          serve `ingress` routes. Ports of `tcpPort` routes are not opened;
+          add them to `networking.firewall.allowedTCPPorts`.
         '';
       };
 
@@ -579,9 +592,15 @@ in
       networking.firewall.trustedInterfaces = lib.mkIf (
         cfg.agent.mesh.enable && cfg.agent.mesh.trustInterface
       ) [ "wg-fleet" ];
-      networking.firewall.allowedTCPPorts = lib.mkIf cfg.agent.proxyOpenFirewall [
-        (lib.toInt (lib.last (lib.splitString ":" cfg.agent.proxyListen)))
-      ];
+      networking.firewall.allowedTCPPorts = lib.mkIf cfg.agent.proxyOpenFirewall (
+        map (listen: lib.toInt (lib.last (lib.splitString ":" listen))) (
+          [ cfg.agent.proxyListen ]
+          ++ lib.optional (cfg.agent.proxyTlsListen != null) cfg.agent.proxyTlsListen
+        )
+      );
+
+      # Route keys in /run/ekafleet/ingress-tls are readable by this group.
+      users.groups.ekafleet-proxy = { };
 
       assertions = [
         {
@@ -686,12 +705,16 @@ in
           Restart = "on-failure";
           RestartSec = 5;
 
-          ExecStart = "${cfg.agent.package}/bin/ekafleet proxy --listen ${cfg.agent.proxyListen} --trust-domain ${cfg.agent.domain} --data-dir ${cfg.agent.dataDir}";
+          ExecStart = "${cfg.agent.package}/bin/ekafleet proxy --listen ${cfg.agent.proxyListen} --trust-domain ${cfg.agent.domain} --data-dir ${cfg.agent.dataDir}${
+            lib.optionalString (cfg.agent.proxyTlsListen != null) " --tls-listen ${cfg.agent.proxyTlsListen}"
+          }";
 
           # Unprivileged except CAP_NET_BIND_SERVICE for ports < 1024.
           # Handles untrusted network traffic but has no access to
           # root privileges, the fleet key, or systemd units.
           DynamicUser = true;
+          # Reads the keys of TLS routes.
+          SupplementaryGroups = [ "ekafleet-proxy" ];
           CapabilityBoundingSet = [ "CAP_NET_BIND_SERVICE" ];
           AmbientCapabilities = [ "CAP_NET_BIND_SERVICE" ];
           NoNewPrivileges = true;

@@ -190,4 +190,6 @@ pub struct AgentConfig {
 pub(super) struct LocalState {
     pub(super) desired_services: HashMap<String, crate::proto::ServiceSpec>,
     pub(super) system_path: String,
+    /// The last ingress routes, rewritten when a certificate arrives.
+    pub(super) ingress: Option<crate::proto::IngressUpdate>,
 }

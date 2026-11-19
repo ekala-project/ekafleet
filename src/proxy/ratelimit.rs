@@ -88,6 +88,15 @@ impl RateLimiter {
 
     /// Check if a request to the given service is allowed.
     /// Returns true if within rate limit, false if rate limited.
+    /// Forget keys whose bucket has refilled: they behave as new keys do.
+    pub async fn prune(&self) {
+        let mut buckets = self.buckets.write().await;
+        buckets.retain(|_, bucket| {
+            bucket.refill();
+            bucket.tokens < bucket.capacity
+        });
+    }
+
     pub async fn allow(&self, service_name: &str) -> bool {
         let mut buckets = self.buckets.write().await;
         let bucket = buckets

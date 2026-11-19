@@ -111,6 +111,41 @@ impl SecretInjector {
         Ok(true)
     }
 
+    /// The value of a written secret, if it has one.
+    pub async fn read(
+        &self,
+        service_name: &str,
+        secret_name: &str,
+    ) -> Result<Option<Zeroizing<Vec<u8>>>, SecretInjectorError> {
+        let path = self.path(service_name, secret_name)?;
+        match tokio::fs::read(&path).await {
+            Ok(value) => Ok(Some(Zeroizing::new(value))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Delete the files of `service_name`'s secrets other than `keep`.
+    pub async fn retain_secrets(
+        &self,
+        service_name: &str,
+        keep: &HashSet<&str>,
+    ) -> Result<(), SecretInjectorError> {
+        let mut files = match tokio::fs::read_dir(self.service_dir(service_name)).await {
+            Ok(files) => files,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        while let Some(file) = files.next_entry().await? {
+            let name = file.file_name().to_string_lossy().into_owned();
+            if !keep.contains(name.as_str()) {
+                tokio::fs::remove_file(file.path()).await?;
+                tracing::info!(service = %service_name, secret = %name, "Unused secret removed");
+            }
+        }
+        Ok(())
+    }
+
     /// Remove one secret's file. Returns whether it existed.
     pub async fn remove(
         &self,
@@ -150,6 +185,11 @@ impl SecretInjector {
         };
         while let Some(service) = services.next_entry().await? {
             let name = service.file_name().to_string_lossy().into_owned();
+            if name == super::FLEET_SCOPE {
+                // Fleet secrets the node needs (ingress certificates) are
+                // pruned by their user.
+                continue;
+            }
             let Some(keep) = declared.get(&name) else {
                 tokio::fs::remove_dir_all(service.path()).await?;
                 tracing::info!(service = %name, "Secrets of unassigned service removed");

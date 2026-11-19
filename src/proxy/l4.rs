@@ -1,148 +1,132 @@
-#![allow(dead_code)]
+//! Listeners of TCP ingress routes (`tcpPort`): each forwards connections
+//! to a backend of its route, chosen like an HTTP request's.
 
-use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::collections::{BTreeSet, HashMap};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpListener;
-use tokio::sync::RwLock;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
-use crate::proxy::upstream::UpstreamPool;
+use super::ingress::Ingress;
+use super::routes::RoutesFile;
 
-/// L4 TCP proxy that forwards raw TCP connections to upstream services.
-/// Used for non-HTTP protocols (databases, gRPC, AMQP, custom TCP).
+/// How long a backend may take to accept a connection.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Backends tried per connection.
+const ATTEMPTS: usize = 3;
+
+/// The listeners of TCP routes, on one address.
 #[derive(Clone)]
-pub struct L4Proxy {
-    upstream: UpstreamPool,
-    bindings: Arc<RwLock<HashMap<String, L4Binding>>>,
+pub struct TcpRoutes {
+    ip: IpAddr,
+    listening: Arc<Mutex<HashMap<u16, (SocketAddr, CancellationToken)>>>,
 }
 
-/// A single L4 proxy binding: listen address → service.
-struct L4Binding {
-    service_name: String,
-    listen_addr: SocketAddr,
-}
-
-impl L4Proxy {
-    pub fn new(upstream: UpstreamPool) -> Self {
+impl TcpRoutes {
+    pub fn new(ip: IpAddr) -> Self {
         Self {
-            upstream,
-            bindings: Arc::new(RwLock::new(HashMap::new())),
+            ip,
+            listening: Arc::default(),
         }
     }
 
-    /// Register a TCP proxy binding: connections to `listen_addr` are forwarded
-    /// to an upstream endpoint for `service_name`.
-    pub async fn bind(&self, name: &str, service_name: &str, listen_addr: SocketAddr) {
-        let mut bindings = self.bindings.write().await;
-        bindings.insert(
-            name.to_string(),
-            L4Binding {
-                service_name: service_name.to_string(),
-                listen_addr,
-            },
-        );
-        tracing::info!(
-            name = %name,
-            service = %service_name,
-            addr = %listen_addr,
-            "L4 proxy binding registered"
-        );
+    /// The addresses listened on, by route port.
+    pub async fn listening(&self) -> HashMap<u16, SocketAddr> {
+        let listening = self.listening.lock().await;
+        listening.iter().map(|(p, (a, _))| (*p, *a)).collect()
     }
 
-    /// Start all registered L4 proxy listeners.
-    /// Each binding spawns an independent accept loop.
-    pub async fn start(&self) -> Result<(), std::io::Error> {
-        let bindings = self.bindings.read().await;
-        for (name, binding) in bindings.iter() {
-            let listener = TcpListener::bind(binding.listen_addr).await?;
-            let upstream = self.upstream.clone();
-            let service_name = binding.service_name.clone();
-            let binding_name = name.clone();
-
-            tokio::spawn(async move {
-                tracing::info!(
-                    name = %binding_name,
-                    addr = %listener.local_addr().unwrap(),
-                    service = %service_name,
-                    "L4 proxy listener started"
-                );
-
-                loop {
-                    match listener.accept().await {
-                        Ok((inbound, peer)) => {
-                            let upstream = upstream.clone();
-                            let svc = service_name.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) =
-                                    handle_l4_connection(inbound, peer, &upstream, &svc).await
-                                {
-                                    tracing::debug!(
-                                        peer = %peer,
-                                        service = %svc,
-                                        error = %e,
-                                        "L4 proxy connection error"
-                                    );
-                                }
-                            });
-                        }
-                        Err(e) => {
-                            tracing::error!(error = %e, "L4 proxy accept error");
-                        }
-                    }
+    /// Listen on exactly the ports of `routes`' TCP routes. A port that
+    /// cannot be bound is logged and tried again on the next call.
+    pub async fn sync(&self, routes: &RoutesFile, ingress: &Ingress) {
+        let wanted: BTreeSet<u16> = routes.routes.iter().filter_map(|r| r.tcp_port).collect();
+        let mut listening = self.listening.lock().await;
+        listening.retain(|port, (_, stop)| {
+            let keep = wanted.contains(port);
+            if !keep {
+                stop.cancel();
+                tracing::info!(port, "TCP route listener stopped");
+            }
+            keep
+        });
+        for port in wanted {
+            if listening.contains_key(&port) {
+                continue;
+            }
+            let listener = match TcpListener::bind((self.ip, port)).await {
+                Ok(listener) => listener,
+                Err(e) => {
+                    tracing::warn!(port, error = %e, "Cannot listen for a TCP route");
+                    continue;
                 }
-            });
+            };
+            let addr = listener.local_addr().unwrap_or((self.ip, port).into());
+            let stop = CancellationToken::new();
+            tokio::spawn(accept_loop(listener, port, ingress.clone(), stop.clone()));
+            tracing::info!(port, addr = %addr, "TCP route listener started");
+            listening.insert(port, (addr, stop));
         }
-
-        Ok(())
     }
 }
 
-/// Handle a single L4 connection by selecting an upstream and performing
-/// bidirectional byte copying.
-async fn handle_l4_connection(
-    inbound: impl AsyncRead + AsyncWrite + Unpin,
-    peer: SocketAddr,
-    upstream: &UpstreamPool,
-    service_name: &str,
-) -> Result<(), std::io::Error> {
-    let endpoint = upstream
-        .next_endpoint(service_name)
-        .await
-        .ok_or_else(|| std::io::Error::other("no healthy upstream"))?;
-
-    tracing::debug!(
-        peer = %peer,
-        upstream = %endpoint,
-        service = %service_name,
-        "L4 proxy connecting"
-    );
-
-    let outbound = tokio::net::TcpStream::connect(endpoint)
-        .await
-        .inspect_err(|_| {
-            upstream.mark_unhealthy_sync(service_name, endpoint);
-        })?;
-
-    let (mut ri, mut wi) = tokio::io::split(inbound);
-    let (mut ro, mut wo) = tokio::io::split(outbound);
-
-    let client_to_server = tokio::io::copy(&mut ri, &mut wo);
-    let server_to_client = tokio::io::copy(&mut ro, &mut wi);
-
-    tokio::select! {
-        r = client_to_server => {
-            if let Err(e) = r {
-                tracing::debug!(error = %e, "L4 client→server copy ended");
+async fn accept_loop(listener: TcpListener, port: u16, ingress: Ingress, stop: CancellationToken) {
+    loop {
+        let accepted = tokio::select! {
+            _ = stop.cancelled() => return,
+            accepted = listener.accept() => accepted,
+        };
+        match accepted {
+            Ok((inbound, client)) => {
+                let ingress = ingress.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = forward(inbound, client, port, &ingress).await {
+                        tracing::debug!(port, client = %client, error = %e, "TCP route connection ended");
+                    }
+                });
             }
-        }
-        r = server_to_client => {
-            if let Err(e) = r {
-                tracing::debug!(error = %e, "L4 server→client copy ended");
+            Err(e) => {
+                tracing::warn!(port, error = %e, "TCP route accept failed");
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
     }
+}
 
-    Ok(())
+async fn forward(
+    mut inbound: TcpStream,
+    client: SocketAddr,
+    port: u16,
+    ingress: &Ingress,
+) -> std::io::Result<()> {
+    let (route, options) = ingress
+        .routes
+        .tcp(port)
+        .await
+        .ok_or_else(|| std::io::Error::other("no route"))?;
+    for _ in 0..ATTEMPTS {
+        let Some((pool, endpoint)) = options.pick(&ingress.upstream, client.ip()).await else {
+            break;
+        };
+        match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(endpoint)).await {
+            Ok(Ok(mut outbound)) => {
+                tracing::debug!(route = %route, client = %client, upstream = %endpoint, "TCP route connected");
+                tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await?;
+                return Ok(());
+            }
+            Ok(Err(e)) => {
+                tracing::debug!(route = %route, upstream = %endpoint, error = %e, "TCP backend refused");
+            }
+            Err(_) => {
+                tracing::debug!(route = %route, upstream = %endpoint, "TCP backend timed out");
+            }
+        }
+        ingress.upstream.mark_unhealthy(&pool, endpoint).await;
+    }
+    Err(std::io::Error::other(format!(
+        "route {route}: no backend accepted"
+    )))
 }

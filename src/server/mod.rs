@@ -257,6 +257,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         identity: server_identity.clone(),
         ca_cert_pem: String::from_utf8(ca_chain_pem)?,
     };
+    let client_ca = tls.ca_cert_pem.clone();
 
     // Optional HTTPS for the REST API. Opt-in via EKAFLEET_HTTP_TLS; when set,
     // the REST server reuses the server SVID (combined cert-chain + key bundle)
@@ -504,8 +505,12 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
                 .with_external(raft_state.clone(), external_health)
                 .with_federation(federation_view.clone())
                 .spawn(term.child_token());
-            ingress::IngressPublisher::new(fleet_state.clone(), raft_state.clone())
-                .spawn(term.child_token());
+            ingress::IngressPublisher::new(
+                fleet_state.clone(),
+                raft_state.clone(),
+                client_ca.clone(),
+            )
+            .spawn(term.child_token());
             netpolicy::PolicyPublisher::new(fleet_state.clone(), raft_state.clone())
                 .spawn(term.child_token());
             autoscaler::Autoscaler {
