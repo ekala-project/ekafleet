@@ -345,23 +345,43 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         )
     })?;
     let alone = members.len() == 1;
-    crate::raft::consensus::form_cluster(&raft, members, |id, node| {
-        let network = network.clone();
+    let forming = {
+        let (raft, network) = (raft.clone(), network.clone());
         async move {
-            match network.status(&node.addr).await {
-                // Any member or log means it belongs to a cluster already.
-                Ok(status) => !status.members.is_empty() || status.last_log_index > 0,
-                Err(e) => {
-                    tracing::info!(peer = id, addr = %node.addr, error = %e, "Peer not reachable");
-                    false
+            crate::raft::consensus::form_cluster(&raft, members, |id, node| {
+                let network = network.clone();
+                async move {
+                    use crate::raft::consensus::PeerState;
+                    match network.status(&node.addr).await {
+                        // Any member or log means it belongs to a cluster.
+                        Ok(s) if !s.members.is_empty() || s.last_log_index > 0 => {
+                            PeerState::Clustered
+                        }
+                        Ok(_) => PeerState::Empty,
+                        Err(e) => {
+                            tracing::debug!(peer = id, addr = %node.addr, error = %e, "Peer not reachable");
+                            PeerState::Unreachable
+                        }
+                    }
                 }
-            }
+            })
+            .await
         }
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("form the Raft cluster: {e}"))?;
+    };
     // A one-server cluster leads at once; serve only once it does. With
-    // peers, this server serves whichever role the election gives it.
+    // peers, this server serves (as a follower until elected) while it
+    // waits for enough of them to form the cluster.
+    if alone {
+        forming
+            .await
+            .map_err(|e| anyhow::anyhow!("form the Raft cluster: {e}"))?;
+    } else {
+        tokio::spawn(async move {
+            if let Err(e) = forming.await {
+                tracing::error!(error = %e, "Could not form the Raft cluster");
+            }
+        });
+    }
     if alone {
         crate::raft::consensus::wait_leading(&raft, std::time::Duration::from_secs(30))
             .await
