@@ -220,6 +220,7 @@ pub async fn cmd_dev(
         node_id: server::DEFAULT_NODE_ID,
         peers: Default::default(),
         grpc_listen: listen,
+        raft_addr: None,
         http_listen,
         token: dev_token.to_string(),
         domain: "dev.local".to_string(),
