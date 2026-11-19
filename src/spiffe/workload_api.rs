@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -40,6 +40,8 @@ struct WorkloadState {
     trust_bundle_pem: Option<String>,
     /// JWT bundle (JWKS) for validating JWT-SVIDs
     jwt_bundle: Option<String>,
+    /// Bundles of federated trust domains, by trust domain.
+    federated: BTreeMap<String, FederatedBundle>,
     /// service_name → issued SVID
     svids: HashMap<String, Svid>,
 }
@@ -59,6 +61,15 @@ struct Svid {
     expires_at: u64,
 }
 
+/// The bundles of a federated trust domain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FederatedBundle {
+    /// CA certificates PEM.
+    pub x509_pem: String,
+    /// JWKS; empty when the peer publishes none.
+    pub jwks: String,
+}
+
 /// A snapshot of one workload's X.509-SVID material.
 pub struct SvidMaterial {
     pub spiffe_id: String,
@@ -76,6 +87,7 @@ impl WorkloadManager {
                 trust_domain: trust_domain.to_string(),
                 trust_bundle_pem: None,
                 jwt_bundle: None,
+                federated: BTreeMap::new(),
                 svids: HashMap::new(),
             })),
             changes: watch::channel(0).0,
@@ -152,6 +164,27 @@ impl WorkloadManager {
     /// The current JWT bundle (JWKS), once received from the server.
     pub async fn jwt_bundle(&self) -> Option<String> {
         self.inner.read().await.jwt_bundle.clone()
+    }
+
+    /// Replace the bundles of federated trust domains. The local trust
+    /// domain is never federated with itself and is dropped. Notifies
+    /// streams only when the set changed.
+    pub async fn set_federated_bundles(&self, mut bundles: BTreeMap<String, FederatedBundle>) {
+        let mut state = self.inner.write().await;
+        bundles.remove(&state.trust_domain);
+        if state.federated == bundles {
+            return;
+        }
+        let domains: Vec<String> = bundles.keys().cloned().collect();
+        state.federated = bundles;
+        drop(state);
+        self.notify();
+        tracing::info!(trust_domains = ?domains, "Federated trust bundles updated");
+    }
+
+    /// The bundles of federated trust domains.
+    pub async fn federated_bundles(&self) -> BTreeMap<String, FederatedBundle> {
+        self.inner.read().await.federated.clone()
     }
 
     /// The broker that obtains JWT-SVIDs from the server.
@@ -372,6 +405,29 @@ mod tests {
 
         mgr.remove_svid("svc").await.unwrap();
         assert!(rx.has_changed().unwrap());
+    }
+
+    #[tokio::test]
+    async fn federated_bundles_exclude_the_local_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = WorkloadManager::new(dir.path(), "test.internal");
+        let mut rx = mgr.subscribe();
+        let bundle = |pem: &str| FederatedBundle {
+            x509_pem: pem.into(),
+            jwks: String::new(),
+        };
+        let bundles = BTreeMap::from([
+            ("test.internal".to_string(), bundle("SELF")),
+            ("peer.test".to_string(), bundle("PEER")),
+        ]);
+        mgr.set_federated_bundles(bundles.clone()).await;
+        assert!(rx.has_changed().unwrap());
+        rx.mark_unchanged();
+        let got = mgr.federated_bundles().await;
+        assert_eq!(got.keys().collect::<Vec<_>>(), ["peer.test"]);
+        // Same set again: no notification.
+        mgr.set_federated_bundles(bundles).await;
+        assert!(!rx.has_changed().unwrap());
     }
 
     #[tokio::test]

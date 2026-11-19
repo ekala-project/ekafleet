@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -102,6 +103,25 @@ fn pem_pkcs8_der(pem: &str) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
     }
 }
 
+/// DER bundles of federated trust domains, keyed by trust domain ID.
+/// A bundle that does not parse is left out rather than failing the
+/// response for the local domain.
+async fn federated_x509(mgr: &WorkloadManager) -> HashMap<String, Vec<u8>> {
+    let mut bundles = HashMap::new();
+    for (domain, bundle) in mgr.federated_bundles().await {
+        match pem_certs_der(&bundle.x509_pem) {
+            Ok(certs) if !certs.is_empty() => {
+                bundles.insert(trust_domain_id(&domain), certs.concat());
+            }
+            Ok(_) => tracing::warn!(trust_domain = %domain, "Federated bundle has no certificates"),
+            Err(e) => {
+                tracing::warn!(trust_domain = %domain, error = %e, "Federated bundle does not parse")
+            }
+        }
+    }
+    bundles
+}
+
 /// Build the X509SVIDResponse for `service`, or `None` until it has both an
 /// SVID and a trust bundle.
 async fn x509_svid_response(
@@ -134,7 +154,7 @@ async fn x509_svid_response(
             hint: String::new(),
         }],
         crl: vec![],
-        federated_bundles: Default::default(),
+        federated_bundles: federated_x509(mgr).await,
     }))
 }
 
@@ -146,9 +166,11 @@ async fn x509_bundles_response(
     };
     let domain = mgr.trust_domain_str().await.unwrap_or_default();
     let bundle = pem_certs_der(&bundle_pem)?.concat();
+    let mut bundles = federated_x509(mgr).await;
+    bundles.insert(trust_domain_id(&domain), bundle);
     Ok(Some(X509BundlesResponse {
         crl: vec![],
-        bundles: [(trust_domain_id(&domain), bundle)].into(),
+        bundles,
     }))
 }
 
@@ -157,9 +179,15 @@ async fn jwt_bundles_response(mgr: &WorkloadManager) -> Result<Option<JwtBundles
         return Ok(None);
     };
     let domain = mgr.trust_domain_str().await.unwrap_or_default();
-    Ok(Some(JwtBundlesResponse {
-        bundles: [(trust_domain_id(&domain), jwks.into_bytes())].into(),
-    }))
+    let mut bundles: HashMap<String, Vec<u8>> = mgr
+        .federated_bundles()
+        .await
+        .into_iter()
+        .filter(|(_, b)| !b.jwks.is_empty())
+        .map(|(d, b)| (trust_domain_id(&d), b.jwks.into_bytes()))
+        .collect();
+    bundles.insert(trust_domain_id(&domain), jwks.into_bytes());
+    Ok(Some(JwtBundlesResponse { bundles }))
 }
 
 /// Convert JSON to a protobuf `Value` (for `ValidateJWTSVIDResponse.claims`).
@@ -358,6 +386,7 @@ impl SpiffeWorkloadApi for WorkloadApiService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::spiffe::workload_api::FederatedBundle;
 
     /// A real CA chain and an SVID issued from a CSR, as the agent holds them.
     async fn issued_svid(mgr: &WorkloadManager) {
@@ -426,6 +455,51 @@ mod tests {
         let resp = x509_bundles_response(&mgr).await.unwrap().unwrap();
         let bundle = resp.bundles.get("spiffe://test.internal").unwrap();
         x509_parser::parse_x509_certificate(bundle).unwrap();
+    }
+
+    #[tokio::test]
+    async fn federated_bundles_are_served_alongside_the_local_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = WorkloadManager::new(dir.path(), "test.internal");
+        issued_svid(&mgr).await;
+        let peer = rcgen::generate_simple_self_signed(vec!["peer".into()]).unwrap();
+        mgr.set_federated_bundles(
+            [
+                (
+                    "peer.test".to_string(),
+                    FederatedBundle {
+                        x509_pem: peer.cert.pem(),
+                        jwks: r#"{"keys":[]}"#.into(),
+                    },
+                ),
+                (
+                    "broken.test".to_string(),
+                    FederatedBundle {
+                        x509_pem: "junk".into(),
+                        jwks: String::new(),
+                    },
+                ),
+            ]
+            .into(),
+        )
+        .await;
+
+        let bundles = x509_bundles_response(&mgr).await.unwrap().unwrap().bundles;
+        let mut keys: Vec<_> = bundles.keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["spiffe://peer.test", "spiffe://test.internal"]);
+        assert_eq!(bundles["spiffe://peer.test"], peer.cert.der().to_vec());
+
+        let svid = x509_svid_response(&mgr, "web").await.unwrap().unwrap();
+        assert_eq!(
+            svid.federated_bundles.keys().collect::<Vec<_>>(),
+            ["spiffe://peer.test"]
+        );
+
+        mgr.set_jwt_bundle(r#"{"keys":[1]}"#).await;
+        let jwt = jwt_bundles_response(&mgr).await.unwrap().unwrap().bundles;
+        assert_eq!(jwt["spiffe://peer.test"], br#"{"keys":[]}"#);
+        assert_eq!(jwt.len(), 2);
     }
 
     #[tokio::test]

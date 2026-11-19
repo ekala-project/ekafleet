@@ -498,6 +498,16 @@ message TrustBundleUpdate {
   bytes ca_certificate_pem = 2;
   // The trust domain's JWT bundle (JWKS, RFC 7517) for JWT-SVID validation.
   bytes jwt_bundle_jwks = 3;
+  // Bundles of federated trust domains, which workloads get from the
+  // Workload API alongside the local bundle. Every update carries the
+  // complete set.
+  repeated FederatedBundle federated_bundles = 4;
+}
+
+message FederatedBundle {
+  string trust_domain = 1;
+  bytes ca_certificates_pem = 2;
+  bytes jwt_bundle_jwks = 3;
 }
 
 message DesiredState {

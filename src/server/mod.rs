@@ -63,6 +63,9 @@ pub struct ServerConfig {
     pub allow_bearer_agents: bool,
     /// Also run an agent for this host in-process.
     pub embedded_agent: Option<EmbeddedAgentConfig>,
+    /// Where federation peers fetch this cluster's trust bundles and
+    /// exported services; `None` runs no federation listener.
+    pub federation_listen: Option<std::net::SocketAddr>,
 }
 
 /// The in-process agent of `ekafleet server --embedded-agent` and
@@ -230,6 +233,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     let agent_ca_pem = trust_bundle_pem.clone();
 
     // Start gRPC and HTTP servers concurrently
+    let federation_view = federation::FederationView::new();
     let grpc_config = api::GrpcServerConfig {
         addr: grpc_addr,
         tls,
@@ -248,6 +252,8 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         binary_cache: Some(binary_cache),
         metrics: metrics.clone(),
         audit_log: audit_log.clone(),
+        federation: federation_view.clone(),
+        federation_listen: config.federation_listen,
     };
 
     let grpc_shutdown = shutdown.clone();
@@ -277,6 +283,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     .spawn(shutdown.child_token());
     dns::DnsPublisher::new(fleet_state.clone())
         .with_external(grpc_config.raft_state.clone(), external_health)
+        .with_federation(federation_view)
         .spawn(shutdown.child_token());
     autoscaler::Autoscaler {
         raft_state: grpc_config.raft_state.clone(),

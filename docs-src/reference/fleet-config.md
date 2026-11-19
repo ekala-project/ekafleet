@@ -13,6 +13,7 @@ Complete reference for the `fleet.nix` configuration schema.
     machines = { ... };        # Machine inventory
     nodePools = { ... };       # Node pool definitions (optional)
     externalServices = { ... };# Services outside the fleet, in DNS (optional)
+    federation = { ... };      # Peer clusters (optional)
   };
 }
 ```
@@ -702,17 +703,24 @@ curl -H "Authorization: Bearer $TOKEN" http://server:7402/v1/alerts/silences
 curl -X DELETE -H "Authorization: Bearer $TOKEN" http://server:7402/v1/alerts/silences/0
 ```
 
-## FederatedCluster
+## FederationConfig
 
-Configuration for multi-region federation with peer clusters:
+Trust and service discovery shared with peer ekafleet clusters; see [Trust Domain Federation](../operations/spiffe.md#trust-domain-federation).
 
 ```nix
-federation = [
-  {
-    name = "us-west";
-    address = "us-west-server:7400";
-    trustDomain = "us-west.fleet.internal";
-    discoveryEnabled = true;
-  }
-];
+federation = {
+  exportServices = [ "api" ];   # default-namespace services peers may discover
+  peers.east = {                # local name of the peer (DNS label)
+    endpoint = "east-server.example.com:7404";  # the peer's federation listener (required)
+    trustDomain = "east.internal";              # the peer's trust domain (required)
+    caCert = builtins.readFile ./east-ca.pem;   # the peer's root CA PEM (required)
+  };
+};
 ```
+
+The peer's exported services resolve as `<svc>.east.federation.<domain>`. The following are rejected:
+
+- a trust domain equal to this fleet's own;
+- two peers with the same trust domain;
+- exports of services that are undefined or not in the default namespace.
+

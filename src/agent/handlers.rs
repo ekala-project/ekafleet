@@ -541,6 +541,19 @@ pub(super) async fn handle_server_message(
                     Err(_) => tracing::error!("JWT bundle is not valid UTF-8"),
                 }
             }
+            let federated = bundle
+                .federated_bundles
+                .into_iter()
+                .filter_map(|b| {
+                    let x509_pem = String::from_utf8(b.ca_certificates_pem).ok()?;
+                    let jwks = String::from_utf8(b.jwt_bundle_jwks).ok()?;
+                    Some((
+                        b.trust_domain,
+                        crate::spiffe::workload_api::FederatedBundle { x509_pem, jwks },
+                    ))
+                })
+                .collect();
+            workload_mgr.set_federated_bundles(federated).await;
         }
         ServerPayload::JwtSvid(response) => {
             workload_mgr.jwt_broker().complete(response).await;

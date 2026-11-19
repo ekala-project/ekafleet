@@ -81,6 +81,16 @@ in
         description = "HTTP API listen address.";
       };
 
+      federationListen = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "0.0.0.0:7404";
+        description = ''
+          Address where federation peers fetch this cluster's trust bundles
+          and exported services over mutual TLS. `null` disables it.
+        '';
+      };
+
       domain = lib.mkOption {
         type = lib.types.str;
         default = "fleet.internal";
@@ -413,13 +423,16 @@ in
               peersArg = lib.optionalString (
                 cfg.server.peers != [ ]
               ) "--peers ${lib.concatStringsSep "," cfg.server.peers}";
+              federationArg = lib.optionalString (
+                cfg.server.federationListen != null
+              ) "--federation-listen ${cfg.server.federationListen}";
             in
             {
               Type = "simple";
               Restart = "on-failure";
               RestartSec = 5;
 
-              ExecStart = "${cfg.server.package}/bin/ekafleet server --data-dir ${cfg.server.dataDir} --listen ${cfg.server.grpcListen} --http-listen ${cfg.server.httpListen} --domain ${cfg.server.domain} --ca-socket ${cfg.server.caSocketPath} ${peersArg}";
+              ExecStart = "${cfg.server.package}/bin/ekafleet server --data-dir ${cfg.server.dataDir} --listen ${cfg.server.grpcListen} --http-listen ${cfg.server.httpListen} --domain ${cfg.server.domain} --ca-socket ${cfg.server.caSocketPath} ${peersArg} ${federationArg}";
 
               # The control plane does not hold the CA key (that's in ca-signer).
               User = "ekafleet";
