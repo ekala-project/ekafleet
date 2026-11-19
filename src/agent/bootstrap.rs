@@ -23,6 +23,72 @@ pub fn tls_config(server_addr: &str, ca_pem: &str) -> tonic::transport::ClientTl
     tls
 }
 
+/// Redirects followed from one server before trying the next.
+const MAX_REDIRECTS: usize = 3;
+
+/// The servers in a comma-separated `--join` list, each `ip:port`.
+pub fn server_list(servers: &str) -> anyhow::Result<Vec<String>> {
+    let list: Vec<String> = servers
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if list.is_empty() {
+        anyhow::bail!("no server address given");
+    }
+    for server in &list {
+        server
+            .parse::<std::net::SocketAddr>()
+            .map_err(|e| anyhow::anyhow!("invalid server address '{server}': {e}"))?;
+    }
+    Ok(list)
+}
+
+/// The next server to try after `current` failed with `error`: the leader
+/// a follower named, else the server after `index` in `servers`. Returns
+/// the target and the index it continues from.
+pub fn next_server(
+    servers: &[String],
+    index: usize,
+    error: Option<&anyhow::Error>,
+) -> (String, usize, bool) {
+    if let Some(leader) = error.and_then(crate::server::leadership::leader_hint_in) {
+        return (leader, index, true);
+    }
+    let next = (index + 1) % servers.len();
+    (servers[next].clone(), next, false)
+}
+
+/// [`join`] through whichever of `servers` leads, following redirects.
+pub async fn join_any(
+    servers: &[String],
+    ca_pem: &str,
+    node_name: &str,
+    join_token: &str,
+    identity: &mut NodeIdentity,
+) -> anyhow::Result<()> {
+    let mut last = None;
+    for (index, first) in servers.iter().enumerate() {
+        let mut target = first.clone();
+        for _ in 0..=MAX_REDIRECTS {
+            match join(&target, ca_pem, node_name, join_token, identity).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    let (next, _, redirected) = next_server(servers, index, Some(&e));
+                    tracing::warn!(server = %target, error = %e, "Join attempt failed");
+                    last = Some(e);
+                    if !redirected {
+                        break;
+                    }
+                    target = next;
+                }
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow::anyhow!("no server address given")))
+}
+
 /// Attest as `node_name` with `join_token` and install the issued SVID.
 pub async fn join(
     server_addr: &str,
@@ -74,4 +140,44 @@ pub async fn join(
         .await?;
     tracing::info!(spiffe_id = %expected, "Joined the fleet");
     Ok(())
+}
+
+#[cfg(test)]
+mod server_tests {
+    use super::*;
+
+    #[test]
+    fn server_lists_are_validated() {
+        assert_eq!(
+            server_list("10.0.0.1:7400, 10.0.0.2:7400,").unwrap(),
+            vec!["10.0.0.1:7400", "10.0.0.2:7400"]
+        );
+        assert!(server_list("").is_err());
+        assert!(server_list("10.0.0.1:7400,nope").is_err());
+    }
+
+    #[test]
+    fn failures_rotate_and_refusals_redirect() {
+        let servers = server_list("10.0.0.1:7400,10.0.0.2:7400").unwrap();
+        let down = anyhow::anyhow!("connection refused");
+        assert_eq!(
+            next_server(&servers, 1, Some(&down)),
+            ("10.0.0.1:7400".to_string(), 0, false)
+        );
+        let mut metadata = tonic::metadata::MetadataMap::new();
+        metadata.insert(
+            crate::server::leadership::LEADER_METADATA,
+            "10.0.0.3:7400".parse().unwrap(),
+        );
+        let refused = anyhow::Error::new(tonic::Status::with_metadata(
+            tonic::Code::Unavailable,
+            "not the leader",
+            metadata,
+        ))
+        .context("stream_control");
+        assert_eq!(
+            next_server(&servers, 0, Some(&refused)),
+            ("10.0.0.3:7400".to_string(), 0, true)
+        );
+    }
 }
