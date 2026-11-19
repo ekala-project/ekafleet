@@ -33,7 +33,10 @@ Enable `services.ekafleet.server` to deploy the control plane. This creates two 
 | `tokenFile` | string | *(required)* | File holding the initial admin bearer token; delivered via `LoadCredential` (may be root-only, never in the Nix store or argv) |
 | `dataDir` | path | `/var/lib/ekafleet-server` | Control-plane state directory (must be under `/var/lib/`) |
 | `sealPassphraseFile` | null or string | `null` | Passphrase file that seals key material at rest, delivered to both units via `LoadCredential` (may be root-only) |
-| `peers` | list of string | `[]` | Peer server addresses for HA |
+| `nodeId` | positive int | `1` | This server's Raft node id, unique among the servers |
+| `peers` | attrs of string | `{}` | The servers of a new HA cluster by node id, this one included (`{ "1" = "10.0.0.1:7400"; ... }`); first boot only |
+| `keyBundleFile` | null or string | `null` | Sealed bundle from `ekafleet keys export`, imported before each start of the server and CA signer; set on every server added to a cluster |
+| `keyBundlePassphraseFile` | null or string | `null` | Passphrase of the key bundle; required with `keyBundleFile` (both via `LoadCredential`) |
 | `grpcListen` | string | `0.0.0.0:7400` | gRPC listen address |
 | `httpListen` | string | `0.0.0.0:7402` | HTTP API listen address |
 | `federationListen` | null or string | `null` | Federation listener for peer clusters, e.g. `0.0.0.0:7404` |
