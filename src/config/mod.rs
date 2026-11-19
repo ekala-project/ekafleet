@@ -955,10 +955,55 @@ impl SecretConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct IdentityConfig {
+    /// Services that may call this one. When set, other nodes reach the
+    /// service's ports only from nodes running one of them (or serving an
+    /// ingress route to it).
     #[serde(default)]
     pub allowed_callers: Vec<String>,
     #[serde(default)]
     pub allowed_targets: Vec<String>,
+    /// Outbound traffic the service's processes may send, first match
+    /// wins; when set, anything unmatched is dropped.
+    #[serde(default)]
+    pub egress_rules: Vec<EgressRuleConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct EgressRuleConfig {
+    /// IPv4 address or CIDR (`0.0.0.0/0` for anywhere).
+    pub dest_cidr: String,
+    /// TCP and UDP destination ports; empty for all.
+    #[serde(default)]
+    pub dest_ports: Vec<u16>,
+    #[serde(default)]
+    pub action: EgressAction,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EgressAction {
+    #[default]
+    Allow,
+    Deny,
+}
+
+/// Parse an IPv4 address or `address/prefix`, as nftables accepts it.
+pub fn parse_ipv4_cidr(cidr: &str) -> Result<(std::net::Ipv4Addr, u8), String> {
+    let (addr, len) = match cidr.split_once('/') {
+        Some((addr, len)) => (
+            addr,
+            len.parse::<u8>()
+                .ok()
+                .filter(|l| *l <= 32)
+                .ok_or_else(|| format!("'{cidr}': prefix length must be 0-32"))?,
+        ),
+        None => (cidr, 32),
+    };
+    let addr = addr
+        .parse()
+        .map_err(|_| format!("'{cidr}' is not an IPv4 address or CIDR"))?;
+    Ok((addr, len))
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1824,6 +1869,16 @@ pub fn validate(config: &FleetConfig) -> Result<(), Vec<String>> {
     }
 
     for (name, service) in &config.services {
+        for (i, rule) in service.identity.egress_rules.iter().enumerate() {
+            if let Err(e) = parse_ipv4_cidr(&rule.dest_cidr) {
+                errors.push(format!("service '{name}' egressRules[{i}].destCidr: {e}"));
+            }
+            if rule.dest_ports.contains(&0) {
+                errors.push(format!(
+                    "service '{name}' egressRules[{i}].destPorts: port 0 is not a port"
+                ));
+            }
+        }
         let mut secrets: Vec<_> = service.secrets.iter().collect();
         secrets.sort_by_key(|(key, _)| key.as_str());
         if !secrets.is_empty()

@@ -183,6 +183,20 @@ pub async fn run_until(config: AgentConfig, stop: CancellationToken) -> anyhow::
         &servers[0],
     )));
     let policy_enforcer = Arc::new(PolicyEnforcer::new());
+    {
+        // Egress rules name unit cgroups, which a restart replaces.
+        let policy_enforcer = policy_enforcer.clone();
+        let stop = stop.child_token();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                tokio::select! {
+                    _ = stop.cancelled() => return,
+                    _ = tick.tick() => policy_enforcer.refresh().await,
+                }
+            }
+        });
+    }
     let netns_manager = Arc::new(netns::NamespaceNetworkManager::new());
     let volumes = Arc::new(storage::VolumeManager::new(
         &config.data_dir,
