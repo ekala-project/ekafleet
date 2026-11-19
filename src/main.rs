@@ -543,6 +543,12 @@ enum Command {
         action: TransitAction,
     },
 
+    /// Carry the keys shared by every server to a new one
+    Keys {
+        #[command(subcommand)]
+        action: KeysAction,
+    },
+
     /// Servers of the HA control plane (Raft cluster)
     Raft {
         #[command(subcommand)]
@@ -886,6 +892,49 @@ enum TransitAction {
         /// Server address
         #[arg(long, default_value = "127.0.0.1:7400")]
         server: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum KeysAction {
+    /// Seal this server's shared keys (fleet key, binary cache key, root CA,
+    /// JWT-SVID key) into a bundle for `ekafleet keys import`
+    Export {
+        /// The server's data directory
+        #[arg(long, default_value = "/var/lib/ekafleet")]
+        data_dir: PathBuf,
+        /// The `ekafleet ca-signer` data directory, when the CA runs there
+        #[arg(long)]
+        ca_dir: Option<PathBuf>,
+        /// SPIFFE trust domain for fleet identities
+        #[arg(long, default_value = "fleet.internal")]
+        domain: String,
+        /// File holding the passphrase to seal the bundle with
+        #[arg(long)]
+        passphrase_file: PathBuf,
+        /// Where to write the sealed bundle
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Install the keys of a bundle before a new server's first start.
+    /// Keys already present are kept; a server that made its own is refused
+    Import {
+        /// The sealed bundle from `ekafleet keys export`
+        #[arg(long)]
+        bundle: PathBuf,
+        /// Data directory to install the keys into
+        #[arg(long, default_value = "/var/lib/ekafleet")]
+        data_dir: PathBuf,
+        /// Which keys: `server` and `ca` split them between a server and its
+        /// `ekafleet ca-signer`
+        #[arg(long, value_enum, default_value = "all")]
+        scope: ekafleet::server::keybundle::Scope,
+        /// Refuse a bundle of another trust domain
+        #[arg(long)]
+        domain: Option<String>,
+        /// File holding the bundle passphrase
+        #[arg(long)]
+        passphrase_file: PathBuf,
     },
 }
 
@@ -1554,6 +1603,40 @@ async fn main() -> anyhow::Result<()> {
             } => commands::cmd_secret_revoke(service, name, server).await?,
         },
 
+        Command::Keys { action } => match action {
+            KeysAction::Export {
+                data_dir,
+                ca_dir,
+                domain,
+                passphrase_file,
+                out,
+            } => {
+                commands::cmd_keys_export(
+                    &data_dir,
+                    ca_dir.as_deref(),
+                    &domain,
+                    &passphrase_file,
+                    &out,
+                )
+                .await?
+            }
+            KeysAction::Import {
+                bundle,
+                data_dir,
+                scope,
+                domain,
+                passphrase_file,
+            } => {
+                commands::cmd_keys_import(
+                    &bundle,
+                    &data_dir,
+                    scope,
+                    domain.as_deref(),
+                    &passphrase_file,
+                )
+                .await?
+            }
+        },
         Command::Raft { action } => match action {
             RaftAction::Status { server } => commands::cmd_raft_status(server).await?,
             RaftAction::Add { id, addr, server } => {

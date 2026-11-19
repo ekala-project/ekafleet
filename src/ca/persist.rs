@@ -13,11 +13,11 @@ use super::jwt::JwtSigner;
 use super::root::RootCa;
 use crate::server::seal;
 
-const ROOT_KEY: &str = "ca-key.pem";
-const ROOT_CERT: &str = "ca-cert.pem";
+pub(crate) const ROOT_KEY: &str = "ca-key.pem";
+pub(crate) const ROOT_CERT: &str = "ca-cert.pem";
 const INT_KEY: &str = "ca-intermediate-key.pem";
 const INT_CERT: &str = "ca-intermediate-cert.pem";
-const JWT_KEY: &str = "jwt-signing-key.pk8";
+pub(crate) const JWT_KEY: &str = "jwt-signing-key.pk8";
 
 /// Read a (possibly sealed) private key PEM and its certificate. Returns
 /// `None` when either file is absent.
