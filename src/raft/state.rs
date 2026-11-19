@@ -3,9 +3,10 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard};
 
 use super::RaftError;
+use super::consensus::{Proposal, Raft};
 use super::storage::{LogEntry, RaftStorage};
 
 /// Term recorded in log entries. Single-node until consensus lands.
@@ -25,6 +26,31 @@ pub struct FleetStateMachine {
     /// Durable log. When set, every command is persisted before it is
     /// applied, so an acknowledged write survives a crash.
     log: Option<Arc<RaftStorage>>,
+    /// Consensus. Once attached, commands are proposed to the cluster and
+    /// applied by [`super::consensus::StateMachineStore`] when committed;
+    /// `log` is then unused.
+    raft: Arc<std::sync::OnceLock<Raft>>,
+    /// Serializes proposals, so a helper's check and its write see no
+    /// other write from this server in between.
+    propose: Arc<Mutex<()>>,
+}
+
+/// One proposer's exclusive turn: read state, then commit. `commit` takes
+/// `&mut self`, so the borrow checker rejects holding a read guard across
+/// it (applying needs the write lock).
+struct Turn<'a> {
+    machine: &'a FleetStateMachine,
+    _turn: MutexGuard<'a, ()>,
+}
+
+impl Turn<'_> {
+    async fn read(&self) -> RwLockReadGuard<'_, StateMachineInner> {
+        self.machine.inner.read().await
+    }
+
+    async fn commit(&mut self, command: Command) -> Result<u64, RaftError> {
+        self.machine.commit(command).await
+    }
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -363,6 +389,11 @@ pub enum Command {
     ReleaseMeshIp {
         node_id: String,
     },
+    /// Replace the fleet state with an operator backup (JSON of the whole
+    /// state, as `Snapshot` returns it). Consensus bookkeeping is kept.
+    RestoreState {
+        data: Vec<u8>,
+    },
 }
 
 /// The WireGuard mesh network, `10.100.0.0/16`.
@@ -393,6 +424,8 @@ impl FleetStateMachine {
         Self {
             inner: Arc::new(RwLock::new(StateMachineInner::default())),
             log: None,
+            raft: Default::default(),
+            propose: Default::default(),
         }
     }
 
@@ -402,6 +435,8 @@ impl FleetStateMachine {
         Self {
             inner: Arc::new(RwLock::new(StateMachineInner::default())),
             log: Some(storage),
+            raft: Default::default(),
+            propose: Default::default(),
         }
     }
 
@@ -457,6 +492,39 @@ impl FleetStateMachine {
     /// With a log attached the command is persisted first; if that fails
     /// nothing is applied and the error is returned.
     pub async fn apply_next(&self, command: Command) -> Result<u64, RaftError> {
+        self.turn().await.commit(command).await
+    }
+
+    /// Route every later write through consensus. The state is then
+    /// applied by the Raft state machine store sharing this state.
+    pub fn attach(&self, raft: Raft) {
+        if self.raft.set(raft).is_err() {
+            tracing::warn!("Raft already attached to the fleet state");
+        }
+    }
+
+    /// The attached consensus, if any.
+    pub fn raft(&self) -> Option<&Raft> {
+        self.raft.get()
+    }
+
+    async fn turn(&self) -> Turn<'_> {
+        Turn {
+            machine: self,
+            _turn: self.propose.lock().await,
+        }
+    }
+
+    /// Propose `command` (or, without consensus, persist and apply it) and
+    /// return its index once it is applied here.
+    async fn commit(&self, command: Command) -> Result<u64, RaftError> {
+        if let Some(raft) = self.raft.get() {
+            let response = raft
+                .client_write(Proposal::new(command))
+                .await
+                .map_err(RaftError::from_client_write)?;
+            return Ok(response.log_id.index);
+        }
         let mut state = self.inner.write().await;
         self.commit_locked(&mut state, command).await
     }
@@ -801,6 +869,19 @@ impl FleetStateMachine {
             Command::ReleaseMeshIp { node_id } => {
                 state.mesh_ips.remove(&node_id);
             }
+            Command::RestoreState { data } => {
+                match serde_json::from_slice::<StateMachineInner>(&data) {
+                    Ok(mut restored) => {
+                        restored.last_applied_log = state.last_applied_log;
+                        restored.last_membership = std::mem::take(&mut state.last_membership);
+                        *state = restored;
+                    }
+                    // Checked before proposing, so only a corrupt entry lands here.
+                    Err(e) => {
+                        tracing::error!(index, error = %e, "Ignoring unreadable state restore")
+                    }
+                }
+            }
         }
 
         state.last_applied = index;
@@ -817,9 +898,14 @@ impl FleetStateMachine {
     /// revision it created.
     pub async fn apply_config(&self, command: Command) -> Result<u64, RaftError> {
         debug_assert!(matches!(command, Command::ApplyConfig { .. }));
-        let mut state = self.inner.write().await;
-        self.commit_locked(&mut state, command).await?;
-        Ok(state.config_revisions.last().map_or(0, |r| r.revision))
+        let mut turn = self.turn().await;
+        turn.commit(command).await?;
+        Ok(turn
+            .read()
+            .await
+            .config_revisions
+            .last()
+            .map_or(0, |r| r.revision))
     }
 
     /// The configuration the server currently reconciles toward.
@@ -848,21 +934,25 @@ impl FleetStateMachine {
     /// and the snapshot's, and with a log attached it replaces the persisted
     /// state, so it survives restarts and later writes build on it.
     pub async fn install_snapshot(&self, data: &[u8]) -> Result<u64, RaftError> {
-        let mut restored: StateMachineInner = serde_json::from_slice(data)?;
-        let mut state = self.inner.write().await;
-        let index = restored.last_applied.max(state.last_applied) + 1;
-        restored.last_applied = index;
-        if let Some(log) = &self.log {
-            log.rewrite(index, &serde_json::to_vec(&restored)?).await?;
-        }
-        *state = restored;
-        Ok(index)
+        // Reject a bad backup before it reaches the log.
+        serde_json::from_slice::<StateMachineInner>(data)?;
+        self.apply_next(Command::RestoreState {
+            data: data.to_vec(),
+        })
+        .await
     }
 
     /// Persist a snapshot of the current state and drop the log entries it
     /// subsumes. Returns the snapshot index, or `None` when there is nothing
     /// to snapshot or no log is attached.
     pub async fn checkpoint(&self) -> Result<Option<u64>, RaftError> {
+        if let Some(raft) = self.raft.get() {
+            raft.trigger()
+                .snapshot()
+                .await
+                .map_err(|e| RaftError::Consensus(e.to_string()))?;
+            return Ok(Some(self.last_applied().await));
+        }
         let Some(log) = &self.log else {
             return Ok(None);
         };
@@ -899,17 +989,16 @@ impl FleetStateMachine {
         secret_name: &str,
         sealed: Vec<u8>,
     ) -> Result<u64, RaftError> {
-        let mut state = self.inner.write().await;
-        self.commit_locked(
-            &mut state,
-            Command::PutSecret {
-                service_name: service_name.to_string(),
-                secret_name: secret_name.to_string(),
-                encrypted_value: sealed,
-            },
-        )
+        let mut turn = self.turn().await;
+        let state = turn.read().await;
+        drop(state);
+        turn.commit(Command::PutSecret {
+            service_name: service_name.to_string(),
+            secret_name: secret_name.to_string(),
+            encrypted_value: sealed,
+        })
         .await?;
-        Ok(state.secret_versions[service_name][secret_name])
+        Ok(turn.read().await.secret_versions[service_name][secret_name])
     }
 
     /// Make an earlier version of a secret current again, as a new version.
@@ -920,7 +1009,8 @@ impl FleetStateMachine {
         secret_name: &str,
         version: u64,
     ) -> Result<Option<u64>, RaftError> {
-        let mut state = self.inner.write().await;
+        let mut turn = self.turn().await;
+        let state = turn.read().await;
         let Some(sealed) = state
             .secret_history
             .get(service_name)
@@ -930,16 +1020,16 @@ impl FleetStateMachine {
         else {
             return Ok(None);
         };
-        self.commit_locked(
-            &mut state,
-            Command::PutSecret {
-                service_name: service_name.to_string(),
-                secret_name: secret_name.to_string(),
-                encrypted_value: sealed,
-            },
-        )
+        drop(state);
+        turn.commit(Command::PutSecret {
+            service_name: service_name.to_string(),
+            secret_name: secret_name.to_string(),
+            encrypted_value: sealed,
+        })
         .await?;
-        Ok(Some(state.secret_versions[service_name][secret_name]))
+        Ok(Some(
+            turn.read().await.secret_versions[service_name][secret_name],
+        ))
     }
 
     /// Delete a secret's value. Returns whether it had one.
@@ -948,7 +1038,8 @@ impl FleetStateMachine {
         service_name: &str,
         secret_name: &str,
     ) -> Result<bool, RaftError> {
-        let mut state = self.inner.write().await;
+        let mut turn = self.turn().await;
+        let state = turn.read().await;
         if !state
             .secrets
             .get(service_name)
@@ -956,13 +1047,11 @@ impl FleetStateMachine {
         {
             return Ok(false);
         }
-        self.commit_locked(
-            &mut state,
-            Command::DeleteSecret {
-                service_name: service_name.to_string(),
-                secret_name: secret_name.to_string(),
-            },
-        )
+        drop(state);
+        turn.commit(Command::DeleteSecret {
+            service_name: service_name.to_string(),
+            secret_name: secret_name.to_string(),
+        })
         .await?;
         Ok(true)
     }
@@ -1001,15 +1090,14 @@ impl FleetStateMachine {
         history: HashMap<String, HashMap<String, HashMap<u64, Vec<u8>>>>,
         transit: HashMap<String, Vec<Vec<u8>>>,
     ) -> Result<(), RaftError> {
-        let mut state = self.inner.write().await;
-        self.commit_locked(
-            &mut state,
-            Command::ResealSecrets {
-                secrets,
-                history,
-                transit,
-            },
-        )
+        let mut turn = self.turn().await;
+        let state = turn.read().await;
+        drop(state);
+        turn.commit(Command::ResealSecrets {
+            secrets,
+            history,
+            transit,
+        })
         .await
         .map(drop)
     }
@@ -1025,17 +1113,16 @@ impl FleetStateMachine {
 
     /// Store a new transit key; false if one with that name exists.
     pub async fn create_transit_key(&self, name: &str, key: TransitKey) -> Result<bool, RaftError> {
-        let mut state = self.inner.write().await;
+        let mut turn = self.turn().await;
+        let state = turn.read().await;
         if state.transit_keys.contains_key(name) {
             return Ok(false);
         }
-        self.commit_locked(
-            &mut state,
-            Command::PutTransitKey {
-                name: name.to_string(),
-                key,
-            },
-        )
+        drop(state);
+        turn.commit(Command::PutTransitKey {
+            name: name.to_string(),
+            key,
+        })
         .await
         .map(|_| true)
     }
@@ -1047,35 +1134,33 @@ impl FleetStateMachine {
         name: &str,
         sealed: Vec<u8>,
     ) -> Result<Option<u32>, RaftError> {
-        let mut state = self.inner.write().await;
+        let mut turn = self.turn().await;
+        let state = turn.read().await;
         let Some(mut key) = state.transit_keys.get(name).cloned() else {
             return Ok(None);
         };
         key.versions.push(sealed);
         let version = key.versions.len() as u32;
-        self.commit_locked(
-            &mut state,
-            Command::PutTransitKey {
-                name: name.to_string(),
-                key,
-            },
-        )
+        drop(state);
+        turn.commit(Command::PutTransitKey {
+            name: name.to_string(),
+            key,
+        })
         .await?;
         Ok(Some(version))
     }
 
     /// Delete a transit key; false if there was none.
     pub async fn delete_transit_key(&self, name: &str) -> Result<bool, RaftError> {
-        let mut state = self.inner.write().await;
+        let mut turn = self.turn().await;
+        let state = turn.read().await;
         if !state.transit_keys.contains_key(name) {
             return Ok(false);
         }
-        self.commit_locked(
-            &mut state,
-            Command::DeleteTransitKey {
-                name: name.to_string(),
-            },
-        )
+        drop(state);
+        turn.commit(Command::DeleteTransitKey {
+            name: name.to_string(),
+        })
         .await
         .map(|_| true)
     }
@@ -1098,18 +1183,17 @@ impl FleetStateMachine {
         sealed: Vec<u8>,
         lease: DynamicLease,
     ) -> Result<u64, RaftError> {
-        let mut state = self.inner.write().await;
-        self.commit_locked(
-            &mut state,
-            Command::IssueDynamicSecret {
-                service_name: service_name.to_string(),
-                secret_name: secret_name.to_string(),
-                encrypted_value: sealed,
-                lease,
-            },
-        )
+        let mut turn = self.turn().await;
+        let state = turn.read().await;
+        drop(state);
+        turn.commit(Command::IssueDynamicSecret {
+            service_name: service_name.to_string(),
+            secret_name: secret_name.to_string(),
+            encrypted_value: sealed,
+            lease,
+        })
         .await?;
-        Ok(state.secret_versions[service_name][secret_name])
+        Ok(turn.read().await.secret_versions[service_name][secret_name])
     }
 
     /// Remove a dynamic secret, retiring its user at `drop_at`. Returns
@@ -1120,7 +1204,8 @@ impl FleetStateMachine {
         secret_name: &str,
         drop_at: u64,
     ) -> Result<bool, RaftError> {
-        let mut state = self.inner.write().await;
+        let mut turn = self.turn().await;
+        let state = turn.read().await;
         if !state
             .dynamic_leases
             .get(service_name)
@@ -1128,28 +1213,25 @@ impl FleetStateMachine {
         {
             return Ok(false);
         }
-        self.commit_locked(
-            &mut state,
-            Command::RetireDynamicSecret {
-                service_name: service_name.to_string(),
-                secret_name: secret_name.to_string(),
-                drop_at,
-            },
-        )
+        drop(state);
+        turn.commit(Command::RetireDynamicSecret {
+            service_name: service_name.to_string(),
+            secret_name: secret_name.to_string(),
+            drop_at,
+        })
         .await
         .map(|_| true)
     }
 
     /// Stop tracking a retired user.
     pub async fn forget_retired_user(&self, engine: &str, username: &str) -> Result<(), RaftError> {
-        let mut state = self.inner.write().await;
-        self.commit_locked(
-            &mut state,
-            Command::ForgetRetiredUser {
-                engine: engine.to_string(),
-                username: username.to_string(),
-            },
-        )
+        let mut turn = self.turn().await;
+        let state = turn.read().await;
+        drop(state);
+        turn.commit(Command::ForgetRetiredUser {
+            engine: engine.to_string(),
+            username: username.to_string(),
+        })
         .await
         .map(|_| ())
     }
@@ -1236,26 +1318,30 @@ impl FleetStateMachine {
         namespace: &str,
         holder: &str,
     ) -> Result<Option<Ipv4Addr>, RaftError> {
-        let mut state = self.inner.write().await;
-        let octet = match state.namespace_subnets.get(namespace) {
-            Some(octet) => *octet,
+        let mut turn = self.turn().await;
+        let subnet = turn.read().await.namespace_subnets.get(namespace).copied();
+        let octet = match subnet {
+            Some(octet) => octet,
             None => {
-                let used: std::collections::HashSet<u8> =
-                    state.namespace_subnets.values().copied().collect();
+                let used: std::collections::HashSet<u8> = turn
+                    .read()
+                    .await
+                    .namespace_subnets
+                    .values()
+                    .copied()
+                    .collect();
                 let Some(octet) = (1..=254).find(|o| !used.contains(o)) else {
                     return Ok(None);
                 };
-                self.commit_locked(
-                    &mut state,
-                    Command::AllocateNamespaceSubnet {
-                        namespace: namespace.to_string(),
-                        octet,
-                    },
-                )
+                turn.commit(Command::AllocateNamespaceSubnet {
+                    namespace: namespace.to_string(),
+                    octet,
+                })
                 .await?;
                 octet
             }
         };
+        let state = turn.read().await;
         let existing = state.namespace_ips.get(namespace);
         if let Some(ip) = existing.and_then(|ips| ips.get(holder))
             && ip.octets()[2] == octet
@@ -1275,14 +1361,12 @@ impl FleetStateMachine {
             return Ok(None);
         };
         let ip = Ipv4Addr::new(10, 200, octet, host);
-        self.commit_locked(
-            &mut state,
-            Command::AllocateNamespaceIp {
-                namespace: namespace.to_string(),
-                holder: holder.to_string(),
-                ip,
-            },
-        )
+        drop(state);
+        turn.commit(Command::AllocateNamespaceIp {
+            namespace: namespace.to_string(),
+            holder: holder.to_string(),
+            ip,
+        })
         .await?;
         Ok(Some(ip))
     }
@@ -1294,7 +1378,8 @@ impl FleetStateMachine {
         &self,
         live: &std::collections::HashSet<(String, String)>,
     ) -> Result<usize, RaftError> {
-        let mut state = self.inner.write().await;
+        let mut turn = self.turn().await;
+        let state = turn.read().await;
         let mut stale: Vec<(String, String)> = state
             .namespace_ips
             .iter()
@@ -1311,12 +1396,10 @@ impl FleetStateMachine {
         );
         stale.sort();
         let released = stale.iter().filter(|(_, h)| !h.is_empty()).count();
+        drop(state);
         for (namespace, holder) in stale {
-            self.commit_locked(
-                &mut state,
-                Command::ReleaseNamespaceIp { namespace, holder },
-            )
-            .await?;
+            turn.commit(Command::ReleaseNamespaceIp { namespace, holder })
+                .await?;
         }
         Ok(released)
     }
@@ -1335,7 +1418,8 @@ impl FleetStateMachine {
     /// `10.100.0.0/16` first if needed (check and commit under one lock).
     /// `Ok(None)` means the mesh network is full.
     pub async fn ensure_mesh_ip(&self, node_id: &str) -> Result<Option<Ipv4Addr>, RaftError> {
-        let mut state = self.inner.write().await;
+        let mut turn = self.turn().await;
+        let state = turn.read().await;
         if let Some(ip) = state.mesh_ips.get(node_id) {
             return Ok(Some(*ip));
         }
@@ -1351,29 +1435,26 @@ impl FleetStateMachine {
         else {
             return Ok(None);
         };
-        self.commit_locked(
-            &mut state,
-            Command::AllocateMeshIp {
-                node_id: node_id.to_string(),
-                ip,
-            },
-        )
+        drop(state);
+        turn.commit(Command::AllocateMeshIp {
+            node_id: node_id.to_string(),
+            ip,
+        })
         .await?;
         Ok(Some(ip))
     }
 
     /// Release the mesh address of a node that left the fleet.
     pub async fn release_mesh_ip(&self, node_id: &str) -> Result<(), RaftError> {
-        let mut state = self.inner.write().await;
+        let mut turn = self.turn().await;
+        let state = turn.read().await;
         if !state.mesh_ips.contains_key(node_id) {
             return Ok(());
         }
-        self.commit_locked(
-            &mut state,
-            Command::ReleaseMeshIp {
-                node_id: node_id.to_string(),
-            },
-        )
+        drop(state);
+        turn.commit(Command::ReleaseMeshIp {
+            node_id: node_id.to_string(),
+        })
         .await
         .map(drop)
     }
