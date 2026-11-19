@@ -480,13 +480,19 @@ fn probe_port(cfg: &config::ServiceConfig) -> Option<&config::PortConfig> {
 
 /// Convert a fleet `ServiceConfig` to a proto `ServiceSpec` for sending to agents.
 fn service_config_to_spec(name: &str, cfg: &config::ServiceConfig) -> crate::proto::ServiceSpec {
+    let first_port = probe_port(cfg);
+    // Probes check the port that declares them: an HTTP GET of `path`, or a
+    // TCP connect without one.
+    let port = first_port.map_or(0, |p| u32::from(p.port));
     let health_check_to_proto = |hc: &config::HealthCheckConfig| -> crate::proto::HealthCheckSpec {
+        use crate::proto::health_check_spec::Probe;
         crate::proto::HealthCheckSpec {
-            probe: hc.path.as_ref().map(|path| {
-                crate::proto::health_check_spec::Probe::Http(crate::proto::HttpProbe {
+            probe: Some(match &hc.path {
+                Some(path) => Probe::Http(crate::proto::HttpProbe {
                     path: path.clone(),
-                    port: 0,
-                })
+                    port,
+                }),
+                None => Probe::Tcp(crate::proto::TcpProbe { port }),
             }),
             interval_seconds: hc.interval,
             timeout_seconds: hc.timeout,
@@ -494,8 +500,6 @@ fn service_config_to_spec(name: &str, cfg: &config::ServiceConfig) -> crate::pro
             unhealthy_threshold: hc.unhealthy_threshold,
         }
     };
-
-    let first_port = probe_port(cfg);
 
     let health_check = first_port
         .and_then(|p| p.health_check.as_ref())
@@ -1129,9 +1133,12 @@ async fn apply_plan(
                     disruption_budget: service_cfg.scheduling.disruption_budget.clone(),
                     total_replicas: service_cfg.scheduling.replicas,
                     previous_store_path,
-                    // The agent probes the unified health check only.
-                    health_checked: probe_port(service_cfg)
-                        .is_some_and(|p| p.health_check.is_some()),
+                    // The agent reports readiness when a readiness, unified
+                    // or liveness probe is declared (readiness falls back to
+                    // the others); a startup probe alone reports none.
+                    health_checked: probe_port(service_cfg).is_some_and(|p| {
+                        p.readiness.is_some() || p.health_check.is_some() || p.liveness.is_some()
+                    }),
                 };
                 let store_path = deploy_plan.store_path.clone();
 
@@ -2202,5 +2209,31 @@ mod tests {
             .await
             .unwrap();
         assert!(raft.get_deployment("web").await.is_none());
+    }
+
+    #[test]
+    fn probes_check_the_port_that_declares_them() {
+        use crate::proto::health_check_spec::Probe;
+        let mut svc = simple_service();
+        let port: config::PortConfig = serde_json::from_value(serde_json::json!({
+            "port": 8080,
+            "healthCheck": { "path": "/healthz" },
+            "startup": {},
+        }))
+        .unwrap();
+        svc.ports.insert("http".into(), port);
+        let spec = service_config_to_spec("web", &svc);
+        assert_eq!(
+            spec.health_check.unwrap().probe,
+            Some(Probe::Http(crate::proto::HttpProbe {
+                path: "/healthz".into(),
+                port: 8080
+            }))
+        );
+        assert_eq!(
+            spec.startup_probe.unwrap().probe,
+            Some(Probe::Tcp(crate::proto::TcpProbe { port: 8080 }))
+        );
+        assert!(spec.liveness_probe.is_none());
     }
 }

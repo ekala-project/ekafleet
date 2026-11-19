@@ -70,13 +70,19 @@ ports.<name> = {
 };
 ```
 
-When `liveness`, `readiness`, or `startup` probes are specified, they take precedence over the unified `healthCheck`. If only `healthCheck` is specified, it is used for both liveness and readiness.
+When `liveness`, `readiness`, or `startup` probes are specified, they take precedence over the unified `healthCheck`. If only `healthCheck` is specified, it is used for both liveness and readiness. A `liveness` probe without a `readiness` probe also serves as the readiness probe.
+
+Probes check the port that declares them (the first port by name that declares any), on loopback, or on the service's namespace IP in a non-default namespace. How each probe acts:
+
+- Each run of `unhealthy_threshold` consecutive liveness failures restarts the service.
+- A startup probe holds back liveness and readiness until it passes, after the first start and after every restart.
+- Deployments wait for readiness when a `readiness`, `healthCheck` or `liveness` probe is declared.
 
 ## HealthCheckConfig
 
 ```nix
 healthCheck = {
-  path                = "/health";  # HTTP path (optional, enables HTTP probe)
+  path                = "/health";  # HTTP GET expecting 2xx (optional; without it, a TCP connect)
   interval            = 10;         # Seconds between checks (default: 10)
   timeout             = 5;          # Seconds before timeout (default: 5)
   healthy_threshold   = 3;          # Consecutive successes to be healthy (default: 3)

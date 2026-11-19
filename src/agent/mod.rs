@@ -138,7 +138,28 @@ pub async fn run_until(config: AgentConfig, stop: CancellationToken) -> anyhow::
     let secret_injector = Arc::new(RwLock::new(SecretInjector::new(Path::new(
         crate::secrets::AGENT_SECRETS_DIR,
     ))));
-    let health_checker = HealthChecker::new();
+    // Services whose liveness probe failed are restarted here, off the
+    // probe loops.
+    let (restart_tx, mut restart_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let health_checker = HealthChecker::new().with_restarts(restart_tx);
+    {
+        let supervisor = supervisor.clone();
+        let stop = stop.child_token();
+        tokio::spawn(async move {
+            loop {
+                let service = tokio::select! {
+                    _ = stop.cancelled() => return,
+                    service = restart_rx.recv() => match service {
+                        Some(service) => service,
+                        None => return,
+                    },
+                };
+                if let Err(e) = supervisor.read().await.restart(&service).await {
+                    tracing::error!(service = %service, error = %e, "Restart after a failed liveness probe failed");
+                }
+            }
+        });
+    }
     let dns = Arc::new(AgentDns::start(&config.dns, stop.child_token()).await);
     let templates = Arc::new(templates::TemplateManager::new(
         std::path::PathBuf::from(templates::TEMPLATES_DIR),
