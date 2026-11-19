@@ -990,7 +990,7 @@ impl FleetControl for FleetControlService {
 
         // The target's closures are normally still rooted (and in the store)
         // because retained revisions keep their GC roots.
-        root_closures(&self.data_dir.join("gcroots"), &target.closures)
+        realise_revision(&self.data_dir.join("gcroots"), target)
             .await
             .map_err(|e| Status::failed_precondition(format!("revision {wanted}: {e}")))?;
 
@@ -2649,9 +2649,35 @@ pub async fn serve_grpc(
     let term_bundle = trust_bundle_pem.clone();
     let identity = tls.identity.clone();
     let stop_state = service.state.clone();
+    let term_gcroots = service
+        .binary_cache
+        .is_some()
+        .then(|| service.data_dir.join("gcroots"));
     leadership.spawn_terms(
         shutdown.clone(),
         move |term| {
+            // Agents fetch the current revision's closures from the leader.
+            if let Some(gcroots) = term_gcroots.clone() {
+                let raft_state = raft_state.clone();
+                let term = term.clone();
+                tokio::spawn(async move {
+                    let Some(revision) = raft_state.current_config().await else {
+                        return;
+                    };
+                    tokio::select! {
+                        _ = term.cancelled() => {}
+                        realised = realise_revision(&gcroots, &revision) => {
+                            if let Err(e) = realised {
+                                tracing::error!(
+                                    revision = revision.revision,
+                                    error = %e,
+                                    "Cannot serve the current revision's closures"
+                                );
+                            }
+                        }
+                    }
+                });
+            }
             controller.clone().spawn(
                 term_bundle.clone(),
                 super::controller::RECONCILE_INTERVAL,
@@ -2831,6 +2857,46 @@ where
     built
 }
 
+/// The recorded store paths of `closures` this server's store lacks.
+fn missing_paths(closures: &Closures) -> Vec<&str> {
+    closures
+        .values()
+        .flatten()
+        .map(String::as_str)
+        .filter(|p| !std::path::Path::new(p).exists())
+        .collect()
+}
+
+/// Make sure the store paths `revision` recorded are in this server's
+/// store and rooted, rebuilding them from its locked flake reference when
+/// they are not: a server that takes over leadership, or rolls back to a
+/// revision whose paths it collected, then serves agents the same paths
+/// the revision names.
+pub(super) async fn realise_revision(
+    gcroots: &std::path::Path,
+    revision: &crate::raft::state::ConfigRevision,
+) -> Result<(), super::nix::NixError> {
+    let missing = missing_paths(&revision.closures);
+    if missing.is_empty() {
+        return root_closures(gcroots, &revision.closures).await;
+    }
+    tracing::info!(
+        revision = revision.revision,
+        flake_ref = %revision.flake_ref,
+        missing = missing.len(),
+        "Rebuilding the closures of a revision this server did not build"
+    );
+    let nothing = |_: u64, _: crate::proto::ApplyStatus, _: String| async { true };
+    let rebuilt = build_service_closures(&revision.flake_ref, gcroots, &nothing).await?;
+    if rebuilt != revision.closures {
+        return Err(super::nix::NixError::BuildFailed(format!(
+            "rebuilding revision {} from {} gave other store paths than recorded",
+            revision.revision, revision.flake_ref
+        )));
+    }
+    Ok(())
+}
+
 /// Make sure `closures` are present and rooted under their content-named
 /// directory. Building already-built paths only creates the roots.
 async fn root_closures(
@@ -2889,6 +2955,20 @@ fn unix_now() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_paths_absent_from_the_store_are_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let present = dir.path().to_string_lossy().into_owned();
+        let absent = dir.path().join("gone").to_string_lossy().into_owned();
+        let closures: super::Closures = [
+            ("web".to_string(), vec![present.clone()]),
+            ("db".to_string(), vec![present, absent.clone()]),
+        ]
+        .into();
+        assert_eq!(super::missing_paths(&closures), vec![absent.as_str()]);
+        assert!(super::missing_paths(&super::Closures::new()).is_empty());
+    }
+
     use super::resolve_stream_node_id;
 
     #[test]
