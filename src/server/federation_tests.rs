@@ -194,7 +194,7 @@ async fn non_server_svids_are_not_peers() {
         )
         .await
         .unwrap();
-    let agent = rustls_pemfile::certs(&mut agent_pem.as_slice())
+    let agent = crate::ca::pki::pem_certs(&mut agent_pem.as_slice())
         .next()
         .unwrap()
         .unwrap();

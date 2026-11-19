@@ -1,0 +1,8 @@
+[advisories]
+ignore = [
+  # Marvin attack on RSA private-key operations (decryption, signing). The
+  # only user, sqlx-mysql, encrypts the password to the server's RSA public
+  # key during caching_sha2 authentication and never holds a private key.
+  # No fixed rsa release exists yet; revisit when sqlx moves to rsa 0.10.
+  "RUSTSEC-2023-0071",
+]
