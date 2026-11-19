@@ -659,6 +659,8 @@ pub enum CaError {
     AttestationFailed(String),
     #[error("invalid CSR: {0}")]
     InvalidCsr(String),
+    #[error("too many requests: {0}")]
+    RateLimited(String),
 }
 
 #[cfg(test)]
