@@ -59,11 +59,8 @@ const RECONNECT_MAX: Duration = Duration::from_secs(60);
 /// (possibly renewed) node SVID each time. Running services, the Workload
 /// API and the mesh interface stay up across reconnects.
 pub async fn run_until(config: AgentConfig, stop: CancellationToken) -> anyhow::Result<()> {
-    // Validate server address format before connecting
-    config
-        .server_addr
-        .parse::<std::net::SocketAddr>()
-        .map_err(|e| anyhow::anyhow!("invalid server address '{}': {e}", config.server_addr))?;
+    // One or more servers; whichever leads serves the agent.
+    let servers = bootstrap::server_list(&config.server_addr)?;
 
     tracing::info!(
         server = %config.server_addr,
@@ -103,14 +100,7 @@ pub async fn run_until(config: AgentConfig, stop: CancellationToken) -> anyhow::
         );
         match (&config.join_token, &config.ca_cert_pem) {
             (Some(join_token), Some(ca_pem)) => {
-                bootstrap::join(
-                    &config.server_addr,
-                    ca_pem,
-                    &node_id,
-                    join_token,
-                    &mut identity,
-                )
-                .await?;
+                bootstrap::join_any(&servers, ca_pem, &node_id, join_token, &mut identity).await?;
             }
             (Some(_), None) => anyhow::bail!("--ca-cert is required to join the fleet"),
             (None, _) if config.token.is_some() => tracing::warn!(
@@ -168,7 +158,7 @@ pub async fn run_until(config: AgentConfig, stop: CancellationToken) -> anyhow::
     let peer_manager = Arc::new(RwLock::new(PeerManager::new(
         wg_manager,
         config.mesh.clone(),
-        &config.server_addr,
+        &servers[0],
     )));
     let policy_enforcer = Arc::new(PolicyEnforcer::new());
     let netns_manager = Arc::new(netns::NamespaceNetworkManager::new());
@@ -227,26 +217,43 @@ pub async fn run_until(config: AgentConfig, stop: CancellationToken) -> anyhow::
     };
 
     let mut attempt: u32 = 0;
+    let (mut target, mut index) = (servers[0].clone(), 0);
     loop {
         let mut connected = false;
-        let result = agent.session(&config, &stop, &mut connected).await;
+        let result = agent.session(&config, &target, &stop, &mut connected).await;
         if stop.is_cancelled() {
             return Ok(());
         }
         if connected {
             attempt = 0;
         }
-        let delay = reconnect_delay(attempt);
-        attempt = attempt.saturating_add(1);
+        // A follower names the leader: go there next, without backing off
+        // further. Otherwise try the next server.
+        let (next, next_index, redirected) =
+            bootstrap::next_server(&servers, index, result.as_ref().err());
+        let delay = if redirected {
+            RECONNECT_BASE
+        } else {
+            let delay = reconnect_delay(attempt);
+            attempt = attempt.saturating_add(1);
+            delay
+        };
+        let previous = std::mem::replace(&mut target, next);
+        index = next_index;
         match result {
-            Ok(()) => tracing::warn!(retry_in = ?delay, "Disconnected from the server"),
+            Err(e) if redirected => {
+                tracing::info!(server = %previous, leader = %target, error = %e, "Following the leader");
+            }
+            Ok(()) => {
+                tracing::warn!(server = %previous, retry_in = ?delay, "Disconnected from the server")
+            }
             // Retrying cannot fix a refused identity; exit and let the
             // supervisor (or operator) act on it.
             Err(e) if is_rejection(&e) => {
                 return Err(e.context("the server refused this agent's credentials"));
             }
             Err(e) => {
-                tracing::warn!(error = %e, retry_in = ?delay, "Disconnected from the server")
+                tracing::warn!(server = %previous, error = %e, retry_in = ?delay, "Disconnected from the server")
             }
         }
         tokio::select! {
@@ -311,6 +318,7 @@ impl Components {
     async fn session(
         &self,
         config: &AgentConfig,
+        server: &str,
         stop: &CancellationToken,
         connected: &mut bool,
     ) -> anyhow::Result<()> {
@@ -335,8 +343,8 @@ impl Components {
         let use_mtls = node_identity.read().await.has_valid_svid();
 
         let channel = if let Some(ca_pem) = &config.ca_cert_pem {
-            let endpoint = format!("https://{}", config.server_addr);
-            let mut tls_config = bootstrap::tls_config(&config.server_addr, ca_pem);
+            let endpoint = format!("https://{server}");
+            let mut tls_config = bootstrap::tls_config(server, ca_pem);
             if use_mtls {
                 let ni = node_identity.read().await;
                 if let (Some(cert), Some(key)) = (&ni.cert_pem, &ni.key_pem) {
@@ -358,7 +366,7 @@ impl Components {
         } else {
             // Plaintext fallback (development only)
             tracing::warn!("Connecting without TLS — use --ca-cert in production");
-            let endpoint = format!("http://{}", config.server_addr);
+            let endpoint = format!("http://{server}");
             tonic::transport::Endpoint::from_shared(endpoint)?
                 .http2_keep_alive_interval(Duration::from_secs(20))
                 .keep_alive_timeout(Duration::from_secs(10))
@@ -398,7 +406,7 @@ impl Components {
         let response = client.stream_control(ReceiverStream::new(rx)).await?;
         let mut inbound = response.into_inner();
         *connected = true;
-        tracing::info!(server = %config.server_addr, "Connected to the server");
+        tracing::info!(%server, "Connected to the server");
 
         // Ends this session's background tasks when the stream goes away.
         let shutdown = stop.child_token();

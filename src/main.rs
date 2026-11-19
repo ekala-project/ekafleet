@@ -23,7 +23,9 @@ struct Cli {
     #[arg(long, global = true)]
     context: Option<String>,
 
-    /// Override the server address (`host:port`) for this invocation.
+    /// Override the server address (`host:port`) for this invocation. A
+    /// comma-separated list is tried in order, and the CLI connects to
+    /// whichever server leads.
     #[arg(long, global = true)]
     server: Option<String>,
 
@@ -187,7 +189,8 @@ enum Command {
 
     /// Start in agent mode (data plane)
     Agent {
-        /// Server address to join
+        /// Server address to join (`ip:port`), or a comma-separated list of
+        /// servers; the agent follows whichever leads
         #[arg(long)]
         join: String,
 

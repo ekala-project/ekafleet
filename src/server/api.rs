@@ -2236,6 +2236,18 @@ impl FleetControl for FleetControlService {
             .map(Response::new)
     }
 
+    async fn raft_status(
+        &self,
+        request: Request<crate::proto::RaftStatusRequest>,
+    ) -> Result<Response<crate::proto::RaftStatusResponse>, Status> {
+        require_fleet_permission(&request, Permission::Read)?;
+        let raft = self
+            .raft_state
+            .raft()
+            .ok_or_else(|| Status::failed_precondition("this server does not run Raft"))?;
+        Ok(Response::new(super::leadership::raft_status(raft)))
+    }
+
     async fn delete_transit_key(
         &self,
         request: Request<crate::proto::DeleteTransitKeyRequest>,
@@ -2456,6 +2468,10 @@ pub struct GrpcServerConfig {
     /// Where peers fetch this cluster's federation document; `None` serves
     /// none (peers can still be fetched).
     pub federation_listen: Option<std::net::SocketAddr>,
+    /// Whether this server leads; followers refuse control-plane RPCs.
+    pub leadership: super::leadership::Leadership,
+    /// More background tasks to run for each term this server leads.
+    pub leader_tasks: Box<dyn Fn(tokio_util::sync::CancellationToken) + Send>,
 }
 
 /// Start the gRPC server with TLS and RBAC-based authentication.
@@ -2485,6 +2501,8 @@ pub async fn serve_grpc(
         audit_log,
         federation,
         federation_listen,
+        leadership,
+        leader_tasks,
     } = config;
 
     tracing::info!(%addr, domain = %domain, "gRPC server listening (TLS + RBAC + SPIFFE)");
@@ -2592,62 +2610,97 @@ pub async fn serve_grpc(
         Some(cache) => service.with_binary_cache(cache),
         None => service,
     };
-    service.controller().spawn(
-        trust_bundle_pem.clone(),
-        super::controller::RECONCILE_INTERVAL,
-        shutdown.clone(),
+    // The controllers run only while this server leads.
+    let controller = service.controller();
+    let (state, raft_state, fleet_key, secret_store, events, mesh) = (
+        service.state.clone(),
+        service.raft_state.clone(),
+        service.fleet_key.clone(),
+        service.secret_store.clone(),
+        service.event_store.clone(),
+        service.mesh.clone(),
     );
-    service.secret_publisher().spawn(shutdown.clone());
-    super::dynamic::LeaseManager {
-        raft_state: service.raft_state.clone(),
-        state: service.state.clone(),
-        events: service.event_store.clone(),
-        fleet_key: service.fleet_key.clone(),
-        secret_store: service.secret_store.clone(),
-        backend: Arc::new(crate::secrets::dynamic::Databases),
-    }
-    .spawn(shutdown.clone());
-    super::webhook::EventNotifier {
-        events: service.event_store.clone(),
-        raft_state: service.raft_state.clone(),
-        secret_store: service.secret_store.clone(),
-    }
-    .spawn(shutdown.clone());
     let trusted_peers = super::federation::TrustedPeers::default();
     let local_jwks = service.jwt_bundle.clone().unwrap_or_default();
-    super::federation::FederationManager {
-        raft_state: service.raft_state.clone(),
-        view: federation,
-        trusted: trusted_peers.clone(),
-        identity: tls.identity.clone(),
-        state: service.state.clone(),
-        events: service.event_store.clone(),
-        domain: domain.clone(),
-        bundle_pem: trust_bundle_pem.clone(),
-        jwks: local_jwks.clone(),
-    }
-    .spawn(shutdown.clone());
-    if let Some(listen) = federation_listen {
-        let listener = tokio::net::TcpListener::bind(listen).await?;
-        let exporter = super::federation::Exporter {
-            domain: domain.clone(),
-            bundle_pem: trust_bundle_pem.clone(),
-            jwks: local_jwks,
-            raft_state: service.raft_state.clone(),
-            state: service.state.clone(),
-            mesh: service.mesh.clone(),
-        };
-        let identity = tls.identity.clone();
-        let shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            if let Err(e) =
-                super::federation::serve(listener, identity, trusted_peers, exporter, shutdown)
-                    .await
-            {
-                tracing::error!(error = %e, "Federation listener failed");
+    let term_domain = domain.clone();
+    let term_bundle = trust_bundle_pem.clone();
+    let identity = tls.identity.clone();
+    let stop_state = service.state.clone();
+    leadership.spawn_terms(
+        shutdown.clone(),
+        move |term| {
+            controller.clone().spawn(
+                term_bundle.clone(),
+                super::controller::RECONCILE_INTERVAL,
+                term.clone(),
+            );
+            super::secrets::SecretPublisher::new(
+                state.clone(),
+                raft_state.clone(),
+                fleet_key.clone(),
+                secret_store.clone(),
+                &term_domain,
+            )
+            .spawn(term.clone());
+            super::dynamic::LeaseManager {
+                raft_state: raft_state.clone(),
+                state: state.clone(),
+                events: events.clone(),
+                fleet_key: fleet_key.clone(),
+                secret_store: secret_store.clone(),
+                backend: Arc::new(crate::secrets::dynamic::Databases),
             }
-        });
-    }
+            .spawn(term.clone());
+            super::webhook::EventNotifier {
+                events: events.clone(),
+                raft_state: raft_state.clone(),
+                secret_store: secret_store.clone(),
+            }
+            .spawn(term.clone());
+            super::federation::FederationManager {
+                raft_state: raft_state.clone(),
+                view: federation.clone(),
+                trusted: trusted_peers.clone(),
+                identity: identity.clone(),
+                state: state.clone(),
+                events: events.clone(),
+                domain: term_domain.clone(),
+                bundle_pem: term_bundle.clone(),
+                jwks: local_jwks.clone(),
+            }
+            .spawn(term.clone());
+            if let Some(listen) = federation_listen {
+                let exporter = super::federation::Exporter {
+                    domain: term_domain.clone(),
+                    bundle_pem: term_bundle.clone(),
+                    jwks: local_jwks.clone(),
+                    raft_state: raft_state.clone(),
+                    state: state.clone(),
+                    mesh: mesh.clone(),
+                };
+                let (identity, trusted) = (identity.clone(), trusted_peers.clone());
+                let term = term.clone();
+                tokio::spawn(async move {
+                    let served = match tokio::net::TcpListener::bind(listen).await {
+                        Ok(listener) => {
+                            super::federation::serve(listener, identity, trusted, exporter, term)
+                                .await
+                        }
+                        Err(e) => Err(e.into()),
+                    };
+                    if let Err(e) = served {
+                        tracing::error!(%listen, error = %e, "Federation listener failed");
+                    }
+                });
+            }
+            leader_tasks(term);
+        },
+        move || {
+            // Agents reconnect to the new leader.
+            let state = stop_state.clone();
+            tokio::spawn(async move { state.disconnect_agents().await });
+        },
+    );
     if allow_bearer_agents {
         tracing::warn!("Accepting bearer-token agents (development mode)");
     }
@@ -2664,16 +2717,22 @@ pub async fn serve_grpc(
     tonic::transport::Server::builder()
         .http2_keepalive_interval(Some(Duration::from_secs(20)))
         .http2_keepalive_timeout(Some(Duration::from_secs(10)))
-        .add_service(FleetBootstrapServer::new(bootstrap))
+        .add_service(super::leadership::LeaderOnly::new(
+            FleetBootstrapServer::new(bootstrap),
+            leadership.clone(),
+        ))
         .add_service(
             crate::proto::raft_internal_server::RaftInternalServer::new(raft_service)
                 .max_decoding_message_size(super::raft_rpc::MAX_MESSAGE)
                 .max_encoding_message_size(super::raft_rpc::MAX_MESSAGE),
         )
-        .add_service(super::access_audit::AuditDenials::new(
-            FleetControlServer::with_interceptor(service, interceptor),
-            audit_log,
-            service_token_store_for_audit,
+        .add_service(super::leadership::LeaderOnly::new(
+            super::access_audit::AuditDenials::new(
+                FleetControlServer::with_interceptor(service, interceptor),
+                audit_log,
+                service_token_store_for_audit,
+            ),
+            leadership,
         ))
         .serve_with_incoming_shutdown(incoming, shutdown.cancelled())
         .await?;

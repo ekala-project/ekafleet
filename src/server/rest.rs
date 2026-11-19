@@ -209,6 +209,7 @@ pub async fn serve_http(
     jwt_bundle: String,
     tls: Option<ServerIdentity>,
     audit_log: super::audit::AuditLog,
+    leadership: Option<super::leadership::Leadership>,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<()> {
     let api_state = HttpApiState {
@@ -255,6 +256,10 @@ pub async fn serve_http(
                 audit: audit_log,
             },
             authorize_http,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            leadership,
+            require_leader,
         ));
 
     // The JWT bundle is public key material: relying parties outside the
@@ -656,6 +661,30 @@ async fn rest_query(
 struct HttpAuth {
     tokens: TokenStore,
     audit: super::audit::AuditLog,
+}
+
+/// Followers refuse the API with 503 and the leader's gRPC address in the
+/// `x-ekafleet-leader` header.
+async fn require_leader(
+    axum::extract::State(leadership): axum::extract::State<Option<super::leadership::Leadership>>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let Some(leadership) = leadership.filter(|l| !l.is_leader()) else {
+        return next.run(req).await;
+    };
+    let leader = leadership.leader_addr();
+    let message = match &leader {
+        Some(addr) => format!("this server is not the leader; the leader is {addr}\n"),
+        None => "this server is not the leader and none is known yet\n".to_string(),
+    };
+    let mut response = (StatusCode::SERVICE_UNAVAILABLE, message).into_response();
+    if let Some(value) = leader.and_then(|a| a.parse().ok()) {
+        response
+            .headers_mut()
+            .insert(super::leadership::LEADER_METADATA, value);
+    }
+    response
 }
 
 /// Authenticate and authorize an HTTP API request, auditing refusals.

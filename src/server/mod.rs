@@ -19,6 +19,7 @@ pub mod federation;
 pub mod identity;
 pub mod images;
 pub mod ingress;
+pub mod leadership;
 pub mod mesh;
 pub mod nix;
 pub mod policy;
@@ -225,6 +226,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     crate::raft::consensus::wait_leading(&raft, std::time::Duration::from_secs(30))
         .await
         .map_err(|e| anyhow::anyhow!("Raft did not elect this server: {e}"))?;
+    let leadership = leadership::Leadership::new(raft.clone());
 
     // A fleet key rotation interrupted by a crash leaves its key staged.
     let staged_key = if config.data_dir.join(secrets::NEXT_FLEET_KEY_FILE).exists() {
@@ -258,7 +260,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
 
     // Start gRPC and HTTP servers concurrently
     let federation_view = federation::FederationView::new();
-    let grpc_config = api::GrpcServerConfig {
+    let mut grpc_config = api::GrpcServerConfig {
         addr: grpc_addr,
         tls,
         cert_issuer,
@@ -278,6 +280,8 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         audit_log: audit_log.clone(),
         federation: federation_view.clone(),
         federation_listen: config.federation_listen,
+        leadership: leadership.clone(),
+        leader_tasks: Box::new(|_| {}),
     };
 
     let grpc_shutdown = shutdown.clone();
@@ -298,32 +302,46 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         housekeeping_loop(hk_deps, hk_shutdown).await;
     });
 
-    let external_health = external::ExternalHealth::new();
-    external::ExternalChecker {
-        raft_state: grpc_config.raft_state.clone(),
-        health: external_health.clone(),
-        events: event_store.clone(),
-    }
-    .spawn(shutdown.child_token());
-    dns::DnsPublisher::new(fleet_state.clone())
-        .with_external(grpc_config.raft_state.clone(), external_health)
-        .with_federation(federation_view)
-        .spawn(shutdown.child_token());
-    ingress::IngressPublisher::new(fleet_state.clone(), grpc_config.raft_state.clone())
-        .spawn(shutdown.child_token());
-    autoscaler::Autoscaler {
-        raft_state: grpc_config.raft_state.clone(),
-        state: fleet_state.clone(),
-        metrics: metrics.clone(),
-        events: event_store.clone(),
-    }
-    .spawn(shutdown.child_token());
-    alerts::AlertLoop {
-        raft_state: grpc_config.raft_state.clone(),
-        metrics: metrics.clone(),
-        evaluator: alert_evaluator.clone(),
-    }
-    .spawn(shutdown.child_token());
+    // Started by serve_grpc for each term this server leads.
+    let leader_tasks = {
+        let (raft_state, fleet_state, events, metrics, alerts) = (
+            grpc_config.raft_state.clone(),
+            fleet_state.clone(),
+            event_store.clone(),
+            metrics.clone(),
+            alert_evaluator.clone(),
+        );
+        let federation_view = federation_view.clone();
+        Box::new(move |term: CancellationToken| {
+            let external_health = external::ExternalHealth::new();
+            external::ExternalChecker {
+                raft_state: raft_state.clone(),
+                health: external_health.clone(),
+                events: events.clone(),
+            }
+            .spawn(term.child_token());
+            dns::DnsPublisher::new(fleet_state.clone())
+                .with_external(raft_state.clone(), external_health)
+                .with_federation(federation_view.clone())
+                .spawn(term.child_token());
+            ingress::IngressPublisher::new(fleet_state.clone(), raft_state.clone())
+                .spawn(term.child_token());
+            autoscaler::Autoscaler {
+                raft_state: raft_state.clone(),
+                state: fleet_state.clone(),
+                metrics: metrics.clone(),
+                events: events.clone(),
+            }
+            .spawn(term.child_token());
+            alerts::AlertLoop {
+                raft_state: raft_state.clone(),
+                metrics: metrics.clone(),
+                evaluator: alerts.clone(),
+            }
+            .spawn(term.child_token());
+        })
+    };
+    grpc_config.leader_tasks = leader_tasks;
 
     if let Some(agent) = config.embedded_agent {
         spawn_embedded_agent(
@@ -353,6 +371,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
             jwt_bundle,
             http_tls,
             audit_log,
+            Some(leadership),
             http_shutdown,
         ) => {
             result?;
