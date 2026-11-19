@@ -268,6 +268,96 @@ impl RaftStorage {
         Ok(removed)
     }
 
+    /// Path of the sealed record `index` in `dir`.
+    fn record_path(&self, dir: &str, ext: &str, index: u64) -> PathBuf {
+        self.data_dir.join(dir).join(format!("{index:020}.{ext}"))
+    }
+
+    /// Create `dir` (under the storage directory) if it is missing.
+    pub(crate) async fn ensure_dir(&self, dir: &str) -> Result<(), RaftError> {
+        tokio::fs::create_dir_all(self.data_dir.join(dir)).await?;
+        Ok(())
+    }
+
+    /// Flush `dir`'s entries (creates, renames, removes) to disk.
+    pub(crate) async fn sync_dir(&self, dir: &str) -> Result<(), RaftError> {
+        let path = self.data_dir.join(dir);
+        tokio::task::spawn_blocking(move || std::fs::File::open(path)?.sync_all())
+            .await
+            .map_err(std::io::Error::other)??;
+        Ok(())
+    }
+
+    /// Store `data` sealed as record `index` of `kind` in `dir`. The file
+    /// itself is fsynced; call [`Self::sync_dir`] to make it durable.
+    pub(crate) async fn put_record(
+        &self,
+        dir: &str,
+        ext: &str,
+        kind: &str,
+        index: u64,
+        data: &[u8],
+    ) -> Result<(), RaftError> {
+        self.write_sealed(&self.record_path(dir, ext, index), kind, index, data)
+            .await
+    }
+
+    /// Record `index` of `kind` in `dir`, decrypted, if present.
+    pub(crate) async fn get_record(
+        &self,
+        dir: &str,
+        ext: &str,
+        kind: &str,
+        index: u64,
+    ) -> Result<Option<Vec<u8>>, RaftError> {
+        let path = self.record_path(dir, ext, index);
+        match tokio::fs::metadata(&path).await {
+            Ok(_) => self.read_sealed(&path, kind, index).await.map(Some),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Indices of the records in `dir`, ascending.
+    pub(crate) async fn record_indices(&self, dir: &str, ext: &str) -> Result<Vec<u64>, RaftError> {
+        Ok(self
+            .indexed_files(dir, ext)
+            .await?
+            .into_iter()
+            .map(|(index, _)| index)
+            .collect())
+    }
+
+    /// Remove record `index` from `dir` (absent is fine).
+    pub(crate) async fn remove_record(
+        &self,
+        dir: &str,
+        ext: &str,
+        index: u64,
+    ) -> Result<(), RaftError> {
+        match tokio::fs::remove_file(self.record_path(dir, ext, index)).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Drop the pre-consensus log and snapshots once migrated.
+    pub(crate) async fn remove_legacy_layout(&self) -> Result<(), RaftError> {
+        for dir in ["log", "snapshots"] {
+            match tokio::fs::remove_dir_all(self.data_dir.join(dir)).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let path = self.data_dir.clone();
+        tokio::task::spawn_blocking(move || std::fs::File::open(path)?.sync_all())
+            .await
+            .map_err(std::io::Error::other)??;
+        Ok(())
+    }
+
     /// Write `entry` in the pre-raft-key format (this storage's key standing
     /// in for the fleet key, index-less AAD), for migration tests.
     #[cfg(test)]
