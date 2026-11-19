@@ -40,6 +40,7 @@ ekafleet server [OPTIONS]
 |--------|---------|-------------|
 | `--data-dir` | `/var/lib/ekafleet` | Data directory for persistent state |
 | `--node-id` | `1` | This server's Raft node id, unique among the servers (`EKAFLEET_NODE_ID`) |
+| `--raft-addr` | | The gRPC `host:port` other servers and agents reach this server on (`EKAFLEET_RAFT_ADDR`); defaults to its `--peers` entry, else `--listen` with `0.0.0.0` replaced by the hostname |
 | `--peers` | | The servers of a new HA cluster, this one included: `<id>=<host:port>,...` (`EKAFLEET_PEERS`); first boot only, see [High Availability](../operations/high-availability.md) |
 | `--listen` | `0.0.0.0:7400` | gRPC listen address |
 | `--http-listen` | `0.0.0.0:7402` | HTTP API listen address |

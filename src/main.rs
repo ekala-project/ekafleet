@@ -118,6 +118,12 @@ enum Command {
         #[arg(long, env = "EKAFLEET_NODE_ID", default_value_t = ekafleet::server::DEFAULT_NODE_ID)]
         node_id: u64,
 
+        /// The gRPC address (`host:port`) other servers and agents reach
+        /// this server on [default: its `--peers` entry, else `--listen`
+        /// with an unspecified host replaced by the hostname]
+        #[arg(long, env = "EKAFLEET_RAFT_ADDR")]
+        raft_addr: Option<String>,
+
         /// The servers of a new HA cluster, this one included, as
         /// `<node-id>=<host:port>,...` (their gRPC addresses). Read on first
         /// boot only; change membership later with `ekafleet raft`
@@ -1343,6 +1349,7 @@ async fn main() -> anyhow::Result<()> {
             data_dir,
             node_id,
             peers,
+            raft_addr,
             listen,
             http_listen,
             federation_listen,
@@ -1379,6 +1386,7 @@ async fn main() -> anyhow::Result<()> {
                 node_id,
                 peers: ekafleet::server::parse_peers(peers.as_deref().unwrap_or_default())?,
                 grpc_listen: listen,
+                raft_addr,
                 http_listen,
                 token: commands::secret_arg(token, token_file)?
                     .ok_or_else(|| anyhow::anyhow!("--token or --token-file is required"))?

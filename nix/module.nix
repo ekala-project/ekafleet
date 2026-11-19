@@ -88,6 +88,17 @@ in
         '';
       };
 
+      raftAddr = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "10.0.0.1:7400";
+        description = ''
+          The gRPC address (`host:port`) other servers and agents reach this
+          server on. Defaults to this server's entry in `peers`, else
+          `grpcListen` with an unspecified host replaced by the hostname.
+        '';
+      };
+
       nodeId = lib.mkOption {
         type = lib.types.ints.positive;
         default = 1;
@@ -507,7 +518,9 @@ in
               Restart = "on-failure";
               RestartSec = 5;
 
-              ExecStart = "${cfg.server.package}/bin/ekafleet server --data-dir ${cfg.server.dataDir} --listen ${cfg.server.grpcListen} --http-listen ${cfg.server.httpListen} --domain ${cfg.server.domain} --ca-socket ${cfg.server.caSocketPath} --node-id ${toString cfg.server.nodeId} ${peersArg} ${federationArg}";
+              ExecStart = "${cfg.server.package}/bin/ekafleet server --data-dir ${cfg.server.dataDir} --listen ${cfg.server.grpcListen} --http-listen ${cfg.server.httpListen} --domain ${cfg.server.domain} --ca-socket ${cfg.server.caSocketPath} --node-id ${toString cfg.server.nodeId} ${peersArg} ${
+                lib.optionalString (cfg.server.raftAddr != null) "--raft-addr ${cfg.server.raftAddr}"
+              } ${federationArg}";
 
               # The control plane does not hold the CA key (that's in ca-signer).
               User = "ekafleet";

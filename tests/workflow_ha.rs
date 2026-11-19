@@ -46,6 +46,7 @@ impl Server {
             node_id: id,
             peers: peers.clone(),
             grpc_listen: grpc.to_string(),
+            raft_addr: None,
             http_listen: free_addr().to_string(),
             token: ADMIN_TOKEN.into(),
             domain: DOMAIN.into(),
