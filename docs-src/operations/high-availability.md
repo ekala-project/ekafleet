@@ -79,7 +79,3 @@ ekafleet raft remove 2
 A new server joins as a learner. It becomes a voter only once it has caught up with the log. ekafleet never removes the last voting server. These commands need the `admin` role (`ManageCluster`).
 
 To replace a failed server, remove it, then add the replacement under a new id.
-
-## Limits
-
-- The fleet key version that agents are sent is kept in memory on each server, so it restarts from 1 on a new leader. Agents use the key itself, not the version.

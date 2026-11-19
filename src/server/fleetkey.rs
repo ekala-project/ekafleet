@@ -226,6 +226,11 @@ impl FleetKeySync {
         };
         if has_check(&self.fleet_key.read().await.key, &expected) {
             self.drop_abandoned_stage().await;
+            // The version agents are sent follows the replicated one.
+            let version = self.raft_state.fleet_key_version().await;
+            if version > self.fleet_key.read().await.version {
+                self.fleet_key.write().await.version = version;
+            }
             return true;
         }
         if let Some(staged) = read_staged(&self.data_dir).await
@@ -313,7 +318,7 @@ impl FleetKeySync {
             let _ = tokio::fs::remove_file(staged_path(&self.data_dir)).await;
         }
         *store = SecretStore::new(array);
-        fleet_key.version += 1;
+        fleet_key.version = (fleet_key.version + 1).max(self.raft_state.fleet_key_version().await);
         fleet_key.key = key;
         let version = fleet_key.version;
         let (notified, total) =
@@ -339,6 +344,43 @@ mod tests {
         assert_ne!(key_check(&a), key_check(&b));
         assert_eq!(key_check(&a).len(), 32);
         assert!(!key_check(&a).windows(4).any(|w| w == [1, 1, 1, 1]));
+    }
+
+    #[tokio::test]
+    async fn rotations_count_the_version_in_the_replicated_state() {
+        let raft = FleetStateMachine::new();
+        assert_eq!(raft.fleet_key_version().await, 0);
+        raft.apply_next(Command::SetFleetKeyCheck {
+            check: key_check(&[1; 32]),
+        })
+        .await
+        .unwrap();
+        assert_eq!(raft.fleet_key_version().await, 1);
+        let reseal = |check: Option<Vec<u8>>| {
+            let raft = raft.clone();
+            async move {
+                raft.reseal_under(
+                    Default::default(),
+                    Default::default(),
+                    Default::default(),
+                    check,
+                )
+                .await
+                .unwrap()
+            }
+        };
+        reseal(Some(key_check(&[2; 32]))).await;
+        assert_eq!(raft.fleet_key_version().await, 2);
+        // Resealing without a new key, or recording the same one again,
+        // is no rotation.
+        reseal(None).await;
+        reseal(Some(key_check(&[2; 32]))).await;
+        raft.apply_next(Command::SetFleetKeyCheck {
+            check: key_check(&[2; 32]),
+        })
+        .await
+        .unwrap();
+        assert_eq!(raft.fleet_key_version().await, 2);
     }
 
     #[tokio::test]
