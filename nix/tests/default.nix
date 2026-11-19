@@ -14,6 +14,7 @@
   oci-container = import ./oci-container.nix { inherit pkgs lib; };
   oci-registry = import ./oci-registry.nix { inherit pkgs lib; };
   metrics-alerts = import ./metrics-alerts.nix { inherit pkgs lib; };
+  fleet-operations = import ./fleet-operations.nix { inherit pkgs lib; };
   lifecycle = import ./lifecycle.nix { inherit pkgs lib; };
   fleet-module = import ./fleet-module.nix { inherit pkgs lib; };
 }
