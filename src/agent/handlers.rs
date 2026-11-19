@@ -25,7 +25,7 @@ use crate::spiffe::workload_api::WorkloadManager;
 /// Fetch each service's closure from the server's cache. A service whose
 /// closure cannot be fetched keeps its `previous` spec if it had one and is
 /// left out otherwise.
-async fn fetch_service_closures(
+pub(super) async fn fetch_service_closures(
     client: &super::closures::AgentClient,
     services: Vec<crate::proto::ServiceSpec>,
     public_key: &str,
@@ -180,10 +180,9 @@ pub(super) async fn handle_server_message(
     images: &Arc<ImageManager>,
     tx: &mpsc::Sender<AgentMessage>,
     node_id: &str,
-    client: &super::closures::AgentClient,
 ) {
     match payload {
-        ServerPayload::DesiredState(mut ds) => {
+        ServerPayload::DesiredState(ds) => {
             if let Err(e) = images.set_signature_policy(&ds.signature_policy_json) {
                 tracing::error!(error = %e, "Refusing to pull images until the signature policy is fixed");
             }
@@ -195,16 +194,10 @@ pub(super) async fn handle_server_message(
                 "Received desired state"
             );
 
-            // Fetch the closures services need before touching anything else,
-            // so a service whose closure cannot be fetched keeps running its
-            // current version instead of being restarted into a missing one.
-            ds.services = fetch_service_closures(
-                client,
-                ds.services,
-                &ds.cache_public_key,
-                &local_state.read().await.desired_services,
-            )
-            .await;
+            // The agent loop fetched the closures services need before
+            // handing the state over (`fetch_service_closures`), so a service
+            // whose closure could not be fetched keeps running its current
+            // version instead of being restarted into a missing one.
 
             // Activate EkaOS system closure if a new system_path is provided
             if !ds.system_path.is_empty() {
