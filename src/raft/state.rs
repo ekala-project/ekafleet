@@ -168,6 +168,11 @@ pub(super) struct StateMachineInner {
     /// Join tokens, by digest.
     #[serde(default)]
     join_tokens: BTreeMap<String, JoinTokenRecord>,
+    /// Identifies the current fleet key without revealing it (see
+    /// `server::secrets::key_check`), so a server can tell its own copy
+    /// is out of date.
+    #[serde(default)]
+    fleet_key_check: Option<Vec<u8>>,
 }
 
 /// A transit encryption key: its namespace and every version, oldest
@@ -368,6 +373,14 @@ pub enum Command {
         /// Transit keys, resealed: name → every version.
         #[serde(default)]
         transit: HashMap<String, Vec<Vec<u8>>>,
+        /// The check value of the key they are now sealed under.
+        #[serde(default)]
+        key_check: Option<Vec<u8>>,
+    },
+    /// Record the check value of the fleet key (first set by a leader that
+    /// finds none).
+    SetFleetKeyCheck {
+        check: Vec<u8>,
     },
     /// Create, rotate (a version added) or replace a transit key.
     PutTransitKey {
@@ -750,11 +763,18 @@ impl FleetStateMachine {
                     }
                 }
             }
+            Command::SetFleetKeyCheck { check } => {
+                state.fleet_key_check = Some(check);
+            }
             Command::ResealSecrets {
                 secrets,
                 history,
                 transit,
+                key_check,
             } => {
+                if key_check.is_some() {
+                    state.fleet_key_check = key_check;
+                }
                 for (name, versions) in transit {
                     if let Some(key) = state.transit_keys.get_mut(&name)
                         && key.versions.len() == versions.len()
@@ -1251,16 +1271,31 @@ impl FleetStateMachine {
         history: HashMap<String, HashMap<String, HashMap<u64, Vec<u8>>>>,
         transit: HashMap<String, Vec<Vec<u8>>>,
     ) -> Result<(), RaftError> {
-        let mut turn = self.turn().await;
-        let state = turn.read().await;
-        drop(state);
-        turn.commit(Command::ResealSecrets {
+        self.reseal_under(secrets, history, transit, None).await
+    }
+
+    /// [`Self::reseal_secrets`] under a new fleet key with check value
+    /// `key_check`, recorded in the same entry.
+    pub async fn reseal_under(
+        &self,
+        secrets: HashMap<String, HashMap<String, Vec<u8>>>,
+        history: HashMap<String, HashMap<String, HashMap<u64, Vec<u8>>>>,
+        transit: HashMap<String, Vec<Vec<u8>>>,
+        key_check: Option<Vec<u8>>,
+    ) -> Result<(), RaftError> {
+        self.apply_next(Command::ResealSecrets {
             secrets,
             history,
             transit,
+            key_check,
         })
         .await
         .map(drop)
+    }
+
+    /// The check value of the current fleet key, once recorded.
+    pub async fn fleet_key_check(&self) -> Option<Vec<u8>> {
+        self.inner.read().await.fleet_key_check.clone()
     }
 
     /// Every transit key, by name.

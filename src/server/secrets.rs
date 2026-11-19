@@ -394,7 +394,8 @@ impl FleetControlService {
         // Sealed and stored under the read locks, so a key rotation cannot
         // reseal the stored values in between and miss this one.
         let version = {
-            let _fleet_key = self.fleet_key.read().await;
+            let fleet_key = self.fleet_key.read().await;
+            super::fleetkey::ensure_current(&self.raft_state, &fleet_key).await?;
             let store = self.secret_store.read().await;
             let sealed = store
                 .seal(&req.service_name, &req.secret_name, &value)
@@ -648,7 +649,12 @@ impl FleetControlService {
             .map_err(|e| Status::internal(format!("failed to stage rotated key: {e}")))?;
         if let Err(e) = self
             .raft_state
-            .reseal_secrets(resealed, resealed_history, resealed_transit)
+            .reseal_under(
+                resealed,
+                resealed_history,
+                resealed_transit,
+                Some(super::fleetkey::key_check(new_key.as_ref())),
+            )
             .await
         {
             let _ = tokio::fs::remove_file(&staged).await;
@@ -668,21 +674,13 @@ impl FleetControlService {
 
         // Push the new derived key to every connected agent now; the
         // publisher also re-sends it before any value sealed under it.
-        let node_ids = self.state.connected_nodes().await;
-        let mut notified: u32 = 0;
-        for node in &node_ids {
-            let agent_id = format!("spiffe://{}/agent/{}", self.domain, node);
-            let derived = Zeroizing::new(derive_agent_key(new_key.as_ref(), &agent_id));
-            let msg = ServerMessage {
-                payload: Some(ServerPayload::FleetKey(FleetKeyUpdate {
-                    encrypted_key: derived.to_vec(),
-                    version: new_version,
-                })),
-            };
-            if self.state.send_to_agent(node, msg).await {
-                notified += 1;
-            }
-        }
+        let (notified, total_agents) = super::fleetkey::notify_agents(
+            &self.state,
+            &self.domain,
+            new_key.as_ref(),
+            new_version,
+        )
+        .await;
         drop(store);
         drop(fleet_key);
 
@@ -691,7 +689,7 @@ impl FleetControlService {
             new_version,
             secrets = count,
             notified,
-            total_agents = node_ids.len(),
+            total_agents,
             "Fleet key rotated"
         );
         Ok(RotateFleetKeyResponse {
@@ -701,8 +699,7 @@ impl FleetControlService {
             agents_notified: notified,
             message: format!(
                 "Fleet key rotated from v{prev_version} to v{new_version} ({count} secrets resealed), \
-                 {notified}/{} agents notified",
-                node_ids.len()
+                 {notified}/{total_agents} agents notified"
             ),
         })
     }

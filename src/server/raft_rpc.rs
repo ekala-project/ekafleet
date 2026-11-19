@@ -25,6 +25,8 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tonic::{Request, Response, Status};
 
+use zeroize::Zeroizing;
+
 use super::identity::ServerIdentity;
 use crate::proto::RaftMessage;
 use crate::proto::raft_internal_client::RaftInternalClient;
@@ -70,6 +72,7 @@ fn encode<T: Serialize>(value: &T) -> Result<Response<RaftMessage>, Status> {
 pub struct RaftService {
     raft_state: FleetStateMachine,
     domain: String,
+    fleet_key: Option<Arc<tokio::sync::RwLock<super::api::FleetKeyState>>>,
 }
 
 impl RaftService {
@@ -77,7 +80,17 @@ impl RaftService {
         Self {
             raft_state,
             domain: domain.to_string(),
+            fleet_key: None,
         }
+    }
+
+    /// Serve `fleet_key` to peers whose copy is out of date.
+    pub fn with_fleet_key(
+        mut self,
+        fleet_key: Arc<tokio::sync::RwLock<super::api::FleetKeyState>>,
+    ) -> Self {
+        self.fleet_key = Some(fleet_key);
+        self
     }
 
     fn raft<T>(&self, request: &Request<T>) -> Result<&Raft, Status> {
@@ -121,6 +134,28 @@ impl RaftInternal for RaftService {
     ) -> Result<Response<crate::proto::RaftStatusResponse>, Status> {
         let raft = self.raft(&request)?;
         Ok(Response::new(super::leadership::raft_status(raft)))
+    }
+
+    async fn fleet_key(
+        &self,
+        request: Request<crate::proto::FleetKeyRequest>,
+    ) -> Result<Response<crate::proto::FleetKeyResponse>, Status> {
+        let peer = server_peer(&request, &self.domain)?;
+        let fleet_key = self
+            .fleet_key
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("no fleet key here"))?
+            .read()
+            .await;
+        if !super::fleetkey::has_check(&fleet_key.key, &request.get_ref().check) {
+            return Err(Status::failed_precondition(
+                "this server does not hold the requested fleet key",
+            ));
+        }
+        tracing::info!(%peer, "Sending the current fleet key to a peer");
+        Ok(Response::new(crate::proto::FleetKeyResponse {
+            key: fleet_key.key.to_vec(),
+        }))
     }
 }
 
@@ -205,6 +240,22 @@ impl GrpcNetwork {
         .await
         .map_err(|_| anyhow::anyhow!("{addr} did not answer"))??;
         Ok(status.into_inner())
+    }
+
+    /// The fleet key with check value `check`, from the server at `addr`.
+    pub async fn fleet_key(&self, addr: &str, check: &[u8]) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+        let channel = self.channel(addr).map_err(anyhow::Error::msg)?;
+        let response = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            RaftInternalClient::new(channel).fleet_key(crate::proto::FleetKeyRequest {
+                check: check.to_vec(),
+            }),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("{addr} did not answer"))??;
+        Ok(Zeroizing::new(std::mem::take(
+            &mut response.into_inner().key,
+        )))
     }
 }
 
@@ -329,6 +380,7 @@ mod tests {
         identity: ServerIdentity,
         ca_pem: String,
         state: FleetStateMachine,
+        fleet_key: Arc<tokio::sync::RwLock<super::super::api::FleetKeyState>>,
         _shutdown: tokio_util::sync::DropGuard,
     }
 
@@ -353,7 +405,13 @@ mod tests {
             shutdown.clone(),
         );
         let state = FleetStateMachine::new();
-        let service = RaftInternalServer::new(RaftService::new(state.clone(), DOMAIN));
+        let fleet_key = Arc::new(tokio::sync::RwLock::new(super::super::api::FleetKeyState {
+            key: Zeroizing::new(vec![1; 32]),
+            version: 1,
+        }));
+        let service = RaftInternalServer::new(
+            RaftService::new(state.clone(), DOMAIN).with_fleet_key(fleet_key.clone()),
+        );
         let stop = shutdown.clone();
         tokio::spawn(async move {
             tonic::transport::Server::builder()
@@ -367,6 +425,7 @@ mod tests {
             identity,
             ca_pem: tls.ca_cert_pem,
             state,
+            fleet_key,
             _shutdown: shutdown.drop_guard(),
         }
     }
@@ -458,6 +517,48 @@ mod tests {
         assert_eq!(status.node_id, 2);
         assert_eq!(status.leader_id, leader);
         assert_eq!(status.members.len(), 2);
+
+        // A fleet key rotated on the leader reaches the other server.
+        use super::super::fleetkey::{FleetKeySync, key_check};
+        let (rotated, stale) = (
+            &servers[(leader - 1) as usize],
+            &servers[(2 - leader) as usize],
+        );
+        rotated.fleet_key.write().await.key = Zeroizing::new(vec![2; 32]);
+        rafts[(leader - 1) as usize]
+            .client_write(Proposal::new(Command::SetFleetKeyCheck {
+                check: key_check(&[2; 32]),
+            }))
+            .await
+            .unwrap();
+        let key_dir = tempfile::tempdir().unwrap();
+        let sync = FleetKeySync {
+            raft_state: stale.state.clone(),
+            fleet_key: stale.fleet_key.clone(),
+            secret_store: Arc::new(tokio::sync::RwLock::new(
+                crate::secrets::store::SecretStore::new(&[1; 32]),
+            )),
+            network: GrpcNetwork::new(stale.identity.clone(), &stale.ca_pem, DOMAIN).unwrap(),
+            state: super::super::state::FleetState::new(),
+            data_dir: key_dir.path().to_path_buf(),
+            domain: DOMAIN.into(),
+        };
+        for _ in 0..100 {
+            if sync.sync().await && stale.fleet_key.read().await.key[..] == [2; 32] {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(stale.fleet_key.read().await.key[..], [2; 32]);
+        assert_eq!(stale.fleet_key.read().await.version, 2);
+        assert!(key_dir.path().join("fleet-key").exists());
+        // Only the key asked for is served.
+        let other = network
+            .fleet_key(&servers[1].addr.to_string(), &key_check(&[9; 32]))
+            .await
+            .unwrap_err();
+        assert!(other.to_string().contains("does not hold"), "{other}");
+
         for raft in rafts {
             raft.shutdown().await.unwrap();
         }
