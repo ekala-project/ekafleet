@@ -723,6 +723,42 @@ pub(crate) mod testing {
                 .map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
         }
     }
+
+    /// Election timings for tests: leaders emerge in well under a second.
+    pub fn fast_config() -> std::sync::Arc<openraft::Config> {
+        std::sync::Arc::new(
+            openraft::Config {
+                heartbeat_interval: 50,
+                election_timeout_min: 200,
+                election_timeout_max: 400,
+                snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(5),
+                max_in_snapshot_log_to_keep: 0,
+                ..Default::default()
+            }
+            .validate()
+            .unwrap(),
+        )
+    }
+
+    /// An uninitialized node stored in `dir`, reachable through `router`.
+    pub async fn node(
+        router: &Router,
+        id: NodeId,
+        dir: &std::path::Path,
+    ) -> (Raft, crate::raft::state::FleetStateMachine) {
+        let storage = Arc::new(crate::raft::storage::RaftStorage::new(dir, &[7u8; 32]));
+        storage.initialize().await.unwrap();
+        let log = super::LogStore::open(storage.clone()).await.unwrap();
+        let state = crate::raft::state::FleetStateMachine::new();
+        let machine = super::StateMachineStore::open(state.clone(), storage)
+            .await
+            .unwrap();
+        let raft = Raft::new(id, fast_config(), router.clone(), log, machine)
+            .await
+            .unwrap();
+        router.add(id, raft.clone());
+        (raft, state)
+    }
 }
 
 #[cfg(test)]
@@ -730,7 +766,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::time::Duration;
 
-    use super::testing::Router;
+    use super::testing::{Router, fast_config};
     use super::*;
 
     fn key() -> [u8; 32] {
@@ -762,21 +798,6 @@ mod tests {
     #[test]
     fn storage_passes_the_openraft_suite() {
         openraft::testing::Suite::test_all(Builder).unwrap();
-    }
-
-    fn fast_config() -> Arc<openraft::Config> {
-        Arc::new(
-            openraft::Config {
-                heartbeat_interval: 50,
-                election_timeout_min: 200,
-                election_timeout_max: 400,
-                snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(5),
-                max_in_snapshot_log_to_keep: 0,
-                ..Default::default()
-            }
-            .validate()
-            .unwrap(),
-        )
     }
 
     struct Node {

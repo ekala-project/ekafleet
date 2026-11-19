@@ -63,12 +63,56 @@ pub async fn connect_server_as(
     // Per-command `--server` flags default to the historical address. Treat a
     // non-default value as an explicit override; otherwise defer to the
     // context resolved from the config file / env / global `--server`.
-    let server = if server == client_config::DEFAULT_SERVER {
+    let servers = if server == client_config::DEFAULT_SERVER {
         ctx.server.as_str()
     } else {
         server
     };
 
+    // `--server` may list several servers: the first that answers is asked
+    // who leads, and the client connects there.
+    let mut last = None;
+    for server in servers.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let mut client = match connect_one(ctx, server, identity).await {
+            Ok(client) => client,
+            Err(e) => {
+                last = Some(e.context(format!("connect to {server}")));
+                continue;
+            }
+        };
+        // Servers without Raft, and callers without Read permission, get an
+        // error here: use the server as given.
+        let status = client
+            .raft_status(ekafleet::proto::RaftStatusRequest {})
+            .await
+            .map(tonic::Response::into_inner);
+        if let Ok(status) = status
+            && status.leader_id != 0
+            && status.leader_id != status.node_id
+            && !status.leader_addr.is_empty()
+        {
+            match connect_one(ctx, &status.leader_addr, identity).await {
+                Ok(leader) => return Ok(leader),
+                Err(e) => {
+                    last = Some(e.context(format!(
+                        "connect to the leader {} (named by {server})",
+                        status.leader_addr
+                    )));
+                    continue;
+                }
+            }
+        }
+        return Ok(client);
+    }
+    Err(last.unwrap_or_else(|| anyhow::anyhow!("no server address given")))
+}
+
+/// Connect to the single `server`.
+async fn connect_one(
+    ctx: &client_config::ClientContext,
+    server: &str,
+    identity: Option<(&std::path::Path, &std::path::Path)>,
+) -> anyhow::Result<FleetClient> {
     let channel = if let Some(ca_path) = &ctx.ca_cert {
         let ca_pem = std::fs::read(ca_path)
             .map_err(|e| anyhow::anyhow!("failed to read CA cert {}: {e}", ca_path.display()))?;

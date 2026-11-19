@@ -168,6 +168,36 @@ service FleetControl {
   // the server's cache key (DesiredState.cache_public_key).
   rpc CacheNarInfo(CacheNarInfoRequest) returns (CacheNarInfoResponse);
   rpc CacheNar(CacheNarRequest) returns (stream CacheNarChunk);
+
+  // Raft cluster membership and leadership. Every server answers it, leader
+  // or not; every other RPC is refused by followers with UNAVAILABLE and
+  // the leader's address in the `x-ekafleet-leader` header.
+  rpc RaftStatus(RaftStatusRequest) returns (RaftStatusResponse);
+}
+
+message RaftStatusRequest {}
+
+message RaftMember {
+  uint64 id = 1;
+  // gRPC address other servers, agents and the CLI reach it on.
+  string addr = 2;
+  bool voter = 3;
+  // Highest log index known replicated to it (reported by the leader only).
+  uint64 matched = 4;
+}
+
+message RaftStatusResponse {
+  // The answering server.
+  uint64 node_id = 1;
+  // 0 when no leader is known.
+  uint64 leader_id = 2;
+  string leader_addr = 3;
+  uint64 term = 4;
+  uint64 last_log_index = 5;
+  uint64 last_applied = 6;
+  // "leader", "follower", "candidate", "learner" or "shutdown".
+  string state = 7;
+  repeated RaftMember members = 8;
 }
 
 // --- Agent → Server messages ---

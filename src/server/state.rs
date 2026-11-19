@@ -375,6 +375,21 @@ impl FleetState {
         self.reconcile.trigger();
     }
 
+    /// End every agent's control stream (their outbound channels are
+    /// dropped), as when this server stops leading: the agents reconnect to
+    /// the new leader.
+    pub async fn disconnect_agents(&self) {
+        let dropped = {
+            let mut state = self.inner.write().await;
+            let dropped = state.nodes.len();
+            state.nodes.clear();
+            dropped
+        };
+        if dropped > 0 {
+            tracing::info!(agents = dropped, "Disconnected all agents");
+        }
+    }
+
     /// Evict nodes whose last heartbeat exceeds the timeout.
     /// Returns the IDs of evicted nodes so the caller can trigger
     /// reconciliation to reschedule their services.
