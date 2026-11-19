@@ -166,6 +166,35 @@ impl MeshRegistry {
         }
     }
 
+    /// Forget the nodes that are not connected and `keep` rejects (gone
+    /// from the configuration and the cloud tracker): their
+    /// advertisements and mesh addresses. The remaining agents are sent
+    /// their new peer sets when any was forgotten. Returns those nodes.
+    pub async fn prune(&self, state: &FleetState, keep: impl Fn(&str) -> bool) -> Vec<String> {
+        let connected: std::collections::HashSet<String> =
+            state.connected_nodes().await.into_iter().collect();
+        let mut known: std::collections::BTreeSet<String> =
+            self.raft.mesh_nodes().await.into_iter().collect();
+        known.extend(self.peers.read().await.keys().cloned());
+        let mut forgotten = Vec::new();
+        for node in known {
+            if keep(&node) || connected.contains(&node) {
+                continue;
+            }
+            if let Err(e) = self.raft.release_mesh_ip(&node).await {
+                tracing::warn!(node_id = %node, error = %e, "Cannot release a mesh address");
+                continue;
+            }
+            self.peers.write().await.remove(&node);
+            tracing::info!(node_id = %node, "Removed a departed node from the mesh");
+            forgotten.push(node);
+        }
+        if !forgotten.is_empty() {
+            self.distribute(state).await;
+        }
+        forgotten
+    }
+
     /// Handle an advertisement from `node_id`'s stream: record it and, if
     /// it changed, update the node's VXLAN underlay address and send every
     /// agent its new peer set.
@@ -241,6 +270,48 @@ mod tests {
             signature,
             signing_cert_pem: cert_pem.into(),
         }
+    }
+
+    #[tokio::test]
+    async fn departed_nodes_leave_the_mesh() {
+        let raft = FleetStateMachine::new();
+        let mesh = MeshRegistry::new(raft.clone(), DOMAIN);
+        let state = FleetState::new();
+        for node in ["kept", "connected", "gone"] {
+            let ip = mesh.assignment(node).await.unwrap().mesh_ip;
+            let (pem, der, key) = node_cert(node);
+            mesh.accept(
+                node,
+                advert(node, &format!("{ip}/32"), &pem, &key),
+                Some(&der),
+            )
+            .await
+            .unwrap();
+        }
+        let mut rx = state
+            .register_agent("connected", "192.0.2.1".into(), String::new())
+            .await;
+
+        let forgotten = mesh.prune(&state, |node| node == "kept").await;
+        assert_eq!(forgotten, vec!["gone".to_string()]);
+        assert_eq!(raft.mesh_ip("gone").await, None);
+        assert!(raft.mesh_ip("kept").await.is_some());
+        // The connected agent learns that the peer is gone.
+        let mut peers = None;
+        while let Ok(msg) = rx.try_recv() {
+            if let Some(ServerPayload::Peers(update)) = msg.payload {
+                peers = Some(update);
+            }
+        }
+        let peers: Vec<String> = peers
+            .unwrap()
+            .peers
+            .into_iter()
+            .map(|p| p.node_id)
+            .collect();
+        assert_eq!(peers, vec!["kept".to_string()]);
+        // Nothing more to forget.
+        assert!(mesh.prune(&state, |node| node == "kept").await.is_empty());
     }
 
     #[tokio::test]
