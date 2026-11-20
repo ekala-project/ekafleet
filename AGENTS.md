@@ -273,7 +273,7 @@ tests/
   HA — these boot the production server path)
 - NixOS VM tests: `nix/tests/` (module-basic, rest-api, cli-operations, server-agent,
   lifecycle, fleet-module, oci-container, oci-registry, colocated, deploy-closure, dns, mesh,
-  metrics-alerts, secrets, volumes, fleet-operations)
+  metrics-alerts, secrets, volumes, fleet-operations, namespace-network)
 - Helpers: `free_port()` (bind port 0), `start_server()` (spawn with tempdir + Role::Admin
   in interceptor for RBAC)
 - Always use `tempfile::tempdir()` for isolation — never write to fixed paths
