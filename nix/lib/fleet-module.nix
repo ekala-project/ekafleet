@@ -1204,7 +1204,7 @@ let
   ingressSplit = strictSubmodule {
     service = mkOption {
       type = types.str;
-      description = "Default-namespace service declaring the route's port.";
+      description = "Service declaring the route's port.";
     };
     weight = mkOption {
       type = types.ints.between 1 100;
@@ -1226,7 +1226,7 @@ let
     };
     service = mkOption {
       type = types.str;
-      description = "Default-namespace service receiving the traffic.";
+      description = "Service receiving the traffic.";
     };
     port = mkOption {
       type = types.str;

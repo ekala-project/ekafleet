@@ -79,7 +79,8 @@ impl Controller {
     }
 
     /// Forget the mesh peers of nodes neither `config` nor the cloud
-    /// tracker knows and that are not connected.
+    /// tracker knows and that are not connected, and route replicas'
+    /// namespace addresses to their nodes.
     async fn prune_mesh(&self, config: &FleetConfig) {
         let Some(mesh) = &self.mesh else {
             return;
@@ -95,6 +96,7 @@ impl Controller {
             config.machines.contains_key(node) || cloud.contains(node)
         })
         .await;
+        mesh.sync_routes(&self.state).await;
     }
 
     /// Receive the outcome of every later reconcile cycle.

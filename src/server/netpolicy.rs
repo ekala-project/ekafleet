@@ -4,7 +4,7 @@
 //! `identity.allowedCallers` is reachable from other nodes only from the
 //! nodes running one of those callers, or serving an ingress route to it.
 //! A namespaced service is reachable only from its callers' replicas, by
-//! their namespace IPs. A service that declares `identity.egressRules` may
+//! their namespace IPs, and from the ingress proxies routing to it. A service that declares `identity.egressRules` may
 //! send only what they allow. Every [`PUBLISH_INTERVAL`] the server works out
 //! each connected node's policy for the replicas it runs, and the agent
 //! enforces it with nftables (see [`crate::policy::nftables`]). As with
@@ -102,15 +102,15 @@ pub fn build_policies(
                         };
                         sources.extend(found.into_iter().flatten().cloned());
                     }
-                    if !namespaced {
-                        sources.extend(
-                            proxies
-                                .get(spec.name.as_str())
-                                .into_iter()
-                                .flatten()
-                                .cloned(),
-                        );
-                    }
+                    // Proxies reach namespaced replicas from their mesh
+                    // address too, through the namespace's uplink.
+                    sources.extend(
+                        proxies
+                            .get(spec.name.as_str())
+                            .into_iter()
+                            .flatten()
+                            .cloned(),
+                    );
                     update.ingress.push(IngressPolicy {
                         service: spec.name.clone(),
                         namespace: if namespaced {
@@ -273,6 +273,7 @@ mod tests {
             },
             "ingress": {
                 "site": {"host": "*", "service": "api", "port": "http", "pools": ["edge"]},
+                "store": {"host": "s.test", "service": "cache", "port": "r", "nodes": ["d"]},
             },
         }))
         .unwrap();
@@ -331,7 +332,12 @@ mod tests {
                     namespace: "acme".into(),
                     dest_ip: "10.200.0.2".into(),
                     ports: vec![6379],
-                    allowed_sources: vec!["10.200.0.3".into(), "10.200.0.4".into()],
+                    // app's replicas, and d's ingress proxy.
+                    allowed_sources: vec![
+                        "10.100.0.4".into(),
+                        "10.200.0.3".into(),
+                        "10.200.0.4".into()
+                    ],
                 },
                 IngressPolicy {
                     service: "db".into(),

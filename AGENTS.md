@@ -51,6 +51,8 @@ validation checks.
 | Workload Attestation | `src/spiffe/workload_attestor.rs` | Cgroup-only attestation (no env var fallback), PID→service mapping |
 | Raft Storage | `src/raft/storage.rs` | AES-256-GCM encrypted log + snapshots, restore-on-boot |
 | WireGuard Keys | `src/mesh/wireguard.rs` | Private key handling (stdin, never argv), `Zeroizing<String>` |
+| Mesh routing | `src/mesh/peers.rs`, `src/server/mesh.rs` | Signed adverts route only the peer's own /32; server-set `routed_ips` must stay single namespace-network addresses, one peer each |
+| Namespace uplinks | `src/agent/netns.rs` | `inet ekafleet-uplink`: namespaces reach outside only (never host, mesh, other namespaces) |
 | OCI Signatures | `src/agent/oci/signature.rs` | Cosign/sigstore image signature verification |
 | Token Generation | `src/commands.rs` | 256-bit random via `ring::rand::SystemRandom` |
 
@@ -134,7 +136,7 @@ src/
 │   ├── templates.rs     # Renders config templates visible only to their service
 │   ├── latest.rs        # One job at a time, latest submission wins
 │   ├── helpers.rs       # SVID installation helpers
-│   ├── netns.rs         # Per-namespace network isolation (netns, bridge, veth, VXLAN overlay)
+│   ├── netns.rs         # Per-namespace networks (netns, bridge, veth, VXLAN, host uplink + NAT)
 │   ├── template.rs      # Config file template rendering
 │   ├── exec.rs          # Remote command execution in service cgroups
 │   ├── logs.rs          # Journal log streaming
