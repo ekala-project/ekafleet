@@ -8,7 +8,7 @@ Every agent node runs `ekafleet-proxy`, an unprivileged HTTP(S) and TCP reverse 
 ingress = {
   site = {
     host = "www.example.com";   # Host header, without port; "*" matches any host
-    service = "web";            # default-namespace service
+    service = "web";            # any service, in any namespace
     port = "http";              # name of one of the service's ports
     pools = [ "edge" ];         # serve on nodes of these pools ...
   };
@@ -66,7 +66,7 @@ ingress = {
 
 | Option | Behavior |
 |--------|----------|
-| `split` | Each entry takes `weight` percent of the traffic (1-100, at most 100 in total) to another default-namespace service declaring the same port; `service` gets the rest. When a share has no usable backend, the others take its traffic. |
+| `split` | Each entry takes `weight` percent of the traffic (1-100, at most 100 in total) to another service declaring the same port; `service` gets the rest. When a share has no usable backend, the others take its traffic. |
 | `affinity = "clientIp"` | Requests (and TCP connections) from one client IP go to the same split share and the same replica while it serves (rendezvous hashing; nothing is stored). Without it, backends are picked round-robin. |
 | `rateLimit` | A token bucket per client IP (IPv6: per /64): `burst` requests at once, refilled at `requestsPerSecond`. Over the limit the proxy answers 429. HTTP routes only. |
 | `tcpPort` | Forward TCP connections on this port (on the address of `proxyListen`) to the route's backends; `host` and `path` must stay unset. A port that is busy is retried every 2 seconds. Open it in the firewall yourself. |
@@ -90,7 +90,7 @@ ekafleet secret set _fleet shop-key --file privkey.pem
 
 ```text
 fleet config `ingress`
-    ↓ server, every 5 s: routes for each node + mesh addresses of serving replicas
+    ↓ server, every 5 s: routes for each node + addresses of serving replicas
 IngressUpdate (agent stream)
     ↓ agent
 /run/ekafleet/ingress-routes.json  (0644, rewritten only on change)
@@ -100,8 +100,8 @@ routing table + one upstream pool per route
 backend replica (over the WireGuard mesh)
 ```
 
-- **Backends:** a route's backends are the replicas serving its service, in the same sense as DNS (running and not unhealthy). They are addressed by their node's mesh address and the port's number. A replica that stops serving leaves the pool within seconds.
-- **Network reachability:** the service has to listen on its node's mesh address (or `0.0.0.0`). The NixOS module trusts the `wg-fleet` interface by default (`services.ekafleet.agent.mesh.trustInterface`), so the proxy can reach it.
+- **Backends:** a route's backends are the replicas serving its service, in the same sense as DNS (running and not unhealthy). They are addressed by their node's mesh address and the port's number, or, for a service in a namespace other than `default`, by the replica's namespace address (routed to its node over the mesh, see [namespace networks](mesh.md#namespace-networks)). A replica that stops serving leaves the pool within seconds.
+- **Network reachability:** the service has to listen on its node's mesh address, its namespace address, or `0.0.0.0`. The NixOS module trusts the `wg-fleet` interface by default (`services.ekafleet.agent.mesh.trustInterface`), so the proxy can reach it.
 - **Opening the ingress ports:** the proxy listens on `services.ekafleet.agent.proxyListen` (default `0.0.0.0:8080`) and, when set, `proxyTlsListen` (e.g. `0.0.0.0:443`). On ingress nodes, set `services.ekafleet.agent.proxyOpenFirewall = true` to open both.
 - **Network policy:** nodes serving a route count as callers of its services (split ones included) for [network policy](network-policy.md).
 - **Missing or invalid file:** a missing routes file means no routes. An invalid one keeps the previous routes.

@@ -2,8 +2,10 @@
 //!
 //! Every [`PUBLISH_INTERVAL`] the server works out, for each connected node,
 //! the routes of the fleet configuration's `ingress` that the node serves
-//! (by `pools` / `nodes`), each with the mesh addresses of the replicas
-//! currently serving its service. The node's agent hands them to its
+//! (by `pools` / `nodes`), each with the addresses of the replicas
+//! currently serving its service: their node's mesh address, or for a
+//! namespaced service the replica's namespace address (routed to its node
+//! over the mesh, see [`super::mesh::MeshRegistry::sync_routes`]). The node's agent hands them to its
 //! ingress proxy (see [`crate::proxy::routes`]). Like DNS records, a set
 //! is sent when it changes and re-sent periodically for agents that
 //! restarted.
@@ -39,15 +41,19 @@ pub fn build_routes(
     // service → port name → serving backends.
     let mut backends: HashMap<&str, HashMap<&str, BTreeSet<String>>> = HashMap::new();
     for (node, specs) in &inputs.assignments {
-        let Some(ip) = inputs.mesh_ips.get(node) else {
-            continue;
-        };
+        let mesh_ip = inputs.mesh_ips.get(node).map(ToString::to_string);
         for spec in specs {
-            if !crate::agent::netns::is_default_namespace(&spec.namespace)
-                || !inputs.serving.contains(&(node.clone(), spec.name.clone()))
-            {
+            if !inputs.serving.contains(&(node.clone(), spec.name.clone())) {
                 continue;
             }
+            let ip = if crate::agent::netns::is_default_namespace(&spec.namespace) {
+                mesh_ip.clone()
+            } else {
+                Some(spec.namespace_ip.clone()).filter(|ip| !ip.is_empty())
+            };
+            let Some(ip) = ip else {
+                continue;
+            };
             let ports = backends.entry(spec.name.as_str()).or_default();
             for port in spec.ports.iter().filter(|p| p.port != 0) {
                 ports
@@ -284,6 +290,38 @@ mod tests {
             ["10.100.0.1:9000", "10.100.0.2:9000"]
         );
         assert!(routes["e"].is_empty());
+    }
+
+    #[test]
+    fn namespaced_services_are_reached_by_replica_address() {
+        let config: FleetConfig = serde_json::from_value(serde_json::json!({
+            "name": "t",
+            "domain": "fleet.test",
+            "services": {"shop": {"command": "/bin/shop", "namespace": "acme",
+                                  "ports": {"http": {"port": 8080}}}},
+            "ingress": {"shop": {"host": "shop.example.com", "service": "shop", "port": "http"}},
+        }))
+        .unwrap();
+        let replica = |ip: &str| ServiceSpec {
+            namespace_ip: ip.into(),
+            ..spec("shop", "acme")
+        };
+        // b's replica has no address yet.
+        let inputs = DnsInputs {
+            assignments: BTreeMap::from([
+                ("a".into(), vec![replica("10.200.1.2")]),
+                ("b".into(), vec![replica("")]),
+            ]),
+            mesh_ips: BTreeMap::from([("a".into(), Ipv4Addr::new(10, 100, 0, 1))]),
+            serving: [("a", "shop"), ("b", "shop")]
+                .into_iter()
+                .map(|(n, s)| (n.to_string(), s.to_string()))
+                .collect(),
+            ..Default::default()
+        };
+        let nodes = BTreeMap::from([("edge".to_string(), "default".to_string())]);
+        let routes = build_routes(&config, &nodes, &inputs);
+        assert_eq!(routes["edge"][0].backends, ["10.200.1.2:8080"]);
     }
 
     #[test]

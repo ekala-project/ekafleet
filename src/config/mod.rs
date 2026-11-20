@@ -100,7 +100,7 @@ pub struct IngressRouteConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct IngressSplit {
-    /// Default-namespace service declaring the route's port.
+    /// Service declaring the route's port.
     pub service: String,
     /// Percent of the traffic, 1-100.
     pub weight: u32,
@@ -1862,12 +1862,6 @@ fn validate_ingress(config: &FleetConfig, errors: &mut Vec<String>) {
             match config.services.get(target) {
                 None => errors.push(format!("{at}: service '{target}' is not defined")),
                 Some(service) => {
-                    if !crate::agent::netns::is_default_namespace(&service.namespace) {
-                        errors.push(format!(
-                            "{at}: service '{target}' is in namespace '{}': ingress reaches default-namespace services only",
-                            service.namespace
-                        ));
-                    }
                     if !service.ports.contains_key(&route.port) {
                         errors.push(format!(
                             "{at}: service '{target}' declares no port '{}'",
@@ -2483,6 +2477,7 @@ mod nix_module_tests {
                        "rateLimit": {"requestsPerSecond": 5.5, "burst": 10}, "affinity": "clientIp",
                        "tls": {"certSecret": "c-crt", "keySecret": "c-key"}, "allowedCallers": ["web"]},
             "db": {"service": "web", "port": "http", "tcpPort": 5432, "affinity": "clientIp"},
+            "namespaced": {"host": "d.test", "service": "shop", "port": "http"},
         }));
         assert!(validate(&ok).is_ok(), "{:?}", validate(&ok));
         assert_eq!(ok.ingress["site"].path, "/");
@@ -2498,7 +2493,6 @@ mod nix_module_tests {
             "rel": {"host": "b.test", "path": "api", "service": "web", "port": "http"},
             "dup": {"host": "a.test", "service": "web", "port": "http"},
             "missing": {"host": "c.test", "service": "nope", "port": "http"},
-            "namespaced": {"host": "d.test", "service": "shop", "port": "http"},
             "noport": {"host": "e.test", "service": "web", "port": "grpc"},
             "nopool": {"host": "f.test", "service": "web", "port": "http", "pools": ["gpu"]},
             "heavy": {"host": "g.test", "service": "web", "port": "http",
@@ -2523,7 +2517,6 @@ mod nix_module_tests {
             "path 'api' must start with '/'",
             "ingress 'Bad' and 'dup' both route a.test/",
             "service 'nope' is not defined",
-            "ingress reaches default-namespace services only",
             "declares no port 'grpc'",
             "pool 'gpu' is not defined",
             "service 'web2' is not defined",

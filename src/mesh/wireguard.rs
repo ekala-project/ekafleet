@@ -190,6 +190,24 @@ impl WireguardManager {
         Ok(())
     }
 
+    /// Route `ip` (a namespace address routed to a peer) over the mesh,
+    /// from this node's mesh address.
+    pub async fn add_route(&self, ip: Ipv4Addr) -> Result<(), WgError> {
+        let dest = format!("{ip}/32");
+        let src = self.mesh_ip().map(|own| own.to_string());
+        let mut args = vec!["route", "replace", &dest, "dev", &self.interface];
+        if let Some(src) = &src {
+            args.extend(["src", src]);
+        }
+        run_cmd("ip", &args).await
+    }
+
+    /// Remove the route [`Self::add_route`] added.
+    pub async fn remove_route(&self, ip: Ipv4Addr) -> Result<(), WgError> {
+        let dest = format!("{ip}/32");
+        run_cmd("ip", &["route", "del", &dest, "dev", &self.interface]).await
+    }
+
     /// Remove a WireGuard peer.
     pub async fn remove_peer(&self, public_key: &str) -> Result<(), WgError> {
         run_cmd(
@@ -197,6 +215,11 @@ impl WireguardManager {
             &["set", &self.interface, "peer", public_key, "remove"],
         )
         .await
+    }
+
+    /// The interface name (e.g. `wg-fleet`).
+    pub fn interface(&self) -> &str {
+        &self.interface
     }
 
     /// This node's mesh address, once the interface is up.

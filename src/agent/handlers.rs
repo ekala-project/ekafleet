@@ -417,6 +417,14 @@ pub(super) async fn handle_server_message(
             if let Err(e) = netns_manager.gc_namespaces(&active_namespaces).await {
                 tracing::warn!(error = %e, "Failed to GC namespace networks");
             }
+            {
+                let (mesh_iface, mesh_ip) = {
+                    let peers = peer_manager.read().await;
+                    let wg = peers.wireguard();
+                    (wg.interface().to_string(), wg.mesh_ip())
+                };
+                netns_manager.sync_host(&mesh_iface, mesh_ip).await;
+            }
 
             // Drop SVIDs and pending requests for services no longer assigned
             // here (the server would refuse to renew them anyway), then
