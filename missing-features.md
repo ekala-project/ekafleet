@@ -21,11 +21,11 @@ Status legend: **Done** = implemented, wired into the runtime, and tested ·
 | P0.1 gRPC auth bypass | Done | Peer-cert SPIFFE ID, header stripping, RBAC on every handler |
 | P0.2 Plaintext CA / fleet keys | Done | `seal.rs` envelope + `Zeroizing` |
 | P0.3 GC roots for closures | Done | Supervisor adds and removes indirect roots |
-| P0.4 Multi-node Raft | **Open** | Single-node durable state only; `--peers` is logged and nothing else |
-| P1.1 Event-driven reconcile | **Partial** | Trigger exists, but the loop only runs during `apply --follow` |
+| P0.4 Multi-node Raft | Done | openraft over the encrypted store; leader-only control plane; `ekafleet raft` membership |
+| P1.1 Event-driven reconcile | **Partial** | Server-owned controller on the leader; dead-node eviction still fixed at 300s |
 | P1.2 Workload attestation env var | Done | Cgroup-only attestation |
-| P1.3 Node attestation is TOFU | **Partial** | Store hardened; the join-token flow is not wired end to end; no TPM or instance binding |
-| P1.4 WireGuard keys / gossip | **Partial** | Signed-advert verification exists; nothing signs or sends adverts; gossip uses a shared HMAC key and is not started |
+| P1.3 Node attestation is TOFU | **Partial** | Name-bound join tokens → node SVID via `FleetBootstrap`; no TPM or instance binding |
+| P1.4 WireGuard keys / gossip | Done | SVID-signed adverts distributed over the control channel; gossip removed |
 | P1.5 Non-NixOS support | **Partial** | Example + `nix profile` fallback; no VM/container test |
 | P1.6 Generation retention | Done | `GenerationRetention` + module options (one bug: combining both bounds fails) |
 | P2.1 Promote/fail RPCs | Done | Pending-canary registry, real promote/fail |
@@ -72,30 +72,18 @@ when `EKAFLEET_SEAL_PASSPHRASE` is set. In-memory key material is wrapped in
 `remove_gc_root` (line 447) removes them on teardown. `adopt_existing_units`
 recovers state from those roots after an agent restart (see P2.5).
 
-### P0.4 No multi-node Raft consensus — **Open**
+### ~~P0.4 No multi-node Raft consensus~~ (Done)
 
-**Where**: `src/raft/` (`state.rs`, `storage.rs`; `mod.rs` only declares the two
-modules). `--peers` is parsed in `src/main.rs` and stored in `ServerConfig.peers`,
-but its only use is a log field (`src/server/mod.rs:53`).
-
-There is no leader election, log replication, or membership change, and the
-crate has no consensus dependency. The system is honestly scoped to single-node
-with durable state: `FleetStateMachine` is persisted as AES-256-GCM encrypted
-snapshots plus a log (`src/raft/storage.rs`), and `restore_raft_state`
-(`src/server/mod.rs:332`) replays the latest snapshot and trailing log entries at
-boot. Two servers today would be two independent brains.
-
-**Exists**: restore-on-boot; periodic snapshot + log compaction in the
-housekeeping task (`src/server/mod.rs`, around line 440); `ekafleet snapshot` /
-`restore`. The VM test `nix/tests/lifecycle.nix` only checks that the CA, the
-fleet key, and the API survive a server restart. It does not cover Raft state
-contents.
-
-**Remaining**: multi-node consensus (leader election, log replication across
-`--peers`, membership changes, follower read/forward semantics), plus a 3-node VM
-test (this is also the `todo.md` "3 node ekaos HA" example). One candidate
-approach is to integrate `openraft`, wrap `FleetStateMachine` as the state
-machine, and use the existing encrypted storage as the log and snapshot store.
+Fleet state writes commit through openraft (`src/raft/consensus.rs`), with the
+AES-256-GCM encrypted store as its log and snapshot storage. Raft RPCs run between
+servers over the gRPC mTLS listener (`src/server/raft_rpc.rs`). Only the leader
+serves the control plane, and followers forward to it (`src/server/leadership.rs`).
+Clusters form from `--peers` once a majority is reachable. `ekafleet raft` adds and
+removes members (`src/server/membership.rs`). ACL and join tokens are replicated
+through Raft, new servers receive shared keys in a sealed key bundle
+(`src/server/keybundle.rs`), and a rotated fleet key is staged on a majority
+before it is committed (`src/server/fleetkey.rs`). `tests/workflow_ha.rs` covers
+3-server failover through the production server path.
 
 ---
 
@@ -103,27 +91,16 @@ machine, and use the existing encrypted storage as the log and snapshot store.
 
 ### P1.1 Reconciliation is timer/`apply`-driven, not event-driven — **Partial**
 
-**Exists** (commit 13a8aba): `ReconcileTrigger` (`src/server/state.rs:18`, a
-coalescing `tokio::sync::Notify`) fires on:
-- agent disconnect (`deregister_agent`),
-- heartbeat-timeout eviction (`evict_dead_nodes`),
-- a service newly reporting `ServiceFailed` (`update_status`).
-
-The reconcile loop in `src/server/api.rs` (around line 594) `select!`s on the 30s
-tick or the trigger. Unit tests in `src/server/state.rs`:
-`eviction_fires_reconcile_trigger`, `newly_failed_service_fires_trigger`.
+**Exists**: the leader runs a server-owned controller (`src/server/controller.rs`)
+that reconciles the current config revision periodically and on every
+`ReconcileTrigger`: agent disconnect, heartbeat-timeout eviction, a service
+newly reporting `ServiceFailed`, or a new revision from `apply`. `apply --follow`
+only subscribes to its results.
 
 **Remaining**:
-- The loop is only spawned inside the `Apply` handler when `req.watch` is set
-  (`src/server/api.rs:479`). With no open `apply --follow` stream, no
-  reconciliation happens at all, event-driven or periodic. Move it to a
-  server-owned background task started in `src/server/mod.rs`.
-  `reconciler::reconcile_loop` (`src/server/reconciler.rs:170`) exists for this
-  but has no callers, and it ignores the trigger.
-- Dead-node eviction is still hardcoded to 300s in the 60s housekeeping loop
-  (`src/server/mod.rs:409`). Make it configurable.
-- There is no trigger on config change (no watch on `fleet.nix` or the flake).
-- There is no integration or VM test that kills an agent and asserts a reschedule.
+- Dead-node eviction is still hardcoded to 300s in the housekeeping loop
+  (`src/server/mod.rs`). Make it configurable.
+- A flake is not watched for changes. A new revision comes only from `apply`.
 
 ### ~~P1.2 Workload attestation trusts a spoofable env var~~ (Done)
 
@@ -134,58 +111,25 @@ in the same file.
 
 ### P1.3 Node attestation is pure TOFU — **Partial**
 
-**Exists** (commit 14b8bf7), in `src/attestation/join_token.rs`:
-- Persistence: `JoinTokenStore::with_persistence` + `load()`, wired at
-  `src/server/mod.rs:217`. Both live tokens and a consumed-token audit trail are
-  persisted, so a replay after restart is rejected.
-- Rate limiting: 20 failures per 60s window (`RATE_LIMIT_MAX_FAILURES`, checked in
-  `consume`).
-- Optional node binding: `register_bound`.
-- Richer selectors: `attestation_type`, `join_token:bound`, `node_id`.
-- Unit tests in the same file: replay, rate limit, binding mismatch, expiry, and
-  persistence round-trip.
+**Exists**: `ekafleet token create --node <name>` registers a one-time join token
+bound to a node name on the server. The agent exchanges it on the
+`FleetBootstrap` service (`src/server/bootstrap.rs`, `src/agent/bootstrap.rs`)
+for a node SVID, and its key never leaves the agent. Tokens are persisted,
+replicated through Raft, rate-limited and replay-audited
+(`src/attestation/join_token.rs`). `tests/workflow_join.rs` and the VM tests cover
+the join.
 
-**Remaining**:
-- The store is not used end to end:
-  - `ekafleet token create` only prints a random token locally and never
-    registers it with the server (`cmd_token_create`, `src/commands.rs:538`).
-  - The only caller of `register` is the cloud scaling actuator
-    (`src/server/cloud/actuator.rs:403`).
-  - The agent never calls the `Attest` RPC. It accepts `--join-token`
-    (`AgentConfig.join_token`, `src/agent/types.rs:125`), but nothing reads it.
-- Binding cannot work as written. `attest` in `src/server/api.rs` (around line 698)
-  assigns a fresh random UUID as `node_id` for every request (both branches), so a
-  token bound to a node ID never matches. `register_bound` has no callers outside
-  tests.
-- There is no hardware or instance binding: no TPM, cloud instance-identity
-  document, or host-key attestor.
-- There is no test of agent join through `Attest` (unit or VM).
+**Remaining**: there is no hardware or instance binding: no TPM, cloud
+instance-identity document, or host-key attestor.
 
-### P1.4 WireGuard peer keys are not identity-bound; gossip is plaintext — **Partial**
+### ~~P1.4 WireGuard peer keys are not identity-bound; gossip is plaintext~~ (Done)
 
-**Exists** (commit 060a672): `src/mesh/advert.rs` provides `sign_advert` and
-`verify_advert`. An ECDSA P-256 signature from the node SVID covers
-`(node_id, public_key, endpoint, allowed_ip)`, and the cert's SPIFFE URI SAN must
-match `spiffe://<domain>/agent/<node_id>`. `PeerManager::apply_update`
-(`src/mesh/peers.rs:45`) drops unsigned or forged adverts. `WireguardPeer` carries
-`signature` / `signing_cert_pem` (`proto/fleet.proto`). Unit tests are in
-`advert.rs`: tampering, identity mismatch, wrong domain, and a foreign cert.
-
-**Remaining**:
-- Nothing calls `sign_advert` outside tests, and the server never builds a
-  `ServerPayload::Peers` message. The only handler is on the agent side
-  (`src/agent/handlers.rs:343`), so peer distribution is not wired at all, signed
-  or unsigned.
-- The agent constructs `PeerManager` with a hardcoded `"fleet.internal"` trust
-  domain (`src/agent/mod.rs:155`) instead of the fleet's domain.
-- Gossip (`src/gossip/swim.rs`) authenticates with a single shared HMAC-SHA256
-  cluster key (`SwimMembership::new`). It is not encrypted and not bound to node
-  SVIDs. Neither `SwimMembership` nor `ServiceCatalog` is constructed outside
-  `src/gossip/`, so gossip does not run in the server or agent today.
-- Remaining work: server-side peer distribution over the mTLS control channel,
-  agent-side signing with its SVID, and gossip transport encryption with per-node
-  identity (or drop gossip in favour of the control channel). Then add a
-  multi-node VM test.
+Agents sign their WireGuard adverts with their node SVID (`src/mesh/peers.rs`).
+The server distributes signed peers over the mTLS control channel
+(`src/server/mesh.rs`), and agents drop unsigned or forged adverts
+(`src/mesh/advert.rs`). Departed nodes are removed from the mesh. The unused
+gossip layer was removed in favour of the control channel. The `mesh` VM test
+covers it.
 
 ### P1.5 Non-NixOS-with-Nix support is claimed but does not exist — **Partial**
 
@@ -422,12 +366,8 @@ Follow-ups:
 ## Suggested sequencing
 
 1. ~~**P0.1**, **P0.2**, **P0.3**~~: done.
-2. **P0.4** (multi-node consensus): restore-on-boot is done; Raft replication and a
-   3-node test remain.
-3. **P1.1**: run reconciliation as a server-owned task, not only under
-   `apply --follow`.
-4. **P1.3 / P1.4**: wire join-token attestation and signed peer distribution end
-   to end, then add hardware/instance attestation and identity-bound or encrypted
-   gossip.
+2. ~~**P0.4**, **P1.4**~~: done.
+3. **P1.1**: make dead-node eviction configurable.
+4. **P1.3**: hardware/instance attestation (TPM, cloud instance identity).
 5. Remaining Partial P1/P2 items (P1.6 dual-bound bug, P2.2 true blue-green, P2.7
    default to `evalFleet`, P2.8/P2.9 UX), then tests for each.

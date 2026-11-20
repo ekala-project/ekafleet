@@ -124,7 +124,7 @@ ekafleet is a single binary that consolidates capabilities from 10+ separate too
 | Audit logging | **Yes** | **Yes** | **Yes** | Structured control-plane action trail |
 | SPIFFE X.509-SVIDs | **Yes** | No (needs SPIRE) | No (needs SPIRE) | Native SPIFFE identity for every workload |
 | SPIFFE Workload API | **Yes** | No (needs SPIRE) | No (needs SPIRE) | Standard UDS-based API for SVID delivery |
-| Node attestation | *Partial* | **Yes** (kubelet) | **Yes** (Consul) | One-time join tokens (persisted, replay-audited, rate-limited); agent join flow not yet wired; no TPM/cloud instance attestation |
+| Node attestation | *Partial* | **Yes** (kubelet) | **Yes** (Consul) | One-time, name-bound join tokens exchanged for a node SVID; no TPM/cloud instance attestation |
 | mTLS everywhere | **Yes** | No (needs Istio) | **Yes** (Connect) | Agent-server and service-to-service |
 | Identity contracts | **Yes** | No (needs NetworkPolicy) | **Yes** (Intentions) | allowedCallers/allowedTargets per service |
 | Trust domain federation | **Yes** | No (needs SPIRE) | No (needs SPIRE) | Peer bundles served from the Workload API |
@@ -229,7 +229,7 @@ ekafleet is a single binary that consolidates capabilities from 10+ separate too
 | Binary size | ~5 MB (static musl) | ~100 MB+ (control plane) | ~100 MB | Single binary, no dependencies |
 | Runtime dependencies | None | Container runtime, etcd | None | No JVM, no interpreters |
 | OS deployment | **Yes** (Nix closures) | No | No | Full system activation (switch/boot/test) |
-| Reconciliation model | Periodic (30s) + event-triggered | Continuous | Evaluation-based | Terraform-inspired eval→plan→apply loop; runs while `apply --follow` is active; node eviction, agent disconnect, and service failure trigger an immediate pass |
+| Reconciliation model | Periodic (30s) + event-triggered | Continuous | Evaluation-based | Terraform-inspired eval→plan→apply loop, owned by the leader; a new revision, node eviction, agent disconnect, and service failure trigger an immediate pass |
 | Package management | Nix store | Container images | Artifacts | Reproducible builds via Nix |
 
 ---
