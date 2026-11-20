@@ -23,7 +23,7 @@ use super::routes::RoutesFile;
 pub const TLS_DIR: &str = "/run/ekafleet/ingress-tls";
 
 /// The group the proxy runs in, which may read route keys.
-pub const PROXY_GROUP: &str = "ekafleet-proxy";
+pub const PROXY_GROUP: &str = "ekafleet-ingress-tls";
 
 #[derive(Debug, thiserror::Error)]
 pub enum IngressTlsError {
