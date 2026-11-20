@@ -600,7 +600,8 @@ in
       );
 
       # Route keys in /run/ekafleet/ingress-tls are readable by this group.
-      users.groups.ekafleet-proxy = { };
+      # Not "ekafleet-proxy": DynamicUser makes a group of that name.
+      users.groups.ekafleet-ingress-tls = { };
 
       assertions = [
         {
@@ -714,7 +715,7 @@ in
           # root privileges, the fleet key, or systemd units.
           DynamicUser = true;
           # Reads the keys of TLS routes.
-          SupplementaryGroups = [ "ekafleet-proxy" ];
+          SupplementaryGroups = [ "ekafleet-ingress-tls" ];
           CapabilityBoundingSet = [ "CAP_NET_BIND_SERVICE" ];
           AmbientCapabilities = [ "CAP_NET_BIND_SERVICE" ];
           NoNewPrivileges = true;
