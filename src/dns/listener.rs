@@ -6,7 +6,6 @@
 //! to that namespace's records.
 
 use std::net::SocketAddr;
-use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -45,21 +44,12 @@ const FLAG_RA: u16 = 0x0080;
 /// `netns_path` (e.g. `/run/netns/ekafleet-acme`). The socket stays in that
 /// namespace; the calling process does not move.
 pub async fn bind_in_netns(netns_path: &Path, addr: SocketAddr) -> std::io::Result<UdpSocket> {
-    let netns_path = netns_path.to_path_buf();
-    // setns affects only the calling thread, so do it on a throwaway one.
-    let socket = tokio::task::spawn_blocking(move || -> std::io::Result<std::net::UdpSocket> {
-        let ns = std::fs::File::open(&netns_path)?;
-        // SAFETY: `ns` is an open namespace file descriptor; setns only
-        // changes this (throwaway) thread's network namespace.
-        if unsafe { libc::setns(ns.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
+    let socket = crate::agent::netns::run_in_netns(netns_path, move || {
         let socket = std::net::UdpSocket::bind(addr)?;
         socket.set_nonblocking(true)?;
         Ok(socket)
     })
-    .await
-    .map_err(std::io::Error::other)??;
+    .await?;
     UdpSocket::from_std(socket)
 }
 
