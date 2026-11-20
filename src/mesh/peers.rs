@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use zeroize::Zeroizing;
@@ -32,6 +32,8 @@ pub struct PeerManager {
     wg: WireguardManager,
     settings: MeshSettings,
     peers: HashMap<String, PeerInfo>,
+    /// Namespace addresses routed over the mesh (the peers' `routed`).
+    routes: BTreeSet<Ipv4Addr>,
     /// Trust domain used to verify that a peer advertisement's signing
     /// certificate matches the advertised node identity. Taken from this
     /// node's SVID on activation.
@@ -48,6 +50,8 @@ struct PeerInfo {
     public_key: String,
     endpoint: String,
     allowed_ip: String,
+    /// Namespace addresses of the peer's replicas, routed to it.
+    routed: Vec<Ipv4Addr>,
 }
 
 impl PeerManager {
@@ -56,6 +60,7 @@ impl PeerManager {
             wg,
             settings,
             peers: HashMap::new(),
+            routes: BTreeSet::new(),
             trust_domain: String::new(),
             pending: None,
             server_addr: server_addr.to_string(),
@@ -118,8 +123,9 @@ impl PeerManager {
         let endpoint = SocketAddr::new(endpoint_ip, self.wg.listen_port()).to_string();
 
         if self.wg.initialize(ip, prefix_len).await? {
-            // A new interface has no peers.
+            // A new interface has no peers (nor routes over it).
             self.peers.clear();
+            self.routes.clear();
         }
         let public_key = self.wg.public_key().to_string();
         let allowed_ip = format!("{ip}/32");
@@ -137,6 +143,7 @@ impl PeerManager {
             allowed_ip,
             signature,
             signing_cert_pem: leaf_pem,
+            routed_ips: Vec::new(),
         }))
     }
 
@@ -175,13 +182,37 @@ impl PeerManager {
 
         let new_ids: Vec<String> = updates.iter().map(|p| p.node_id.clone()).collect();
 
+        // The namespace addresses each peer's replicas hold. An address is
+        // routed to one peer only.
+        let mut claimed = HashSet::new();
+        let routed: Vec<Vec<Ipv4Addr>> = updates
+            .iter()
+            .map(|peer| {
+                peer.routed_ips
+                    .iter()
+                    .filter_map(|ip| match self.check_routed_ip(ip) {
+                        Ok(ip) if claimed.insert(ip) => Some(ip),
+                        Ok(ip) => {
+                            tracing::warn!(node_id = %peer.node_id, %ip, "Namespace address routed to two peers; ignored");
+                            None
+                        }
+                        Err(e) => {
+                            tracing::warn!(node_id = %peer.node_id, error = %e, "Rejected routed namespace address");
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+
         // Add/update peers
-        for peer in &updates {
+        for (peer, routed) in updates.iter().zip(routed) {
             let existing = self.peers.get(&peer.node_id);
             let changed = existing.is_none_or(|existing| {
                 existing.public_key != peer.public_key
                     || existing.endpoint != peer.endpoint
                     || existing.allowed_ip != peer.allowed_ip
+                    || existing.routed != routed
             });
             if !changed {
                 continue;
@@ -192,13 +223,17 @@ impl PeerManager {
             {
                 self.wg.remove_peer(&old.public_key).await?;
             }
+            let allowed_ips: Vec<String> = std::iter::once(peer.allowed_ip.clone())
+                .chain(routed.iter().map(|ip| format!("{ip}/32")))
+                .collect();
             self.wg
-                .set_peer(&peer.public_key, &peer.endpoint, &peer.allowed_ip)
+                .set_peer(&peer.public_key, &peer.endpoint, &allowed_ips.join(","))
                 .await?;
             tracing::info!(
                 node_id = %peer.node_id,
                 endpoint = %peer.endpoint,
                 allowed_ip = %peer.allowed_ip,
+                routed = routed.len(),
                 "WireGuard peer configured"
             );
             self.peers.insert(
@@ -207,6 +242,7 @@ impl PeerManager {
                     public_key: peer.public_key.clone(),
                     endpoint: peer.endpoint.clone(),
                     allowed_ip: peer.allowed_ip.clone(),
+                    routed,
                 },
             );
         }
@@ -226,7 +262,45 @@ impl PeerManager {
             }
         }
 
+        self.sync_routes().await;
         Ok(())
+    }
+
+    /// Route the peers' namespace addresses over the mesh. A failed route
+    /// is retried with the next update.
+    async fn sync_routes(&mut self) {
+        let wanted: BTreeSet<Ipv4Addr> = self
+            .peers
+            .values()
+            .flat_map(|p| p.routed.iter().copied())
+            .collect();
+        for ip in self.routes.difference(&wanted).copied().collect::<Vec<_>>() {
+            if let Err(e) = self.wg.remove_route(ip).await {
+                tracing::debug!(%ip, error = %e, "Namespace route already gone");
+            }
+            self.routes.remove(&ip);
+        }
+        for ip in wanted.difference(&self.routes).copied().collect::<Vec<_>>() {
+            match self.wg.add_route(ip).await {
+                Ok(()) => {
+                    self.routes.insert(ip);
+                }
+                Err(e) => tracing::warn!(%ip, error = %e, "Cannot route a namespace address"),
+            }
+        }
+    }
+
+    /// A routed address must be a single namespace-network address.
+    fn check_routed_ip(&self, ip: &str) -> Result<Ipv4Addr, String> {
+        let parsed: Ipv4Addr = ip
+            .parse()
+            .map_err(|_| format!("routed address {ip:?} is not a single IPv4 address"))?;
+        if !crate::agent::netns::in_namespace_network(parsed) || self.wg.in_mesh_network(parsed) {
+            return Err(format!(
+                "routed address {ip} is outside the namespace network"
+            ));
+        }
+        Ok(parsed)
     }
 
     /// A peer may route exactly one address, inside the mesh network.

@@ -176,6 +176,7 @@ mod tests {
             allowed_ip: allowed_ip.to_string(),
             signature: sig,
             signing_cert_pem: cert_pem,
+            routed_ips: Vec::new(),
         }
     }
 
@@ -254,6 +255,7 @@ mod tests {
             allowed_ip: allowed_ip.to_string(),
             signature: sig,
             signing_cert_pem: evil_cert,
+            routed_ips: Vec::new(),
         };
         assert!(matches!(
             verify_advert(&peer, "fleet.internal"),

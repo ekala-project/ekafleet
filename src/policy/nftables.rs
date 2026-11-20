@@ -330,7 +330,7 @@ pub fn render(
 /// Load `ruleset` with `nft -f -`, inside the network namespace at `netns`
 /// if given. `nsenter` switches only the network namespace, so cgroup paths
 /// still resolve against the host's cgroup mount.
-async fn apply_ruleset(netns: Option<&str>, ruleset: &str) -> Result<(), NftError> {
+pub(crate) async fn apply_ruleset(netns: Option<&str>, ruleset: &str) -> Result<(), NftError> {
     use tokio::io::AsyncWriteExt;
 
     let mut command = match netns {

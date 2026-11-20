@@ -922,6 +922,11 @@ message WireguardPeer {
   // PEM of the advertising node's SVID certificate, used to verify `signature`
   // and to bind `public_key` to the node's SPIFFE identity.
   string signing_cert_pem = 6;
+  // Namespace addresses of the replicas placed on this node, routed to it
+  // over the mesh so ingress proxies elsewhere reach them. Set by the
+  // server from placement, not by the node, so outside `signature`; agents
+  // accept only single addresses in the namespace network.
+  repeated string routed_ips = 7;
 }
 
 // The complete network policy of one node; it replaces the previous one.

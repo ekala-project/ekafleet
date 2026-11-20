@@ -500,6 +500,11 @@ instances: its replicas, or every eligible machine for system jobs. A
 namespace that is not listed has no quota. Namespace names are 1-32
 lowercase letters, digits and inner dashes.
 
+Services in a namespace other than `default` get their own network: they
+reach each other, and outside networks through their node's uplink, but
+not the node itself, the mesh, or other namespaces. Ingress routes reach
+them on any node. See [namespace networks](../operations/mesh.md#namespace-networks).
+
 ## Machine
 
 ```nix
@@ -721,7 +726,7 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" http://server:7402/v1/alerts/si
 ingress.<name> = {
   host = "www.example.com";  # Host header without port, or "*" (default "*")
   path = "/";                # path prefix (default "/")
-  service = "web";           # default-namespace service (required)
+  service = "web";           # service declaring `port` (required)
   port = "http";             # name of one of its ports (required)
   pools = [ "edge" ];        # serve on nodes of these pools
   nodes = [ "edge-1" ];      # and on these nodes; with neither, every node
