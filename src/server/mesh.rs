@@ -49,6 +49,8 @@ pub enum MeshError {
 #[derive(Clone)]
 pub struct MeshRegistry {
     peers: Arc<RwLock<BTreeMap<String, WireguardPeer>>>,
+    /// Namespace addresses of the replicas on each node, routed to it.
+    routes: Arc<RwLock<BTreeMap<String, Vec<String>>>>,
     raft: FleetStateMachine,
     domain: String,
 }
@@ -57,6 +59,7 @@ impl MeshRegistry {
     pub fn new(raft: FleetStateMachine, domain: &str) -> Self {
         Self {
             peers: Arc::default(),
+            routes: Arc::default(),
             raft,
             domain: domain.to_string(),
         }
@@ -135,14 +138,21 @@ impl MeshRegistry {
             return Err(MeshError::CertMismatch);
         }
 
+        // Routes come from placement, never from the node itself.
+        let peer = WireguardPeer {
+            routed_ips: Vec::new(),
+            ..peer
+        };
         let mut peers = self.peers.write().await;
         let changed = peers.get(node_id) != Some(&peer);
         peers.insert(node_id.to_string(), peer);
         Ok((assigned, changed))
     }
 
-    /// Every node's advertisement except `node_id`'s own.
+    /// Every node's advertisement except `node_id`'s own, each with the
+    /// namespace addresses routed to that node.
     pub async fn peers_for(&self, node_id: &str) -> PeerUpdate {
+        let routes = self.routes.read().await;
         PeerUpdate {
             peers: self
                 .peers
@@ -150,9 +160,33 @@ impl MeshRegistry {
                 .await
                 .iter()
                 .filter(|(id, _)| id.as_str() != node_id)
-                .map(|(_, peer)| peer.clone())
+                .map(|(id, peer)| WireguardPeer {
+                    routed_ips: routes.get(id).cloned().unwrap_or_default(),
+                    ..peer.clone()
+                })
                 .collect(),
         }
+    }
+
+    /// Route every replica's namespace address to the node it is placed
+    /// on, so ingress proxies on other nodes reach it. Sends every agent
+    /// its new peer set when the routes changed.
+    pub async fn sync_routes(&self, state: &FleetState) {
+        let routes: BTreeMap<String, Vec<String>> = self
+            .raft
+            .namespace_ips_by_node()
+            .await
+            .into_iter()
+            .map(|(node, ips)| (node, ips.iter().map(Ipv4Addr::to_string).collect()))
+            .collect();
+        {
+            let mut current = self.routes.write().await;
+            if *current == routes {
+                return;
+            }
+            *current = routes;
+        }
+        self.distribute(state).await;
     }
 
     /// Send each connected agent its current peer set.
@@ -269,7 +303,43 @@ mod tests {
             allowed_ip: allowed_ip.into(),
             signature,
             signing_cert_pem: cert_pem.into(),
+            routed_ips: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn replica_namespace_addresses_are_routed_to_their_nodes() {
+        let raft = FleetStateMachine::new();
+        let mesh = MeshRegistry::new(raft.clone(), DOMAIN);
+        let state = FleetState::new();
+        for node in ["a", "b"] {
+            let ip = mesh.assignment(node).await.unwrap().mesh_ip;
+            let (pem, der, key) = node_cert(node);
+            let mut peer = advert(node, &format!("{ip}/32"), &pem, &key);
+            // A node cannot claim routes for itself.
+            peer.routed_ips = vec!["10.200.9.9".into()];
+            mesh.accept(node, peer, Some(&der)).await.unwrap();
+        }
+        let web = raft
+            .ensure_namespace_ip("acme", &crate::raft::state::namespace_ip_holder("web", "b"))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut rx = state
+            .register_agent("a", "192.0.2.1".into(), String::new())
+            .await;
+
+        mesh.sync_routes(&state).await;
+        let Some(ServerPayload::Peers(update)) = rx.try_recv().unwrap().payload else {
+            panic!("no peer update");
+        };
+        assert_eq!(update.peers.len(), 1);
+        assert_eq!(update.peers[0].node_id, "b");
+        assert_eq!(update.peers[0].routed_ips, vec![web.to_string()]);
+        // Unchanged routes are not re-sent.
+        mesh.sync_routes(&state).await;
+        assert!(rx.try_recv().is_err());
+        assert!(mesh.peers_for("b").await.peers[0].routed_ips.is_empty());
     }
 
     #[tokio::test]

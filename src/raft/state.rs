@@ -1613,6 +1613,22 @@ impl FleetStateMachine {
         Ok(released)
     }
 
+    /// Every replica namespace address, by the node the replica is placed
+    /// on (from its holder, see [`namespace_ip_holder`]).
+    pub async fn namespace_ips_by_node(
+        &self,
+    ) -> std::collections::BTreeMap<String, std::collections::BTreeSet<Ipv4Addr>> {
+        let state = self.inner.read().await;
+        let mut by_node: std::collections::BTreeMap<_, std::collections::BTreeSet<_>> =
+            Default::default();
+        for (holder, ip) in state.namespace_ips.values().flatten() {
+            if let Some((_, node)) = holder.rsplit_once('@') {
+                by_node.entry(node.to_string()).or_default().insert(*ip);
+            }
+        }
+        by_node
+    }
+
     /// Nodes holding a mesh address: every node that has joined the mesh.
     pub async fn mesh_nodes(&self) -> Vec<String> {
         self.inner.read().await.mesh_ips.keys().cloned().collect()

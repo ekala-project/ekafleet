@@ -5,6 +5,15 @@
 //! via the bridge; services in different namespaces are isolated by default (no
 //! routes exist between namespace bridges). The `default` namespace retains host
 //! networking for backward compatibility and infrastructure services.
+//!
+//! Each namespace network also has an uplink to the host: a veth pair
+//! (`nu-<hash>` on the host, `uplink0` inside) with the namespace's default
+//! route. The host masquerades the namespace's outbound traffic and routes
+//! its subnet back in, and the `inet ekafleet-uplink` table confines it:
+//! namespaced services reach outside networks only, never the host itself,
+//! the mesh, or another namespace. Traffic into a namespace comes from the
+//! host (its ingress proxy, probes) or from other nodes over the mesh, to
+//! which the server routes each replica's address.
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -104,6 +113,28 @@ pub struct NamespaceNetworkManager {
 
 struct ManagerInner {
     namespaces: HashMap<String, NamespaceNetwork>,
+    /// The uplink ruleset last loaded on the host.
+    uplink_rules: Option<String>,
+}
+
+/// Name of the namespace side of the uplink.
+const UPLINK: &str = "uplink0";
+
+/// Next hop of a namespace's default route: link-local, resolved to the
+/// host side's MAC by a permanent neighbor entry, so the host needs no
+/// address on the link.
+const UPLINK_GATEWAY: &str = "169.254.1.1";
+
+/// Prefix of the host side of every uplink.
+const UPLINK_PREFIX: &str = "nu-";
+
+/// The network namespace subnets are allocated from (`10.200.0.0/16`).
+const NAMESPACE_NETWORK: &str = "10.200.0.0/16";
+
+/// Whether `ip` lies in the network namespace subnets are allocated from.
+pub fn in_namespace_network(ip: Ipv4Addr) -> bool {
+    let [a, b, ..] = ip.octets();
+    (a, b) == (10, 200)
 }
 
 impl Default for NamespaceNetworkManager {
@@ -117,6 +148,7 @@ impl NamespaceNetworkManager {
         Self {
             inner: Arc::new(RwLock::new(ManagerInner {
                 namespaces: HashMap::new(),
+                uplink_rules: None,
             })),
         }
     }
@@ -180,6 +212,9 @@ impl NamespaceNetworkManager {
         .await?;
         run_ip_netns(&netns_name, &["link", "set", &bridge_name, "up"]).await?;
         run_ip_netns(&netns_name, &["link", "set", "lo", "up"]).await?;
+
+        // 4. Uplink to the host
+        ensure_uplink(&netns_name, &uplink_name_for(namespace), gateway_ip).await?;
 
         tracing::info!(
             namespace = %namespace,
@@ -346,8 +381,10 @@ impl NamespaceNetworkManager {
             return Ok(());
         };
 
-        // Delete the network namespace (also removes all interfaces within it)
+        // Delete the network namespace (also removes all interfaces within
+        // it, and with uplink0 its host side).
         let _ = run_ip(&["netns", "del", &ns.netns_name]).await;
+        let _ = run_ip(&["link", "del", &uplink_name_for(namespace)]).await;
 
         tracing::info!(
             namespace = %namespace,
@@ -553,6 +590,49 @@ impl NamespaceNetworkManager {
         Ok(())
     }
 
+    /// Bring the host side of every uplink in line: the route to each
+    /// namespace subnet (from `mesh`'s address, when the mesh is up, so
+    /// network policy sees proxies by their mesh address), IP forwarding,
+    /// and the `inet ekafleet-uplink` table. `mesh` is the mesh interface
+    /// and this node's address on it.
+    pub async fn sync_host(&self, mesh_iface: &str, mesh_ip: Option<Ipv4Addr>) {
+        let mut inner = self.inner.write().await;
+        let mut subnets: Vec<String> = Vec::new();
+        for (name, ns) in &inner.namespaces {
+            let uplink = uplink_name_for(name);
+            let src = mesh_ip.map(|ip| ip.to_string());
+            let mut args = vec!["route", "replace", &ns.subnet, "dev", &uplink];
+            if let Some(src) = &src {
+                args.extend(["src", src]);
+            }
+            match run_ip(&args).await {
+                Ok(()) => subnets.push(ns.subnet.clone()),
+                Err(e) => {
+                    tracing::warn!(namespace = %name, error = %e, "Cannot route the namespace subnet")
+                }
+            }
+        }
+        subnets.sort();
+        if subnets.is_empty() && inner.uplink_rules.is_none() {
+            // Never loaded: nothing to remove.
+            return;
+        }
+        if !subnets.is_empty() {
+            enable_forwarding().await;
+        }
+        let rules = uplink_ruleset(&subnets, mesh_iface);
+        if inner.uplink_rules.as_deref() == Some(rules.as_str()) {
+            return;
+        }
+        match crate::policy::nftables::apply_ruleset(None, &rules).await {
+            Ok(()) => {
+                tracing::info!(namespaces = subnets.len(), "Namespace uplink rules loaded");
+                inner.uplink_rules = Some(rules);
+            }
+            Err(e) => tracing::error!(error = %e, "Cannot load the namespace uplink rules"),
+        }
+    }
+
     /// Remove namespaces that are no longer needed (not in the provided set).
     pub async fn gc_namespaces(&self, active: &[String]) -> Result<(), NetnsError> {
         let to_remove: Vec<String> = {
@@ -588,6 +668,128 @@ fn bridge_name_for(namespace: &str) -> String {
     // Truncate to 48 bits (12 hex chars) so "br-" + hash = 15 chars
     let truncated = hash & 0xFFFF_FFFF_FFFF;
     format!("br-{truncated:012x}")
+}
+
+/// The host side of a namespace's uplink: "nu-" + 12 hex chars.
+fn uplink_name_for(namespace: &str) -> String {
+    format!(
+        "{UPLINK_PREFIX}{}",
+        bridge_name_for(namespace).trim_start_matches("br-")
+    )
+}
+
+/// Create (or adopt, after an agent restart) the uplink of the network
+/// namespace `netns`, and point its default route at the host. Outbound
+/// traffic leaves from the namespace's `gateway` address.
+async fn ensure_uplink(netns: &str, host_side: &str, gateway: Ipv4Addr) -> Result<(), NetnsError> {
+    if run_ip(&["link", "show", host_side]).await.is_err() {
+        // Drop a namespace side left without its peer.
+        let _ = run_ip_netns(netns, &["link", "del", UPLINK]).await;
+        run_ip(&[
+            "link", "add", host_side, "type", "veth", "peer", "name", UPLINK, "netns", netns,
+        ])
+        .await?;
+    }
+    run_ip(&["link", "set", host_side, "up"]).await?;
+    run_ip_netns(netns, &["link", "set", UPLINK, "up"]).await?;
+    let mac = tokio::fs::read_to_string(format!("/sys/class/net/{host_side}/address")).await?;
+    run_ip_netns(
+        netns,
+        &[
+            "neigh",
+            "replace",
+            UPLINK_GATEWAY,
+            "lladdr",
+            mac.trim(),
+            "dev",
+            UPLINK,
+            "nud",
+            "permanent",
+        ],
+    )
+    .await?;
+    let src = gateway.to_string();
+    run_ip_netns(
+        netns,
+        &[
+            "route",
+            "replace",
+            "default",
+            "via",
+            UPLINK_GATEWAY,
+            "dev",
+            UPLINK,
+            "onlink",
+            "src",
+            &src,
+        ],
+    )
+    .await
+}
+
+/// Let the host forward between uplinks and its other interfaces.
+async fn enable_forwarding() {
+    const PATH: &str = "/proc/sys/net/ipv4/ip_forward";
+    if tokio::fs::read_to_string(PATH)
+        .await
+        .is_ok_and(|v| v.trim() == "1")
+    {
+        return;
+    }
+    match tokio::fs::write(PATH, "1\n").await {
+        Ok(()) => tracing::info!("Enabled IPv4 forwarding for namespace uplinks"),
+        Err(e) => {
+            tracing::warn!(error = %e, "Cannot enable IPv4 forwarding; namespaces have no uplink")
+        }
+    }
+}
+
+/// The host's `inet ekafleet-uplink` table for namespace `subnets`, or its
+/// removal when there are none. A drop in any table is final, so these
+/// hold whatever the host firewall accepts:
+///
+/// - from an uplink, only replies reach the host itself;
+/// - an uplink never forwards to another uplink or to the mesh, except
+///   replies (to ingress proxies on other nodes);
+/// - only the mesh forwards into an uplink (the host's own traffic is not
+///   forwarded), and nothing forwards to other nodes' namespaces;
+/// - outbound namespace traffic is masqueraded.
+fn uplink_ruleset(subnets: &[String], mesh_iface: &str) -> String {
+    let mut out =
+        String::from("table inet ekafleet-uplink {}\ndelete table inet ekafleet-uplink\n");
+    if subnets.is_empty() {
+        return out;
+    }
+    let up = format!("{UPLINK_PREFIX}*");
+    out.push_str(&format!(
+        "table inet ekafleet-uplink {{
+    set namespaces {{
+        type ipv4_addr
+        flags interval
+        elements = {{ {subnets} }}
+    }}
+    chain input {{
+        type filter hook input priority filter; policy accept;
+        iifname \"{up}\" ct state established,related accept
+        iifname \"{up}\" drop
+    }}
+    chain forward {{
+        type filter hook forward priority filter; policy accept;
+        ct state established,related accept
+        iifname \"{up}\" oifname \"{up}\" drop
+        iifname \"{up}\" oifname \"{mesh_iface}\" drop
+        oifname \"{up}\" iifname != \"{mesh_iface}\" drop
+        oifname \"{mesh_iface}\" ip daddr {NAMESPACE_NETWORK} drop
+    }}
+    chain postrouting {{
+        type nat hook postrouting priority srcnat; policy accept;
+        oifname != \"{up}\" ip saddr @namespaces masquerade
+    }}
+}}
+",
+        subnets = subnets.join(", ")
+    ));
+    out
 }
 
 /// Generate the host-side veth name for a service. Must fit IFNAMSIZ.
@@ -752,6 +954,49 @@ mod tests {
         assert!(
             container.len() <= 15,
             "veth container name too long: {container}"
+        );
+    }
+
+    #[test]
+    fn uplink_name_fits_ifnamsiz_and_differs_per_namespace() {
+        let name = uplink_name_for("customer-a");
+        assert_eq!(name.len(), 15);
+        assert!(name.starts_with(UPLINK_PREFIX));
+        assert_ne!(name, uplink_name_for("customer-b"));
+    }
+
+    #[test]
+    fn namespace_network_membership() {
+        assert!(in_namespace_network(Ipv4Addr::new(10, 200, 3, 7)));
+        assert!(!in_namespace_network(Ipv4Addr::new(10, 100, 0, 1)));
+        assert!(!in_namespace_network(Ipv4Addr::new(10, 201, 0, 1)));
+    }
+
+    #[test]
+    fn uplink_rules_confine_namespaces() {
+        let rules = uplink_ruleset(
+            &["10.200.1.0/24".into(), "10.200.2.0/24".into()],
+            "wg-fleet",
+        );
+        assert!(
+            rules.starts_with("table inet ekafleet-uplink {}\ndelete table inet ekafleet-uplink\n")
+        );
+        assert!(rules.contains("elements = { 10.200.1.0/24, 10.200.2.0/24 }"));
+        // No new connections from a namespace to the host, the mesh or
+        // another namespace; only the mesh forwards in.
+        assert!(rules.contains("iifname \"nu-*\" drop"));
+        assert!(rules.contains("iifname \"nu-*\" oifname \"nu-*\" drop"));
+        assert!(rules.contains("iifname \"nu-*\" oifname \"wg-fleet\" drop"));
+        assert!(rules.contains("oifname \"nu-*\" iifname != \"wg-fleet\" drop"));
+        assert!(rules.contains("oifname != \"nu-*\" ip saddr @namespaces masquerade"));
+        // Replies are accepted before the drops.
+        let replies = rules.find("ct state established,related accept").unwrap();
+        assert!(replies < rules.find("iifname \"nu-*\" drop").unwrap());
+
+        // Without namespaces the table is removed.
+        assert_eq!(
+            uplink_ruleset(&[], "wg-fleet"),
+            "table inet ekafleet-uplink {}\ndelete table inet ekafleet-uplink\n"
         );
     }
 

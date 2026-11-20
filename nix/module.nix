@@ -620,6 +620,11 @@ in
         lib.mkBefore [ "127.0.0.1" ]
       );
 
+      # Namespace uplinks (host side of each namespace's veth) are routed
+      # by the agent; a DHCP client must not configure them.
+      networking.dhcpcd.denyInterfaces = [ "nu-*" ];
+      networking.networkmanager.unmanaged = [ "interface-name:nu-*" ];
+
       systemd.services.ekafleet-agent = {
         description = "ekafleet data plane agent";
         wantedBy = [ "multi-user.target" ];
