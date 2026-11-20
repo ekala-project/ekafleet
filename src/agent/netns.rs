@@ -24,6 +24,42 @@ pub enum NetnsError {
     Config(String),
 }
 
+/// Run `f` inside the network namespace at `netns_path` (e.g.
+/// `/run/netns/ekafleet-acme`), on a thread of its own. Sockets `f` makes
+/// stay in that namespace.
+///
+/// setns moves only the calling thread, so never on a pooled thread: a tokio
+/// blocking-pool thread is reused, and work scheduled on it later (`tokio::fs`,
+/// `lookup_host`, ...) would silently run in the namespace. This thread exits
+/// once `f` returns.
+pub async fn run_in_netns<T, F>(netns_path: &std::path::Path, f: F) -> std::io::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> std::io::Result<T> + Send + 'static,
+{
+    let netns_path = netns_path.to_path_buf();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("ekafleet-netns".into())
+        .spawn(move || {
+            let _ = tx.send(enter_netns(&netns_path).and_then(|()| f()));
+        })?;
+    rx.await
+        .map_err(|_| std::io::Error::other("network namespace thread panicked"))?
+}
+
+/// Move the calling thread into the network namespace at `netns_path`.
+fn enter_netns(netns_path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let ns = std::fs::File::open(netns_path)?;
+    // SAFETY: `ns` is an open namespace file descriptor; setns only changes
+    // the calling thread's network namespace.
+    if unsafe { libc::setns(ns.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Information about a remote node hosting services in the same namespace.
 pub struct RemotePeerInfo {
     pub node_id: String,
@@ -664,6 +700,20 @@ async fn run_ip_netns(netns: &str, args: &[&str]) -> Result<(), NetnsError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn run_in_netns_does_not_run_outside_its_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = ran.clone();
+        let result = run_in_netns(&dir.path().join("missing"), move || {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+    }
 
     #[test]
     fn default_namespace_detection() {
