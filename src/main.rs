@@ -149,15 +149,9 @@ enum Command {
         #[arg(long, default_value = "")]
         token: String,
 
-        /// One-time join token for SPIFFE node attestation (replaces --token).
-        /// Used only when the agent has no valid node SVID; requires --ca-cert.
-        #[arg(long, env = "EKAFLEET_JOIN_TOKEN")]
+        /// One-time join token for SPIFFE node attestation (replaces --token)
+        #[arg(long)]
         join_token: Option<String>,
-
-        /// Stable node ID to attest as (default: a UUID generated on first
-        /// start). Persisted in <data-dir>/node-id; must match on later starts.
-        #[arg(long, env = "EKAFLEET_NODE_ID")]
-        node_id: Option<String>,
 
         /// Data directory for local state
         #[arg(long, default_value = "/var/lib/ekafleet")]
@@ -277,7 +271,7 @@ enum Command {
         server: String,
     },
 
-    /// Create a one-time join token for a new agent
+    /// Generate join token
     Token {
         #[command(subcommand)]
         action: TokenAction,
@@ -491,18 +485,11 @@ enum ContextAction {
 
 #[derive(Subcommand)]
 enum TokenAction {
-    /// Register a one-time join token with the server and print it
+    /// Create a new join token
     Create {
-        /// Token type. Only `agent` is supported.
+        /// Token type (agent or server)
         #[arg(long, default_value = "agent")]
         r#type: String,
-        /// Bind the token to this node ID. Only an agent started with the same
-        /// `--node-id` (or already holding that ID) can use it.
-        #[arg(long)]
-        node_id: Option<String>,
-        /// Server address
-        #[arg(long, default_value = "127.0.0.1:7400")]
-        server: String,
     },
 }
 
@@ -880,10 +867,9 @@ async fn main() -> anyhow::Result<()> {
             join,
             token,
             join_token,
-            node_id,
             data_dir,
             ca_cert,
-        } => commands::cmd_agent(join, token, join_token, node_id, data_dir, ca_cert).await?,
+        } => commands::cmd_agent(join, token, join_token, data_dir, ca_cert).await?,
 
         Command::Plan { config, server } => commands::cmd_plan(config, server).await?,
 
@@ -930,13 +916,8 @@ async fn main() -> anyhow::Result<()> {
         } => commands::cmd_scale(service, count, server).await?,
 
         Command::Token {
-            action:
-                TokenAction::Create {
-                    r#type,
-                    node_id,
-                    server,
-                },
-        } => commands::cmd_token_create(r#type, node_id, server).await?,
+            action: TokenAction::Create { r#type },
+        } => commands::cmd_token_create(r#type).await?,
 
         Command::Logs {
             service,

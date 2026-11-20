@@ -50,14 +50,13 @@ ekafleet server --data-dir /var/lib/ekafleet --ca-socket /run/ekafleet/ca.sock
 
 ## 2. Create a Join Token
 
-Ask the server for a one-time join token for SPIFFE node attestation (authenticated with the server's admin token):
+Generate a one-time join token for SPIFFE node attestation:
 
 ```bash
-EKAFLEET_TOKEN=$ADMIN_TOKEN ekafleet --server server-ip:7400 \
-  --ca-cert /var/lib/ekafleet/ca-cert.pem token create
+ekafleet token create --type=agent
 ```
 
-This token can only be used once and expires after one hour. After successful attestation, it is consumed and cannot be replayed.
+This token can only be used once. After successful attestation, it is consumed and cannot be replayed.
 
 ## 3. Join an Agent
 
