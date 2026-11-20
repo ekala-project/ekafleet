@@ -58,8 +58,7 @@ ekafleet agent [OPTIONS]
 |--------|---------|-------------|
 | `--join` | *(required)* | Server address to join (host:port) |
 | `--token` | | Legacy bearer token for authentication |
-| `--join-token` | | One-time join token for SPIFFE node attestation (preferred; needs `--ca-cert`; env `EKAFLEET_JOIN_TOKEN`) |
-| `--node-id` | *(UUID on first start)* | Node ID to attest as; persisted in `<data-dir>/node-id`; env `EKAFLEET_NODE_ID` |
+| `--join-token` | | One-time join token for SPIFFE node attestation (preferred) |
 | `--data-dir` | `/var/lib/ekafleet` | Data directory for local state |
 | `--ca-cert` | | Path to CA certificate PEM for TLS verification |
 
@@ -438,7 +437,7 @@ The `--token` passed at server startup is registered as an `admin` token. Additi
 
 ### `ekafleet token create`
 
-Create a one-time join token on the server (`CreateJoinToken` RPC; needs an admin token). The server generates the token (256-bit, hex-encoded), registers it, and expires it after one hour.
+Generate a cryptographically random join token (256-bit, hex-encoded).
 
 ```
 ekafleet token create [OPTIONS]
@@ -446,11 +445,9 @@ ekafleet token create [OPTIONS]
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--type` | `agent` | Token type; only `agent` exists |
-| `--node-id` | | Bind the token to this node ID |
-| `--server` | `127.0.0.1:7400` | Server address |
+| `--type` | `agent` | Token type: `agent` or `server` |
 
-Connection settings (`--ca-cert`, `EKAFLEET_TOKEN`, contexts) work as for other commands. Output: 64-character hex string to stdout.
+Output: 64-character hex string to stdout.
 
 ### REST API Authentication
 
