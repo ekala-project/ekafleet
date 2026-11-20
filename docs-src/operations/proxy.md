@@ -80,7 +80,7 @@ ekafleet secret set _fleet shop-crt --file fullchain.pem
 ekafleet secret set _fleet shop-key --file privkey.pem
 ```
 
-- The secrets reach only the nodes serving the route, re-encrypted for each node like any secret. The agent checks that the key matches the certificate, then writes both to `/run/ekafleet/ingress-tls/<route>.{crt,key}`. The key is readable by root and the proxy's group (`ekafleet-proxy`) only.
+- The secrets reach only the nodes serving the route, re-encrypted for each node like any secret. The agent checks that the key matches the certificate, then writes both to `/run/ekafleet/ingress-tls/<route>.{crt,key}`. The key is readable by root and the proxy's group (`ekafleet-ingress-tls`) only.
 - The proxy picks the certificate by SNI. A `*` route's certificate, or any one if there is none, answers clients that send no or an unknown name. Routes sharing a host must name the same secrets.
 - Plain-HTTP requests for a TLS route are redirected (308) to HTTPS.
 - Until both secrets have a value, the route is served over plain HTTP, and `ekafleet apply` warns about it. Rotating a certificate is setting the secrets again; the proxy picks the new one up within seconds.
