@@ -354,24 +354,13 @@ impl Target {
             port,
         )
             .into();
-        // setns affects only the calling thread, so connect on a throwaway
-        // one; the socket stays in the namespace it was made in.
-        let stream =
-            tokio::task::spawn_blocking(move || -> std::io::Result<std::net::TcpStream> {
-                use std::os::fd::AsRawFd;
-                let ns = std::fs::File::open(&netns)?;
-                // SAFETY: `ns` is an open namespace file descriptor; setns only
-                // changes this (throwaway) thread's network namespace.
-                if unsafe { libc::setns(ns.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                let stream = std::net::TcpStream::connect_timeout(&addr, timeout)?;
-                stream.set_nonblocking(true)?;
-                Ok(stream)
-            })
-            .await
-            .map_err(|e| e.to_string())?
-            .map_err(|e| e.to_string())?;
+        let stream = crate::agent::netns::run_in_netns(std::path::Path::new(&netns), move || {
+            let stream = std::net::TcpStream::connect_timeout(&addr, timeout)?;
+            stream.set_nonblocking(true)?;
+            Ok(stream)
+        })
+        .await
+        .map_err(|e| e.to_string())?;
         TcpStream::from_std(stream).map_err(|e| e.to_string())
     }
 }
